@@ -1,5 +1,6 @@
 #include "libcamera.h"
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -11,7 +12,6 @@ void queryPixelFormats(int fd, cameraInfo& info) {
     cameraVideoFormat format;
 
     memset(&fmtdesc, 0, sizeof(fmtdesc));
-    memset(&format, 0, sizeof(format));
 
     fmtdesc.index = 0;
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -151,7 +151,7 @@ void populateCameraAttributes(int fd, cameraInfo& info) {
         attr.menuOptions.clear();
 
         if (attr.type == CAMERA_ATTRIBUTE_TYPE::MENU) {
-            for (uint32_t i = queryctrl.minimum; i <= queryctrl.maximum; ++i) {
+            for (int i = queryctrl.minimum; i <= queryctrl.maximum; ++i) {
                 struct v4l2_querymenu querymenu;
                 memset(&querymenu, 0, sizeof(querymenu));
                 querymenu.id = queryctrl.id;
