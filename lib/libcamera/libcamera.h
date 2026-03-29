@@ -1,9 +1,25 @@
 #ifndef LIBCAMERA_H
 #define LIBCAMERA_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
-#include <cstdint>
+
+// --- Static Memory Limits ---
+constexpr uint32_t MAX_CAMERAS = 10;
+constexpr uint32_t MAX_ATTRIBUTES = 64;
+constexpr uint32_t MAX_VIDEO_FORMATS = 256; // PER QUERY, NOT TOTAL
+constexpr uint32_t MAX_MENU_OPTIONS = 16;
+constexpr uint32_t MAX_STRING_LEN = 32;
+
+enum class ERROR_CODE {
+    SUCCESS = 0,
+    INVALID_FILE_DESCRIPTOR = -1,
+    INVALID_ATTRIBUTE,
+    UNSUPPORTED_FORMAT,
+    CAMERA_BUSY,
+    UNKNOWN_ERROR
+};
 
 enum class CAMERA_TYPE {
     CSI,
@@ -12,18 +28,37 @@ enum class CAMERA_TYPE {
     UNKNOWN
 };
 
+enum class CAMERA_ATTRIBUTE_TYPE {
+    INTEGER,
+    I64,
+    U32,
+    U16,
+    U8,
+    FLOAT,
+    STRING,
+    BOOLEAN,
+    MENU,
+    BUTTON,
+    UNKNOWN
+};
+
 struct cameraAttribute {
     std::string name;
-    std::string type;
+    CAMERA_ATTRIBUTE_TYPE type;
     bool isWritable;
     bool isReadable;
+    float minValue;
+    float maxValue;
+    float step;
+    std::vector<std::string> menuOptions;
 };
 
 struct cameraVideoFormat {
     uint32_t width;
     uint32_t height;
-    _Float32 frameRate;
-    std::string pixelFormat;
+    float frameRate;
+    uint32_t pixelFormat; // V4L2 pixel format code (e.g., V4L2_PIX_FMT_YUYV)
+    std::string description;
 };
 
 struct cameraStatus {
@@ -34,29 +69,27 @@ struct cameraStatus {
 };
 
 struct cameraInfo {
-    std::string name;
     CAMERA_TYPE type;
     std::string address;
     std::vector<cameraAttribute> attributes;
     std::vector<cameraVideoFormat> videoFormats;
-    cameraStatus status;
 };
 
-int getCameraList(std::vector<cameraInfo>& cameraList);
+ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList);
 
 class iCamera {
 public:
     virtual ~iCamera() = default;
-    virtual int open() = 0;
-    virtual int close() = 0;
+    virtual ERROR_CODE open() = 0;
+    virtual ERROR_CODE close() = 0;
     virtual bool isOpen() const = 0;
-    virtual cameraInfo getCameraInfo() const = 0;
-    virtual int setCameraAttribute(const std::string& name, const std::string& value) = 0;
-    virtual int setCameraVideoFormat(const cameraVideoFormat& format) = 0;
-    virtual cameraStatus getCameraStatus() const = 0;
-    virtual int start() = 0;
-    virtual int stop() = 0;
-    virtual int captureFrame(std::vector<uint8_t>& buffer) = 0;
+    virtual ERROR_CODE getCameraInfo(cameraInfo& info) const = 0;
+    virtual ERROR_CODE setCameraAttribute(const std::string& name, const std::string& value) = 0;
+    virtual ERROR_CODE setCameraVideoFormat(const cameraVideoFormat& format) = 0;
+    virtual ERROR_CODE getCameraStatus(cameraStatus& status) const = 0;
+    virtual ERROR_CODE start() = 0;
+    virtual ERROR_CODE stop() = 0;
+    virtual ERROR_CODE captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) = 0;
 };
 
 #endif //LIBCAMERA_H
