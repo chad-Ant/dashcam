@@ -81,7 +81,8 @@ protected:
 
     std::map<std::string, std::string> pendingAttributes_; ///< Attributes queued before start().
     std::map<std::string, GstElement*> branchValves_;      ///< Non-owning valve pointers keyed by branch name.
-
+    mutable std::mutex stateMutex_;                        ///< Protects status_ and pendingAttributes_ for concurrent access.
+    
     /**
      * @brief Return the ERROR_CODE used when the GStreamer pipeline fails.
      *

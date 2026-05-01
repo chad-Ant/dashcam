@@ -1,6 +1,6 @@
 ---
 name: jetson-dashcam-dev
-description: Use whenever the user is developing on an NVIDIA Jetson — especially Jetson Orin Nano on JetPack 6.2 — and the work touches AI dashcam features (multi-camera capture, on-device inference, event-triggered recording, GPS/speed overlays, lane/sign/driver detection), DeepStream SDK pipelines, GStreamer + TensorRT, the l4t-ml or deepstream containers from jetson-containers, CSI cameras via nvarguscamerasrc, USB cameras via v4l2src, smart recording, NVDEC/NVENC questions, or any combination of these. Use even when the user only mentions a fragment ("nvarguscamerasrc isn't working in my container", "what pipeline should I use for my IMX296", "trtexec engine build is OOMing"), and use proactively before answering Jetson questions from memory because version pairings and Orin Nano hardware specifics are version-sensitive and easy to get wrong.
+description: Use whenever the user is developing on an NVIDIA Jetson — especially Jetson Orin Nano on JetPack 6.2 — and the work touches AI dashcam features (multi-camera capture, on-device inference, event-triggered recording, GPS/speed overlays, lane/sign/driver detection), DeepStream SDK pipelines, GStreamer + TensorRT, the l4t-ml or deepstream containers from jetson-containers, CSI cameras via nvarguscamerasrc, USB cameras via v4l2src, smart recording, NVDEC/NVENC questions, or any combination of these. Use even when the user only mentions a fragment ("nvarguscamerasrc isn't working in my container", "what pipeline should I use for my IMX296", "trtexec engine build is OOMing"), and use proactively before answering Jetson questions from memory because version pairings and Orin Nano hardware specifics are version-sensitive and easy to get wrong. Also check for thread safety when generating code, use non-deterministic code or language features as low as reasonably possible, and proactively flag Orin Nano constraints (no NVENC, no DLA, RAM limits) when relevant to the user's question or plan.
 ---
 
 # Jetson Dashcam Development
@@ -163,7 +163,7 @@ Triage order (full version in `references/debugging.md`):
 
 ## Closing reminder
 
-The user is building an AI dashcam with this specific camera architecture:
+The user is building a mission-critical AI dashcam with this specific camera architecture:
 
 | Camera | Sensor | Capture | Workloads |
 |---|---|---|---|

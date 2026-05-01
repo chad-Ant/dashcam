@@ -18,7 +18,7 @@ void Camera_GST::teardownPipeline() {
     if (pipeline_) {
         gst_element_set_state(pipeline_, GST_STATE_NULL);
     }
-
+    std::lock_guard<std::mutex> lock(stateMutex_);
     for (GstPad* pad : teePads_) {
         if (tee_) gst_element_release_request_pad(tee_, pad);
         gst_object_unref(pad);
@@ -74,6 +74,7 @@ Camera_GST::~Camera_GST() {
 }
 
 void Camera_GST::open() {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     if (status_.status != CAMERA_STATUS::CLOSED) {
         status_.currentError = status_.currentError == ERROR_CODE::NONE
             ? ERROR_CODE::CAMERA_ALREADY_OPEN : status_.currentError;
@@ -91,6 +92,7 @@ void Camera_GST::open() {
 }
 
 void Camera_GST::close() {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     if (status_.status == CAMERA_STATUS::CLOSED) {
         status_.currentError = ERROR_CODE::CAMERA_ALREADY_CLOSED;
         return;
@@ -110,6 +112,7 @@ bool Camera_GST::isOpen() const {
 void Camera_GST::getCameraInfo(cameraInfo& info) const { info = info_; }
 
 void Camera_GST::setCameraAttribute(const std::string& name, const std::string& value) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     if (status_.status != CAMERA_STATUS::RUNNING) {
         pendingAttributes_[name] = value;
         status_.currentError = ERROR_CODE::NONE;
@@ -126,7 +129,17 @@ void Camera_GST::setCameraVideoFormat(uint16_t formatIndex) {
     status_.currentFormatIndex = formatIndex;
 }
 
-void Camera_GST::getCameraStatus(cameraStatus& status) const { status = status_; }
+void Camera_GST::getCameraStatus(cameraStatus& status) const { 
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    status = status_; 
+}
+
+auto setPipelineError = [&]() {
+        teardownPipeline();
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        status_.status = CAMERA_STATUS::ERROR;
+        status_.currentError = pipelineError();
+    };
 
 void Camera_GST::start() {
     if (status_.status == CAMERA_STATUS::RUNNING) {
@@ -162,9 +175,7 @@ void Camera_GST::start() {
     tee_        = gst_bin_get_by_name(GST_BIN(pipeline_), "srctee");
 
     if (!appsink_ || !camera_src_ || !tee_) {
-        teardownPipeline();
-        status_.status = CAMERA_STATUS::ERROR;
-        status_.currentError = pipelineError();
+        setPipelineError();
         return;
     }
 
@@ -220,35 +231,54 @@ void Camera_GST::start() {
     }
 
     if (branchError) {
-        teardownPipeline();
-        status_.status = CAMERA_STATUS::ERROR;
-        status_.currentError = pipelineError();
+        setPipelineError();
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
     // Apply queued attributes before the pipeline starts so the first frame uses them.
-    for (const auto& [attrName, attrValue] : pendingAttributes_) {
+        for (const auto& [attrName, attrValue] : pendingAttributes_) {
         applyAttributeGStreamer(attrName, attrValue);
+        }   
+        pendingAttributes_.clear();
     }
-    pendingAttributes_.clear();
-
-    if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        teardownPipeline();
-        status_.status = CAMERA_STATUS::ERROR;
-        status_.currentError = pipelineError();
+    
+    GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        setPipelineError();
         return;
+    } 
+    else if (ret == GST_STATE_CHANGE_ASYNC) {
+        // Block and wait for Argus/V4L2 hardware to fully initialize
+        // Timeout set to 5 seconds (5 * GST_SECOND)
+        GstState state, pending;
+        ret = gst_element_get_state(pipeline_, &state, &pending, 5 * GST_SECOND);
+
+        if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {
+            // If it's STILL async after 5 seconds, the camera is hung.
+            setPipelineError();
+            return;
+        }
     }
 
     status_.status = CAMERA_STATUS::RUNNING;
 }
 
 void Camera_GST::stop() {
-    if (status_.status != CAMERA_STATUS::RUNNING) return;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status != CAMERA_STATUS::RUNNING) return;
+        status_.status = CAMERA_STATUS::OPEN;
+    }
     teardownPipeline();
-    status_.status = CAMERA_STATUS::OPEN;
-    status_.freeBufferCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        status_.freeBufferCount = 0;
+    }
 }
 
+/*
 void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) {
     bytesWritten = 0;
     if (status_.status != CAMERA_STATUS::RUNNING || !appsink_) return;
@@ -262,6 +292,43 @@ void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& by
         if (dataSize <= bufferSize) {
             gst_buffer_extract(gstBuffer, 0, buffer, dataSize);
             bytesWritten = static_cast<uint32_t>(dataSize);
+            status_.frameCount++;
+        }
+    }
+    gst_sample_unref(sample);
+}
+*/
+void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) {
+    bytesWritten = 0;
+    
+    GstElement* sinkRef = nullptr;
+    
+    // Briefly lock to check state and safely increment the GStreamer reference count
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status != CAMERA_STATUS::RUNNING || !appsink_) return;
+        sinkRef = static_cast<GstElement*>(gst_object_ref(appsink_));
+    }
+
+    // Now we can safely block for 1 second without locking the rest of the class.
+    // If stop() is called now, it will set the pipeline to NULL, which forces 
+    // try_pull_sample to immediately return nullptr (flushing state). It will NOT segfault.
+    GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sinkRef), GST_SECOND);
+    
+    // Release our local lease on the appsink
+    gst_object_unref(sinkRef);
+
+    if (!sample) return;
+
+    GstBuffer* gstBuffer = gst_sample_get_buffer(sample);
+    if (gstBuffer) {
+        gsize dataSize = gst_buffer_get_size(gstBuffer);
+        if (dataSize <= bufferSize) {
+            gst_buffer_extract(gstBuffer, 0, buffer, dataSize);
+            bytesWritten = static_cast<uint32_t>(dataSize);
+            
+            // Lock briefly again just to update the telemetry metric
+            std::lock_guard<std::mutex> lock(stateMutex_);
             status_.frameCount++;
         }
     }
