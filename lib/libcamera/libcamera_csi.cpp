@@ -207,6 +207,11 @@ GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
 
     if (!gst_element_link_many(nvvidconv, capsfilter, ovTL, ovTR, ovBL, ovBR,
                                encoder, parser, muxer, sink, nullptr)) {
+        // Null the overlay pointers before freeing the bin — elements are owned
+        // by the bin and will be freed by the unref, so any live setOverlayData()
+        // caller must not reach them after this point.
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        ovTopLeft_ = ovTopRight_ = ovBottomLeft_ = ovBottomRight_ = nullptr;
         gst_object_unref(bin);
         return nullptr;
     }

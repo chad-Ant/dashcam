@@ -1,15 +1,24 @@
 #include "libcamera_gst.h"
+#include <climits>
 #include <cstdlib>
 
 // ─── private helpers ────────────────────────────────────────────────────────
 
 /// Destruction order matters for GStreamer reference counting:
-///   1. Release tee request pads (gst_element_release_request_pad + unref).
-///   2. Clear tracking vectors (branches_, teePads_, branchValves_).
-///   3. Unref non-owning element handles (tee_, camera_src_, appsink_).
-///   4. Set pipeline to NULL state — joins the streaming thread and unrefs all
-///      bin members — then unref the pipeline itself.
+///   1. Set pipeline to NULL — joins the streaming thread, so no more callbacks.
+///   2. Release tee request pads (gst_element_release_request_pad + unref).
+///   3. Clear tracking vectors (branches_, teePads_, branchValves_).
+///   4. Unref non-owning element handles (tee_, camera_src_, appsink_).
+///   5. Unref the pipeline — releases all bin members.
+///
+/// The pipeline MUST reach NULL before pads are released.  Releasing request
+/// pads while the streaming thread is still running (i.e. before NULL state)
+/// is a GStreamer API violation and can cause the streaming thread to crash.
 void Camera_GST::teardownPipeline() {
+    if (pipeline_) {
+        gst_element_set_state(pipeline_, GST_STATE_NULL);
+    }
+
     for (GstPad* pad : teePads_) {
         if (tee_) gst_element_release_request_pad(tee_, pad);
         gst_object_unref(pad);
@@ -22,7 +31,6 @@ void Camera_GST::teardownPipeline() {
     if (camera_src_) { gst_object_unref(camera_src_); camera_src_ = nullptr; }
     if (appsink_)    { gst_object_unref(appsink_);    appsink_    = nullptr; }
     if (pipeline_) {
-        gst_element_set_state(pipeline_, GST_STATE_NULL);
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
     }
@@ -35,6 +43,7 @@ bool Camera_GST::safeStoi(const std::string& str, int& outVal) {
     char* end = nullptr;
     long val = std::strtol(str.c_str(), &end, 10);
     if (end == str.c_str() || *end != '\0') return false;
+    if (val < static_cast<long>(INT_MIN) || val > static_cast<long>(INT_MAX)) return false;
     outVal = static_cast<int>(val);
     return true;
 }
