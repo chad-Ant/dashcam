@@ -21,6 +21,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -161,12 +162,24 @@ private:
     /**
      * @brief Release all GStreamer resources acquired since the last open().
      *
-     * Releases tee request pads, clears branch and valve maps, unrefs
-     * camera_src_, appsink_, tee_, then sets the pipeline to NULL state and
-     * unrefs it.  Safe to call when any subset of those pointers is null.
-     * Called from stop(), close(), and every error path in start().
+     * Sets the pipeline to NULL state first (joins the streaming thread), then
+     * releases tee request pads, clears tracking vectors, unrefs element handles,
+     * and unrefs the pipeline.  Safe to call when any subset of those pointers
+     * is null.  Called from stop(), close(), and every error path in start().
+     *
+     * @note Not thread-safe; must be called only from lifecycle methods.
      */
     void teardownPipeline();
+
+    /**
+     * @brief Convenience helper: tear down and record a pipeline error.
+     *
+     * Calls teardownPipeline(), sets status to ERROR, and records the
+     * driver-specific pipelineError() code.  Used by start() error paths.
+     *
+     * @note Not thread-safe; must be called only from start().
+     */
+    void setPipelineError();
 
 public:
     /**
