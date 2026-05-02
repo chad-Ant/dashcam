@@ -104,19 +104,18 @@ static const char* headingToCardinal(float deg) {
     return names[sector < 0 ? sector + 8 : sector];
 }
 
-/// Apply corner position and common visual style to a textoverlay element.
-static void configureTextOverlay(GstElement* elem,
-                                  const char* halign, const char* valign) {
-    gst_util_set_object_arg(G_OBJECT(elem), "halignment", halign);
-    gst_util_set_object_arg(G_OBJECT(elem), "valignment",  valign);
-    g_object_set(G_OBJECT(elem),
-                 "font-desc",         "Monospace Bold 14",
-                 "color",             (guint)0xFFFFFFFF,   // white
-                 "shaded-background", (gboolean)TRUE,       // semi-transparent backing
-                 "xpad",              (gint)12,
-                 "ypad",              (gint)8,
-                 NULL);
-}
+// configureTextOverlay — replaced by inline pipeline-string properties in createRecordingBin().
+// static void configureTextOverlay(GstElement* elem, const char* halign, const char* valign) {
+//     gst_util_set_object_arg(G_OBJECT(elem), "halignment", halign);
+//     gst_util_set_object_arg(G_OBJECT(elem), "valignment",  valign);
+//     g_object_set(G_OBJECT(elem),
+//                  "font-desc",         "Monospace Bold 14",
+//                  "color",             (guint)0xFFFFFFFF,
+//                  "shaded-background", (gboolean)TRUE,
+//                  "xpad",              (gint)12,
+//                  "ypad",              (gint)8,
+//                  NULL);
+// }
 
 void Camera_CSI::updateTextOverlays(const OverlayData& od) {
     // UTC timestamp
@@ -155,74 +154,61 @@ void Camera_CSI::updateTextOverlays(const OverlayData& od) {
 
 // ─── recording bin ────────────────────────────────────────────────────────────
 
-// Keyframe interval for the recording encoder.
-// At 60 fps (IMX296 1080p60) this produces one keyframe per second,
-// keeping GOP short enough for fast seek on event clips without
-// inflating bitrate the way a sub-second interval would.
-static constexpr guint MAX_FRAMES_PER_KEYFRAME = 60;
-
 GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
-    GstElement* bin        = gst_bin_new(nullptr);
-    GstElement* nvvidconv  = gst_element_factory_make("nvvidconv",   nullptr);
-    GstElement* capsfilter = gst_element_factory_make("capsfilter",  nullptr);
-    GstElement* ovTL       = gst_element_factory_make("textoverlay", nullptr);
-    GstElement* ovTR       = gst_element_factory_make("textoverlay", nullptr);
-    GstElement* ovBL       = gst_element_factory_make("textoverlay", nullptr);
-    GstElement* ovBR       = gst_element_factory_make("textoverlay", nullptr);
-    GstElement* encoder    = gst_element_factory_make("x264enc",     nullptr);
-    GstElement* parser     = gst_element_factory_make("h264parse",   nullptr);
-    GstElement* muxer      = gst_element_factory_make("mp4mux",      nullptr);
-    GstElement* sink       = gst_element_factory_make("filesink",    nullptr);
+    // ghost_unlinked_pads=TRUE: GStreamer auto-wraps nvvidconv's unlinked "sink"
+    // pad as a ghost pad named "sink" on the bin — no manual ghost-pad code needed.
+    // filename is set via g_object_set below (not in the string) to handle paths
+    // with spaces or other characters that would break the description parser.
+    static const char* binDesc =
+        "nvvidconv name=conv ! video/x-raw,format=(string)I420 "
+        "! textoverlay name=ov_tl halignment=left  valignment=top    "
+          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
+        "! textoverlay name=ov_tr halignment=right valignment=top    "
+          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
+        "! textoverlay name=ov_bl halignment=left  valignment=bottom "
+          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
+        "! textoverlay name=ov_br halignment=right valignment=bottom "
+          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
+        "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=60 "
+        "! h264parse ! mp4mux ! filesink name=fsink";
 
-    if (!bin || !nvvidconv || !capsfilter || !ovTL || !ovTR || !ovBL || !ovBR ||
-        !encoder || !parser || !muxer || !sink) {
-        GstElement* elems[] = { bin, nvvidconv, capsfilter, ovTL, ovTR, ovBL, ovBR,
-                                 encoder, parser, muxer, sink };
-        for (GstElement* e : elems) {
-            if (e) { gst_object_ref_sink(e); gst_object_unref(e); }
-        }
+    GError*     err = nullptr;
+    GstElement* bin = gst_parse_bin_from_description(binDesc, TRUE, &err);
+    if (!bin || err) {
+        if (err) g_error_free(err);
+        if (bin) gst_object_unref(bin);
         return nullptr;
     }
 
-    // nvvidconv converts NVMM NV12 → I420 system memory for textoverlay
-    GstCaps* i420Caps = gst_caps_from_string("video/x-raw,format=(string)I420");
-    g_object_set(G_OBJECT(capsfilter), "caps", i420Caps, NULL);
-    gst_caps_unref(i420Caps);
+    // Set the output path via g_object_set — safe for paths containing spaces.
+    GstElement* fsink = gst_bin_get_by_name(GST_BIN(bin), "fsink");
+    if (fsink) {
+        g_object_set(G_OBJECT(fsink), "location", filename.c_str(), NULL);
+        gst_object_unref(fsink);
+    }
 
-    configureTextOverlay(ovTL, "left",  "top");
-    configureTextOverlay(ovTR, "right", "top");
-    configureTextOverlay(ovBL, "left",  "bottom");
-    configureTextOverlay(ovBR, "right", "bottom");
+    // gst_bin_get_by_name returns an owned ref (+1).  Immediately release it so
+    // the bin remains the sole owner; the raw pointers stay valid for the bin's
+    // lifetime, matching the non-owning semantics used by setOverlayData/stop().
+    GstElement* ovTL = gst_bin_get_by_name(GST_BIN(bin), "ov_tl");
+    GstElement* ovTR = gst_bin_get_by_name(GST_BIN(bin), "ov_tr");
+    GstElement* ovBL = gst_bin_get_by_name(GST_BIN(bin), "ov_bl");
+    GstElement* ovBR = gst_bin_get_by_name(GST_BIN(bin), "ov_br");
 
-    gst_util_set_object_arg(G_OBJECT(encoder), "tune",         "zerolatency");
-    gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "ultrafast");
-    g_object_set(G_OBJECT(encoder), "bitrate", (guint)4000, NULL);
-    g_object_set(G_OBJECT(encoder), "key-int-max", MAX_FRAMES_PER_KEYFRAME, NULL);
-
-    g_object_set(G_OBJECT(sink), "location", filename.c_str(), NULL);
-
-    gst_bin_add_many(GST_BIN(bin),
-                     nvvidconv, capsfilter, ovTL, ovTR, ovBL, ovBR,
-                     encoder, parser, muxer, sink, nullptr);
-
-    if (!gst_element_link_many(nvvidconv, capsfilter, ovTL, ovTR, ovBL, ovBR,
-                               encoder, parser, muxer, sink, nullptr)) {
-        // Null the overlay pointers before freeing the bin — elements are owned
-        // by the bin and will be freed by the unref, so any live setOverlayData()
-        // caller must not reach them after this point.
-        std::lock_guard<std::mutex> lock(overlayMutex_);
-        ovTopLeft_ = ovTopRight_ = ovBottomLeft_ = ovBottomRight_ = nullptr;
+    if (!ovTL || !ovTR || !ovBL || !ovBR) {
+        if (ovTL) gst_object_unref(ovTL);
+        if (ovTR) gst_object_unref(ovTR);
+        if (ovBL) gst_object_unref(ovBL);
+        if (ovBR) gst_object_unref(ovBR);
         gst_object_unref(bin);
         return nullptr;
     }
 
-    // Ghost sink pad on nvvidconv so the bin accepts input from the tee
-    GstPad* sinkPad  = gst_element_get_static_pad(nvvidconv, "sink");
-    GstPad* ghostPad = gst_ghost_pad_new("sink", sinkPad);
-    gst_object_unref(sinkPad);
-    gst_element_add_pad(bin, ghostPad);
+    gst_object_unref(ovTL);
+    gst_object_unref(ovTR);
+    gst_object_unref(ovBL);
+    gst_object_unref(ovBR);
 
-    // Store non-owning pointers and prime the overlay text with current data
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
         ovTopLeft_     = ovTL;

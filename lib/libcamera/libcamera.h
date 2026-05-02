@@ -53,7 +53,7 @@ enum class ERROR_CODE {
 enum class CAMERA_TYPE {
     CSI,     ///< MIPI CSI-2 sensor accessed via the NVIDIA Argus / tegra-video driver.
     USB,     ///< USB UVC device (driver: uvcvideo).
-    GIGE,    ///< GigE Vision camera (V4L2 attribute enumeration is skipped).
+//    GIGE,    ///< GigE Vision camera (V4L2 attribute enumeration is skipped). GIGE detection not supported yet.
     UNKNOWN  ///< Driver name not recognised; basic capture may still work.
 };
 

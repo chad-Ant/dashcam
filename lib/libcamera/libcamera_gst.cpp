@@ -57,6 +57,7 @@ void Camera_GST::teardownPipeline() {
 
 void Camera_GST::setPipelineError() {
     teardownPipeline();
+    std::lock_guard<std::mutex> lock(stateMutex_);
     status_.status       = CAMERA_STATUS::ERROR;
     status_.currentError = pipelineError();
 }
@@ -99,6 +100,7 @@ Camera_GST::~Camera_GST() {
 }
 
 void Camera_GST::open() {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     if (status_.status != CAMERA_STATUS::CLOSED) {
         status_.currentError = status_.currentError == ERROR_CODE::NONE
             ? ERROR_CODE::CAMERA_ALREADY_OPEN : status_.currentError;
@@ -116,20 +118,31 @@ void Camera_GST::open() {
 }
 
 void Camera_GST::close() {
-    if (status_.status == CAMERA_STATUS::CLOSED) {
-        status_.currentError = ERROR_CODE::CAMERA_ALREADY_CLOSED;
-        return;
+    bool requiresStop = false;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status == CAMERA_STATUS::CLOSED) {
+            status_.currentError = ERROR_CODE::CAMERA_ALREADY_CLOSED;
+            return;
+        }
+        requiresStop = (status_.status == CAMERA_STATUS::RUNNING);
     }
-    if (status_.status == CAMERA_STATUS::RUNNING) {
-        stop();  // stop() calls teardownPipeline() internally
+
+    // Drop lock before hitting GStreamer teardown logic to prevent deadlocks
+    if (requiresStop) {
+        stop();  
     } else {
-        teardownPipeline();  // clean up any partial resources from OPEN or ERROR state
+        teardownPipeline();  
     }
+
+    // Re-acquire to finalize state
+    std::lock_guard<std::mutex> lock(stateMutex_);
     status_.status = CAMERA_STATUS::CLOSED;
     status_.currentError = ERROR_CODE::NONE;
 }
 
 bool Camera_GST::isOpen() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     return status_.status != CAMERA_STATUS::CLOSED;
 }
 
@@ -161,18 +174,23 @@ void Camera_GST::getCameraStatus(cameraStatus& status) const {
 }
 
 void Camera_GST::start() {
-    if (status_.status == CAMERA_STATUS::RUNNING) {
-        status_.currentError = ERROR_CODE::CAMERA_ALREADY_RUNNING;
-        return;
-    }
-    if (status_.status != CAMERA_STATUS::OPEN) return;
-    if (info_.videoFormats.empty() || status_.currentFormatIndex >= info_.videoFormats.size()) {
-        status_.status = CAMERA_STATUS::ERROR;
-        status_.currentError = ERROR_CODE::UNSUPPORTED_FORMAT;
-        return;
+    uint16_t formatIndex = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status == CAMERA_STATUS::RUNNING) {
+            status_.currentError = ERROR_CODE::CAMERA_ALREADY_RUNNING;
+            return;
+        }
+        if (status_.status != CAMERA_STATUS::OPEN) return;
+        if (info_.videoFormats.empty() || status_.currentFormatIndex >= info_.videoFormats.size()) {
+            status_.status = CAMERA_STATUS::ERROR;
+            status_.currentError = ERROR_CODE::UNSUPPORTED_FORMAT;
+            return;
+        }
+        formatIndex = status_.currentFormatIndex;
     }
 
-    const auto& fmt = info_.videoFormats[status_.currentFormatIndex];
+    const auto& fmt = info_.videoFormats[formatIndex];
 
     uint32_t frNum, frDen;
     computeFpsRational(fmt.frameRate, frNum, frDen);
@@ -184,8 +202,7 @@ void Camera_GST::start() {
     if (error != nullptr || pipeline_ == nullptr) {
         if (error) g_error_free(error);
         if (pipeline_) { gst_object_unref(pipeline_); pipeline_ = nullptr; }
-        status_.status = CAMERA_STATUS::ERROR;
-        status_.currentError = pipelineError();
+        setPipelineError();
         return;
     }
 
@@ -203,12 +220,12 @@ void Camera_GST::start() {
     // The queue isolates backpressure; the valve enables runtime enable/disable.
     bool branchError = false;
     for (size_t i = 0; i < branches_.size(); ++i) {
-        auto& [branchName, branchBin] = branches_[i];
+        auto& [branchName, branchBin, branchLeaky] = branches_[i];
 
         auto releaseRemaining = [&](size_t from) {
             for (size_t j = from; j < branches_.size(); ++j) {
-                gst_object_ref_sink(branches_[j].second);
-                gst_object_unref(branches_[j].second);
+                gst_object_ref_sink(branches_[j].bin);
+                gst_object_unref(branches_[j].bin);
             }
         };
 
@@ -218,6 +235,15 @@ void Camera_GST::start() {
             releaseRemaining(i + 1);
             branchError = true;
             break;
+        }
+
+        if (branchLeaky) {
+            g_object_set(G_OBJECT(queue),
+                "max-size-buffers", (guint)2,
+                "max-size-bytes",   (guint)0,
+                "max-size-time",    (guint64)0,
+                "leaky",            (gint)2,   // GST_QUEUE_LEAK_DOWNSTREAM
+                NULL);
         }
 
         GstElement* valve = gst_element_factory_make("valve", nullptr);
@@ -231,7 +257,13 @@ void Camera_GST::start() {
 
         gst_bin_add_many(GST_BIN(pipeline_), queue, valve, branchBin, nullptr);
 
-        GstPad* teeSrcPad    = gst_element_request_pad_simple(tee_, "src_%u");
+        GstPad* teeSrcPad = gst_element_request_pad_simple(tee_, "src_%u");
+        if (!teeSrcPad) {
+            releaseRemaining(i + 1);
+            branchError = true;
+            break;
+        }
+
         GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
         GstPadLinkReturn ret = gst_pad_link(teeSrcPad, queueSinkPad);
         gst_object_unref(queueSinkPad);
@@ -254,6 +286,20 @@ void Camera_GST::start() {
         return;
     }
 
+    // Pre-start flush: apply pending attributes while the pipeline is in NULL state.
+    // nvarguscamerasrc reads GObject properties during the PAUSED→PLAYING ISP
+    // bringup, so frame 0 uses the requested exposure/gain/lock with no AE flash.
+    // Holding stateMutex_ here is safe: no streaming thread exists yet, so
+    // g_object_set is just writing struct fields — no blocking, no callbacks.
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        for (const auto& [attrName, attrValue] : pendingAttributes_) {
+            applyAttributeGStreamer(attrName, attrValue);
+        }
+        pendingAttributes_.clear();
+    }
+
+    // Hardware boots here with the correct ISP settings already applied.
     GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         setPipelineError();
@@ -261,6 +307,8 @@ void Camera_GST::start() {
     }
     if (ret == GST_STATE_CHANGE_ASYNC) {
         // Block until Argus/V4L2 hardware fully initialises (up to 5 s).
+        // Any setCameraAttribute() calls during this window are safely queued
+        // into pendingAttributes_ because status is still OPEN.
         GstState state, pending;
         ret = gst_element_get_state(pipeline_, &state, &pending, 5 * GST_SECOND);
         if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {
@@ -269,29 +317,29 @@ void Camera_GST::start() {
         }
     }
 
-    // Snapshot and clear pendingAttributes_ atomically with the RUNNING transition.
-    // Setting RUNNING first means any setCameraAttribute() call after the unlock
-    // routes to applyAttributeGStreamer() directly instead of the pending map, so
-    // no attribute written after this point can be lost to a subsequent clear().
-    std::map<std::string, std::string> toApply;
+    // Atomically set RUNNING and drain anything queued during the startup window.
+    std::map<std::string, std::string> lateAttribs;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         status_.status = CAMERA_STATUS::RUNNING;
-        toApply = std::move(pendingAttributes_);
+        lateAttribs = std::move(pendingAttributes_);
     }
-    for (const auto& [attrName, attrValue] : toApply) {
+    for (const auto& [attrName, attrValue] : lateAttribs) {
         applyAttributeGStreamer(attrName, attrValue);
     }
 }
 
 void Camera_GST::stop() {
-    if (status_.status != CAMERA_STATUS::RUNNING) return;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status != CAMERA_STATUS::RUNNING) return;
         status_.status = CAMERA_STATUS::OPEN;
     }
     teardownPipeline();
-    status_.freeBufferCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        status_.freeBufferCount = 0;
+    }
 }
 
 void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) {
@@ -330,12 +378,13 @@ void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& by
 
 // ─── multi-sink extensions ───────────────────────────────────────────────────
 
-void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin) {
+void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin, bool leaky) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     if (status_.status == CAMERA_STATUS::RUNNING) {
         status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
         return;
     }
-    branches_.emplace_back(name, sinkBin);
+    branches_.push_back({name, sinkBin, leaky});
 }
 
 GstElement* Camera_GST::getTee() const { return tee_; }
@@ -343,6 +392,7 @@ GstElement* Camera_GST::getTee() const { return tee_; }
 // Valve drop=true discards buffers without flushing — timestamps remain
 // continuous in the recording pipeline, so re-enabling mid-stream works cleanly.
 void Camera_GST::setBranchEnabled(const std::string& name, bool enabled) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     auto it = branchValves_.find(name);
     if (it == branchValves_.end()) {
         status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;

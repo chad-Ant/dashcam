@@ -23,7 +23,6 @@
 #include <map>
 #include <mutex>
 #include <string>
-#include <utility>
 #include <vector>
 
 /**
@@ -72,9 +71,15 @@ protected:
     GstElement* appsink_;    ///< Default BGR output sink; pulled by captureFrame().
     GstElement* tee_;        ///< Fan-out tee element; nullptr when not running.
 
+    struct BranchEntry {
+        std::string  name;
+        GstElement*  bin;
+        bool         leaky; ///< true → leaky downstream queue (inference); false → blocking queue (recording).
+    };
+
     /// Branches registered via addBranch() before start().  The pipeline takes
     /// ownership of each GstElement* via gst_bin_add() during start().
-    std::vector<std::pair<std::string, GstElement*>> branches_;
+    std::vector<BranchEntry> branches_;
 
     /// Request pads obtained from tee_ for each external branch.
     /// Released via gst_element_release_request_pad() in teardownPipeline().
@@ -235,9 +240,13 @@ public:
      *
      * @param[in] name     Unique branch identifier used by setBranchEnabled().
      * @param[in] sinkBin  GstElement (typically a GstBin) to attach to the tee.
+     * @param[in] leaky    If @c true, the inter-branch queue uses a 2-buffer leaky-downstream
+     *                     policy — always delivers the most recent frame, never blocks the tee.
+     *                     Use @c true for inference branches and @c false (default) for
+     *                     recording branches where every frame must be preserved.
      * @pre Must be called before start().
      */
-    void addBranch(const std::string& name, GstElement* sinkBin);
+    void addBranch(const std::string& name, GstElement* sinkBin, bool leaky = false);
 
     /**
      * @brief Return the tee element for direct pipeline manipulation.

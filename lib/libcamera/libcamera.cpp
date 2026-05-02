@@ -10,6 +10,12 @@
 #include <unistd.h>
 #include <linux/videodev2.h>
 
+struct ScopedFd {
+    int fd;
+    explicit ScopedFd(int fd) : fd(fd) {}
+    ~ScopedFd() { if (fd >= 0) ::close(fd); }
+    operator int() const { return fd; }
+};
 
 /**
  * @brief Enumerate discrete pixel formats supported by a V4L2 capture device.
@@ -24,7 +30,7 @@
  */
 static void queryPixelFormats(int fd, cameraInfo& info) {
     struct v4l2_fmtdesc fmtdesc;
-    cameraVideoFormat format;
+    cameraVideoFormat format{0, 0, 0.0f, 0, ""};
 
     memset(&fmtdesc, 0, sizeof(fmtdesc));
     fmtdesc.index = 0;
@@ -271,43 +277,37 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
     // CSI cameras are addressed by Argus sensor-id (0-based among CSI cameras),
     // which is independent of the /dev/videoN numbering.
     uint32_t csiSensorCount = 0;
-
+    int fd;
+    
     for (const auto& devicePath : videoPaths) {
-        int fd = open(devicePath.c_str(), O_RDONLY | O_NONBLOCK);
-        if (fd < 0) {
-            continue;
-        }
+        ScopedFd fd(::open(devicePath.c_str(), O_RDONLY | O_NONBLOCK));
+        if (fd < 0) continue;
 
         struct v4l2_capability cap;
-        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
-            ::close(fd);
-            continue;
-        }
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) continue;
 
-        if (!(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
-            ::close(fd);
-            continue;
-        }
+        if (!(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) continue;
 
         cameraInfo info;
         info.address = devicePath.string();
         std::string driverName(reinterpret_cast<const char*>(cap.driver));
+
+        uint32_t parsedDevId = static_cast<uint32_t>(std::strtoul(devicePath.filename().string().c_str() + 5, nullptr, 10));
 
         if (driverName == "tegra-video" || driverName == "vi") {
             info.type     = CAMERA_TYPE::CSI;
             info.deviceId = csiSensorCount++;
         } else if (driverName == "uvcvideo") {
             info.type     = CAMERA_TYPE::USB;
-            info.deviceId = static_cast<uint32_t>(std::strtoul(devicePath.filename().string().c_str() + 5, nullptr, 10));
+            info.deviceId = parsedDevId;
         } else {
             info.type     = CAMERA_TYPE::UNKNOWN;
-            info.deviceId = static_cast<uint32_t>(std::strtoul(devicePath.filename().string().c_str() + 5, nullptr, 10));
+            info.deviceId = parsedDevId;
         }
 
         populateCameraAttributes(fd, info);
         populateCameraVideoFormats(fd, info);
         cameraList.push_back(info);
-        ::close(fd);
     }
 
     if (cameraList.empty()) {
