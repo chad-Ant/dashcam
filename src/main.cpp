@@ -112,7 +112,7 @@ bool test_graceful_mid_recording_stop(const cameraInfo& info) {
     uint32_t written = 0;
 
     auto start_time = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(2)) {
+    while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(7)) {
         cam.captureFrame(buffer.data(), buffer.size(), written);
         if (written > 0) frames++;
     }
