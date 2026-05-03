@@ -11,7 +11,7 @@
  *   getCameraList(list);
  *   Camera_CSI cam(list[0]);
  *
- *   GstElement* recBin = cam.createRecordingBin("/data/clip.mp4");
+ *   GstElement* recBin = cam.createRecordingBin("/data/clip.mkv");
  *   cam.addBranch("recording", recBin);
  *   cam.open();
  *   cam.setCameraVideoFormat(0);
@@ -94,6 +94,9 @@ private:
     int         videoWidth_   = 0;  ///< Frame width set by the caps-changed callback.
     int         videoHeight_  = 0;  ///< Frame height set by the caps-changed callback.
 
+    /** @brief Disconnect and clear Cairo overlay signal handlers under overlayMutex_. */
+    void disconnectOverlay();
+
     /** @brief Render all four corner labels onto @p cr for the current frame. */
     void renderOverlay(cairo_t* cr);
 
@@ -152,7 +155,7 @@ public:
     OverlayData getOverlayData() const;
 
     /**
-     * @brief Create a self-contained recording GstBin that writes an MP4 file.
+     * @brief Create a self-contained recording GstBin that writes an MKV file.
      *
      * The returned bin accepts NV12 (NVMM) video on its ghost sink pad and
      * internally converts to I420 system memory before rendering the overlay.
@@ -161,7 +164,7 @@ public:
      *   nvvidconv ! video/x-raw,format=BGRx
      *     ! cairooverlay
      *     ! videoconvert ! video/x-raw,format=I420
-     *     ! x264enc ! h264parse ! mp4mux ! filesink
+     *     ! x264enc ! h264parse ! matroskamux ! filesink
      * @endverbatim
      *
      * A single @c cairooverlay element fires the "draw" signal on every frame.
@@ -175,10 +178,10 @@ public:
      *   - Bottom-right: UTC date, UTC time
      *
      * The bin can be handed directly to addBranch() and started/stopped
-     * together with the rest of the pipeline.  The file is finalised (mp4mux
-     * index written) when the pipeline transitions to NULL state.
+     * together with the rest of the pipeline.  The file is finalised
+     * (matroskamux cluster closed) when the pipeline transitions to NULL state.
      *
-     * @param[in] filename  Absolute or relative path for the output MP4 file.
+     * @param[in] filename  Absolute or relative path for the output MKV file.
      * @return Newly created GstBin (floating reference); nullptr on failure.
      *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
      * @note   Must be called before start().

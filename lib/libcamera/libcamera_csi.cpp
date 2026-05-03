@@ -76,35 +76,26 @@ Camera_CSI::Camera_CSI(const cameraInfo& camera)
     : Camera_GST(camera) {
 }
 
-void Camera_CSI::stop() {
-    {
-        std::lock_guard<std::mutex> lock(overlayMutex_);
-        if (cairoOverlay_) {
-            g_signal_handler_disconnect(cairoOverlay_, cairoDrawId_);
-            g_signal_handler_disconnect(cairoOverlay_, cairoCapsId_);
-        }
-        cairoOverlay_ = nullptr;
-        cairoDrawId_  = 0;
-        cairoCapsId_  = 0;
-        videoWidth_   = 0;
-        videoHeight_  = 0;
+void Camera_CSI::disconnectOverlay() {
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    if (cairoOverlay_) {
+        g_signal_handler_disconnect(cairoOverlay_, cairoDrawId_);
+        g_signal_handler_disconnect(cairoOverlay_, cairoCapsId_);
     }
+    cairoOverlay_ = nullptr;
+    cairoDrawId_  = 0;
+    cairoCapsId_  = 0;
+    videoWidth_   = 0;
+    videoHeight_  = 0;
+}
+
+void Camera_CSI::stop() {
+    disconnectOverlay();
     Camera_GST::stop();
 }
 
 void Camera_CSI::close() {
-    {
-        std::lock_guard<std::mutex> lock(overlayMutex_);
-        if (cairoOverlay_) {
-            g_signal_handler_disconnect(cairoOverlay_, cairoDrawId_);
-            g_signal_handler_disconnect(cairoOverlay_, cairoCapsId_);
-        }
-        cairoOverlay_ = nullptr;
-        cairoDrawId_  = 0;
-        cairoCapsId_  = 0;
-        videoWidth_   = 0;
-        videoHeight_  = 0;
-    }
+    disconnectOverlay();
     Camera_GST::close();
 }
 

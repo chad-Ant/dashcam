@@ -49,7 +49,7 @@ std::string Camera_USB::buildPipelineString(const cameraVideoFormat& fmt,
     return "v4l2src name=camerasrc device=" + info_.address +
            " ! " + formatCaps +
            " ! tee name=srctee"
-           " srctee. ! queue ! videoconvert ! video/x-raw, format=(string)BGR"
+           " srctee. ! queue max-size-buffers=2 leaky=2 ! videoconvert ! video/x-raw, format=(string)BGR"
            " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
 }
 

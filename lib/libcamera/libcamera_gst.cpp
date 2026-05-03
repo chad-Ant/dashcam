@@ -6,10 +6,11 @@
 
 /// Destruction order matters for GStreamer reference counting:
 ///   1. Atomically claim pipeline_ via swap under stateMutex_ (re-entrancy guard).
-///   2. Send EOS and wait — forces mp4mux to write the moov atom.
+///   2. Send EOS and wait — forces the muxer to finalise the container.
 ///   3. Set pipeline to NULL and wait for confirmation — joins the streaming thread.
 ///   4. Release tee request pads (gst_element_release_request_pad + unref).
-///   5. Clear tracking vectors (branches_, teePads_, branchValves_).
+///   5. Free orphaned branch bins (registered but never added to the pipeline);
+///      clear tracking vectors.
 ///   6. Unref non-owning element handles (tee_, camera_src_, appsink_).
 ///   7. Unref the pipeline — releases all bin members.
 ///
@@ -38,7 +39,7 @@ void Camera_GST::teardownPipeline() {
             gst_element_send_event(pipe, gst_event_new_eos());
 
             // Wait up to 5 s for EOS to propagate.  With a ±30 s recording
-            // pre-buffer active, mp4mux must flush all buffered frames before
+            // pre-buffer active, matroskamux must flush all buffered frames before
             // emitting EOS downstream — this can exceed 1.5 s on a CPU-encoder
             // path, so a generous window is required.
             GstBus* bus = gst_element_get_bus(pipe);
@@ -70,6 +71,22 @@ void Camera_GST::teardownPipeline() {
         gst_object_unref(pad);
     }
     teePads_.clear();
+
+    // Free branch bins that were registered but never added to a pipeline
+    // (e.g., addBranch() then close() without start(), or a failed early start()).
+    // Bins that were gst_bin_add_many()'d have the pipeline as their parent and
+    // will be freed by gst_object_unref(pipe) below; check parent to distinguish.
+    for (auto& br : branches_) {
+        if (br.bin) {
+            GstObject* parent = gst_object_get_parent(GST_OBJECT(br.bin));
+            if (parent) {
+                gst_object_unref(parent);
+            } else {
+                gst_object_ref_sink(br.bin);
+                gst_object_unref(br.bin);
+            }
+        }
+    }
     branches_.clear();
     branchValves_.clear();
 
@@ -262,12 +279,14 @@ void Camera_GST::start() {
             for (size_t j = from; j < branches_.size(); ++j) {
                 gst_object_ref_sink(branches_[j].bin);
                 gst_object_unref(branches_[j].bin);
+                branches_[j].bin = nullptr;  // prevent double-free in teardownPipeline
             }
         };
 
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         if (!queue) {
             gst_object_ref_sink(branchBin); gst_object_unref(branchBin);
+            branchBin = nullptr;
             releaseRemaining(i + 1);
             branchError = true;
             break;
@@ -286,6 +305,7 @@ void Camera_GST::start() {
         if (!valve) {
             gst_object_ref_sink(queue);     gst_object_unref(queue);
             gst_object_ref_sink(branchBin); gst_object_unref(branchBin);
+            branchBin = nullptr;
             releaseRemaining(i + 1);
             branchError = true;
             break;
