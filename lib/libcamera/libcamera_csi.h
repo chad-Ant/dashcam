@@ -119,10 +119,29 @@ public:
     void stop() override;
 
     /**
+     * @brief Close the camera and null out textoverlay element pointers.
+     *
+     * Mirrors stop() for the ERROR→CLOSED transition: when start() fails,
+     * Camera_GST::setPipelineError() tears down the pipeline (freeing the
+     * recording bin) without calling stop(), leaving ov*_ dangling.  This
+     * override nulls them under overlayMutex_ before delegating to the base
+     * close() so a stray setOverlayData() call after a failed start() cannot
+     * write to a freed GstElement.
+     */
+    void close() override;
+
+    /**
      * @brief Update the telemetry overlay data from any thread.
      *
-     * Thread-safe.  If the recording bin is active (pipeline RUNNING), the four
-     * textoverlay elements are updated immediately via g_object_set.
+     * Thread-safe.  Stores @p data and, if the pipeline is RUNNING and the
+     * recording bin is active, pushes the formatted text to the four textoverlay
+     * elements via g_object_set.
+     *
+     * **Safety:** The ov*_ pointers are only valid when status==RUNNING. This
+     * method checks that precondition before writing. If a start() fails,
+     * close() nulls the pointers before the pipeline is torn down, and a
+     * stray setOverlayData() call before close() is invoked will simply skip
+     * the update.
      *
      * @param[in] data  New telemetry values to store.
      */

@@ -1,336 +1,170 @@
-// CSI camera function test — Jetson Orin Nano, Argus path (IMX296 1080p60)
-// Usage: ./csi_test [sensor-id]   (default sensor-id=0)
-//
-// Requires: GStreamer 1.0 with nvarguscamerasrc + nvvidconv (JetPack 6.2 / L4T R36.4.x)
-// Run nvargus-daemon before starting:  sudo systemctl restart nvargus-daemon
-
-#include <gst/gst.h>
-#include <atomic>
+#include "libcamera_csi.h"
+#include <algorithm>
 #include <chrono>
-#include <csignal>
-#include <cstdio>
 #include <cstdlib>
-#include <string>
+#include <filesystem>
+#include <iostream>
 #include <thread>
 #include <vector>
 
-struct TestResult {
-    std::string name;
-    bool        passed;
-    std::string message;
-};
+namespace fs = std::filesystem;
 
-static std::atomic<bool> g_quit{false};
-static void on_sigint(int) { g_quit = true; }
+static constexpr uint16_t TARGET_FORMAT_INDEX = 4;  // 720p60 on this sensor
 
-// Pad probe increments a frame counter for every buffer that passes through.
-static GstPadProbeReturn frame_count_probe(GstPad*, GstPadProbeInfo*, gpointer ud)
-{
-    (*static_cast<std::atomic<int>*>(ud))++;
-    return GST_PAD_PROBE_OK;
-}
-
-// Poll gst_element_get_state in 100 ms ticks so SIGINT exits within one tick
-// rather than blocking for the full timeout_s.
-static GstStateChangeReturn wait_for_playing(GstElement* pipeline,
-                                             GstState*   out_state,
-                                             int         timeout_s)
-{
-    *out_state = GST_STATE_NULL;
-    GstStateChangeReturn sc = GST_STATE_CHANGE_ASYNC;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
-    while (!g_quit && sc == GST_STATE_CHANGE_ASYNC &&
-           std::chrono::steady_clock::now() < deadline) {
-        sc = gst_element_get_state(pipeline, out_state, nullptr, 100 * GST_MSECOND);
+static bool checkRunning(Camera_CSI& cam, const char* phase) {
+    cameraStatus st;
+    cam.getCameraStatus(st);
+    if (st.status != CAMERA_STATUS::RUNNING) {
+        std::cerr << "[" << phase << "] camera not RUNNING after start(): "
+                  << "status=" << static_cast<int>(st.status)
+                  << " error=" << static_cast<int>(st.currentError) << "\n";
+        return false;
     }
-    return sc;
+    return true;
 }
 
-// Build + run a pipeline string for up to `duration_s` seconds.
-// The pipeline must contain a fakesink named "sink0" — buffers arriving
-// at its sink pad are counted via a probe.
-// Returns frame count on success, -1 on pipeline error.
-static int run_timed(const std::string& pl, int duration_s)
-{
-    GError*     err      = nullptr;
-    GstElement* pipeline = gst_parse_launch(pl.c_str(), &err);
-    if (!pipeline || err) {
-        if (err) {
-            fprintf(stderr, "  parse error: %s\n", err->message);
-            g_error_free(err);
+static bool selectFormat(const cameraInfo& info, uint16_t idx) {
+    if (idx >= info.videoFormats.size()) {
+        std::cerr << "Format index " << idx << " out of range (have "
+                  << info.videoFormats.size() << " formats).\n";
+        return false;
+    }
+    const auto& fmt = info.videoFormats[idx];
+    std::cout << "Selected format[" << idx << "]: " << fmt.width << "x" << fmt.height
+              << "@" << fmt.frameRate << " (" << fmt.description << ")\n";
+    return true;
+}
+
+bool test_recording_overlay(const cameraInfo& info) {
+    std::cout << "\n--- Test 1: Full Recording with Dynamic Telemetry ---\n";
+    if (!selectFormat(info, TARGET_FORMAT_INDEX)) return false;
+
+    Camera_CSI cam(info);
+
+    std::string filename = "./archive/test_overlay.mp4";
+    if (fs::exists(filename)) fs::remove(filename);
+
+    GstElement* recBin = cam.createRecordingBin(filename);
+    if (!recBin) {
+        std::cerr << "createRecordingBin() failed\n";
+        return false;
+    }
+
+    cam.addBranch("recording", recBin, false);
+    cam.open();
+    cam.setCameraVideoFormat(TARGET_FORMAT_INDEX);
+    cam.start();
+    if (!checkRunning(cam, "Test 1")) return false;
+
+    std::vector<uint8_t> buffer(1280 * 720 * 3);
+    int frames = 0;
+    uint32_t written = 0;
+
+    auto start_time = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(5)) {
+        cam.captureFrame(buffer.data(), buffer.size(), written);
+        if (written > 0) {
+            frames++;
+            cam.setOverlayData({
+                10.7725 + (frames * 0.0001),
+                106.6581 + (frames * 0.0001),
+                52.3 + (frames * 0.05),
+                static_cast<float>(frames % 80),
+                1.2f,
+                static_cast<float>(frames % 360),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()
+            });
         }
-        if (pipeline) gst_object_unref(pipeline);
-        return -1;
     }
 
-    std::atomic<int> frames{0};
-    GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink0");
-    if (sink) {
-        GstPad* pad = gst_element_get_static_pad(sink, "sink");
-        gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-                          frame_count_probe, &frames, nullptr);
-        gst_object_unref(pad);
-        gst_object_unref(sink);
-    }
+    cam.stop();
+    cam.close();
 
-    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        fprintf(stderr, "  set_state(PLAYING) failed\n");
-        gst_object_unref(pipeline);
-        return -1;
-    }
-
-    GstState state;
-    GstStateChangeReturn sc = wait_for_playing(pipeline, &state, 5);
-    if (g_quit || sc == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
-        fprintf(stderr, "  pipeline did not reach PLAYING (state=%s)\n",
-                gst_element_state_get_name(state));
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        return -1;
-    }
-
-    GstBus* bus      = gst_element_get_bus(pipeline);
-    auto    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration_s);
-    bool    bus_err  = false;
-
-    while (!g_quit && std::chrono::steady_clock::now() < deadline) {
-        GstMessage* msg = gst_bus_timed_pop_filtered(
-            bus, 100 * GST_MSECOND,
-            static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
-        if (!msg) continue;
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-            GError* e = nullptr; gchar* dbg = nullptr;
-            gst_message_parse_error(msg, &e, &dbg);
-            fprintf(stderr, "  bus error: %s\n", e ? e->message : "(unknown)");
-            if (e) g_error_free(e);
-            g_free(dbg);
-            bus_err = true;
-        }
-        gst_message_unref(msg);
-        break;
-    }
-
-    gst_object_unref(bus);
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
-    return bus_err ? -1 : frames.load();
+    uintmax_t size = fs::exists(filename) ? fs::file_size(filename) : 0;
+    std::cout << "Captured " << frames << " frames. File size: " << size / 1024 << " KB.\n";
+    return size > 100000;
 }
 
-// ── Individual tests ──────────────────────────────────────────────────────────
+bool test_graceful_mid_recording_stop(const cameraInfo& info) {
+    std::cout << "\n--- Test 2: Graceful Mid-Recording Stop (EOS path) ---\n";
+    if (!selectFormat(info, TARGET_FORMAT_INDEX)) return false;
 
-// Test 1: sanity — can Argus open the sensor and deliver num-buffers=10?
-static TestResult test_start(int sid)
-{
-    std::string pl =
-        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
-        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
+    Camera_CSI cam(info);
 
-    int n = run_timed(pl, 6);
-    bool ok = (n >= 0);
-    return {
-        "pipeline start (sensor-id=" + std::to_string(sid) + ")", ok,
-        ok ? "received " + std::to_string(n) + " frames (expected 10)"
-           : "failed — check sensor connection and nvargus-daemon"
-    };
-}
+    std::string filename = "./archive/test_shutdown.mp4";
+    if (fs::exists(filename)) fs::remove(filename);
 
-// Test 2: 1080p30 sustained frame delivery (3 s, expect ~90, accept >= 60)
-static TestResult test_1080p30(int sid)
-{
-    std::string pl =
-        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
-        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
-
-    int n = run_timed(pl, 3);
-    bool ok = (n >= 60);
-    return {
-        "1080p30 frame delivery (sensor-id=" + std::to_string(sid) + ")", ok,
-        n >= 0 ? std::to_string(n) + " frames in 3 s (expected ~90)"
-               : "pipeline error"
-    };
-}
-
-// Test 3: 1080p60 — primary dashcam mode for IMX296 global-shutter sensor
-//         (3 s, expect ~180, accept >= 120)
-static TestResult test_1080p60(int sid)
-{
-/*
-    std::string pl =
-        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1,format=(string)NV12 ! "
-        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
-*/
-// Update Test 3 to match an IMX219 60fps mode (e.g., 720p)
-    std::string pl =
-        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "video/x-raw(memory:NVMM),width=1280,height=720,framerate=60/1,format=(string)NV12 ! "
-        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
-    int n = run_timed(pl, 3);
-    bool ok = (n >= 120);
-    return {
-        "720p60 frame delivery — dashcam mode (sensor-id=" + std::to_string(sid) + ")", ok,
-        n >= 0 ? std::to_string(n) + " frames in 3 s (expected ~180)"
-               : "pipeline error — sensor may not support 720p60 in this ISP mode"
-    };
-}
-
-// Test 4: Dynamic ISP Control — inject AE lock + fixed exposure mid-stream
-//         and verify frames keep flowing (>= 60 frames over ~3 s at 30 fps).
-static TestResult test_dynamic_attributes(int sid)
-{
-    std::string pl =
-        "nvarguscamerasrc name=camerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
-        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
-
-    GError*     err      = nullptr;
-    GstElement* pipeline = gst_parse_launch(pl.c_str(), &err);
-    if (!pipeline || err) {
-        if (err) { g_error_free(err); }
-        if (pipeline) gst_object_unref(pipeline);
-        return {"Dynamic Attribute Injection (sensor-id=" + std::to_string(sid) + ")",
-                false, "Parse error"};
+    GstElement* recBin = cam.createRecordingBin(filename);
+    if (!recBin) {
+        std::cerr << "createRecordingBin() failed\n";
+        return false;
     }
 
-    std::atomic<int> frames{0};
-    GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink0");
-    GstElement* src  = gst_bin_get_by_name(GST_BIN(pipeline), "camerasrc");
+    cam.addBranch("recording", recBin, false);
+    cam.open();
+    cam.setCameraVideoFormat(TARGET_FORMAT_INDEX);
+    cam.start();
+    if (!checkRunning(cam, "Test 2")) return false;
 
-    if (sink) {
-        GstPad* pad = gst_element_get_static_pad(sink, "sink");
-        gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, frame_count_probe, &frames, nullptr);
-        gst_object_unref(pad);
-        gst_object_unref(sink);
+    std::vector<uint8_t> buffer(1280 * 720 * 3);
+    int frames = 0;
+    uint32_t written = 0;
+
+    auto start_time = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(2)) {
+        cam.captureFrame(buffer.data(), buffer.size(), written);
+        if (written > 0) frames++;
     }
 
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    std::cout << "Triggering mid-recording stop()...\n";
+    cam.stop();
+    cam.close();
 
-    // Wait for PLAYING before touching ISP properties.
-    GstState state;
-    GstStateChangeReturn sc = wait_for_playing(pipeline, &state, 5);
-    if (g_quit || sc == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
-        if (src) gst_object_unref(src);
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        return {"Dynamic Attribute Injection (sensor-id=" + std::to_string(sid) + ")",
-                false, g_quit ? "interrupted" : "Pipeline failed to reach PLAYING"};
+    uintmax_t size = fs::exists(filename) ? fs::file_size(filename) : 0;
+    std::cout << "Captured " << frames << " frames. File size: " << size / 1024 << " KB.\n";
+    if (size <= 50000) return false;
+
+    // Verify the file is a valid, playable MP4 — exercises both the EOS-driven
+    // moov finalisation in teardownPipeline() and the fragmented-MP4 fallback.
+    std::cout << "Validating with ffprobe...\n";
+    int rc = std::system(("ffprobe -v error -show_entries format=duration "
+                          "-of default=noprint_wrappers=1:nokey=1 " + filename +
+                          " > /dev/null 2>&1").c_str());
+    if (rc != 0) {
+        std::cerr << "ffprobe rejected the file (rc=" << rc << ")\n";
+        return false;
     }
-
-    // Let auto-exposure settle for 1 s before locking it.
-    for (int i = 0; i < 10 && !g_quit; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    if (g_quit) {
-        if (src) gst_object_unref(src);
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        return {"Dynamic Attribute Injection (sensor-id=" + std::to_string(sid) + ")",
-                false, "interrupted"};
-    }
-
-    // Mid-stream: lock AE and pin exposure time to 13 ms (max for 60 fps headroom).
-    if (src) {
-        g_object_set(G_OBJECT(src),
-            "aelock", TRUE,
-            "exposuretimerange", "13000 13000",
-            "gainrange", "1.0 1.0", // Lock gain at 1x to prevent ISP panic
-            NULL);
-        gst_object_unref(src);
-    }
-
-    // 2 s more — frames must not drop after property injection.
-    for (int i = 0; i < 20 && !g_quit; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
-
-    bool ok = (frames.load() >= 60);
-    return {
-        "Dynamic Attribute Injection (sensor-id=" + std::to_string(sid) + ")", ok,
-        ok ? "Daemon accepted mid-stream property updates cleanly ("
-                 + std::to_string(frames.load()) + " frames)"
-           : "Pipeline crashed or dropped frames during attribute update"
-    };
+    std::cout << "ffprobe accepted the file.\n";
+    return true;
 }
 
-// Test 5: Argus Daemon Rapid Restart Stability — open/close 3 times, 200 ms apart.
-static TestResult test_daemon_stability(int sid)
-{
-    std::string pl =
-        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " num-buffers=15 ! "
-        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
-        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
-
-    int runs_passed = 0;
-    for (int i = 0; i < 3 && !g_quit; ++i) {
-        if (run_timed(pl, 3) > 0) runs_passed++;
-        if (!g_quit)
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    bool ok = (runs_passed == 3);
-    return {
-        "Argus Daemon Rapid Restart (sensor-id=" + std::to_string(sid) + ")", ok,
-        ok ? "Daemon survived 3 rapid start/stop cycles"
-           : "Daemon locked up on cycle " + std::to_string(runs_passed + 1)
-                 + " — run: sudo systemctl restart nvargus-daemon"
-    };
-}
-
-// ── Reporting ─────────────────────────────────────────────────────────────────
-
-static void print_result(const TestResult& r)
-{
-    const char* tag = r.passed ? "\033[32mPASS\033[0m" : "\033[31mFAIL\033[0m";
-    printf("[%s] %s\n       %s\n", tag, r.name.c_str(), r.message.c_str());
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-int main(int argc, char* argv[])
-{
-    std::signal(SIGINT, on_sigint);
+int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
+    fs::create_directories("./archive");
 
-    int sid = (argc >= 2) ? std::atoi(argv[1]) : 0;
-
-    printf("=== CSI Camera Function Test ===\n");
-    printf("sensor-id : %d\n", sid);
-    printf("target    : IMX296 global-shutter, Argus path, JetPack 6.2\n");
-    printf("usage     : %s [sensor-id]\n\n", argv[0]);
-
-    std::vector<TestResult> results;
-
-    // Test 1 gates the rest — no point testing frame rates if Argus can't open the sensor.
-    results.push_back(test_start(sid));
-    print_result(results.back());
-    if (!results.back().passed) {
-        printf("\nGating failure — skipping remaining tests.\n");
-        printf("Triage steps:\n");
-        printf("  sudo systemctl restart nvargus-daemon\n");
-        printf("  GST_DEBUG=3 gst-launch-1.0 nvarguscamerasrc num-buffers=5 ! fakesink\n");
-        printf("  v4l2-ctl --list-devices\n");
+    std::vector<cameraInfo> cameras;
+    if (getCameraList(cameras) != ERROR_CODE::NONE || cameras.empty()) {
+        std::cerr << "No cameras found.\n";
         return 1;
     }
 
-    results.push_back(test_1080p30(sid));
-    print_result(results.back());
+    auto it = std::find_if(cameras.begin(), cameras.end(),
+        [](const cameraInfo& c){ return c.type == CAMERA_TYPE::CSI; });
+    if (it == cameras.end()) {
+        std::cerr << "No CSI camera found among " << cameras.size() << " devices.\n";
+        return 1;
+    }
+    const cameraInfo& csiInfo = *it;
 
-    results.push_back(test_1080p60(sid));
-    print_result(results.back());
+    std::cout << "Testing libcamera via " << csiInfo.address
+              << " (Argus sensor-id " << csiInfo.deviceId << ")...\n";
 
-    results.push_back(test_dynamic_attributes(sid));
-    print_result(results.back());
+    bool t1 = test_recording_overlay(csiInfo);
+    bool t2 = test_graceful_mid_recording_stop(csiInfo);
 
-    results.push_back(test_daemon_stability(sid));
-    print_result(results.back());
+    std::cout << "\nTest 1 (Overlay):       " << (t1 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 2 (Mid-stop + MP4): " << (t2 ? "PASS" : "FAIL") << "\n";
 
-    int passed = 0, failed = 0;
-    for (const auto& r : results) r.passed ? ++passed : ++failed;
-
-    printf("\n%d/%d tests passed\n", passed, passed + failed);
-    return failed > 0 ? 1 : 0;
+    return (t1 && t2) ? 0 : 1;
 }

@@ -44,10 +44,10 @@ struct OverlayData {
 /**
  * @brief Abstract GStreamer base class implementing the iCamera interface.
  *
- * Builds a GStreamer pipeline of the form:
+ * Builds a multi-sink GStreamer pipeline of the form:
  * @verbatim
  *   <subclass-defined source + caps + tee name=srctee>
- *   srctee. ! queue ! <optional format conversion> ! BGR
+ *   srctee. ! queue ! <format conversion> ! BGR
  *          ! appsink name=mysink              ← captureFrame() source
  *   srctee. ! queue ! valve ! <branch0>       ← addBranch() branches
  *   srctee. ! queue ! valve ! <branch1>
@@ -58,8 +58,26 @@ struct OverlayData {
  * buildPipelineString().  All other pipeline management (tee pad allocation,
  * valve insertion, state transitions, teardown) is handled here.
  *
- * Attributes set before start() are queued in pendingAttributes_ and applied
- * to camera_src_ inside start(), before the pipeline transitions to PLAYING.
+ * **Multi-branching architecture:**
+ * - Branches (recording bins, inference chains, etc.) are registered via addBranch()
+ *   before start(). Each gets a queue (for backpressure isolation) and a valve
+ *   (for runtime enable/disable). Recording branches use blocking queues; inference
+ *   branches use leaky queues to drop old frames on backpressure.
+ * - Branches are enabled/disabled at runtime via setBranchEnabled() without
+ *   rebuilding the pipeline.
+ * - The valve silently drops buffers if enabled=false (no timestamp discontinuity;
+ *   re-enabling works seamlessly).
+ *
+ * **Attribute lifecycle:**
+ * - Attributes set before start() are queued in pendingAttributes_ and applied
+ *   to camera_src_ inside start(), before the pipeline transitions to PLAYING.
+ * - Attributes set during RUNNING are applied immediately to camera_src_ hardware.
+ *
+ * **Concurrent safety:**
+ * - Concurrent start() calls are serialized by the state machine (optimistic RUNNING claim).
+ * - captureFrame() can run on another thread during start() and returns zero bytes
+ *   until the pipeline is fully constructed.
+ * - Attribute writes during RUNNING may temporarily block; see applyAttributeGStreamer().
  */
 class Camera_GST : public iCamera {
 protected:
@@ -71,10 +89,19 @@ protected:
     GstElement* appsink_;    ///< Default BGR output sink; pulled by captureFrame().
     GstElement* tee_;        ///< Fan-out tee element; nullptr when not running.
 
+    /**
+     * @struct BranchEntry
+     * @brief A recording or inference sink registered with the camera.
+     *
+     * Each branch is a GStreamer bin (containing encoding, file I/O, inference,
+     * or analysis logic) that receives frames from the main tee element.
+     * Branches are linked during start() with an intervening queue and valve
+     * for flow control and enable/disable logic.
+     */
     struct BranchEntry {
-        std::string  name;
-        GstElement*  bin;
-        bool         leaky; ///< true → leaky downstream queue (inference); false → blocking queue (recording).
+        std::string  name;        ///< User-supplied identifier for setBranchEnabled().
+        GstElement*  bin;         ///< GStreamer bin providing the branch logic (owned by pipeline after start()).
+        bool         leaky;       ///< true = leaky downstream queue (inference, drop old on backpressure); false = blocking queue (recording, preserve all).
     };
 
     /// Branches registered via addBranch() before start().  The pipeline takes
@@ -85,9 +112,23 @@ protected:
     /// Released via gst_element_release_request_pad() in teardownPipeline().
     std::vector<GstPad*> teePads_;
 
-    std::map<std::string, std::string> pendingAttributes_; ///< Attributes queued before start().
-    std::map<std::string, GstElement*> branchValves_;      ///< Non-owning valve pointers keyed by branch name.
-    mutable std::mutex stateMutex_;                        ///< Protects status_ and pendingAttributes_ for concurrent access.
+    /// Attributes queued via setCameraAttribute() before start(); flushed and
+    /// applied in start() before the pipeline transitions to PLAYING, so the
+    /// first captured frame already uses requested settings (e.g. exposure).
+    std::map<std::string, std::string> pendingAttributes_;
+
+    /// Non-owning pointers to the valve element in each branch, keyed by branch name.
+    /// Used by setBranchEnabled() to drop/pass buffers at runtime without rebuilding.
+    /// Valid only while RUNNING; owned by the pipeline.
+    std::map<std::string, GstElement*> branchValves_;
+
+    /// Protects access to status_, currentFormatIndex, frameCount, freeBufferCount,
+    /// currentError, and pendingAttributes_.  Also protects pipeline_ pointer
+    /// from race during concurrent start() calls (set RUNNING optimistically).
+    /// Lock is acquired briefly; held longer only during gst_init_check() (now
+    /// released) and during attribute application (unavoidable, locks GStreamer
+    /// property writes).
+    mutable std::mutex stateMutex_;
     
     /**
      * @brief Return the ERROR_CODE used when the GStreamer pipeline fails.
@@ -220,6 +261,13 @@ public:
      * the pipeline, links all registered branches to the tee, flushes pending
      * attributes, then transitions the pipeline to PLAYING.
      *
+     * **Thread-safety:** Concurrent start() calls are serialized by claiming
+     * RUNNING status optimistically under stateMutex_ before releasing it for
+     * the long GStreamer construction phase. A second concurrent caller sees
+     * CAMERA_ALREADY_RUNNING. captureFrame() can run concurrently; it checks
+     * both status==RUNNING and appsink_ (null until fully built), so returns
+     * zero bytes until the pipeline is ready.
+     *
      * @pre  Status == OPEN and cameraInfo::videoFormats is not empty.
      * @post Status transitions: OPEN → RUNNING on success, OPEN → ERROR on failure.
      */
@@ -234,17 +282,32 @@ public:
     /**
      * @brief Register a GstElement to be linked to the tee on the next start().
      *
-     * start() inserts a @c queue and a @c valve between the tee and the element
-     * automatically.  Ownership of @p sinkBin transfers to the pipeline via
-     * gst_bin_add().  Re-register branches before each start() following a stop().
+     * During start(), a @c queue and @c valve are automatically inserted between
+     * the tee and @p sinkBin:
+     * @verbatim
+     *   srctee. ! queue [! valve] ! sinkBin
+     * @endverbatim
+     *
+     * Ownership of @p sinkBin transfers to the pipeline via gst_bin_add().
+     * Branches must be re-registered before each start() following a stop().
      *
      * @param[in] name     Unique branch identifier used by setBranchEnabled().
      * @param[in] sinkBin  GstElement (typically a GstBin) to attach to the tee.
-     * @param[in] leaky    If @c true, the inter-branch queue uses a 2-buffer leaky-downstream
-     *                     policy — always delivers the most recent frame, never blocks the tee.
-     *                     Use @c true for inference branches and @c false (default) for
-     *                     recording branches where every frame must be preserved.
-     * @pre Must be called before start().
+     *                     Must be a valid GStreamer element; ownership transfers
+     *                     to the pipeline.
+     * @param[in] leaky    Queue behavior:
+     *                     - @c true:  2-buffer leaky downstream queue. Drops old frames
+     *                       on backpressure; never blocks the tee. Use for inference
+     *                       branches where missing a frame is acceptable but the tee
+     *                       must not block.
+     *                     - @c false (default): Blocking queue. Buffers accumulate on
+     *                       backpressure, blocking the tee if the queue fills. Use for
+     *                       recording branches where frame loss is unacceptable.
+     * @pre Must be called before start().  Calling while RUNNING sets INVALID_ATTRIBUTE
+     *      and returns without modification.
+     *
+     * @post Branches are linked during start().  On a failed start(), all branches
+     *       are torn down by teardownPipeline().
      */
     void addBranch(const std::string& name, GstElement* sinkBin, bool leaky = false);
 

@@ -1,2 +1,1 @@
-lib/libcamera/cam_test
-lib/libcamera/main.cpp
+bin/

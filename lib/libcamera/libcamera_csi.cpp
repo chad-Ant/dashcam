@@ -80,13 +80,32 @@ void Camera_CSI::stop() {
     Camera_GST::stop();
 }
 
+void Camera_CSI::close() {
+    // Covers the ERROR→CLOSED path: setPipelineError() (called from a failing
+    // start()) tears down the pipeline without going through stop(), so the
+    // ov*_ pointers would otherwise still reference freed elements when the
+    // caller eventually invokes close().
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        ovTopLeft_ = ovTopRight_ = ovBottomLeft_ = ovBottomRight_ = nullptr;
+    }
+    Camera_GST::close();
+}
+
 // ─── overlay API ─────────────────────────────────────────────────────────────
 
 void Camera_CSI::setOverlayData(const OverlayData& data) {
     std::lock_guard<std::mutex> lock(overlayMutex_);
     overlayData_ = data;
     if (ovTopLeft_) {
-        updateTextOverlays(data);
+        // Belt-and-suspenders: even with the close() override, there is a
+        // window between setPipelineError() and the caller invoking close()
+        // during which ov*_ may be dangling.  Verify the pipeline is actually
+        // RUNNING before pushing data into the textoverlay elements.
+        // Lock order overlayMutex_ → stateMutex_ matches Camera_CSI::stop().
+        std::lock_guard<std::mutex> slk(stateMutex_);
+        if (status_.status == CAMERA_STATUS::RUNNING)
+            updateTextOverlays(data);
     }
 }
 
@@ -155,6 +174,18 @@ void Camera_CSI::updateTextOverlays(const OverlayData& od) {
 // ─── recording bin ────────────────────────────────────────────────────────────
 
 GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
+    // Must be called before start(): the returned bin is meant to be passed to
+    // addBranch(), which itself rejects RUNNING.  Calling here while RUNNING
+    // would also overwrite the live ov*_ pointers with handles to elements
+    // that aren't in any pipeline.
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status == CAMERA_STATUS::RUNNING) {
+            status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
+            return nullptr;
+        }
+    }
+
     // ghost_unlinked_pads=TRUE: GStreamer auto-wraps nvvidconv's unlinked "sink"
     // pad as a ghost pad named "sink" on the bin — no manual ghost-pad code needed.
     // filename is set via g_object_set below (not in the string) to handle paths
@@ -170,7 +201,12 @@ GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
         "! textoverlay name=ov_br halignment=right valignment=bottom "
           "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
         "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=60 "
-        "! h264parse ! mp4mux ! filesink name=fsink";
+        // fragment-duration=1000: write a self-contained moof+mdat atom every 1 s.
+        // The initial moov is written at the start of the file, so all complete
+        // fragments are playable even if the process is killed or power is cut.
+        // Worst-case loss is the last ~1 s of footage.  EOS on graceful shutdown
+        // still works — it flushes and finalises the trailing partial fragment.
+        "! h264parse ! mp4mux fragment-duration=1000 ! filesink name=fsink";
 
     GError*     err = nullptr;
     GstElement* bin = gst_parse_bin_from_description(binDesc, TRUE, &err);

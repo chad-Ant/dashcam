@@ -128,9 +128,8 @@ static void queryFrameRates(int fd, const cameraVideoFormat& info, std::vector<c
  * @param[in,out] info  cameraInfo to populate; videoFormats is replaced on each stage.
  */
 static void populateCameraVideoFormats(int fd, cameraInfo& info) {
-    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
-        return;
-    }
+//    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
+    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN) return;
 
     queryPixelFormats(fd, info);
 
@@ -166,7 +165,8 @@ static void populateCameraVideoFormats(int fd, cameraInfo& info) {
  * @param[in,out] info  cameraInfo whose attributes vector is populated.
  */
 static void populateCameraAttributes(int fd, cameraInfo& info) {
-    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
+//    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
+    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN) {
         return;
     }
 
@@ -277,8 +277,7 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
     // CSI cameras are addressed by Argus sensor-id (0-based among CSI cameras),
     // which is independent of the /dev/videoN numbering.
     uint32_t csiSensorCount = 0;
-    int fd;
-    
+
     for (const auto& devicePath : videoPaths) {
         ScopedFd fd(::open(devicePath.c_str(), O_RDONLY | O_NONBLOCK));
         if (fd < 0) continue;
@@ -286,7 +285,12 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
         struct v4l2_capability cap;
         if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) continue;
 
-        if (!(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) continue;
+        // device_caps is only valid when V4L2_CAP_DEVICE_CAPS is advertised.
+        // Older drivers leave device_caps zero and report capabilities only
+        // through cap.capabilities, so fall back to it in that case.
+        const uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+                            ? cap.device_caps : cap.capabilities;
+        if (!(caps & V4L2_CAP_VIDEO_CAPTURE)) continue;
 
         cameraInfo info;
         info.address = devicePath.string();

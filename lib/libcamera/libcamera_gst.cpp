@@ -5,32 +5,59 @@
 // ─── private helpers ────────────────────────────────────────────────────────
 
 /// Destruction order matters for GStreamer reference counting:
-///   1. Set pipeline to NULL — joins the streaming thread, so no more callbacks.
-///   2. Release tee request pads (gst_element_release_request_pad + unref).
-///   3. Clear tracking vectors (branches_, teePads_, branchValves_).
-///   4. Unref non-owning element handles (tee_, camera_src_, appsink_).
-///   5. Unref the pipeline — releases all bin members.
+///   1. Atomically claim pipeline_ via swap under stateMutex_ (re-entrancy guard).
+///   2. Send EOS and wait — forces mp4mux to write the moov atom.
+///   3. Set pipeline to NULL and wait for confirmation — joins the streaming thread.
+///   4. Release tee request pads (gst_element_release_request_pad + unref).
+///   5. Clear tracking vectors (branches_, teePads_, branchValves_).
+///   6. Unref non-owning element handles (tee_, camera_src_, appsink_).
+///   7. Unref the pipeline — releases all bin members.
 ///
 /// The pipeline MUST reach NULL before pads are released.  Releasing request
 /// pads while the streaming thread is still running (i.e. before NULL state)
 /// is a GStreamer API violation and can cause the streaming thread to crash.
 void Camera_GST::teardownPipeline() {
-    // Step 1: push the pipeline to NULL.  This flushes the streaming thread
-    // and forces any in-flight gst_app_sink_try_pull_sample in captureFrame()
-    // to return nullptr immediately — so there is no blocking caller left that
-    // could be mid-way through using appsink_.
-    if (pipeline_) {
-        gst_element_set_state(pipeline_, GST_STATE_NULL);
+    // Atomically claim the pipeline pointer so a concurrent re-entrant call
+    // (e.g. a future bus-watch callback racing a lifecycle stop) gets nullptr
+    // and exits immediately rather than double-freeing.
+    GstElement* pipe = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        std::swap(pipe, pipeline_);
     }
 
-    // Step 2: swap appsink_ to nullptr under the lock.  captureFrame() holds
-    // stateMutex_ for the duration of its status-check + gst_object_ref, so
-    // after this swap one of two things is true:
-    //   a) captureFrame() already took its ref (refcount 1→2) before this
-    //      critical section: our unref below takes it 2→1; captureFrame's
-    //      later unref takes it 1→0.  Object freed exactly once. ✓
-    //   b) captureFrame() has not yet entered the lock: it will see appsink_
-    //      == nullptr and return early without touching the object.          ✓
+    if (pipe) {
+        // timeout=0 returns the last *achieved* state, which is stale during an
+        // async transition.  Check pending too: if the pipeline is mid-transition
+        // toward PLAYING we must still send EOS so mp4mux writes its moov atom.
+        GstState state, pending;
+        gst_element_get_state(pipe, &state, &pending, 0);
+        if (state == GST_STATE_PLAYING  || state == GST_STATE_PAUSED ||
+            pending == GST_STATE_PLAYING || pending == GST_STATE_PAUSED) {
+
+            gst_element_send_event(pipe, gst_event_new_eos());
+
+            // Wait up to 5 s for EOS to propagate.  With a ±30 s recording
+            // pre-buffer active, mp4mux must flush all buffered frames before
+            // emitting EOS downstream — this can exceed 1.5 s on a CPU-encoder
+            // path, so a generous window is required.
+            GstBus* bus = gst_element_get_bus(pipe);
+            if (bus) {
+                GstMessage* msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND,
+                    static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+                if (msg) gst_message_unref(msg);
+                gst_object_unref(bus);
+            }
+        }
+
+        // Transition to NULL joins the streaming thread.  nvarguscamerasrc
+        // hardware teardown can be briefly async, so wait for confirmation
+        // before releasing pads or unreffing elements.
+        GstStateChangeReturn sc = gst_element_set_state(pipe, GST_STATE_NULL);
+        if (sc == GST_STATE_CHANGE_ASYNC)
+            gst_element_get_state(pipe, nullptr, nullptr, 5 * GST_SECOND);
+    }
+
     GstElement* appsinkToUnref = nullptr;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -49,10 +76,7 @@ void Camera_GST::teardownPipeline() {
     if (tee_)          { gst_object_unref(tee_);          tee_        = nullptr; }
     if (camera_src_)   { gst_object_unref(camera_src_);   camera_src_ = nullptr; }
     if (appsinkToUnref){ gst_object_unref(appsinkToUnref);               }
-    if (pipeline_) {
-        gst_object_unref(pipeline_);
-        pipeline_ = nullptr;
-    }
+    if (pipe)            gst_object_unref(pipe);
 }
 
 void Camera_GST::setPipelineError() {
@@ -100,17 +124,27 @@ Camera_GST::~Camera_GST() {
 }
 
 void Camera_GST::open() {
-    std::lock_guard<std::mutex> lock(stateMutex_);
-    if (status_.status != CAMERA_STATUS::CLOSED) {
-        status_.currentError = status_.currentError == ERROR_CODE::NONE
-            ? ERROR_CODE::CAMERA_ALREADY_OPEN : status_.currentError;
-        return;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status != CAMERA_STATUS::CLOSED) {
+            status_.currentError = status_.currentError == ERROR_CODE::NONE
+                ? ERROR_CODE::CAMERA_ALREADY_OPEN : status_.currentError;
+            return;
+        }
     }
+
+    // gst_init_check() scans the GStreamer plugin registry on first call,
+    // which can take hundreds of milliseconds.  It is internally thread-safe
+    // and idempotent across processes, so we drop stateMutex_ to keep
+    // getCameraStatus()/captureFrame() responsive on other threads.
     GError* err = nullptr;
-    if (!gst_init_check(nullptr, nullptr, &err)) {
+    bool gstOk = gst_init_check(nullptr, nullptr, &err);
+    if (err) g_error_free(err);
+
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (!gstOk) {
         status_.status = CAMERA_STATUS::ERROR;
         status_.currentError = pipelineError();
-        if (err) g_error_free(err);
         return;
     }
     status_.status = CAMERA_STATUS::OPEN;
@@ -161,6 +195,7 @@ void Camera_GST::setCameraAttribute(const std::string& name, const std::string& 
 }
 
 void Camera_GST::setCameraVideoFormat(uint16_t formatIndex) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
     if (formatIndex >= info_.videoFormats.size()) {
         status_.currentError = ERROR_CODE::UNSUPPORTED_FORMAT;
         return;
@@ -188,6 +223,7 @@ void Camera_GST::start() {
             return;
         }
         formatIndex = status_.currentFormatIndex;
+        status_.status = CAMERA_STATUS::RUNNING;  // Optimistic claim; Phase 2 proceeds, or setPipelineError() reverts.
     }
 
     const auto& fmt = info_.videoFormats[formatIndex];
@@ -317,11 +353,11 @@ void Camera_GST::start() {
         }
     }
 
-    // Atomically set RUNNING and drain anything queued during the startup window.
+    // Drain anything queued during the startup window.  status_ is already
+    // RUNNING (claimed at the top of start() to serialise concurrent callers).
     std::map<std::string, std::string> lateAttribs;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        status_.status = CAMERA_STATUS::RUNNING;
         lateAttribs = std::move(pendingAttributes_);
         for (const auto& [attrName, attrValue] : lateAttribs) {
             applyAttributeGStreamer(attrName, attrValue);
