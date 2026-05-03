@@ -323,9 +323,9 @@ void Camera_GST::start() {
         std::lock_guard<std::mutex> lock(stateMutex_);
         status_.status = CAMERA_STATUS::RUNNING;
         lateAttribs = std::move(pendingAttributes_);
-    }
-    for (const auto& [attrName, attrValue] : lateAttribs) {
-        applyAttributeGStreamer(attrName, attrValue);
+        for (const auto& [attrName, attrValue] : lateAttribs) {
+            applyAttributeGStreamer(attrName, attrValue);
+        }
     }
 }
 

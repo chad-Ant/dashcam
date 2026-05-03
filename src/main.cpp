@@ -30,6 +30,22 @@ static GstPadProbeReturn frame_count_probe(GstPad*, GstPadProbeInfo*, gpointer u
     return GST_PAD_PROBE_OK;
 }
 
+// Poll gst_element_get_state in 100 ms ticks so SIGINT exits within one tick
+// rather than blocking for the full timeout_s.
+static GstStateChangeReturn wait_for_playing(GstElement* pipeline,
+                                             GstState*   out_state,
+                                             int         timeout_s)
+{
+    *out_state = GST_STATE_NULL;
+    GstStateChangeReturn sc = GST_STATE_CHANGE_ASYNC;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    while (!g_quit && sc == GST_STATE_CHANGE_ASYNC &&
+           std::chrono::steady_clock::now() < deadline) {
+        sc = gst_element_get_state(pipeline, out_state, nullptr, 100 * GST_MSECOND);
+    }
+    return sc;
+}
+
 // Build + run a pipeline string for up to `duration_s` seconds.
 // The pipeline must contain a fakesink named "sink0" — buffers arriving
 // at its sink pad are counted via a probe.
@@ -64,9 +80,8 @@ static int run_timed(const std::string& pl, int duration_s)
     }
 
     GstState state;
-    GstStateChangeReturn sc =
-        gst_element_get_state(pipeline, &state, nullptr, 5 * GST_SECOND);
-    if (sc == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
+    GstStateChangeReturn sc = wait_for_playing(pipeline, &state, 5);
+    if (g_quit || sc == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
         fprintf(stderr, "  pipeline did not reach PLAYING (state=%s)\n",
                 gst_element_state_get_name(state));
         gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -107,9 +122,9 @@ static int run_timed(const std::string& pl, int duration_s)
 static TestResult test_start(int sid)
 {
     std::string pl =
-        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " num-buffers=10 ! "
-        "'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=NV12' ! "
-        "nvvidconv ! 'video/x-raw,format=I420' ! fakesink name=sink0";
+        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
+        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
+        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
 
     int n = run_timed(pl, 6);
     bool ok = (n >= 0);
@@ -125,8 +140,8 @@ static TestResult test_1080p30(int sid)
 {
     std::string pl =
         "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=NV12' ! "
-        "nvvidconv ! 'video/x-raw,format=I420' ! fakesink name=sink0 sync=false";
+        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
+        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
 
     int n = run_timed(pl, 3);
     bool ok = (n >= 60);
@@ -141,17 +156,23 @@ static TestResult test_1080p30(int sid)
 //         (3 s, expect ~180, accept >= 120)
 static TestResult test_1080p60(int sid)
 {
+/*
     std::string pl =
         "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1,format=NV12' ! "
-        "nvvidconv ! 'video/x-raw,format=I420' ! fakesink name=sink0 sync=false";
-
+        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1,format=(string)NV12 ! "
+        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
+*/
+// Update Test 3 to match an IMX219 60fps mode (e.g., 720p)
+    std::string pl =
+        "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " ! "
+        "video/x-raw(memory:NVMM),width=1280,height=720,framerate=60/1,format=(string)NV12 ! "
+        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
     int n = run_timed(pl, 3);
     bool ok = (n >= 120);
     return {
-        "1080p60 frame delivery — dashcam mode (sensor-id=" + std::to_string(sid) + ")", ok,
+        "720p60 frame delivery — dashcam mode (sensor-id=" + std::to_string(sid) + ")", ok,
         n >= 0 ? std::to_string(n) + " frames in 3 s (expected ~180)"
-               : "pipeline error — sensor may not support 1080p60 in this ISP mode"
+               : "pipeline error — sensor may not support 720p60 in this ISP mode"
     };
 }
 
@@ -161,8 +182,8 @@ static TestResult test_dynamic_attributes(int sid)
 {
     std::string pl =
         "nvarguscamerasrc name=camerasrc sensor-id=" + std::to_string(sid) + " ! "
-        "'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=NV12' ! "
-        "nvvidconv ! 'video/x-raw,format=I420' ! fakesink name=sink0 sync=false";
+        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
+        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
 
     GError*     err      = nullptr;
     GstElement* pipeline = gst_parse_launch(pl.c_str(), &err);
@@ -188,28 +209,40 @@ static TestResult test_dynamic_attributes(int sid)
 
     // Wait for PLAYING before touching ISP properties.
     GstState state;
-    GstStateChangeReturn sc =
-        gst_element_get_state(pipeline, &state, nullptr, 5 * GST_SECOND);
-    if (sc == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
+    GstStateChangeReturn sc = wait_for_playing(pipeline, &state, 5);
+    if (g_quit || sc == GST_STATE_CHANGE_FAILURE || state != GST_STATE_PLAYING) {
         if (src) gst_object_unref(src);
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         return {"Dynamic Attribute Injection (sensor-id=" + std::to_string(sid) + ")",
-                false, "Pipeline failed to reach PLAYING"};
+                false, g_quit ? "interrupted" : "Pipeline failed to reach PLAYING"};
     }
 
     // Let auto-exposure settle for 1 s before locking it.
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    for (int i = 0; i < 10 && !g_quit; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    if (g_quit) {
+        if (src) gst_object_unref(src);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        return {"Dynamic Attribute Injection (sensor-id=" + std::to_string(sid) + ")",
+                false, "interrupted"};
+    }
 
     // Mid-stream: lock AE and pin exposure time to 13 ms (max for 60 fps headroom).
     if (src) {
-        g_object_set(G_OBJECT(src), "aelock", TRUE, NULL);
-        g_object_set(G_OBJECT(src), "exposuretimerange", "13000 13000", NULL);
+        g_object_set(G_OBJECT(src),
+            "aelock", TRUE,
+            "exposuretimerange", "13000 13000",
+            "gainrange", "1.0 1.0", // Lock gain at 1x to prevent ISP panic
+            NULL);
         gst_object_unref(src);
     }
 
     // 2 s more — frames must not drop after property injection.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    for (int i = 0; i < 20 && !g_quit; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
@@ -228,13 +261,14 @@ static TestResult test_daemon_stability(int sid)
 {
     std::string pl =
         "nvarguscamerasrc sensor-id=" + std::to_string(sid) + " num-buffers=15 ! "
-        "'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=NV12' ! "
-        "nvvidconv ! 'video/x-raw,format=I420' ! fakesink name=sink0 sync=false";
+        "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=(string)NV12 ! "
+        "nvvidconv ! video/x-raw,format=(string)I420 ! fakesink name=sink0 sync=false";
 
     int runs_passed = 0;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3 && !g_quit; ++i) {
         if (run_timed(pl, 3) > 0) runs_passed++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!g_quit)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     bool ok = (runs_passed == 3);
