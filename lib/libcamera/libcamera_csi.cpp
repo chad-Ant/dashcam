@@ -23,8 +23,7 @@ std::string Camera_CSI::buildPipelineString(const cameraVideoFormat& fmt,
            ", height=" + std::to_string(fmt.height) +
            ", format=(string)NV12, framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
            " ! tee name=srctee"
-           " srctee. ! queue ! nvvidconv ! video/x-raw, format=(string)BGRx"
-           " ! videoconvert ! video/x-raw, format=(string)BGR"
+           " srctee. ! queue max-size-buffers=2 leaky=2 ! nvvidconv ! video/x-raw, format=(string)BGRx"
            " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
 }
 
@@ -251,7 +250,7 @@ GstElement* Camera_CSI::createRecordingBin(const std::string& filename,
         "! videoconvert ! video/x-raw,format=(string)I420 "
         "! queue max-size-buffers=3 leaky=0 "
         "! videorate ! video/x-raw,framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) + " "
-        "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=60 insert-vui=true aud=true "
+        "! x264enc speed-preset=ultrafast bitrate=4000 key-int-max=60 insert-vui=true aud=true "
         "! h264parse ! matroskamux ! filesink name=fsink sync=false async=false";
 
     g_print("createRecordingBin pipeline:\n  %s\n", binDesc.c_str());

@@ -74,7 +74,7 @@ bool test_recording_overlay(const cameraInfo& info) {
     if (!checkRunning(cam, "Test 1")) return false;
     std::cout << "  Pipeline RUNNING.\n";
 
-    std::vector<uint8_t> buffer(1280 * 720 * 3);
+    std::vector<uint8_t> buffer(1280 * 720 * 4);
     int frames = 0;
     uint32_t written = 0;
 
@@ -156,7 +156,7 @@ bool test_graceful_mid_recording_stop(const cameraInfo& info) {
     if (!checkRunning(cam, "Test 2")) return false;
     std::cout << "  Pipeline RUNNING.\n";
 
-    std::vector<uint8_t> buffer(1280 * 720 * 3);
+    std::vector<uint8_t> buffer(1280 * 720 * 4);
     int frames = 0;
     uint32_t written = 0;
 
