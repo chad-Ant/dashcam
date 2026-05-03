@@ -1,9 +1,14 @@
 #include "libcamera_csi.h"
 #include <algorithm>
+#include <cairo/cairo.h>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <gst/video/video.h>
+#include <string>
+#include <vector>
 
 // ─── Camera_GST hooks ────────────────────────────────────────────────────────
 
@@ -18,8 +23,7 @@ std::string Camera_CSI::buildPipelineString(const cameraVideoFormat& fmt,
            ", height=" + std::to_string(fmt.height) +
            ", format=(string)NV12, framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
            " ! tee name=srctee"
-           " srctee. ! queue ! nvvidconv ! video/x-raw, format=(string)BGRx"
-           " ! videoconvert ! video/x-raw, format=(string)BGR"
+           " srctee. ! queue max-size-buffers=2 leaky=2 ! nvvidconv ! video/x-raw, format=(string)BGRx"
            " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
 }
 
@@ -75,19 +79,31 @@ Camera_CSI::Camera_CSI(const cameraInfo& camera)
 void Camera_CSI::stop() {
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        ovTopLeft_ = ovTopRight_ = ovBottomLeft_ = ovBottomRight_ = nullptr;
+        if (cairoOverlay_) {
+            g_signal_handler_disconnect(cairoOverlay_, cairoDrawId_);
+            g_signal_handler_disconnect(cairoOverlay_, cairoCapsId_);
+        }
+        cairoOverlay_ = nullptr;
+        cairoDrawId_  = 0;
+        cairoCapsId_  = 0;
+        videoWidth_   = 0;
+        videoHeight_  = 0;
     }
     Camera_GST::stop();
 }
 
 void Camera_CSI::close() {
-    // Covers the ERROR→CLOSED path: setPipelineError() (called from a failing
-    // start()) tears down the pipeline without going through stop(), so the
-    // ov*_ pointers would otherwise still reference freed elements when the
-    // caller eventually invokes close().
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        ovTopLeft_ = ovTopRight_ = ovBottomLeft_ = ovBottomRight_ = nullptr;
+        if (cairoOverlay_) {
+            g_signal_handler_disconnect(cairoOverlay_, cairoDrawId_);
+            g_signal_handler_disconnect(cairoOverlay_, cairoCapsId_);
+        }
+        cairoOverlay_ = nullptr;
+        cairoDrawId_  = 0;
+        cairoCapsId_  = 0;
+        videoWidth_   = 0;
+        videoHeight_  = 0;
     }
     Camera_GST::close();
 }
@@ -97,16 +113,6 @@ void Camera_CSI::close() {
 void Camera_CSI::setOverlayData(const OverlayData& data) {
     std::lock_guard<std::mutex> lock(overlayMutex_);
     overlayData_ = data;
-    if (ovTopLeft_) {
-        // Belt-and-suspenders: even with the close() override, there is a
-        // window between setPipelineError() and the caller invoking close()
-        // during which ov*_ may be dangling.  Verify the pipeline is actually
-        // RUNNING before pushing data into the textoverlay elements.
-        // Lock order overlayMutex_ → stateMutex_ matches Camera_CSI::stop().
-        std::lock_guard<std::mutex> slk(stateMutex_);
-        if (status_.status == CAMERA_STATUS::RUNNING)
-            updateTextOverlays(data);
-    }
 }
 
 OverlayData Camera_CSI::getOverlayData() const {
@@ -114,7 +120,7 @@ OverlayData Camera_CSI::getOverlayData() const {
     return overlayData_;
 }
 
-// ─── textoverlay helpers ──────────────────────────────────────────────────────
+// ─── Cairo overlay helpers ────────────────────────────────────────────────────
 
 static const char* headingToCardinal(float deg) {
     // 8-point compass; each sector is 45°, offset by 22.5° so N spans [-22.5, 22.5].
@@ -123,21 +129,74 @@ static const char* headingToCardinal(float deg) {
     return names[sector < 0 ? sector + 8 : sector];
 }
 
-// configureTextOverlay — replaced by inline pipeline-string properties in createRecordingBin().
-// static void configureTextOverlay(GstElement* elem, const char* halign, const char* valign) {
-//     gst_util_set_object_arg(G_OBJECT(elem), "halignment", halign);
-//     gst_util_set_object_arg(G_OBJECT(elem), "valignment",  valign);
-//     g_object_set(G_OBJECT(elem),
-//                  "font-desc",         "Monospace Bold 14",
-//                  "color",             (guint)0xFFFFFFFF,
-//                  "shaded-background", (gboolean)TRUE,
-//                  "xpad",              (gint)12,
-//                  "ypad",              (gint)8,
-//                  NULL);
-// }
+// Render multi-line text with a semi-transparent background box at one corner.
+// rightAligned/bottomAligned select which corner; frameW/H are the video dimensions.
+static void drawCornerLabel(cairo_t* cr, const char* text,
+                             bool rightAligned, bool bottomAligned,
+                             double frameW, double frameH) {
+    const double xpad = 12.0, ypad = 8.0;
 
-void Camera_CSI::updateTextOverlays(const OverlayData& od) {
-    // UTC timestamp
+    cairo_font_extents_t fe;
+    cairo_font_extents(cr, &fe);
+
+    std::vector<std::string> lines;
+    for (const char* p = text; *p; ) {
+        const char* nl = std::strchr(p, '\n');
+        lines.emplace_back(p, nl ? static_cast<std::size_t>(nl - p) : std::strlen(p));
+        p = nl ? nl + 1 : p + std::strlen(p);
+    }
+
+    double maxW = 0.0;
+    for (const auto& ln : lines) {
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, ln.c_str(), &te);
+        maxW = std::max(maxW, te.x_advance);
+    }
+
+    double boxW = maxW + 2.0 * xpad;
+    double boxH = fe.height * static_cast<double>(lines.size()) + 2.0 * ypad;
+    double boxX = rightAligned  ? frameW - boxW : 0.0;
+    double boxY = bottomAligned ? frameH - boxH : 0.0;
+
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.5);
+    cairo_rectangle(cr, boxX, boxY, boxW, boxH);
+    cairo_fill(cr);
+
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        cairo_move_to(cr, boxX + xpad,
+                      boxY + ypad + fe.ascent + static_cast<double>(i) * fe.height);
+        cairo_show_text(cr, lines[i].c_str());
+    }
+}
+
+void Camera_CSI::onCairoDraw(GstElement* /*overlay*/, cairo_t* cr,
+                              GstClockTime /*ts*/, GstClockTime /*dur*/,
+                              gpointer user_data) {
+    static_cast<Camera_CSI*>(user_data)->renderOverlay(cr);
+}
+
+void Camera_CSI::onCairoCapsChanged(GstElement* /*overlay*/, GstCaps* caps,
+                                     gpointer user_data) {
+    GstVideoInfo info;
+    if (!gst_video_info_from_caps(&info, caps)) return;
+    auto* self = static_cast<Camera_CSI*>(user_data);
+    std::lock_guard<std::mutex> lock(self->overlayMutex_);
+    self->videoWidth_  = GST_VIDEO_INFO_WIDTH(&info);
+    self->videoHeight_ = GST_VIDEO_INFO_HEIGHT(&info);
+}
+
+void Camera_CSI::renderOverlay(cairo_t* cr) {
+    OverlayData od;
+    double w, h;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        od = overlayData_;
+        w  = static_cast<double>(videoWidth_);
+        h  = static_cast<double>(videoHeight_);
+    }
+    if (w == 0.0 || h == 0.0) return;
+
     time_t epochSec = static_cast<time_t>(od.timestampMs / 1000LL);
     struct tm tmBuf;
     gmtime_r(&epochSec, &tmBuf);
@@ -147,37 +206,36 @@ void Camera_CSI::updateTextOverlays(const OverlayData& od) {
 
     char buf[128];
 
-    // Top-left: speed / acceleration
+    cairo_select_font_face(cr, "Monospace", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 14.0);
+
     std::snprintf(buf, sizeof(buf), "SPD %.1f km/h\nACC %+.1f m/s2",
                   static_cast<double>(od.speedKmh),
                   static_cast<double>(od.accelerationMs2));
-    g_object_set(G_OBJECT(ovTopLeft_), "text", buf, NULL);
+    drawCornerLabel(cr, buf, false, false, w, h);
 
-    // Top-right: heading + cardinal
     std::snprintf(buf, sizeof(buf), "HDG %03.0f %s",
-                  static_cast<double>(od.headingDeg),
-                  headingToCardinal(od.headingDeg));
-    g_object_set(G_OBJECT(ovTopRight_), "text", buf, NULL);
+                  static_cast<double>(od.headingDeg), headingToCardinal(od.headingDeg));
+    drawCornerLabel(cr, buf, true, false, w, h);
 
-    // Bottom-left: lat / lon / alt
     std::snprintf(buf, sizeof(buf), "LAT %.6f %c\nLON %.6f %c\nALT %.1f m",
                   std::abs(od.latitude),  od.latitude  >= 0.0 ? 'N' : 'S',
                   std::abs(od.longitude), od.longitude >= 0.0 ? 'E' : 'W',
                   od.altitudeM);
-    g_object_set(G_OBJECT(ovBottomLeft_), "text", buf, NULL);
+    drawCornerLabel(cr, buf, false, true, w, h);
 
-    // Bottom-right: date / time
     std::snprintf(buf, sizeof(buf), "%s\n%s", dateBuf, timeBuf);
-    g_object_set(G_OBJECT(ovBottomRight_), "text", buf, NULL);
+    drawCornerLabel(cr, buf, true, true, w, h);
 }
 
 // ─── recording bin ────────────────────────────────────────────────────────────
 
-GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
+GstElement* Camera_CSI::createRecordingBin(const std::string& filename,
+                                            uint32_t frNum, uint32_t frDen) {
     // Must be called before start(): the returned bin is meant to be passed to
     // addBranch(), which itself rejects RUNNING.  Calling here while RUNNING
-    // would also overwrite the live ov*_ pointers with handles to elements
-    // that aren't in any pipeline.
+    // would also overwrite the live cairoOverlay_ pointer with a handle to an
+    // element that isn't in any pipeline.
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         if (status_.status == CAMERA_STATUS::RUNNING) {
@@ -186,72 +244,56 @@ GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
         }
     }
 
-    // ghost_unlinked_pads=TRUE: GStreamer auto-wraps nvvidconv's unlinked "sink"
-    // pad as a ghost pad named "sink" on the bin — no manual ghost-pad code needed.
-    // filename is set via g_object_set below (not in the string) to handle paths
-    // with spaces or other characters that would break the description parser.
-    static const char* binDesc =
-        "nvvidconv name=conv ! video/x-raw,format=(string)I420 "
-        "! textoverlay name=ov_tl halignment=left  valignment=top    "
-          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
-        "! textoverlay name=ov_tr halignment=right valignment=top    "
-          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
-        "! textoverlay name=ov_bl halignment=left  valignment=bottom "
-          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
-        "! textoverlay name=ov_br halignment=right valignment=bottom "
-          "font-desc=\"Monospace Bold 14\" color=4294967295 shaded-background=true xpad=12 ypad=8 "
-        "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=60 "
-        // fragment-duration=1000: write a self-contained moof+mdat atom every 1 s.
-        // The initial moov is written at the start of the file, so all complete
-        // fragments are playable even if the process is killed or power is cut.
-        // Worst-case loss is the last ~1 s of footage.  EOS on graceful shutdown
-        // still works — it flushes and finalises the trailing partial fragment.
-        "! h264parse ! mp4mux fragment-duration=1000 ! filesink name=fsink";
+    const std::string binDesc =
+        "nvvidconv name=conv ! video/x-raw,format=(string)BGRx "
+        "! cairooverlay name=cairoov "
+        "! videoconvert ! video/x-raw,format=(string)I420 "
+        "! queue max-size-buffers=3 leaky=0 "
+        "! videorate ! video/x-raw,framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) + " "
+        "! x264enc speed-preset=ultrafast bitrate=4000 key-int-max=60 insert-vui=true aud=true "
+        "! h264parse ! matroskamux ! filesink name=fsink sync=false async=false";
+
+    g_print("createRecordingBin pipeline:\n  %s\n", binDesc.c_str());
 
     GError*     err = nullptr;
-    GstElement* bin = gst_parse_bin_from_description(binDesc, TRUE, &err);
+    GstElement* bin = gst_parse_bin_from_description(binDesc.c_str(), TRUE, &err);
     if (!bin || err) {
-        if (err) g_error_free(err);
+        if (err) {
+            g_printerr("createRecordingBin: gst_parse_bin_from_description failed: %s\n",
+                       err->message);
+            g_error_free(err);
+        }
         if (bin) gst_object_unref(bin);
         return nullptr;
     }
 
-    // Set the output path via g_object_set — safe for paths containing spaces.
     GstElement* fsink = gst_bin_get_by_name(GST_BIN(bin), "fsink");
     if (fsink) {
         g_object_set(G_OBJECT(fsink), "location", filename.c_str(), NULL);
         gst_object_unref(fsink);
     }
 
-    // gst_bin_get_by_name returns an owned ref (+1).  Immediately release it so
-    // the bin remains the sole owner; the raw pointers stay valid for the bin's
-    // lifetime, matching the non-owning semantics used by setOverlayData/stop().
-    GstElement* ovTL = gst_bin_get_by_name(GST_BIN(bin), "ov_tl");
-    GstElement* ovTR = gst_bin_get_by_name(GST_BIN(bin), "ov_tr");
-    GstElement* ovBL = gst_bin_get_by_name(GST_BIN(bin), "ov_bl");
-    GstElement* ovBR = gst_bin_get_by_name(GST_BIN(bin), "ov_br");
-
-    if (!ovTL || !ovTR || !ovBL || !ovBR) {
-        if (ovTL) gst_object_unref(ovTL);
-        if (ovTR) gst_object_unref(ovTR);
-        if (ovBL) gst_object_unref(ovBL);
-        if (ovBR) gst_object_unref(ovBR);
+    // gst_bin_get_by_name returns an owned ref (+1).  Release it immediately so
+    // the bin remains the sole owner; the raw pointer stays valid for the bin's
+    // lifetime, matching the non-owning semantics in stop()/close().
+    GstElement* cairoOv = gst_bin_get_by_name(GST_BIN(bin), "cairoov");
+    if (!cairoOv) {
+        g_printerr("createRecordingBin: could not find cairooverlay element\n");
         gst_object_unref(bin);
         return nullptr;
     }
 
-    gst_object_unref(ovTL);
-    gst_object_unref(ovTR);
-    gst_object_unref(ovBL);
-    gst_object_unref(ovBR);
+    gulong drawId = g_signal_connect(cairoOv, "draw",
+                                     G_CALLBACK(Camera_CSI::onCairoDraw), this);
+    gulong capsId = g_signal_connect(cairoOv, "caps-changed",
+                                     G_CALLBACK(Camera_CSI::onCairoCapsChanged), this);
+    gst_object_unref(cairoOv);
 
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        ovTopLeft_     = ovTL;
-        ovTopRight_    = ovTR;
-        ovBottomLeft_  = ovBL;
-        ovBottomRight_ = ovBR;
-        updateTextOverlays(overlayData_);
+        cairoOverlay_ = cairoOv;
+        cairoDrawId_  = drawId;
+        cairoCapsId_  = capsId;
     }
 
     return bin;

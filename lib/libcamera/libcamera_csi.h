@@ -33,6 +33,7 @@
 #define LIBCAMERA_CSI_H
 
 #include "libcamera_gst.h"
+#include <cairo/cairo.h>
 #include <mutex>
 #include <string>
 
@@ -82,23 +83,25 @@ protected:
     void applyAttributeGStreamer(const std::string& name, const std::string& value) override;
 
 private:
-    OverlayData        overlayData_;   ///< Latest telemetry; written by setOverlayData(), read by getOverlayData().
-    mutable std::mutex overlayMutex_;  ///< Guards overlayData_ and ov*_ pointers for cross-thread access.
+    OverlayData        overlayData_;   ///< Latest telemetry; written by setOverlayData(), read by renderOverlay().
+    mutable std::mutex overlayMutex_;  ///< Guards overlayData_, cairoOverlay_, and video dimensions.
 
-    /// Non-owning pointers to the four textoverlay elements inside the recording bin.
-    /// Valid only while the pipeline is RUNNING; nulled under overlayMutex_ in stop().
-    GstElement* ovTopLeft_     = nullptr;
-    GstElement* ovTopRight_    = nullptr;
-    GstElement* ovBottomLeft_  = nullptr;
-    GstElement* ovBottomRight_ = nullptr;
+    /// Non-owning pointer to the cairooverlay element inside the recording bin.
+    /// Valid only while the recording bin is attached; nulled under overlayMutex_ in stop()/close().
+    GstElement* cairoOverlay_ = nullptr;
+    gulong      cairoDrawId_  = 0;  ///< Signal handler ID for "draw"; 0 when disconnected.
+    gulong      cairoCapsId_  = 0;  ///< Signal handler ID for "caps-changed"; 0 when disconnected.
+    int         videoWidth_   = 0;  ///< Frame width set by the caps-changed callback.
+    int         videoHeight_  = 0;  ///< Frame height set by the caps-changed callback.
 
-    /**
-     * @brief Format telemetry into strings and push them to the four overlay elements.
-     *
-     * @pre  Called under overlayMutex_ with all four ov*_ pointers non-null.
-     * @param[in] od  Telemetry snapshot to render.
-     */
-    void updateTextOverlays(const OverlayData& od);
+    /** @brief Render all four corner labels onto @p cr for the current frame. */
+    void renderOverlay(cairo_t* cr);
+
+    /** @brief GStreamer "draw" signal callback; delegates to renderOverlay(). */
+    static void onCairoDraw(GstElement*, cairo_t*, GstClockTime, GstClockTime, gpointer);
+
+    /** @brief GStreamer "caps-changed" signal callback; stores frame dimensions. */
+    static void onCairoCapsChanged(GstElement*, GstCaps*, gpointer);
 
 public:
     /**
@@ -110,38 +113,30 @@ public:
     ~Camera_CSI() override = default;
 
     /**
-     * @brief Stop the capture pipeline and null out textoverlay element pointers.
+     * @brief Stop the capture pipeline and disconnect the Cairo draw callbacks.
      *
-     * Nulls the four ov*_ pointers under overlayMutex_ before delegating to
-     * Camera_GST::stop(), ensuring setOverlayData() cannot call g_object_set
-     * on elements that are being destroyed.
+     * Disconnects the "draw" and "caps-changed" signal handlers and nulls
+     * cairoOverlay_ under overlayMutex_ before delegating to Camera_GST::stop(),
+     * ensuring the draw callback cannot fire on a destroyed pipeline.
      */
     void stop() override;
 
     /**
-     * @brief Close the camera and null out textoverlay element pointers.
+     * @brief Close the camera and disconnect the Cairo draw callbacks.
      *
      * Mirrors stop() for the ERROR→CLOSED transition: when start() fails,
      * Camera_GST::setPipelineError() tears down the pipeline (freeing the
-     * recording bin) without calling stop(), leaving ov*_ dangling.  This
-     * override nulls them under overlayMutex_ before delegating to the base
-     * close() so a stray setOverlayData() call after a failed start() cannot
-     * write to a freed GstElement.
+     * recording bin) without calling stop(), leaving cairoOverlay_ dangling.
+     * This override disconnects and nulls it before delegating to the base
+     * close() so a stray draw signal cannot fire on a freed GstElement.
      */
     void close() override;
 
     /**
      * @brief Update the telemetry overlay data from any thread.
      *
-     * Thread-safe.  Stores @p data and, if the pipeline is RUNNING and the
-     * recording bin is active, pushes the formatted text to the four textoverlay
-     * elements via g_object_set.
-     *
-     * **Safety:** The ov*_ pointers are only valid when status==RUNNING. This
-     * method checks that precondition before writing. If a start() fails,
-     * close() nulls the pointers before the pipeline is torn down, and a
-     * stray setOverlayData() call before close() is invoked will simply skip
-     * the update.
+     * Thread-safe.  Stores @p data under overlayMutex_.  The Cairo draw
+     * callback reads it on the next frame — no per-frame push needed.
      *
      * @param[in] data  New telemetry values to store.
      */
@@ -163,18 +158,15 @@ public:
      * internally converts to I420 system memory before rendering the overlay.
      * The internal chain is:
      * @verbatim
-     *   nvvidconv ! video/x-raw,format=I420
-     *     ! textoverlay(top-left)
-     *     ! textoverlay(top-right)
-     *     ! textoverlay(bottom-left)
-     *     ! textoverlay(bottom-right)
+     *   nvvidconv ! video/x-raw,format=BGRx
+     *     ! cairooverlay
+     *     ! videoconvert ! video/x-raw,format=I420
      *     ! x264enc ! h264parse ! mp4mux ! filesink
      * @endverbatim
      *
-     * Four GStreamer @c textoverlay elements burn telemetry directly into each
-     * passing frame.  Their @c text properties are updated in-place on every
-     * setOverlayData() call — no per-frame callbacks, no extra library
-     * dependencies beyond @c gst-plugins-base.
+     * A single @c cairooverlay element fires the "draw" signal on every frame.
+     * The Cairo callback renders all four corner labels from the latest
+     * overlayData_ snapshot — no GStreamer property writes per frame.
      *
      * Corner layout:
      *   - Top-left:     speed, acceleration
@@ -191,7 +183,8 @@ public:
      *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
      * @note   Must be called before start().
      */
-    GstElement* createRecordingBin(const std::string& filename);
+    GstElement* createRecordingBin(const std::string& filename,
+                                   uint32_t frNum = 60, uint32_t frDen = 1);
 };
 
 #endif // LIBCAMERA_CSI_H

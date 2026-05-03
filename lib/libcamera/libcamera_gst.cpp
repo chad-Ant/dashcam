@@ -256,7 +256,7 @@ void Camera_GST::start() {
     // The queue isolates backpressure; the valve enables runtime enable/disable.
     bool branchError = false;
     for (size_t i = 0; i < branches_.size(); ++i) {
-        auto& [branchName, branchBin, branchLeaky] = branches_[i];
+        auto& [branchName, branchBin, branchLeaky, branchInitEnabled] = branches_[i];
 
         auto releaseRemaining = [&](size_t from) {
             for (size_t j = from; j < branches_.size(); ++j) {
@@ -290,6 +290,8 @@ void Camera_GST::start() {
             branchError = true;
             break;
         }
+        if (!branchInitEnabled)
+            g_object_set(G_OBJECT(valve), "drop", TRUE, NULL);
 
         gst_bin_add_many(GST_BIN(pipeline_), queue, valve, branchBin, nullptr);
 
@@ -414,13 +416,14 @@ void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& by
 
 // ─── multi-sink extensions ───────────────────────────────────────────────────
 
-void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin, bool leaky) {
+void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin,
+                           bool leaky, bool initialEnabled) {  // defaults in header
     std::lock_guard<std::mutex> lock(stateMutex_);
     if (status_.status == CAMERA_STATUS::RUNNING) {
         status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
         return;
     }
-    branches_.push_back({name, sinkBin, leaky});
+    branches_.push_back({name, sinkBin, leaky, initialEnabled});
 }
 
 GstElement* Camera_GST::getTee() const { return tee_; }

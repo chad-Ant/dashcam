@@ -4,10 +4,10 @@ CXX      ?= g++
 # GStreamer flags, C++17, debug symbols, and the library include path
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/libcamera \
-            $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0)
+            $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 cairo)
 
-# GStreamer libs and POSIX threads
-LDFLAGS  := $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0) -pthread
+# GStreamer libs, Cairo, and POSIX threads
+LDFLAGS  := $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 cairo) -pthread
 
 # Each invocation gets its own timestamped output directory.
 # TIMESTAMP is evaluated once at parse time (:=), so all rules share the same value.
