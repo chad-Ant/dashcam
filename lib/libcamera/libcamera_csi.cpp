@@ -231,7 +231,8 @@ void Camera_CSI::renderOverlay(cairo_t* cr) {
 
 // ─── recording bin ────────────────────────────────────────────────────────────
 
-GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
+GstElement* Camera_CSI::createRecordingBin(const std::string& filename,
+                                            uint32_t frNum, uint32_t frDen) {
     // Must be called before start(): the returned bin is meant to be passed to
     // addBranch(), which itself rejects RUNNING.  Calling here while RUNNING
     // would also overwrite the live cairoOverlay_ pointer with a handle to an
@@ -244,23 +245,19 @@ GstElement* Camera_CSI::createRecordingBin(const std::string& filename) {
         }
     }
 
-    // ghost_unlinked_pads=TRUE: GStreamer auto-wraps nvvidconv's unlinked "sink"
-    // pad as a ghost pad named "sink" on the bin — no manual ghost-pad code needed.
-    // filename is set via g_object_set below (not in the string) to handle paths
-    // with spaces or other characters that would break the description parser.
-    // nvvidconv outputs BGRx (32-bit RGB) because cairooverlay requires a
-    // non-planar format; videoconvert converts back to I420 for x264enc.
-    // fragment-duration=1000: write a self-contained moof+mdat atom every 1 s.
-    // Worst-case power-cut loss is the last ~1 s of footage.
-    static const char* binDesc =
+    const std::string binDesc =
         "nvvidconv name=conv ! video/x-raw,format=(string)BGRx "
         "! cairooverlay name=cairoov "
         "! videoconvert ! video/x-raw,format=(string)I420 "
-        "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=60 "
-        "! h264parse ! mp4mux fragment-duration=1000 ! filesink name=fsink";
+        "! queue max-size-buffers=3 leaky=0 "
+        "! videorate ! video/x-raw,framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) + " "
+        "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=60 insert-vui=true aud=true "
+        "! h264parse ! matroskamux ! filesink name=fsink sync=false async=false";
+
+    g_print("createRecordingBin pipeline:\n  %s\n", binDesc.c_str());
 
     GError*     err = nullptr;
-    GstElement* bin = gst_parse_bin_from_description(binDesc, TRUE, &err);
+    GstElement* bin = gst_parse_bin_from_description(binDesc.c_str(), TRUE, &err);
     if (!bin || err) {
         if (err) {
             g_printerr("createRecordingBin: gst_parse_bin_from_description failed: %s\n",

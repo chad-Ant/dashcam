@@ -99,9 +99,10 @@ protected:
      * for flow control and enable/disable logic.
      */
     struct BranchEntry {
-        std::string  name;        ///< User-supplied identifier for setBranchEnabled().
-        GstElement*  bin;         ///< GStreamer bin providing the branch logic (owned by pipeline after start()).
-        bool         leaky;       ///< true = leaky downstream queue (inference, drop old on backpressure); false = blocking queue (recording, preserve all).
+        std::string  name;           ///< User-supplied identifier for setBranchEnabled().
+        GstElement*  bin;            ///< GStreamer bin providing the branch logic (owned by pipeline after start()).
+        bool         leaky;          ///< true = leaky downstream queue (inference); false = blocking (recording).
+        bool         initialEnabled; ///< If false, valve starts with drop=TRUE so recording is paused until setBranchEnabled(true).
     };
 
     /// Branches registered via addBranch() before start().  The pipeline takes
@@ -186,19 +187,6 @@ protected:
     static bool safeStoi(const std::string& str, int& outVal);
 
     /**
-     * @brief Convert a floating-point frame rate to a reduced integer fraction.
-     *
-     * Multiplies @p fps by 1000, rounds to the nearest integer, then reduces
-     * the resulting fraction by the GCD.  This preserves common drop-frame
-     * rates exactly (e.g. 29.97 → 30000/1001).
-     *
-     * @param[in]  fps    Frame rate in frames per second.
-     * @param[out] frNum  Reduced numerator.
-     * @param[out] frDen  Reduced denominator.
-     */
-    static void computeFpsRational(float fps, uint32_t& frNum, uint32_t& frDen);
-
-    /**
      * @brief Construct base state; must be called by every concrete subclass constructor.
      * @param[in] camera  cameraInfo obtained from getCameraList().
      */
@@ -228,6 +216,18 @@ private:
     void setPipelineError();
 
 public:
+    /**
+     * @brief Convert a floating-point frame rate to a reduced integer fraction.
+     *
+     * Multiplies @p fps by 1000, rounds to the nearest integer, then reduces
+     * the resulting fraction by the GCD.
+     *
+     * @param[in]  fps    Frame rate in frames per second.
+     * @param[out] frNum  Reduced numerator.
+     * @param[out] frDen  Reduced denominator.
+     */
+    static void computeFpsRational(float fps, uint32_t& frNum, uint32_t& frDen);
+
     /**
      * @brief Destructor; calls close() if the camera is not already in CLOSED state.
      */
@@ -309,7 +309,8 @@ public:
      * @post Branches are linked during start().  On a failed start(), all branches
      *       are torn down by teardownPipeline().
      */
-    void addBranch(const std::string& name, GstElement* sinkBin, bool leaky = false);
+    void addBranch(const std::string& name, GstElement* sinkBin,
+                   bool leaky = false, bool initialEnabled = true);
 
     /**
      * @brief Return the tee element for direct pipeline manipulation.

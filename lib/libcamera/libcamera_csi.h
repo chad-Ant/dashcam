@@ -183,7 +183,8 @@ public:
      *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
      * @note   Must be called before start().
      */
-    GstElement* createRecordingBin(const std::string& filename);
+    GstElement* createRecordingBin(const std::string& filename,
+                                   uint32_t frNum = 60, uint32_t frDen = 1);
 };
 
 #endif // LIBCAMERA_CSI_H

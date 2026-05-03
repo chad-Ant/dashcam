@@ -9,7 +9,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr uint16_t TARGET_FORMAT_INDEX = 4;  // 720p60 on this sensor
+static constexpr uint16_t TARGET_FORMAT_INDEX = 4;  // 1080p30 on this sensor
 
 static bool checkRunning(Camera_CSI& cam, const char* phase) {
     cameraStatus st;
@@ -30,9 +30,18 @@ static bool selectFormat(const cameraInfo& info, uint16_t idx) {
         return false;
     }
     const auto& fmt = info.videoFormats[idx];
-    std::cout << "Selected format[" << idx << "]: " << fmt.width << "x" << fmt.height
-              << "@" << fmt.frameRate << " (" << fmt.description << ")\n";
+    std::cout << "  Format[" << idx << "]: " << fmt.width << "x" << fmt.height
+              << " @ " << fmt.frameRate << " fps (" << fmt.description << ")\n";
     return true;
+}
+
+static void ffprobe_streams(const std::string& filename) {
+    std::cout << "  ffprobe streams:\n";
+    std::string cmd =
+        "ffprobe -v error -select_streams v:0"
+        " -show_entries stream=codec_name,r_frame_rate,avg_frame_rate,nb_frames,duration"
+        " -of default=noprint_wrappers=1 " + filename + " 2>&1";
+    std::system(cmd.c_str());
 }
 
 bool test_recording_overlay(const cameraInfo& info) {
@@ -41,26 +50,43 @@ bool test_recording_overlay(const cameraInfo& info) {
 
     Camera_CSI cam(info);
 
-    std::string filename = "./archive/test_overlay.mp4";
+    std::string filename = "./archive/test_overlay.mkv";
     if (fs::exists(filename)) fs::remove(filename);
 
-    GstElement* recBin = cam.createRecordingBin(filename);
+    const auto& fmt = info.videoFormats[TARGET_FORMAT_INDEX];
+    uint32_t frNum, frDen;
+    Camera_GST::computeFpsRational(fmt.frameRate, frNum, frDen);
+    std::cout << "  fps rational: " << frNum << "/" << frDen
+              << " (from frameRate=" << fmt.frameRate << ")\n";
+
+    GstElement* recBin = cam.createRecordingBin(filename, frNum, frDen);
     if (!recBin) {
-        std::cerr << "createRecordingBin() failed\n";
+        std::cerr << "  createRecordingBin() failed\n";
         return false;
     }
 
-    cam.addBranch("recording", recBin, false);
+    // initialEnabled=false: valve starts closed so AE converges before recording begins.
+    cam.addBranch("recording", recBin, false, false);
     cam.open();
     cam.setCameraVideoFormat(TARGET_FORMAT_INDEX);
+    std::cout << "  Starting pipeline...\n";
     cam.start();
     if (!checkRunning(cam, "Test 1")) return false;
+    std::cout << "  Pipeline RUNNING.\n";
 
     std::vector<uint8_t> buffer(1280 * 720 * 3);
     int frames = 0;
     uint32_t written = 0;
 
+    // Warm up: capture a few frames (≈150 ms at 60 fps) so AE settles, then start recording.
+    std::cout << "  Warming up (9 frames)...\n";
+    for (int w = 0; w < 9; ++w)
+        cam.captureFrame(buffer.data(), buffer.size(), written);
+    cam.setBranchEnabled("recording", true);
+    std::cout << "  Recording enabled.\n";
+
     auto start_time = std::chrono::steady_clock::now();
+    auto last_report = start_time;
     while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(5)) {
         cam.captureFrame(buffer.data(), buffer.size(), written);
         if (written > 0) {
@@ -75,14 +101,29 @@ bool test_recording_overlay(const cameraInfo& info) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count()
             });
+            // Print capture rate every second.
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_report >= std::chrono::seconds(1)) {
+                double elapsed = std::chrono::duration<double>(now - start_time).count();
+                std::cout << "  t=" << static_cast<int>(elapsed)
+                          << "s  frames=" << frames
+                          << "  rate=" << static_cast<int>(frames / elapsed) << " fps\n";
+                last_report = now;
+            }
         }
     }
+
+    double total_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time).count();
+    std::cout << "  Recorded " << frames << " frames in " << total_s << "s"
+              << " => " << static_cast<int>(frames / total_s) << " fps (appsink rate)\n";
 
     cam.stop();
     cam.close();
 
     uintmax_t size = fs::exists(filename) ? fs::file_size(filename) : 0;
-    std::cout << "Captured " << frames << " frames. File size: " << size / 1024 << " KB.\n";
+    std::cout << "  File size: " << size / 1024 << " KB\n";
+    ffprobe_streams(filename);
     return size > 100000;
 }
 
@@ -92,50 +133,79 @@ bool test_graceful_mid_recording_stop(const cameraInfo& info) {
 
     Camera_CSI cam(info);
 
-    std::string filename = "./archive/test_shutdown.mp4";
+    std::string filename = "./archive/test_shutdown.mkv";
     if (fs::exists(filename)) fs::remove(filename);
 
-    GstElement* recBin = cam.createRecordingBin(filename);
+    const auto& fmt2 = info.videoFormats[TARGET_FORMAT_INDEX];
+    uint32_t frNum2, frDen2;
+    Camera_GST::computeFpsRational(fmt2.frameRate, frNum2, frDen2);
+    std::cout << "  fps rational: " << frNum2 << "/" << frDen2
+              << " (from frameRate=" << fmt2.frameRate << ")\n";
+
+    GstElement* recBin = cam.createRecordingBin(filename, frNum2, frDen2);
     if (!recBin) {
-        std::cerr << "createRecordingBin() failed\n";
+        std::cerr << "  createRecordingBin() failed\n";
         return false;
     }
 
-    cam.addBranch("recording", recBin, false);
+    cam.addBranch("recording", recBin, false, false);
     cam.open();
     cam.setCameraVideoFormat(TARGET_FORMAT_INDEX);
+    std::cout << "  Starting pipeline...\n";
     cam.start();
     if (!checkRunning(cam, "Test 2")) return false;
+    std::cout << "  Pipeline RUNNING.\n";
 
     std::vector<uint8_t> buffer(1280 * 720 * 3);
     int frames = 0;
     uint32_t written = 0;
 
+    std::cout << "  Warming up (9 frames)...\n";
+    for (int w = 0; w < 9; ++w)
+        cam.captureFrame(buffer.data(), buffer.size(), written);
+    cam.setBranchEnabled("recording", true);
+    std::cout << "  Recording enabled.\n";
+
     auto start_time = std::chrono::steady_clock::now();
+    auto last_report = start_time;
     while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(7)) {
         cam.captureFrame(buffer.data(), buffer.size(), written);
-        if (written > 0) frames++;
+        if (written > 0) {
+            frames++;
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_report >= std::chrono::seconds(1)) {
+                double elapsed = std::chrono::duration<double>(now - start_time).count();
+                std::cout << "  t=" << static_cast<int>(elapsed)
+                          << "s  frames=" << frames
+                          << "  rate=" << static_cast<int>(frames / elapsed) << " fps\n";
+                last_report = now;
+            }
+        }
     }
 
-    std::cout << "Triggering mid-recording stop()...\n";
+    double total_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time).count();
+    std::cout << "  Recorded " << frames << " frames in " << total_s << "s"
+              << " => " << static_cast<int>(frames / total_s) << " fps (appsink rate)\n";
+
+    std::cout << "  Triggering mid-recording stop()...\n";
     cam.stop();
     cam.close();
 
     uintmax_t size = fs::exists(filename) ? fs::file_size(filename) : 0;
-    std::cout << "Captured " << frames << " frames. File size: " << size / 1024 << " KB.\n";
+    std::cout << "  File size: " << size / 1024 << " KB\n";
     if (size <= 50000) return false;
 
-    // Verify the file is a valid, playable MP4 — exercises both the EOS-driven
-    // moov finalisation in teardownPipeline() and the fragmented-MP4 fallback.
-    std::cout << "Validating with ffprobe...\n";
-    int rc = std::system(("ffprobe -v error -show_entries format=duration "
-                          "-of default=noprint_wrappers=1:nokey=1 " + filename +
-                          " > /dev/null 2>&1").c_str());
+    // Verify the file is a valid, playable MKV and print stream details.
+    std::cout << "  Validating with ffprobe...\n";
+    ffprobe_streams(filename);
+    int rc = std::system(("ffprobe -v error -show_entries format=duration"
+                          " -of default=noprint_wrappers=1:nokey=1 " + filename +
+                          " 2>&1").c_str());
     if (rc != 0) {
-        std::cerr << "ffprobe rejected the file (rc=" << rc << ")\n";
+        std::cerr << "  ffprobe rejected the file (rc=" << rc << ")\n";
         return false;
     }
-    std::cout << "ffprobe accepted the file.\n";
     return true;
 }
 
@@ -163,8 +233,8 @@ int main(int argc, char* argv[]) {
     bool t1 = test_recording_overlay(csiInfo);
     bool t2 = test_graceful_mid_recording_stop(csiInfo);
 
-    std::cout << "\nTest 1 (Overlay):       " << (t1 ? "PASS" : "FAIL") << "\n";
-    std::cout << "Test 2 (Mid-stop + MP4): " << (t2 ? "PASS" : "FAIL") << "\n";
+    std::cout << "\nTest 1 (Overlay):        " << (t1 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 2 (Mid-stop + MKV):  " << (t2 ? "PASS" : "FAIL") << "\n";
 
     return (t1 && t2) ? 0 : 1;
 }
