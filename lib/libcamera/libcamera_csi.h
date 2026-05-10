@@ -2,25 +2,29 @@
  * @file libcamera_csi.h
  * @brief MIPI CSI-2 camera implementation for NVIDIA Jetson via GStreamer / Argus.
  *
- * Camera_CSI extends Camera_GST with an nvarguscamerasrc-based pipeline and
- * a thread-safe telemetry overlay data store for recording branches.
+ * Camera_CSI extends Camera_GST with an nvarguscamerasrc-based pipeline.
+ * Recording and Cairo overlay are handled separately by dashcam::record::Recorder
+ * in librecord; see librecord.h for the recording branch API.
  *
  * Typical usage:
  * @code
  *   std::vector<cameraInfo> list;
  *   getCameraList(list);
  *   Camera_CSI cam(list[0]);
+ *   cam.setAttributeDictionary(dict);
  *
- *   GstElement* recBin = cam.createRecordingBin("/data/clip.mkv");
- *   cam.addBranch("recording", recBin);
+ *   // Recording (optional — handled by Recorder in librecord):
+ *   dashcam::record::Recorder recorder;
+ *   GstElement* bin = recorder.createRecordingBin("/data/clip.mkv", frNum, frDen, enc);
+ *   cam.addBranch("recording", bin);
+ *
  *   cam.open();
  *   cam.setCameraVideoFormat(0);
  *   cam.start();
  *
- *   cam.setBranchEnabled("recording", true);
- *   cam.setOverlayData({lat, lon, altM, speedKmh, accelMs2, headingDeg, tsMs});
- *
  *   while (running) cam.captureFrame(buf, size, written);
+ *
+ *   recorder.disconnect();   // before stop()
  *   cam.stop();
  *   cam.close();
  * @endcode
@@ -33,9 +37,8 @@
 #define LIBCAMERA_CSI_H
 
 #include "libcamera_gst.h"
-#include <cairo/cairo.h>
-#include <mutex>
-#include <string>
+
+namespace dashcam::camera {
 
 /**
  * @brief iCamera implementation for MIPI CSI-2 sensors on NVIDIA Jetson.
@@ -45,8 +48,7 @@
  *   nvarguscamerasrc name=camerasrc sensor-id=N
  *     ! video/x-raw(memory:NVMM), NV12, WxH, fps
  *     ! tee name=srctee
- *   srctee. ! queue ! nvvidconv ! BGRx ! videoconvert ! BGR
- *          ! appsink name=mysink
+ *   srctee. ! queue ! nvvidconv ! BGRx ! appsink name=mysink
  *   srctee. ! queue ! valve ! <branch0>
  *   ...
  * @endverbatim
@@ -65,8 +67,8 @@ protected:
      * @brief Build the nvarguscamerasrc pipeline string.
      *
      * Uses @c info_.deviceId as the Argus sensor-id and @c fmt for resolution
-     * and framerate.  The default branch converts NV12 (NVMM) to BGR in system
-     * memory before the appsink.
+     * and framerate.  The default appsink branch converts NV12 (NVMM) to BGRx
+     * in system memory.
      */
     std::string buildPipelineString(const cameraVideoFormat& fmt,
                                     uint32_t frNum, uint32_t frDen) const override;
@@ -74,37 +76,11 @@ protected:
     /**
      * @brief Apply a CSI sensor attribute via g_object_set on nvarguscamerasrc.
      *
-     * Supported names (case-insensitive):
-     *   - "exposure time, absolute" | "exposure" → exposuretimerange (nanoseconds)
-     *   - "gain"                                 → gainrange
-     *   - "auto exposure"                        → aelock  (0 = unlocked, non-0 = locked)
-     *   - "white balance, automatic"             → awblock (0 = unlocked, non-0 = locked)
+     * Resolves the attribute name via the loaded AttributeDictionary.  Supported
+     * properties include exposuretimerange, gainrange, aelock, awblock, wbmode,
+     * saturation, and the TNR/EE families.
      */
     void applyAttributeGStreamer(const std::string& name, const std::string& value) override;
-
-private:
-    OverlayData        overlayData_;   ///< Latest telemetry; written by setOverlayData(), read by renderOverlay().
-    mutable std::mutex overlayMutex_;  ///< Guards overlayData_, cairoOverlay_, and video dimensions.
-
-    /// Non-owning pointer to the cairooverlay element inside the recording bin.
-    /// Valid only while the recording bin is attached; nulled under overlayMutex_ in stop()/close().
-    GstElement* cairoOverlay_ = nullptr;
-    gulong      cairoDrawId_  = 0;  ///< Signal handler ID for "draw"; 0 when disconnected.
-    gulong      cairoCapsId_  = 0;  ///< Signal handler ID for "caps-changed"; 0 when disconnected.
-    int         videoWidth_   = 0;  ///< Frame width set by the caps-changed callback.
-    int         videoHeight_  = 0;  ///< Frame height set by the caps-changed callback.
-
-    /** @brief Disconnect and clear Cairo overlay signal handlers under overlayMutex_. */
-    void disconnectOverlay();
-
-    /** @brief Render all four corner labels onto @p cr for the current frame. */
-    void renderOverlay(cairo_t* cr);
-
-    /** @brief GStreamer "draw" signal callback; delegates to renderOverlay(). */
-    static void onCairoDraw(GstElement*, cairo_t*, GstClockTime, GstClockTime, gpointer);
-
-    /** @brief GStreamer "caps-changed" signal callback; stores frame dimensions. */
-    static void onCairoCapsChanged(GstElement*, GstCaps*, gpointer);
 
 public:
     /**
@@ -114,80 +90,8 @@ public:
     explicit Camera_CSI(const cameraInfo& camera);
 
     ~Camera_CSI() override = default;
-
-    /**
-     * @brief Stop the capture pipeline and disconnect the Cairo draw callbacks.
-     *
-     * Disconnects the "draw" and "caps-changed" signal handlers and nulls
-     * cairoOverlay_ under overlayMutex_ before delegating to Camera_GST::stop(),
-     * ensuring the draw callback cannot fire on a destroyed pipeline.
-     */
-    void stop() override;
-
-    /**
-     * @brief Close the camera and disconnect the Cairo draw callbacks.
-     *
-     * Mirrors stop() for the ERROR→CLOSED transition: when start() fails,
-     * Camera_GST::setPipelineError() tears down the pipeline (freeing the
-     * recording bin) without calling stop(), leaving cairoOverlay_ dangling.
-     * This override disconnects and nulls it before delegating to the base
-     * close() so a stray draw signal cannot fire on a freed GstElement.
-     */
-    void close() override;
-
-    /**
-     * @brief Update the telemetry overlay data from any thread.
-     *
-     * Thread-safe.  Stores @p data under overlayMutex_.  The Cairo draw
-     * callback reads it on the next frame — no per-frame push needed.
-     *
-     * @param[in] data  New telemetry values to store.
-     */
-    void setOverlayData(const OverlayData& data);
-
-    /**
-     * @brief Return a snapshot of the current telemetry overlay data.
-     *
-     * Thread-safe.
-     *
-     * @return Copy of the most recently written OverlayData.
-     */
-    OverlayData getOverlayData() const;
-
-    /**
-     * @brief Create a self-contained recording GstBin that writes an MKV file.
-     *
-     * The returned bin accepts NV12 (NVMM) video on its ghost sink pad and
-     * internally converts to I420 system memory before rendering the overlay.
-     * The internal chain is:
-     * @verbatim
-     *   nvvidconv ! video/x-raw,format=BGRx
-     *     ! cairooverlay
-     *     ! videoconvert ! video/x-raw,format=I420
-     *     ! x264enc ! h264parse ! matroskamux ! filesink
-     * @endverbatim
-     *
-     * A single @c cairooverlay element fires the "draw" signal on every frame.
-     * The Cairo callback renders all four corner labels from the latest
-     * overlayData_ snapshot — no GStreamer property writes per frame.
-     *
-     * Corner layout:
-     *   - Top-left:     speed, acceleration
-     *   - Top-right:    heading + cardinal
-     *   - Bottom-left:  latitude, longitude, altitude
-     *   - Bottom-right: UTC date, UTC time
-     *
-     * The bin can be handed directly to addBranch() and started/stopped
-     * together with the rest of the pipeline.  The file is finalised
-     * (matroskamux cluster closed) when the pipeline transitions to NULL state.
-     *
-     * @param[in] filename  Absolute or relative path for the output MKV file.
-     * @return Newly created GstBin (floating reference); nullptr on failure.
-     *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
-     * @note   Must be called before start().
-     */
-    GstElement* createRecordingBin(const std::string& filename,
-                                   uint32_t frNum = 60, uint32_t frDen = 1);
 };
+
+} // namespace dashcam::camera
 
 #endif // LIBCAMERA_CSI_H

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DashcamConfig>
+
+  <!-- H.264 software encoder (x264enc — Orin Nano has no NVENC) -->
+  <Encoder>
+    <Bitrate>8000</Bitrate>            <!-- kbps -->
+    <SpeedPreset>ultrafast</SpeedPreset>
+    <KeyIntMax>60</KeyIntMax>          <!-- keyframe every N frames; 60 = 1 s at 60 fps -->
+    <Tune></Tune>                      <!-- x264 tune string, e.g. "zerolatency"; leave empty to omit -->
+  </Encoder>
+
+  <!-- Cairo telemetry overlay burned into the recorded video -->
+  <Overlay>
+    <Enabled>true</Enabled>
+    <BackgroundOpacity>0.5</BackgroundOpacity>  <!-- 0.0 = transparent, 1.0 = opaque -->
+    <FontSize>14.0</FontSize>                   <!-- points -->
+    <FontFace>Monospace Bold</FontFace>          <!-- Pango font description -->
+  </Overlay>
+
+  <!-- Each <Camera> entry becomes one CameraConfig in AppConfig::cameras[].
+       name  = user-defined label referenced at runtime (must be unique).
+       type  = "CSI" or "USB" — controls which pipeline is built.
+       Cameras are loaded in document order; index 0 is the first entry. -->
+  <!-- Camera list is intentionally empty here.
+       Run the dashcam binary once to auto-generate entries from discovered hardware,
+       or add <Camera> entries manually. -->
+  <Cameras>
+  </Cameras>
+
+  <!-- System / runtime parameters -->
+  <System>
+    <ArchivePath>./archive</ArchivePath>  <!-- directory for recorded MKV files -->
+    <WarmupFrames>9</WarmupFrames>        <!-- frames discarded before recording starts -->
+  </System>
+
+</DashcamConfig>

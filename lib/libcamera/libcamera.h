@@ -11,9 +11,12 @@
 #ifndef LIBCAMERA_H
 #define LIBCAMERA_H
 
+#include "liblog.h"
 #include <cstdint>
 #include <string>
 #include <vector>
+
+namespace dashcam::camera {
 
 // ─── limits ──────────────────────────────────────────────────────────────────
 
@@ -300,5 +303,80 @@ public:
      */
     virtual void captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) = 0;
 };
+
+// ─── attribute dictionary ─────────────────────────────────────────────────────
+
+/**
+ * @brief How a capability value string is converted before being handed to g_object_set().
+ */
+enum class AttributeValueType {
+    String,       ///< Pass value string directly as const char*.
+    Int,          ///< Parse as gint.
+    Float,        ///< Parse as gfloat.
+    Bool,         ///< Parse "true"/"false" or "1"/"0" as gboolean.
+    BoolFromZero, ///< Parse as int; 0 → TRUE, non-zero → FALSE (AE/AWB lock inversion).
+    RangeString,  ///< Mirror single value to "val val" as const char* (nvargus range props).
+};
+
+/**
+ * @brief One entry in the GStreamer attribute dictionary.
+ *
+ * Maps a set of alias names (as written in CameraConfig::capabilities) to the
+ * GStreamer element property name used by the camera source element, together
+ * with the required value conversion type.
+ */
+struct AttributeEntry {
+    std::string        gstProperty;                            ///< Property name passed to g_object_set().
+    std::string        type;                                   ///< Camera type filter: "CSI", "USB", or "any".
+    AttributeValueType valueType = AttributeValueType::String; ///< Value conversion type.
+    std::vector<std::string> aliases;                          ///< Recognized names, matched case-insensitively.
+};
+
+/**
+ * @brief Loaded attribute dictionary mapping capability names to GStreamer properties.
+ *
+ * Loaded once from camera_attributes.xml; passed into every Camera_GST instance via
+ * setAttributeDictionary().  The dictionary is camera-type-scoped: resolve() filters
+ * entries by "CSI", "USB", or "any" to prevent cross-driver mismatches.
+ *
+ * Typical usage:
+ * @code
+ *   dashcam::camera::AttributeDictionary dict;
+ *   dashcam::camera::AttributeDictionary::load("config/camera_attributes.xml", dict);
+ *   camera.setAttributeDictionary(dict);
+ *   camera.setCameraAttribute("exposuretimerange", "13000");
+ * @endcode
+ */
+class AttributeDictionary {
+public:
+    std::vector<AttributeEntry> entries;
+
+    /**
+     * @brief Find the entry matching @p alias for the given camera type.
+     *
+     * Alias comparison is case-insensitive.  An entry whose type is "any"
+     * matches every camera type.
+     *
+     * @param[in] alias       Capability name (e.g. from a CameraConfig::capabilities map).
+     * @param[in] cameraType  "CSI" or "USB".
+     * @return Pointer to the matching entry, or nullptr if not found.
+     */
+    const AttributeEntry* resolve(const std::string& alias,
+                                  const std::string& cameraType) const;
+
+    /**
+     * @brief Parse @p filePath (a camera_attributes.xml) into @p dict.
+     *
+     * @p dict is cleared before loading.  On error, @p dict is left empty.
+     *
+     * @param[in]  filePath  Path to the XML dictionary file.
+     * @param[out] dict      Receives parsed entries.
+     * @return @c true on success; @c false if the file cannot be read or has no root node.
+     */
+    static bool load(const std::string& filePath, AttributeDictionary& dict,
+                     const dashcam::log::LogCallback& log = {});
+};
+
+} // namespace dashcam::camera
 
 #endif // LIBCAMERA_H

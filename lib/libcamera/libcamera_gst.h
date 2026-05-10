@@ -18,6 +18,7 @@
 #define LIBCAMERA_GST_H
 
 #include "libcamera.h"
+#include "liblog.h"
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <map>
@@ -25,21 +26,7 @@
 #include <string>
 #include <vector>
 
-/**
- * @brief Telemetry payload written into a recording branch overlay.
- *
- * Passed to Camera_CSI::setOverlayData() from any thread.  Fields are all
- * plain data; the struct is copied under a mutex on each write and read.
- */
-struct OverlayData {
-    double  latitude       = 10.7725;      ///< WGS-84 latitude in decimal degrees.
-    double  longitude      = 106.6581;     ///< WGS-84 longitude in decimal degrees.
-    double  altitudeM      = 52.3;         ///< Altitude above mean sea level in metres.
-    float   speedKmh       = 1.5f;         ///< Ground speed in kilometres per hour.
-    float   accelerationMs2 = 0.0f;        ///< Longitudinal acceleration in m/s² (positive = forward).
-    float   headingDeg     = 90.0f;        ///< True heading in degrees (0 = North, clockwise).
-    int64_t timestampMs    = 1777633580;   ///< UNIX epoch timestamp in milliseconds.
-};
+namespace dashcam::camera {
 
 /**
  * @brief Abstract GStreamer base class implementing the iCamera interface.
@@ -130,7 +117,16 @@ protected:
     /// released) and during attribute application (unavoidable, locks GStreamer
     /// property writes).
     mutable std::mutex stateMutex_;
-    
+
+    /// Loaded attribute dictionary used by applyAttributeGStreamer() to resolve
+    /// capability names to GStreamer property names.  Set via setAttributeDictionary()
+    /// before open() or between stop() and start().
+    AttributeDictionary dict_;
+
+    /// Optional diagnostic callback injected by the application.  Called from
+    /// lifecycle methods; never called while stateMutex_ is held.
+    dashcam::log::LogCallback log_{};
+
     /**
      * @brief Return the ERROR_CODE used when the GStreamer pipeline fails.
      *
@@ -176,6 +172,21 @@ protected:
                                          const std::string& value) = 0;
 
     /**
+     * @brief Apply a single resolved attribute entry to a GStreamer source element.
+     *
+     * Converts @p value to the type encoded in @p entry and calls g_object_set().
+     * Used by concrete applyAttributeGStreamer() implementations.
+     *
+     * @param[in] src    GStreamer element to modify (must be non-null).
+     * @param[in] entry  Resolved dictionary entry (gstProperty + valueType).
+     * @param[in] value  Value string from CameraConfig::capabilities.
+     * @return @c true on success; @c false if @p value cannot be parsed.
+     */
+    static bool applyGstProperty(GstElement* src,
+                                  const AttributeEntry& entry,
+                                  const std::string& value);
+
+    /**
      * @brief Parse a decimal integer from @p str without throwing.
      *
      * @param[in]  str     Input string; must be non-empty and contain only
@@ -216,6 +227,24 @@ private:
     void setPipelineError();
 
 public:
+    /**
+     * @brief Install an attribute dictionary used by setCameraAttribute() resolution.
+     *
+     * The dictionary is copied into the camera object.  Call this before open()
+     * or between stop() and start(); the dictionary must remain consistent while
+     * the camera is RUNNING.
+     *
+     * @param[in] dict  Loaded AttributeDictionary (from AttributeDictionary::load()).
+     */
+    void setAttributeDictionary(const AttributeDictionary& dict);
+
+    /**
+     * @brief Inject a log callback.  The callback is invoked on lifecycle events
+     *        and pipeline errors; it is never called while stateMutex_ is held.
+     *        Defaults to a no-op (silent) if not set.
+     */
+    void setLogCallback(dashcam::log::LogCallback cb);
+
     /**
      * @brief Convert a floating-point frame rate to a reduced integer fraction.
      *
@@ -331,5 +360,7 @@ public:
      */
     void setBranchEnabled(const std::string& name, bool enabled);
 };
+
+} // namespace dashcam::camera
 
 #endif // LIBCAMERA_GST_H

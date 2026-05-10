@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <linux/videodev2.h>
 
+namespace dashcam::camera {
+
 struct ScopedFd {
     int fd;
     explicit ScopedFd(int fd) : fd(fd) {}
@@ -319,3 +321,5 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
     }
     return ERROR_CODE::NONE;
 }
+
+} // namespace dashcam::camera

@@ -1,6 +1,24 @@
 #include "libcamera_gst.h"
+#include <algorithm>
 #include <climits>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
+
+namespace dashcam::camera {
+
+// ─── file-local log helper ────────────────────────────────────────────────────
+
+static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
+                  const char* fmt, ...) {
+    if (!cb) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    cb(lvl, buf);
+}
 
 // ─── private helpers ────────────────────────────────────────────────────────
 
@@ -97,6 +115,8 @@ void Camera_GST::teardownPipeline() {
 }
 
 void Camera_GST::setPipelineError() {
+    doLog(log_, dashcam::log::LogLevel::ERROR,
+          "pipeline error on %s", info_.address.c_str());
     teardownPipeline();
     std::lock_guard<std::mutex> lock(stateMutex_);
     status_.status       = CAMERA_STATUS::ERROR;
@@ -113,6 +133,67 @@ bool Camera_GST::safeStoi(const std::string& str, int& outVal) {
     if (val < static_cast<long>(INT_MIN) || val > static_cast<long>(INT_MAX)) return false;
     outVal = static_cast<int>(val);
     return true;
+}
+
+void Camera_GST::setAttributeDictionary(const dashcam::config::AttributeDictionary& dict) {
+    dict_ = dict;
+}
+
+void Camera_GST::setLogCallback(dashcam::log::LogCallback cb) {
+    log_ = std::move(cb);
+}
+
+bool Camera_GST::applyGstProperty(GstElement* src,
+                                   const AttributeEntry& entry,
+                                   const std::string& value) {
+    const char* prop = entry.gstProperty.c_str();
+
+    switch (entry.valueType) {
+        case AttributeValueType::String:
+            g_object_set(G_OBJECT(src), prop, value.c_str(), NULL);
+            return true;
+
+        case AttributeValueType::Int: {
+            int iv = 0;
+            if (!safeStoi(value, iv)) return false;
+            g_object_set(G_OBJECT(src), prop, static_cast<gint>(iv), NULL);
+            return true;
+        }
+
+        case AttributeValueType::Float: {
+            char* end = nullptr;
+            float fv = std::strtof(value.c_str(), &end);
+            if (!end || end == value.c_str()) return false;
+            g_object_set(G_OBJECT(src), prop, static_cast<gfloat>(fv), NULL);
+            return true;
+        }
+
+        case AttributeValueType::Bool: {
+            std::string lower = value;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            gboolean bv;
+            if      (lower == "true"  || lower == "1") bv = TRUE;
+            else if (lower == "false" || lower == "0") bv = FALSE;
+            else return false;
+            g_object_set(G_OBJECT(src), prop, bv, NULL);
+            return true;
+        }
+
+        case AttributeValueType::BoolFromZero: {
+            int iv = 0;
+            if (!safeStoi(value, iv)) return false;
+            g_object_set(G_OBJECT(src), prop, iv == 0 ? TRUE : FALSE, NULL);
+            return true;
+        }
+
+        case AttributeValueType::RangeString: {
+            std::string range = value + " " + value;
+            g_object_set(G_OBJECT(src), prop, range.c_str(), NULL);
+            return true;
+        }
+    }
+    return false;
 }
 
 void Camera_GST::computeFpsRational(float fps, uint32_t& frNum, uint32_t& frDen) {
@@ -166,6 +247,8 @@ void Camera_GST::open() {
     }
     status_.status = CAMERA_STATUS::OPEN;
     status_.currentError = ERROR_CODE::NONE;
+    doLog(log_, dashcam::log::LogLevel::INFO,
+          "camera opened: %s", info_.address.c_str());
 }
 
 void Camera_GST::close() {
@@ -178,12 +261,14 @@ void Camera_GST::close() {
         }
         requiresStop = (status_.status == CAMERA_STATUS::RUNNING);
     }
+    doLog(log_, dashcam::log::LogLevel::INFO,
+          "camera closing: %s", info_.address.c_str());
 
     // Drop lock before hitting GStreamer teardown logic to prevent deadlocks
     if (requiresStop) {
-        stop();  
+        stop();
     } else {
-        teardownPipeline();  
+        teardownPipeline();
     }
 
     // Re-acquire to finalize state
@@ -249,6 +334,10 @@ void Camera_GST::start() {
     computeFpsRational(fmt.frameRate, frNum, frDen);
 
     std::string pipelineStr = buildPipelineString(fmt, frNum, frDen);
+    doLog(log_, dashcam::log::LogLevel::INFO,
+          "starting pipeline on %s", info_.address.c_str());
+    doLog(log_, dashcam::log::LogLevel::DEBUG,
+          "pipeline: %s", pipelineStr.c_str());
 
     GError* error = nullptr;
     pipeline_ = gst_parse_launch(pipelineStr.c_str(), &error);
@@ -264,6 +353,8 @@ void Camera_GST::start() {
     tee_        = gst_bin_get_by_name(GST_BIN(pipeline_), "srctee");
 
     if (!appsink_ || !camera_src_ || !tee_) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "required pipeline elements not found on %s", info_.address.c_str());
         setPipelineError();
         return;
     }
@@ -285,6 +376,8 @@ void Camera_GST::start() {
 
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         if (!queue) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "failed to create queue element for branch '%s'", branchName.c_str());
             gst_object_ref_sink(branchBin); gst_object_unref(branchBin);
             branchBin = nullptr;
             releaseRemaining(i + 1);
@@ -303,6 +396,8 @@ void Camera_GST::start() {
 
         GstElement* valve = gst_element_factory_make("valve", nullptr);
         if (!valve) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "failed to create valve element for branch '%s'", branchName.c_str());
             gst_object_ref_sink(queue);     gst_object_unref(queue);
             gst_object_ref_sink(branchBin); gst_object_unref(branchBin);
             branchBin = nullptr;
@@ -317,6 +412,8 @@ void Camera_GST::start() {
 
         GstPad* teeSrcPad = gst_element_request_pad_simple(tee_, "src_%u");
         if (!teeSrcPad) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "failed to get tee src pad for branch '%s'", branchName.c_str());
             releaseRemaining(i + 1);
             branchError = true;
             break;
@@ -329,12 +426,16 @@ void Camera_GST::start() {
         if (ret != GST_PAD_LINK_OK ||
             !gst_element_link(queue, valve) ||
             !gst_element_link(valve, branchBin)) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "pad/element link failed for branch '%s'", branchName.c_str());
             gst_element_release_request_pad(tee_, teeSrcPad);
             gst_object_unref(teeSrcPad);
             releaseRemaining(i + 1);
             branchError = true;
             break;
         }
+        doLog(log_, dashcam::log::LogLevel::INFO,
+              "branch linked: %s", branchName.c_str());
         teePads_.push_back(teeSrcPad);
         branchValves_[branchName] = valve;
     }
@@ -375,6 +476,9 @@ void Camera_GST::start() {
         }
     }
 
+    doLog(log_, dashcam::log::LogLevel::INFO,
+          "pipeline running: %s", info_.address.c_str());
+
     // Drain anything queued during the startup window.  status_ is already
     // RUNNING (claimed at the top of start() to serialise concurrent callers).
     std::map<std::string, std::string> lateAttribs;
@@ -393,6 +497,8 @@ void Camera_GST::stop() {
         if (status_.status != CAMERA_STATUS::RUNNING) return;
         status_.status = CAMERA_STATUS::OPEN;
     }
+    doLog(log_, dashcam::log::LogLevel::INFO,
+          "stopping pipeline: %s", info_.address.c_str());
     teardownPipeline();
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -460,3 +566,5 @@ void Camera_GST::setBranchEnabled(const std::string& name, bool enabled) {
     g_object_set(G_OBJECT(it->second), "drop", enabled ? FALSE : TRUE, NULL);
     status_.currentError = ERROR_CODE::NONE;
 }
+
+} // namespace dashcam::camera

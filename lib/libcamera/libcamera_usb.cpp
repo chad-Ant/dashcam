@@ -1,7 +1,7 @@
 #include "libcamera_usb.h"
-#include <algorithm>
-#include <cctype>
 #include <linux/videodev2.h>
+
+namespace dashcam::camera {
 
 // ─── private helper ──────────────────────────────────────────────────────────
 
@@ -53,37 +53,16 @@ std::string Camera_USB::buildPipelineString(const cameraVideoFormat& fmt,
            " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
 }
 
-/// Supported attribute names (case-insensitive) and their v4l2src GObject property mappings:
-///   "brightness"  → brightness  (integer; range depends on device)
-///   "contrast"    → contrast    (integer; range depends on device)
-///   "saturation"  → saturation  (integer; range depends on device)
 void Camera_USB::applyAttributeGStreamer(const std::string& name, const std::string& value) {
     if (!camera_src_) {
         status_.currentError = pipelineError();
         return;
     }
-
-    std::string lowerName = name;
-    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
-                   [](unsigned char c){ return std::tolower(c); });
-
-    int intVal = 0;
-    if (!safeStoi(value, intVal)) {
+    const auto* entry = dict_.resolve(name, "USB");
+    if (!entry || !applyGstProperty(camera_src_, *entry, value)) {
         status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
         return;
     }
-
-    if (lowerName == "brightness") {
-        g_object_set(G_OBJECT(camera_src_), "brightness", intVal, NULL);
-    } else if (lowerName == "contrast") {
-        g_object_set(G_OBJECT(camera_src_), "contrast", intVal, NULL);
-    } else if (lowerName == "saturation") {
-        g_object_set(G_OBJECT(camera_src_), "saturation", intVal, NULL);
-    } else {
-        status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
-        return;
-    }
-
     status_.currentError = ERROR_CODE::NONE;
 }
 
@@ -92,3 +71,5 @@ void Camera_USB::applyAttributeGStreamer(const std::string& name, const std::str
 Camera_USB::Camera_USB(const cameraInfo& camera)
     : Camera_GST(camera) {
 }
+
+} // namespace dashcam::camera

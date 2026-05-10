@@ -32,6 +32,8 @@
 #include "libcamera_gst.h"
 #include <string>
 
+namespace dashcam::camera {
+
 /**
  * @brief iCamera implementation for USB UVC cameras via GStreamer v4l2src.
  *
@@ -86,5 +88,7 @@ public:
 
     ~Camera_USB() override = default;
 };
+
+} // namespace dashcam::camera
 
 #endif // LIBCAMERA_USB_H
