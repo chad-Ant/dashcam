@@ -46,12 +46,11 @@ void init(const std::string& logDir) {
     try {
         spdlog::init_thread_pool(8192, 1);
 
-        auto file_sink    = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
             fname, 3 * 1024 * 1024, /*max_files=*/3);
-        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-
-        // Per-sink patterns: color codes stay out of the log file.
         file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
         console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
         std::vector<spdlog::sink_ptr> sinks{console_sink, file_sink};

@@ -135,7 +135,7 @@ bool Camera_GST::safeStoi(const std::string& str, int& outVal) {
     return true;
 }
 
-void Camera_GST::setAttributeDictionary(const dashcam::config::AttributeDictionary& dict) {
+void Camera_GST::setAttributeDictionary(const dashcam::camera::AttributeDictionary& dict) {
     dict_ = dict;
 }
 

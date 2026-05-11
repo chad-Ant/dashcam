@@ -68,6 +68,21 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam) {
     if (auto n = node.child("SensorId"))    cam.sensorId    = n.text().as_int(cam.sensorId);
     if (auto n = node.child("FormatIndex")) cam.formatIndex = n.text().as_int(cam.formatIndex);
 
+    if (auto attrs = node.child("Attributes")) {
+        for (auto attr : attrs.children("Attribute")) {
+            CameraAttributeInfo ai;
+            ai.name     = attr.attribute("name").as_string();
+            ai.writable = attr.attribute("writable").as_bool();
+            ai.readable = attr.attribute("readable").as_bool();
+            ai.minValue = attr.attribute("min").as_float();
+            ai.maxValue = attr.attribute("max").as_float();
+            ai.step     = attr.attribute("step").as_float();
+            ai.menuOptions = attr.attribute("menu").as_string();
+            if (!ai.name.empty())
+                cam.attributeInfo.push_back(std::move(ai));
+        }
+    }
+
     if (auto caps = node.child("Capabilities")) {
         for (auto cap : caps.children("Capability")) {
             const char* key = cap.attribute("name").value();
@@ -107,6 +122,20 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
     n.append_child("Device").text().set(cam.device.c_str());
     n.append_child("SensorId").text().set(cam.sensorId);
     n.append_child("FormatIndex").text().set(cam.formatIndex);
+    if (!cam.attributeInfo.empty()) {
+        pugi::xml_node attrs = n.append_child("Attributes");
+        for (const auto& ai : cam.attributeInfo) {
+            pugi::xml_node a = attrs.append_child("Attribute");
+            a.append_attribute("name").set_value(ai.name.c_str());
+            a.append_attribute("writable").set_value(ai.writable);
+            a.append_attribute("readable").set_value(ai.readable);
+            a.append_attribute("min").set_value(static_cast<double>(ai.minValue));
+            a.append_attribute("max").set_value(static_cast<double>(ai.maxValue));
+            a.append_attribute("step").set_value(static_cast<double>(ai.step));
+            if (!ai.menuOptions.empty())
+                a.append_attribute("menu").set_value(ai.menuOptions.c_str());
+        }
+    }
     if (!cam.capabilities.empty()) {
         pugi::xml_node caps = n.append_child("Capabilities");
         for (const auto& [key, val] : cam.capabilities) {

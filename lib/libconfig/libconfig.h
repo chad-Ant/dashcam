@@ -60,6 +60,26 @@ struct OverlayConfig {
 };
 
 /**
+ * @brief Metadata for a single V4L2 control discovered on a camera.
+ *
+ * Populated by demo_terminal / bootstrap code from cameraInfo::attributes and
+ * written into <Attributes> so the operator can see what controls exist and
+ * their valid ranges before editing <Capabilities>.  Read back on load for
+ * round-trip fidelity; not used at runtime (runtime uses capabilities only).
+ *
+ * XML element: <Camera><Attributes><Attribute name="..." .../>
+ */
+struct CameraAttributeInfo {
+    std::string name;
+    bool        writable    = false;
+    bool        readable    = false;
+    float       minValue    = 0.0f;
+    float       maxValue    = 0.0f;
+    float       step        = 0.0f;
+    std::string menuOptions; ///< Semicolon-separated option strings for MENU controls; empty otherwise.
+};
+
+/**
  * @brief Configuration for a single recognized camera.
  *
  * XML element: <Cameras><Camera name="..." type="...">
@@ -67,6 +87,8 @@ struct OverlayConfig {
  * @c type must be "CSI" or "USB".  @c capabilities feeds directly into
  * iCamera::setCameraAttribute(); keys must match the driver's documented
  * attribute names exactly (e.g. "exposure time, absolute", "brightness").
+ * @c attributeInfo is informational only — populated by discovery and written
+ * to the config so the operator knows what controls are available.
  */
 struct CameraConfig {
     std::string name;                    ///< User-defined label, e.g. "front" or "cabin-left".
@@ -75,7 +97,8 @@ struct CameraConfig {
     std::string device;                  ///< Device node (e.g. "/dev/video2"); empty = auto-detect.
     int         sensorId    = 0;         ///< Argus sensor-id for CSI cameras; ignored for USB.
     int         formatIndex = 0;         ///< Index into getCameraList() videoFormats to activate.
-    std::map<std::string, std::string> capabilities; ///< Driver capability name → string value.
+    std::vector<CameraAttributeInfo>   attributeInfo;  ///< Discovered control metadata (informational).
+    std::map<std::string, std::string> capabilities;   ///< Driver capability name → value to apply at start.
 };
 
 /**

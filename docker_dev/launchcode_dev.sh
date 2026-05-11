@@ -13,4 +13,6 @@ docker run -it --rm --network=host --privileged --ipc=host \
     -v /tmp/argus_socket:/tmp/argus_socket \
     -v $OUTPUT_DIR:/user/output \
     -v /home/$USER/dashcam:/user/dashcam \
+    -v /etc/localtime:/etc/localtime:ro \
+    -v /etc/timezone:/etc/timezone:ro \
     $IMAGE_NAME

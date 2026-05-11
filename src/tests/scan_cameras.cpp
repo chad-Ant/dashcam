@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <vector>
 
+using namespace dashcam::camera;
+
 void printCameraData(const cameraInfo& info) {
     std::cout << "\n======================================================\n";
     std::cout << "📷 DEVICE: " << info.address << "\n";

@@ -58,7 +58,7 @@ static void ffprobe_streams(const std::string& filename) {
 
 bool test_recording_overlay(const cameraInfo& info,
                              const dashcam::config::AppConfig& cfg,
-                             const dashcam::config::AttributeDictionary& attrDict) {
+                             const dashcam::camera::AttributeDictionary& attrDict) {
     std::cout << "\n--- Test 1: Full Recording with Dynamic Telemetry ---\n";
     const uint16_t fmtIdx = csiFormatIndex(cfg);
     if (!selectFormat(info, fmtIdx)) return false;
@@ -149,7 +149,7 @@ bool test_recording_overlay(const cameraInfo& info,
 
 bool test_graceful_mid_recording_stop(const cameraInfo& info,
                                        const dashcam::config::AppConfig& cfg,
-                                       const dashcam::config::AttributeDictionary& attrDict) {
+                                       const dashcam::camera::AttributeDictionary& attrDict) {
     std::cout << "\n--- Test 2: Graceful Mid-Recording Stop (EOS path) ---\n";
     const uint16_t fmtIdx = csiFormatIndex(cfg);
     if (!selectFormat(info, fmtIdx)) return false;
