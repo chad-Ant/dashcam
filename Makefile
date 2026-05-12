@@ -10,6 +10,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/libgpio \
             -Ilib/libi2c \
             -Ilib/liblog \
+            -Ilib/libmidi \
             -Ilib/librecord \
             -Ilib/libspi \
             -Ilib/libstereocam \
@@ -25,7 +26,8 @@ LD_BASE := $(shell pkg-config --libs \
 
 LD_CV   := $(shell pkg-config --libs opencv4)
 LD_VPI  := -lvpi
-LD_GPIO := -lgpiod
+LD_GPIO  := -lgpiod
+LD_ALSA  := -lasound
 
 # ─── VPI guard ────────────────────────────────────────────────────────────────
 # libstereocam and the production dashcam binary require VPI 3.x headers
@@ -46,6 +48,7 @@ LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
 LIBCAN_SRCS    := lib/libcan/libcan.cpp
 LIBGPIO_SRCS   := lib/libgpio/libgpio.cpp
 LIBI2C_SRCS    := lib/libi2c/libi2c.cpp
+LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
 LIBSPI_SRCS    := lib/libspi/libspi.cpp
 LIBUART_SRCS   := lib/libuart/libuart.cpp
 LIBLOG_SRCS    := lib/liblog/liblog.cpp
@@ -54,7 +57,7 @@ LIBREC_SRCS    := lib/librecord/librecord.cpp
 LIBSTEREO_SRCS := lib/libstereocam/libstereocam.cpp
 
 # Convenience group: all peripheral interface libs (no GStreamer / OpenCV dependency)
-LIBPERIPH_SRCS := $(LIBCAN_SRCS) $(LIBGPIO_SRCS) $(LIBI2C_SRCS) $(LIBSPI_SRCS) $(LIBUART_SRCS)
+LIBPERIPH_SRCS := $(LIBCAN_SRCS) $(LIBGPIO_SRCS) $(LIBI2C_SRCS) $(LIBMIDI_SRCS) $(LIBSPI_SRCS) $(LIBUART_SRCS)
 
 # ─── build directory (timestamped so parallel invocations don't collide) ──────
 
@@ -83,6 +86,9 @@ SCAN_OBJS := $(call make_objs, $(LIBCAM_CORE_SRCS) src/tests/scan_cameras.cpp)
 # config_test: XML config round-trip tests
 CFG_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCFG_SRCS) $(LIBCAM_CORE_SRCS) src/tests/test_libconfig.cpp)
 
+# midi_test: WAV playback smoke test
+MIDI_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBMIDI_SRCS) src/tests/midi_test.cpp)
+
 # can_test: SocketCAN send/receive loopback test
 CAN_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAN_SRCS) src/tests/can_test.cpp)
 
@@ -104,7 +110,7 @@ DEMO_TERM_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS)
 
 # Always compile these; no VPI dependency.
 BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(SCAN_OBJS) $(CFG_OBJS) \
-                    $(CAN_OBJS) $(GPIO_OBJS) $(DEMO_OBJS) $(DEMO_TERM_OBJS))
+                    $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(DEMO_OBJS) $(DEMO_TERM_OBJS))
 
 ifneq ($(VPI_HDRS),)
 ALL_OBJS := $(sort $(BASE_OBJS) $(DASHCAM_OBJS))
@@ -124,6 +130,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
            $(BUILD_DIR)/gpio_test \
+           $(BUILD_DIR)/midi_test \
            $(BUILD_DIR)/demo_graphical \
            $(BUILD_DIR)/demo_terminal
 
@@ -142,7 +149,7 @@ endif
 
 ifneq ($(VPI_HDRS),)
 $(BUILD_DIR)/dashcam: $(DASHCAM_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_CV) $(LD_VPI) $(LD_GPIO)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_CV) $(LD_VPI) $(LD_GPIO) $(LD_ALSA)
 endif
 
 $(BUILD_DIR)/csi_test: $(CSI_OBJS)
@@ -168,6 +175,9 @@ $(BUILD_DIR)/can_test: $(CAN_OBJS)
 
 $(BUILD_DIR)/gpio_test: $(GPIO_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_GPIO)
+
+$(BUILD_DIR)/midi_test: $(MIDI_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_ALSA)
 
 $(BUILD_DIR)/demo_terminal: $(DEMO_TERM_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)

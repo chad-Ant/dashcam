@@ -91,7 +91,7 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
 
     // Clear O_NONBLOCK — we manage timeouts via select().
     int flags = ::fcntl(m_fd, F_GETFL, 0);
-    ::fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
+    if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
 
     struct termios tty{};
     if (::tcgetattr(m_fd, &tty) < 0) {
@@ -163,9 +163,9 @@ int Uart::read(uint8_t* buf, size_t len, int timeoutMs) {
     if (timeoutMs == 0) {
         // Non-blocking.
         int flags = ::fcntl(m_fd, F_GETFL, 0);
-        ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
+        if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
         ssize_t n = ::read(m_fd, buf, len);
-        ::fcntl(m_fd, F_SETFL, flags);
+        if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags);
         return static_cast<int>(n < 0 ? (errno == EAGAIN ? 0 : -1) : n);
     }
 

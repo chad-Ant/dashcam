@@ -250,7 +250,12 @@ bool GpioWatcher::start() {
 void GpioWatcher::stop() {
     if (!m_running.load()) return;
     m_running.store(false);
-    if (m_pipe[1] >= 0) { uint8_t b = 1; ::write(m_pipe[1], &b, 1); }
+    if (m_pipe[1] >= 0) {
+        uint8_t b = 1;
+        if (::write(m_pipe[1], &b, 1) < 0)
+            doLog(m_log, dashcam::log::LogLevel::WARN,
+                  "GpioWatcher::stop: write to wake pipe failed: %s", ::strerror(errno));
+    }
     if (m_thread.joinable()) m_thread.join();
     doLog(m_log, dashcam::log::LogLevel::INFO, "GpioWatcher::stop: thread stopped");
 }

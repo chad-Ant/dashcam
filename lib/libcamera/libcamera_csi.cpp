@@ -14,6 +14,7 @@ std::string Camera_CSI::buildPipelineString(const cameraVideoFormat& fmt,
            ", format=(string)NV12, framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
            " ! tee name=srctee"
            " srctee. ! queue max-size-buffers=2 leaky=2 ! nvvidconv ! video/x-raw, format=(string)BGRx"
+           " ! videoconvert ! video/x-raw, format=(string)BGR"
            " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
 }
 

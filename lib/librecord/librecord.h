@@ -205,6 +205,12 @@ private:
     int         videoWidth_   = 0;  ///< Frame width set by the caps-changed callback.
     int         videoHeight_  = 0;  ///< Frame height set by the caps-changed callback.
 
+    /// Cached font parse result (derived from overlayConfig_.fontFace in setOverlayConfig).
+    /// Protected by overlayMutex_; snapshotted in renderOverlay() alongside overlayConfig_.
+    std::string cachedFontFamily_;
+    int         cachedFontWeight_ = 0;  ///< cairo_font_weight_t
+    int         cachedFontSlant_  = 0;  ///< cairo_font_slant_t
+
     /** @brief Render all four corner labels onto @p cr for the current frame. */
     void renderOverlay(cairo_t* cr);
 

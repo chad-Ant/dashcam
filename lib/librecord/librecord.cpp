@@ -7,7 +7,6 @@
 #include <cstring>
 #include <ctime>
 #include <string>
-#include <vector>
 
 namespace dashcam::record {
 
@@ -34,12 +33,14 @@ static const char* headingToCardinal(float deg) {
 }
 
 // Parse a Pango-style font description ("Family Bold Italic") into Cairo primitives.
-static void selectCairoFont(cairo_t* cr, const std::string& fontFace) {
-    cairo_font_weight_t weight = CAIRO_FONT_WEIGHT_NORMAL;
-    cairo_font_slant_t  slant  = CAIRO_FONT_SLANT_NORMAL;
-    std::string family = fontFace;
+// Called once in setOverlayConfig(); results are cached to avoid per-frame parsing.
+static void parseFontFace(const std::string& fontFace,
+                          std::string& family, int& weight, int& slant) {
+    weight = CAIRO_FONT_WEIGHT_NORMAL;
+    slant  = CAIRO_FONT_SLANT_NORMAL;
+    family = fontFace;
 
-    struct Suffix { const char* str; cairo_font_weight_t w; cairo_font_slant_t s; };
+    struct Suffix { const char* str; int w; int s; };
     static const Suffix kSuffixes[] = {
         { "Bold Italic",  CAIRO_FONT_WEIGHT_BOLD,   CAIRO_FONT_SLANT_ITALIC  },
         { "Bold Oblique", CAIRO_FONT_WEIGHT_BOLD,   CAIRO_FONT_SLANT_OBLIQUE },
@@ -58,7 +59,6 @@ static void selectCairoFont(cairo_t* cr, const std::string& fontFace) {
             break;
         }
     }
-    cairo_select_font_face(cr, family.c_str(), slant, weight);
 }
 
 // Render multi-line text with a semi-transparent background box at one corner.
@@ -72,22 +72,27 @@ static void drawCornerLabel(cairo_t* cr, const char* text,
     cairo_font_extents_t fe;
     cairo_font_extents(cr, &fe);
 
-    std::vector<std::string> lines;
-    for (const char* p = text; *p; ) {
-        const char* nl = std::strchr(p, '\n');
-        lines.emplace_back(p, nl ? static_cast<std::size_t>(nl - p) : std::strlen(p));
+    char lineBufs[4][128];
+    int  nLines = 0;
+    for (const char* p = text; *p && nLines < 4; ) {
+        const char* nl  = std::strchr(p, '\n');
+        std::size_t len = nl ? static_cast<std::size_t>(nl - p) : std::strlen(p);
+        if (len >= sizeof(lineBufs[0])) len = sizeof(lineBufs[0]) - 1;
+        std::memcpy(lineBufs[nLines], p, len);
+        lineBufs[nLines][len] = '\0';
+        ++nLines;
         p = nl ? nl + 1 : p + std::strlen(p);
     }
 
     double maxW = 0.0;
-    for (const auto& ln : lines) {
+    for (int i = 0; i < nLines; ++i) {
         cairo_text_extents_t te;
-        cairo_text_extents(cr, ln.c_str(), &te);
+        cairo_text_extents(cr, lineBufs[i], &te);
         maxW = std::max(maxW, te.x_advance);
     }
 
     double boxW = maxW + 2.0 * xpad;
-    double boxH = fe.height * static_cast<double>(lines.size()) + 2.0 * ypad;
+    double boxH = fe.height * static_cast<double>(nLines) + 2.0 * ypad;
     double boxX = rightAligned  ? frameW - boxW : 0.0;
     double boxY = bottomAligned ? frameH - boxH : 0.0;
 
@@ -96,10 +101,10 @@ static void drawCornerLabel(cairo_t* cr, const char* text,
     cairo_fill(cr);
 
     cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-    for (std::size_t i = 0; i < lines.size(); ++i) {
+    for (int i = 0; i < nLines; ++i) {
         cairo_move_to(cr, boxX + xpad,
                       boxY + ypad + fe.ascent + static_cast<double>(i) * fe.height);
-        cairo_show_text(cr, lines[i].c_str());
+        cairo_show_text(cr, lineBufs[i]);
     }
 }
 
@@ -130,6 +135,7 @@ OverlayData Recorder::getOverlayData() const {
 void Recorder::setOverlayConfig(const dashcam::config::OverlayConfig& cfg) {
     std::lock_guard<std::mutex> lock(overlayMutex_);
     overlayConfig_ = cfg;
+    parseFontFace(cfg.fontFace, cachedFontFamily_, cachedFontWeight_, cachedFontSlant_);
 }
 
 // ─── Cairo signal callbacks ───────────────────────────────────────────────────
@@ -153,14 +159,19 @@ void Recorder::onCairoCapsChanged(GstElement* /*overlay*/, GstCaps* caps,
 void Recorder::renderOverlay(cairo_t* cr) {
     OverlayData od;
     dashcam::config::OverlayConfig ocfg;
+    std::string fontFamily;
+    int         fontWeight, fontSlant;
     double w, h;
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
         if (!overlayConfig_.enabled) return;
-        od   = overlayData_;
-        ocfg = overlayConfig_;
-        w    = static_cast<double>(videoWidth_);
-        h    = static_cast<double>(videoHeight_);
+        od         = overlayData_;
+        ocfg       = overlayConfig_;
+        fontFamily = cachedFontFamily_;
+        fontWeight = cachedFontWeight_;
+        fontSlant  = cachedFontSlant_;
+        w          = static_cast<double>(videoWidth_);
+        h          = static_cast<double>(videoHeight_);
     }
     if (w == 0.0 || h == 0.0) return;
 
@@ -173,7 +184,9 @@ void Recorder::renderOverlay(cairo_t* cr) {
 
     char buf[128];
 
-    selectCairoFont(cr, ocfg.fontFace);
+    cairo_select_font_face(cr, fontFamily.c_str(),
+                           static_cast<cairo_font_slant_t>(fontSlant),
+                           static_cast<cairo_font_weight_t>(fontWeight));
     cairo_set_font_size(cr, static_cast<double>(ocfg.fontSize));
 
     const double opacity = static_cast<double>(ocfg.backgroundOpacity);
@@ -200,16 +213,23 @@ void Recorder::renderOverlay(cairo_t* cr) {
 // ─── lifecycle ────────────────────────────────────────────────────────────────
 
 void Recorder::disconnect() {
-    std::lock_guard<std::mutex> lock(overlayMutex_);
-    if (cairoOverlay_) {
-        g_signal_handler_disconnect(cairoOverlay_, cairoDrawId_);
-        g_signal_handler_disconnect(cairoOverlay_, cairoCapsId_);
+    GstElement* cairoOv = nullptr;
+    gulong drawId = 0, capsId = 0;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        cairoOv       = cairoOverlay_;
+        drawId        = cairoDrawId_;
+        capsId        = cairoCapsId_;
+        cairoOverlay_ = nullptr;
+        cairoDrawId_  = 0;
+        cairoCapsId_  = 0;
+        videoWidth_   = 0;
+        videoHeight_  = 0;
     }
-    cairoOverlay_ = nullptr;
-    cairoDrawId_  = 0;
-    cairoCapsId_  = 0;
-    videoWidth_   = 0;
-    videoHeight_  = 0;
+    if (cairoOv) {
+        g_signal_handler_disconnect(cairoOv, drawId);
+        g_signal_handler_disconnect(cairoOv, capsId);
+    }
 }
 
 // ─── recording bin ────────────────────────────────────────────────────────────

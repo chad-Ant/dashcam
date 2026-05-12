@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace dashcam::log {
@@ -16,6 +17,7 @@ namespace dashcam::log {
 namespace {
 
 std::shared_ptr<spdlog::logger> g_logger;
+std::once_flag                  g_once;
 
 spdlog::level::level_enum toSpdLevel(LogLevel lvl) {
     switch (lvl) {
@@ -30,7 +32,7 @@ spdlog::level::level_enum toSpdLevel(LogLevel lvl) {
 } // namespace
 
 void init(const std::string& logDir) {
-    if (g_logger) return;
+    std::call_once(g_once, [&logDir]() {
 
     auto now = std::chrono::system_clock::now();
     auto tt  = std::chrono::system_clock::to_time_t(now);
@@ -65,6 +67,8 @@ void init(const std::string& logDir) {
         std::fprintf(stderr, "liblog: spdlog init failed: %s\n", ex.what());
         g_logger.reset();
     }
+
+    }); // call_once
 }
 
 void shutdown() {

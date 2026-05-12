@@ -5,9 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace dashcam::camera {
-
 // ─── file-local log helper ────────────────────────────────────────────────────
+
+namespace {
 
 static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
                   const char* fmt, ...) {
@@ -19,6 +19,10 @@ static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lv
     va_end(ap);
     cb(lvl, buf);
 }
+
+} // namespace
+
+namespace dashcam::camera {
 
 // ─── private helpers ────────────────────────────────────────────────────────
 

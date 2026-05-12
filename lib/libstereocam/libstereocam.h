@@ -114,7 +114,7 @@ struct DepthResult {
  * - At 10 fps with max-buffers=1 appsink, the inter-capture delta is typically
  *   < 2 ms since the frame is already queued in the appsink buffer.
  * - timeDeltaMs in DepthResult reports the measured delta; values exceeding
- *   syncToleranceMs are printed to stderr but do not abort the computation.
+ *   syncToleranceMs are logged via the injected callback but do not abort the computation.
  *
  * Disparity scale:
  * - VPI CUDA SGM:       S16 × 1/32 → float pixels.
@@ -259,10 +259,15 @@ private:
     void* vpiRight_     = nullptr;  ///< VPIImage U8 — right rectified input
     void* vpiDisparity_ = nullptr;  ///< VPIImage S16 — disparity output
 
+    /// cv::Ptr<cv::StereoSGBM>* — allocated in start() when activeBackend_ == OpenCV_CPU.
+    void* sgbm_ = nullptr;
+
     /** @brief Create VPI stream, images, and SGM payload. @return false on any failure. */
     bool initVpi();
     /** @brief Release all VPI objects; safe to call when any pointer is null. */
     void destroyVpi();
+    /** @brief Delete the cached StereoSGBM object; safe to call when sgbm_ is null. */
+    void destroySgbm();
 
     /** @brief Rec.601 BGR→grey conversion (3 bytes/px → 1 byte/px). */
     static void bgrToGray(const uint8_t* bgr, uint8_t* gray, int width, int height);

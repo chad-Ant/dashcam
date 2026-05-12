@@ -100,6 +100,13 @@ void StereoRangefinder::destroyVpi() {
     if (vpiStream_)    { vpiStreamDestroy(*reinterpret_cast<VPIStream*>(&vpiStream_));        vpiStream_    = nullptr; }
 }
 
+void StereoRangefinder::destroySgbm() {
+    if (sgbm_) {
+        delete static_cast<cv::Ptr<cv::StereoSGBM>*>(sgbm_);
+        sgbm_ = nullptr;
+    }
+}
+
 // ─── constructor / destructor ─────────────────────────────────────────────────
 
 StereoRangefinder::StereoRangefinder(dashcam::camera::iCamera* left,
@@ -241,6 +248,17 @@ StereoError StereoRangefinder::start() {
         activeBackend_ = Backend::OpenCV_CPU;
     }
 
+    if (activeBackend_ == Backend::OpenCV_CPU) {
+        constexpr int blockSize = 5;
+        constexpr int numDisp   = 64;
+        sgbm_ = new cv::Ptr<cv::StereoSGBM>(cv::StereoSGBM::create(
+            0, numDisp, blockSize,
+            8  * blockSize * blockSize,
+            32 * blockSize * blockSize,
+            1, 0, 5, 100, 2,
+            cv::StereoSGBM::MODE_SGBM_3WAY));
+    }
+
     left_->start();
     right_->start();
 
@@ -258,6 +276,7 @@ StereoError StereoRangefinder::start() {
 
 StereoError StereoRangefinder::stop() {
     destroyVpi();
+    destroySgbm();
     left_->stop();
     right_->stop();
     return StereoError::NONE;
@@ -353,7 +372,10 @@ bool StereoRangefinder::computeDepthVpi(DepthResult& result) {
               "vpiSubmitStereoDisparityEstimator failed");
         return false;
     }
-    vpiStreamSync(str);
+    if (vpiStreamSync(str) != VPI_SUCCESS) {
+        doLog(log_, dashcam::log::LogLevel::ERROR, "vpiStreamSync failed");
+        return false;
+    }
 
     // Download S16 disparity; convert to float (VPI SGM scale: value = disp × 32).
     VPIImageData dispData = {};
@@ -386,26 +408,10 @@ bool StereoRangefinder::computeDepthCpu(DepthResult& result) {
     const int w = calib_.imageWidth;
     const int h = calib_.imageHeight;
 
-    // Wrap rectified grey buffers as OpenCV Mats (no copy).
     const cv::Mat left(h,  w, CV_8UC1, leftRect_.data());
     const cv::Mat right(h, w, CV_8UC1, rightRect_.data());
 
-    // SGBM with parameters suited to 640×360 images and a narrow webcam baseline.
-    // blockSize=5, nDisparities=64 (must be multiple of 16).
-    const int blockSize   = 5;
-    const int numDisp     = 64;
-    const int P1          = 8  * blockSize * blockSize;
-    const int P2          = 32 * blockSize * blockSize;
-    auto sgbm = cv::StereoSGBM::create(
-        0, numDisp, blockSize,
-        P1, P2,
-        1,    // disp12MaxDiff
-        0,    // preFilterCap
-        5,    // uniquenessRatio
-        100,  // speckleWindowSize
-        2,    // speckleRange
-        cv::StereoSGBM::MODE_SGBM_3WAY);
-
+    cv::Ptr<cv::StereoSGBM>& sgbm = *static_cast<cv::Ptr<cv::StereoSGBM>*>(sgbm_);
     cv::Mat disparity;
     sgbm->compute(left, right, disparity);  // output: S16, value = disp × 16
 
