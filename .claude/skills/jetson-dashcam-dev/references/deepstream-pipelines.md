@@ -28,7 +28,7 @@ Components:
 
 For multi-camera DeepStream pipelines, batch sources via `nvstreammux`:
 ```
-nvarguscamerasrc sensor-id=0 ! 'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1' ! mux.sink_0
+nvarguscamerasrc sensor-id=0 ! 'video/x-raw(memory:NVMM),width=1456,height=1088,framerate=60/1' ! mux.sink_0   # IMX296 native
 v4l2src device=/dev/video1 ! 'image/jpeg,width=640,height=360,framerate=10/1' ! jpegdec ! videoconvert ! nvvideoconvert ! 'video/x-raw(memory:NVMM)' ! mux.sink_1
 nvstreammux name=mux batch-size=2 width=1920 height=1080 batched-push-timeout=40000 live-source=1 ! 
   ...
@@ -58,7 +58,7 @@ Don't open the camera multiple times. One `nvarguscamerasrc`, then `tee`, then p
 
 ```
 nvarguscamerasrc sensor-id=0
-  → caps NVMM 1920x1080@60
+  → caps NVMM 1456x1088@60   // IMX296 native; not 1080p
   → nvstreammux (batch-size=1, width=1920, height=1080, live-source=1, batched-push-timeout=16000)
   → pgie_lane_obstacle (nvinfer, interval=0)   // every frame, 60 fps
   → nvtracker (NvSORT)
@@ -95,6 +95,8 @@ Each `nvinfer` adds its detections to the buffer's metadata under its `gie-uniqu
 
 For dashcam v0.1 on Orin Nano: **NvSORT** as a balance of cost and quality. Upgrade to NvDCF if you see ID swaps in real-world testing.
 
+The stock low-level tracker configs live in `/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/` (all confirmed present on this device): `config_tracker_IOU.yml`, `config_tracker_NvSORT.yml`, `config_tracker_NvDCF_perf.yml`, `config_tracker_NvDCF_accuracy.yml`, `config_tracker_NvDCF_max_perf.yml`, `config_tracker_NvDeepSORT.yml`. They all share one low-level lib, `/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so`. For the dashcam, point `ll-config-file` at **`config_tracker_NvSORT.yml`**.
+
 ## What about the USB cameras?
 
 The 3 USB cameras (stereo pair @ 360p10 + driver cam @ 360p10) don't need DeepStream. They're low-rate, single-task, and DeepStream's value (batched inference, metadata pipeline, OSD, Smart Record) doesn't pay off at 10 fps.
@@ -121,13 +123,13 @@ src0 = Gst.ElementFactory.make("nvarguscamerasrc", "src0")
 src0.set_property("sensor-id", 0)
 caps0 = Gst.ElementFactory.make("capsfilter", "caps0")
 caps0.set_property("caps", Gst.Caps.from_string(
-    "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1,format=NV12"))
+    "video/x-raw(memory:NVMM),width=1456,height=1088,framerate=60/1,format=NV12"))  # IMX296 native
 
 # nvstreammux
 mux = Gst.ElementFactory.make("nvstreammux", "mux")
 mux.set_property("batch-size", 1)
-mux.set_property("width", 1920)
-mux.set_property("height", 1080)
+mux.set_property("width", 1456)    # match the IMX296 native frame; setting 1920 here would upscale
+mux.set_property("height", 1088)
 mux.set_property("live-source", 1)
 mux.set_property("batched-push-timeout", 16000)   # 16 ms ≈ 1 frame at 60 fps
 
@@ -137,7 +139,7 @@ pgie.set_property("config-file-path", "/configs/pgie_dashcam.txt")
 
 # Tracker
 tracker = Gst.ElementFactory.make("nvtracker", "tracker")
-tracker.set_property("ll-config-file", "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")
+tracker.set_property("ll-config-file", "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")  # swap to config_tracker_NvSORT.yml for the dashcam
 tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
 
 # OSD for overlay
@@ -153,7 +155,7 @@ for el in [src0, caps0, mux, pgie, tracker, nvvidconv, osd, sink]:
 
 src0.link(caps0)
 srcpad = caps0.get_static_pad("src")
-sinkpad = mux.get_request_pad("sink_0")
+sinkpad = mux.get_request_pad("sink_0")   # correct for nvstreammux (see note below)
 srcpad.link(sinkpad)
 mux.link(pgie)
 pgie.link(tracker)
@@ -181,6 +183,8 @@ loop.run()
 ```
 
 This is the skeleton; real apps add a bus message handler, error recovery, and clean shutdown.
+
+> **`get_request_pad` vs `request_pad_simple`:** GStreamer deprecated `get_request_pad()` in 1.20 in favour of `request_pad_simple()`, so a linter may flag it. **Keep `get_request_pad()` for `nvstreammux`** — NVIDIA's current DeepStream docs still use it, and on some builds the `GstNvStreamMux` object has no `request_pad_simple` attribute (`AttributeError`), so "modernizing" the call breaks the pipeline. It emits a deprecation warning at most.
 
 ## Adding GPS / speed overlay
 

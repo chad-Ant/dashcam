@@ -30,9 +30,14 @@ v4l2-ctl -d /dev/video0 --list-formats-ext   # supported formats + framerates
 /usr/src/jetson_multimedia_api/argus/build/samples/utils/argus_camera   # if built
 
 # Quick "is the sensor present on I2C" check:
-sudo i2cdetect -r -y 9    # bus number depends on dts; try 9 and 10
-sudo i2cdetect -r -y 10
+sudo i2cdetect -r -y 9    # IMX296 confirmed at bus 9, addr 0x1a (v4l2 name: imx296 9-001a)
 ```
+
+> **Status on this rig (device-confirmed):** with the camera attached, `/dev/video0` enumerates as **`vi-output, imx296 9-001a`** (Sony IMX296 on I2C bus 9, address 0x1a) under `platform:tegra-capture-vi`. `v4l2-ctl -d /dev/video0 --list-formats-ext` reports **exactly one mode**: **`RG10` (10-bit Bayer RGRG/GBGB), discrete 1456×1088 @ 60.000 fps**. There is **no 1920×1080 mode** — the earlier 1456×1088 correction is now verified against the sensor itself. Two consequences:
+> - **V4L2 path** (`v4l2src`/`nvv4l2camerasrc`) gives you **raw RG10 Bayer at 1456×1088** — you'd debayer yourself (hard).
+> - **Argus path** (`nvarguscamerasrc`) runs this RG10 through the ISP and outputs **NV12 at 1456×1088@60** — use this. Cap your pipeline at `width=1456,height=1088,format=NV12,framerate=60/1`; any "1080p" downstream is ISP/VIC upscaling.
+>
+> (`gst-inspect-1.0 nvarguscamerasrc` still shows only the plugin's generic template caps `[1, 2147483647]` and `total-sensor-modes=0` — those populate at *runtime*, not from `gst-inspect`, so they don't contradict the single V4L2 mode above.)
 
 ## CSI camera (Argus path)
 
@@ -68,21 +73,23 @@ If Argus daemon gets confused after a crash, all cameras may go dark. Recover wi
 sudo systemctl restart nvargus-daemon
 ```
 
-### IMX296 (global shutter) at 1080p60 — the dashcam's primary sensor
+### IMX296 (global shutter) at 1456×1088 @ 60 fps — the dashcam's primary sensor
 
-The user's front camera is the IMX296 running 1080p **60 fps**. Notes specific to this configuration:
+**Resolution reality check:** the Sony IMX296 is a **1456×1088** (1.58 MP) global-shutter sensor with a ~60 fps max at full resolution. It has **no native 1920×1080 mode** — you physically cannot capture true 1080p from it. Anything labelled "1080p" from an IMX296 is the ISP/VIC **upscaling** 1456×1088, which costs cycles and adds zero real detail. Capture native 1456×1088 and only scale at the point of need (e.g. a model that wants a specific input size). If the user insists their module does 1080p, confirm the actual sensor-mode list (`gst-inspect-1.0 nvarguscamerasrc`, or the Argus sample) before believing it.
+
+The user's front camera is the IMX296 running **1456×1088 @ 60 fps**. Notes specific to this configuration:
 
 - **Argus support**: The IMX296 has Argus drivers on most modern carrier-board BSPs (Connect Tech, Leopard Imaging). Verify with `gst-inspect-1.0 nvarguscamerasrc` and a sanity capture; if Argus doesn't see it, you're on the V4L2 path with manual debayer (much harder).
 - **Why global shutter matters for this build**: it eliminates rolling-shutter skew. That's important for (a) reading road signs at speed without text being warped, and (b) any AI feature that relies on optical flow or geometric correspondence between frames (e.g., visual odometry, stereo derived from sequential frames).
-- **Sample pipeline** (Argus path, 1080p60):
+- **Sample pipeline** (Argus path, native 1456×1088 @ 60, headless):
   ```bash
   gst-launch-1.0 nvarguscamerasrc sensor-id=0 ! \
-    'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1,format=NV12' ! \
-    nvvidconv ! 'video/x-raw,format=I420' ! fakesink
+    'video/x-raw(memory:NVMM),width=1456,height=1088,framerate=60/1,format=NV12' ! \
+    nvvidconv ! 'video/x-raw,format=I420' ! fakesink   # fakesink, not a display sink
   ```
 - **Exposure control**: a global shutter at 60 fps has at most ~16 ms of exposure per frame. In low light (tunnels, dusk), you'll want to push gain up rather than extending exposure (which 60 fps caps anyway). Use `gainrange="1 16" exposuretimerange="13000 16000000"` (nanoseconds) and let Argus auto-balance, or fix gain manually if you see auto-exposure thrash.
 - **Multi-tasking the stream**: one capture at 60 fps feeds multiple inference workloads at different rates (lane detection at 30/60 fps, sign reading at 5 fps, recording at 30 fps). Don't open the camera multiple times — use a `tee` + `videorate` per branch, or DeepStream's `nvinfer interval=N` to skip frames per inference. See `deepstream-pipelines.md`.
-- **1080p60 + software encoding is tight**: `x264enc` at 1080p60 ultrafast preset is roughly 2× the CPU cost of 1080p30. Recommend recording at 30 fps (downsample after the tee with `videorate ! video/x-raw,framerate=30/1`) while keeping the inference branches at 60 fps for motion-rich features. See `orin-nano-constraints.md` and `event-recording.md`.
+- **60 fps + software encoding is tight**: `x264enc` at 1456×1088@60 ultrafast is roughly 2× the CPU cost of the same frame at 30 fps. Recommend recording at 30 fps (downsample after the tee with `videorate ! video/x-raw,framerate=30/1`) while keeping the inference branches at 60 fps for motion-rich features. There is no NVENC to fall back on. See `orin-nano-constraints.md` and `event-recording.md`.
 
 ## CSI camera (V4L2 path)
 
