@@ -30,6 +30,7 @@
 #ifndef LIBGPIO_H
 #define LIBGPIO_H
 
+#include "ibus.h"
 #include "liblog.h"
 
 #include <atomic>
@@ -158,6 +159,80 @@ private:
     EdgeCallback       m_cb;
     std::mutex         m_cbMtx;
     dashcam::log::LogCallback m_log;
+};
+
+// ─── GpioPeripheral ───────────────────────────────────────────────────────────
+
+/**
+ * @brief Binds a GpioPin (CS / RESET / ENABLE) to a serial bus (IBus).
+ *
+ * Lets GPIO control a peripheral by driving its control line while delegating
+ * data transfers to whichever bus type the peripheral is wired to.
+ *
+ * @code
+ *   dashcam::spi::SpiBus spi;
+ *   spi.open("/dev/spidev0.0", {});
+ *
+ *   dashcam::gpio::GpioPin cs;
+ *   cs.openByName("PBB.00", dashcam::gpio::PinDirection::OUTPUT,
+ *                 dashcam::gpio::LogicLevel::HIGH);   // CS idle-high
+ *
+ *   dashcam::gpio::GpioPeripheral dev(cs, spi);
+ *   dev.assertCS();                                   // drive CS low
+ *   uint8_t cmd = 0x9F;
+ *   dev.send(&cmd, 1);                                // write via SPI
+ *   uint8_t id[3];
+ *   dev.receive(id, 3);                               // read reply
+ *   dev.releaseCS();                                  // drive CS high
+ * @endcode
+ *
+ * For I2C, there is no CS line; use assertCS()/releaseCS() to drive an
+ * optional ENABLE pin, or simply call send()/receive() after setDevice().
+ */
+class GpioPeripheral {
+public:
+    /**
+     * @param controlPin  GPIO output pin used for CS / RESET / ENABLE.
+     *                    Must already be open and configured as OUTPUT.
+     * @param bus         Open bus the peripheral communicates over.
+     *                    Lifetime must exceed this object.
+     */
+    GpioPeripheral(GpioPin& controlPin, dashcam::bus::IBus& bus);
+
+    GpioPeripheral(const GpioPeripheral&)            = delete;
+    GpioPeripheral& operator=(const GpioPeripheral&) = delete;
+
+    /**
+     * @brief Pulse the control pin LOW for @p pulseMs milliseconds then HIGH.
+     *
+     * Typical use: hardware RESET — assert low, wait, de-assert.
+     */
+    void reset(uint32_t pulseMs = 10);
+
+    /** @brief Drive the control pin LOW  (assert CS / enable active-low line). */
+    void assertCS();
+
+    /** @brief Drive the control pin HIGH (release CS / disable active-low line). */
+    void releaseCS();
+
+    /** @brief Drive an active-high ENABLE line; equivalent to write HIGH/LOW. */
+    void setEnabled(bool enabled);
+
+    // ── bus delegation ────────────────────────────────────────────────────────
+
+    /** @brief Set I2C device address before send()/receive().  No-op on UART/SPI. */
+    void setDevice(uint8_t addr) { m_bus.setDevice(addr); }
+
+    bool send   (const uint8_t* buf, size_t len)              { return m_bus.send(buf, len); }
+    int  receive(uint8_t* buf, size_t len, int timeoutMs = 1000) { return m_bus.receive(buf, len, timeoutMs); }
+    void flush  ()                                             { m_bus.flush(); }
+
+    GpioPin&            pin() { return m_pin; }
+    dashcam::bus::IBus& bus() { return m_bus; }
+
+private:
+    GpioPin&            m_pin;
+    dashcam::bus::IBus& m_bus;
 };
 
 } // namespace dashcam::gpio

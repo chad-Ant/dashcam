@@ -135,4 +135,19 @@ void I2cBus::close() {
 
 bool I2cBus::isOpen() const { return m_fd >= 0; }
 
+// ── IBus interface ────────────────────────────────────────────────────────────
+
+void I2cBus::setDevice(uint8_t addr) {
+    setTarget(addr);
+}
+
+bool I2cBus::send(const uint8_t* buf, size_t len) {
+    return write(static_cast<uint8_t>(m_curTarget), buf, len);
+}
+
+int I2cBus::receive(uint8_t* buf, size_t len, int /*timeoutMs*/) {
+    return read(static_cast<uint8_t>(m_curTarget), buf, len)
+        ? static_cast<int>(len) : -1;
+}
+
 } // namespace dashcam::i2c

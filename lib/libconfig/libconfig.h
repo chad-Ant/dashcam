@@ -1,25 +1,37 @@
 /**
  * @file libconfig.h
- * @brief XML-based application configuration loader for the dashcam system.
+ * @brief Self-describing, strongly-typed XML configuration for the dashcam system.
  *
- * Parses a single <DashcamConfig> XML document (via pugixml, which is kept as
- * an implementation detail) and populates a hierarchy of plain-data structs.
- * Every field has a built-in default so the application runs unchanged when a
- * field is absent from the file; only a missing root node is a hard failure.
+ * Every tunable parameter is stored as a ConfigVar<T>, which carries its value
+ * alongside the runtime-accessible metadata that describes it:
+ *
+ *   - name         XML element tag and display identifier.
+ *   - datatype     ConfigDataType enum (Int / Float / Bool / String).
+ *   - value        Current runtime value, always in [min, max] for numeric types.
+ *   - defaultValue Built-in default; the XML file is self-documenting because
+ *                  the default is written as an attribute alongside the value.
+ *   - minValue     Lower bound for numeric types (ignored for Bool / String).
+ *   - maxValue     Upper bound for numeric types.
+ *   - step         Suggested increment for UI sliders / human editing.
+ *   - description  Human-readable one-line explanation of the parameter.
+ *
+ * Existing code that reads a config field (e.g. @c cfg.encoder.bitrate) does
+ * not need to change — @c ConfigVar<T> provides an implicit @c operator const T&
+ * conversion.  Assignment via @c = silently clamps numeric values to [min, max].
  *
  * Typical usage:
  * @code
  *   AppConfig cfg;
- *   ConfigReader::load("config/dashcam.xml", cfg);   // falls back to defaults on error
+ *   ConfigReader::load("config/dashcam.xml", cfg, log);
  *
- *   // Wire encoder settings into the recording bin:
- *   //   cfg.encoder.bitrate, cfg.encoder.speedPreset, …
+ *   // Existing field access still compiles:
+ *   int br = cfg.encoder.bitrate;          // implicit ConfigVar<int> → int
+ *   bool on = cfg.overlay.enabled;         // implicit ConfigVar<bool> → bool
  *
- *   // Apply per-camera capabilities from config:
- *   for (const auto& cam : cfg.cameras)
- *       if (cam.enabled)
- *           for (const auto& [cap, val] : cam.capabilities)
- *               camera.setCameraAttribute(cap, val);
+ *   // Metadata available at runtime:
+ *   cfg.encoder.bitrate.minValue()         // 500
+ *   cfg.encoder.bitrate.description()      // "Target bitrate in kbps"
+ *   cfg.encoder.bitrate.set(99999);        // returns false; value clamped to 50000
  * @endcode
  */
 
@@ -27,47 +39,170 @@
 #define LIBCONFIG_H
 
 #include "liblog.h"
+
+#include <algorithm>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace dashcam::config {
+
+// ─── ConfigDataType ───────────────────────────────────────────────────────────
+
+enum class ConfigDataType { Int, Float, Bool, String };
+
+// ─── ConfigVar<T> ─────────────────────────────────────────────────────────────
+
+/**
+ * @brief A strongly-typed, self-describing configuration variable.
+ *
+ * @tparam T  Must be one of: @c int, @c float, @c bool, @c std::string.
+ *
+ * The variable's @c name() doubles as the XML element tag written by
+ * ConfigReader::save() and read back by ConfigReader::load().  Keep the name
+ * PascalCase to match the existing XML convention.
+ *
+ * For numeric types (int / float), use the six-argument constructor to supply
+ * min / max / step.  For Bool and String, use the three-argument constructor.
+ */
+template<typename T>
+class ConfigVar {
+    static_assert(
+        std::is_same_v<T, int>  || std::is_same_v<T, float> ||
+        std::is_same_v<T, bool> || std::is_same_v<T, std::string>,
+        "ConfigVar<T>: T must be int, float, bool, or std::string");
+
+public:
+    // ── Constructors ──────────────────────────────────────────────────────────
+
+    /**
+     * @brief Numeric constructor (int / float).
+     *
+     * @param name        XML element tag name and display identifier (PascalCase).
+     * @param defaultVal  Initial and default value; must be in [minVal, maxVal].
+     * @param minVal      Minimum allowed value (inclusive).
+     * @param maxVal      Maximum allowed value (inclusive).
+     * @param step        Suggested editing increment (UI / validation hint only).
+     * @param desc        One-line human-readable description.
+     */
+    ConfigVar(std::string name, T defaultVal,
+              T minVal, T maxVal, T step,
+              std::string desc)
+        : name_(std::move(name))
+        , datatype_(deduceType())
+        , value_(defaultVal)
+        , defaultValue_(defaultVal)
+        , minValue_(minVal)
+        , maxValue_(maxVal)
+        , step_(step)
+        , description_(std::move(desc))
+    {}
+
+    /**
+     * @brief Non-numeric constructor (bool / string).
+     *
+     * @param name        XML element tag name (PascalCase).
+     * @param defaultVal  Initial and default value.
+     * @param desc        One-line human-readable description.
+     */
+    ConfigVar(std::string name, T defaultVal, std::string desc)
+        : name_(std::move(name))
+        , datatype_(deduceType())
+        , value_(defaultVal)
+        , defaultValue_(defaultVal)
+        , minValue_{}
+        , maxValue_{}
+        , step_{}
+        , description_(std::move(desc))
+    {}
+
+    // ── Metadata accessors ────────────────────────────────────────────────────
+
+    const std::string& name()         const { return name_; }
+    ConfigDataType     datatype()      const { return datatype_; }
+    const T&           defaultValue()  const { return defaultValue_; }
+    const T&           minValue()      const { return minValue_; }
+    const T&           maxValue()      const { return maxValue_; }
+    const T&           step()          const { return step_; }
+    const std::string& description()   const { return description_; }
+
+    // ── Value access ──────────────────────────────────────────────────────────
+
+    /** @brief Implicit read conversion — existing code compiles unchanged. */
+    operator const T&() const { return value_; }
+
+    /**
+     * @brief Set the value with validation.
+     *
+     * For numeric types the value is clamped to [minValue, maxValue].
+     *
+     * @return @c true if @p v was already in range (no clamping occurred);
+     *         @c false if it was clamped (the stored value is the boundary).
+     */
+    bool set(const T& v) {
+        if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
+            value_ = std::clamp(v, minValue_, maxValue_);
+            return v == value_;
+        } else {
+            value_ = v;
+            return true;
+        }
+    }
+
+    /** @brief Assignment — delegates to set(); clamping is silent. */
+    ConfigVar& operator=(const T& v) { set(v); return *this; }
+
+private:
+    static constexpr ConfigDataType deduceType() {
+        if constexpr (std::is_same_v<T, int>)   return ConfigDataType::Int;
+        else if constexpr (std::is_same_v<T, float>) return ConfigDataType::Float;
+        else if constexpr (std::is_same_v<T, bool>)  return ConfigDataType::Bool;
+        else                                          return ConfigDataType::String;
+    }
+
+    std::string    name_;
+    ConfigDataType datatype_;
+    T              value_;
+    T              defaultValue_;
+    T              minValue_;   ///< Unused for Bool / String.
+    T              maxValue_;   ///< Unused for Bool / String.
+    T              step_;       ///< Unused for Bool / String.
+    std::string    description_;
+};
 
 // ─── per-domain config structs ────────────────────────────────────────────────
 
 /**
  * @brief H.264 software encoder parameters (x264enc; Orin Nano has no NVENC).
- *
- * XML section: <Encoder>
+ * XML section: @c \<Encoder\>
  */
 struct EncoderConfig {
-    int         bitrate     = 8000;          ///< Target bitrate in kbps.
-    std::string speedPreset = "ultrafast";   ///< x264 speed preset name.
-    int         keyIntMax   = 60;            ///< Maximum frames between keyframes.
-    std::string tune        = "";            ///< x264 tune string (e.g. "zerolatency"); empty = omit.
+    ConfigVar<int>         bitrate    {"Bitrate",     8000,        500,  50000, 100,   "Target bitrate in kbps (x264enc, Orin Nano has no NVENC)"};
+    ConfigVar<std::string> speedPreset{"SpeedPreset", "ultrafast",                     "x264 speed preset (ultrafast/superfast/veryfast/faster/fast/medium/slow)"};
+    ConfigVar<int>         keyIntMax  {"KeyIntMax",   60,          1,    300,   1,     "Maximum frames between keyframes"};
+    ConfigVar<std::string> tune       {"Tune",        "",                              "x264 tune string (e.g. zerolatency); empty = omit"};
 };
 
 /**
  * @brief Cairo overlay rendering parameters.
- *
- * XML section: <Overlay>
+ * XML section: @c \<Overlay\>
  */
 struct OverlayConfig {
-    bool        enabled             = true;           ///< Render telemetry on recorded video.
-    float       backgroundOpacity   = 0.85f;           ///< Alpha of the semi-transparent label backing.
-    float       fontSize            = 14.0f;          ///< Label font size in points.
-    std::string fontFace            = "Monospace Bold"; ///< Pango font description string.
+    ConfigVar<bool>        enabled           {"Enabled",           true,                           "Render telemetry overlay on recorded video"};
+    ConfigVar<float>       backgroundOpacity {"BackgroundOpacity", 0.85f, 0.0f,  1.0f,  0.05f,  "Alpha of the semi-transparent label backing [0=transparent, 1=opaque]"};
+    ConfigVar<float>       fontSize          {"FontSize",          14.0f, 4.0f,  72.0f, 0.5f,   "Label font size in points"};
+    ConfigVar<std::string> fontFace          {"FontFace",          "Monospace Bold",               "Pango font description string"};
 };
 
 /**
  * @brief Metadata for a single V4L2 control discovered on a camera.
  *
- * Populated by demo_terminal / bootstrap code from cameraInfo::attributes and
- * written into <Attributes> so the operator can see what controls exist and
- * their valid ranges before editing <Capabilities>.  Read back on load for
- * round-trip fidelity; not used at runtime (runtime uses capabilities only).
+ * Populated from cameraInfo::attributes at discovery time and written to the
+ * config so the operator can see valid ranges before editing capabilities.
+ * Not used at runtime — runtime uses capabilities only.
  *
- * XML element: <Camera><Attributes><Attribute name="..." .../>
+ * XML element: @c \<Camera\>\<Attributes\>\<Attribute name="…" …\/\>
  */
 struct CameraAttributeInfo {
     std::string name;
@@ -76,113 +211,72 @@ struct CameraAttributeInfo {
     float       minValue    = 0.0f;
     float       maxValue    = 0.0f;
     float       step        = 0.0f;
-    std::string menuOptions; ///< Semicolon-separated option strings for MENU controls; empty otherwise.
+    std::string menuOptions; ///< Semicolon-separated option strings for MENU controls.
 };
 
 /**
  * @brief Configuration for a single recognized camera.
  *
- * XML element: <Cameras><Camera name="..." type="...">
+ * XML element: @c \<Cameras\>\<Camera name="…" type="…"\>
  *
- * @c type must be "CSI" or "USB".  @c capabilities feeds directly into
- * iCamera::setCameraAttribute(); keys must match the driver's documented
- * attribute names exactly (e.g. "exposure time, absolute", "brightness").
- * @c attributeInfo is informational only — populated by discovery and written
- * to the config so the operator knows what controls are available.
+ * @c name and @c type are XML attributes on the @c \<Camera\> element (not
+ * child elements) so they remain plain @c std::string.  Tunable scalar fields
+ * use ConfigVar to carry their constraints and descriptions.
+ *
+ * @c capabilities feeds directly into iCamera::setCameraAttribute(); keys must
+ * match the driver's attribute names (e.g. "brightness", "exposure_absolute").
  */
 struct CameraConfig {
-    std::string name;                    ///< User-defined label, e.g. "front" or "cabin-left".
-    std::string type;                    ///< Interface type: "CSI" or "USB".
-    bool        enabled     = true;      ///< Skip this camera if false.
-    std::string device;                  ///< Device node (e.g. "/dev/video2"); empty = auto-detect.
-    int         sensorId    = 0;         ///< Argus sensor-id for CSI cameras; ignored for USB.
-    int         formatIndex = 0;         ///< Index into getCameraList() videoFormats to activate.
+    std::string name;       ///< User label, e.g. "front" or "cabin".  XML attribute.
+    std::string type;       ///< Interface type: "CSI" or "USB".  XML attribute.
+
+    ConfigVar<bool>        enabled     {"Enabled",     true,  "Include this camera at startup"};
+    ConfigVar<std::string> device      {"Device",      "",    "Device node (e.g. /dev/video2); empty = auto-detect"};
+    ConfigVar<int>         sensorId    {"SensorId",    0,     0, 7,   1, "Argus sensor-id for CSI cameras; ignored for USB"};
+    ConfigVar<int>         formatIndex {"FormatIndex", 0,     0, 255, 1, "Index into cameraInfo::videoFormats to activate"};
+
     std::vector<CameraAttributeInfo>   attributeInfo;  ///< Discovered control metadata (informational).
-    std::map<std::string, std::string> capabilities;   ///< Driver capability name → value to apply at start.
+    std::map<std::string, std::string> capabilities;   ///< Attribute name → value applied at cam.start().
 };
 
 /**
  * @brief System-level runtime parameters.
- *
- * XML section: <System>
+ * XML section: @c \<System\>
  */
 struct SystemConfig {
-    std::string archivePath  = "./archive"; ///< Directory for recorded MKV files.
-    int         warmupFrames = 9;           ///< Frames to discard before enabling recording.
+    ConfigVar<std::string> archivePath  {"ArchivePath",  "./archive", "Directory where recorded MKV files are written"};
+    ConfigVar<int>         warmupFrames {"WarmupFrames", 9,           0, 120, 1, "Frames to discard after pipeline start before enabling recording"};
 };
 
 /**
  * @brief Aggregated application configuration.
- *
- * Root XML element: <DashcamConfig>
- *
- * @c cameras is ordered; index 0 corresponds to the first <Camera> element, etc.
+ * Root XML element: @c \<DashcamConfig\>
  */
 struct AppConfig {
     EncoderConfig             encoder;
     OverlayConfig             overlay;
-    std::vector<CameraConfig> cameras; ///< All recognized cameras in document order.
+    std::vector<CameraConfig> cameras;
     SystemConfig              system;
 };
 
 // ─── reader / writer ─────────────────────────────────────────────────────────
 
 /**
- * @brief Loads and saves XML config files for the dashcam system.
+ * @brief Loads and saves the dashcam XML configuration.
  *
- * Typical bootstrap flow — generate a default config from discovered hardware:
- * @code
- *   // 1. Discover cameras via libcamera.
- *   std::vector<dashcam::camera::cameraInfo> found;
- *   dashcam::camera::getCameraList(found);
+ * On load, every ConfigVar field is read from the element whose tag matches
+ * @c ConfigVar::name().  Numeric values outside [min, max] are clamped and a
+ * @c WARN is logged.  Fields absent from the file keep their built-in defaults.
  *
- *   // 2. Build an AppConfig with discovered cameras and all-default settings.
- *   dashcam::config::AppConfig cfg;
- *   for (const auto& info : found) {
- *       dashcam::config::CameraConfig cc;
- *       cc.name   = info.address;          // e.g. "/dev/video0"
- *       cc.type   = (info.type == dashcam::camera::CAMERA_TYPE::CSI) ? "CSI" : "USB";
- *       cc.device = info.address;
- *       cc.sensorId = static_cast<int>(info.deviceId);
- *       cfg.cameras.push_back(cc);
- *   }
- *
- *   // 3. Persist as a starting-point config file.
- *   ConfigReader::save("config/dashcam.xml", cfg);
- * @endcode
+ * On save, every element is written with @c type, @c default, @c description,
+ * and (for numeric types) @c min, @c max, @c step as XML attributes so the
+ * resulting file is self-documenting.
  */
 class ConfigReader {
 public:
-    /**
-     * @brief Parse @p filePath and populate @p config.
-     *
-     * On parse error or missing root node, @p config is left at its default
-     * values and a diagnostic is printed to stderr.
-     *
-     * @param[in]  filePath  Path to the XML config file.
-     * @param[out] config    Receives parsed values; defaults are preserved for
-     *                       any field not present in the file.
-     * @return @c true on success; @c false if the file cannot be opened or
-     *         contains no <DashcamConfig> root node.
-     */
     static bool load(const std::string& filePath, AppConfig& config,
                      const dashcam::log::LogCallback& log = {});
 
-    /**
-     * @brief Serialise @p config to an XML file at @p filePath.
-     *
-     * All sections and all camera entries are written unconditionally,
-     * including those that carry default values.  The intent is to produce a
-     * fully annotated starting-point file that the operator can edit.
-     *
-     * The output file is always UTF-8 with a standard XML declaration.
-     * Parent directories must already exist; the file is truncated if it exists.
-     *
-     * @param[in] filePath  Destination path for the XML file.
-     * @param[in] config    Configuration to serialise.
-     * @param[in] log       Optional callback for error messages; silent if empty.
-     * @return @c true on success; @c false if the file cannot be written.
-     */
     static bool save(const std::string& filePath, const AppConfig& config,
                      const dashcam::log::LogCallback& log = {});
 };

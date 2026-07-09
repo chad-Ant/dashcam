@@ -36,6 +36,7 @@
 #ifndef LIBSPI_H
 #define LIBSPI_H
 
+#include "ibus.h"
 #include "liblog.h"
 
 #include <cstdint>
@@ -54,10 +55,10 @@ struct SpiConfig {
 
 // ─── SpiBus ───────────────────────────────────────────────────────────────────
 
-class SpiBus {
+class SpiBus : public dashcam::bus::IBus {
 public:
     SpiBus();
-    ~SpiBus();
+    ~SpiBus() override;
 
     SpiBus(const SpiBus&)            = delete;
     SpiBus& operator=(const SpiBus&) = delete;
@@ -91,8 +92,16 @@ public:
      */
     bool setSpeedHz(uint32_t hz);
 
-    void close();
-    bool isOpen() const;
+    void close()    override;
+    bool isOpen()   const override;
+
+    // ── IBus interface ────────────────────────────────────────────────────────
+    dashcam::bus::BusType type() const override { return dashcam::bus::BusType::SPI; }
+    bool send   (const uint8_t* buf, size_t len) override { return write(buf, len); }
+    /// SPI transfers are synchronous; timeoutMs is ignored.
+    int  receive(uint8_t* buf, size_t len, int /*timeoutMs*/ = 1000) override {
+        return read(buf, len) ? static_cast<int>(len) : -1;
+    }
 
 private:
     int       m_fd  = -1;

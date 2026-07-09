@@ -23,6 +23,7 @@
 #ifndef LIBI2C_H
 #define LIBI2C_H
 
+#include "ibus.h"
 #include "liblog.h"
 
 #include <cstdint>
@@ -31,10 +32,10 @@
 
 namespace dashcam::i2c {
 
-class I2cBus {
+class I2cBus : public dashcam::bus::IBus {
 public:
     I2cBus();
-    ~I2cBus();
+    ~I2cBus() override;
 
     I2cBus(const I2cBus&)            = delete;
     I2cBus& operator=(const I2cBus&) = delete;
@@ -76,8 +77,26 @@ public:
      */
     bool scanBus(std::vector<uint8_t>& found);
 
-    void close();
-    bool isOpen() const;
+    void close()    override;
+    bool isOpen()   const override;
+
+    // ── IBus interface ────────────────────────────────────────────────────────
+    dashcam::bus::BusType type() const override { return dashcam::bus::BusType::I2C; }
+
+    /**
+     * @brief Select the 7-bit I2C device address for subsequent send/receive calls.
+     *
+     * Must be called before the first send() or receive() when using IBus.
+     * Equivalent to calling I2C_SLAVE ioctl on the bus file descriptor.
+     */
+    void setDevice(uint8_t addr) override;
+
+    /// Write to the device address set by setDevice().
+    bool send   (const uint8_t* buf, size_t len) override;
+
+    /// Read from the device address set by setDevice().  timeoutMs is ignored
+    /// (I2C reads block until the device ACKs or the kernel returns an error).
+    int  receive(uint8_t* buf, size_t len, int timeoutMs = 1000) override;
 
 private:
     bool setTarget(uint8_t addr);

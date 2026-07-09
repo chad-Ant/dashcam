@@ -26,6 +26,7 @@
 #ifndef LIBUART_H
 #define LIBUART_H
 
+#include "ibus.h"
 #include "liblog.h"
 
 #include <cstdint>
@@ -46,10 +47,10 @@ struct UartConfig {
 
 // ─── Uart ─────────────────────────────────────────────────────────────────────
 
-class Uart {
+class Uart : public dashcam::bus::IBus {
 public:
     Uart();
-    ~Uart();
+    ~Uart() override;
 
     Uart(const Uart&)            = delete;
     Uart& operator=(const Uart&) = delete;
@@ -87,10 +88,15 @@ public:
     bool write(const uint8_t* buf, size_t len);
     bool write(const std::string& str);
 
-    void flush();    ///< Discard both RX and TX buffers.
-    void close();
-    bool isOpen() const;
-    int  fd()     const;   ///< Raw fd — use for poll/select in application code.
+    void flush()    override; ///< Discard both RX and TX buffers.
+    void close()    override;
+    bool isOpen()   const override;
+    int  fd()       const;    ///< Raw fd — use for poll/select in application code.
+
+    // ── IBus interface ────────────────────────────────────────────────────────
+    dashcam::bus::BusType type() const override { return dashcam::bus::BusType::UART; }
+    bool send   (const uint8_t* buf, size_t len) override { return write(buf, len); }
+    int  receive(uint8_t* buf, size_t len, int timeoutMs = 1000) override { return read(buf, len, timeoutMs); }
 
 private:
     int m_fd = -1;

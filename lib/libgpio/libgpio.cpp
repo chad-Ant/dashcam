@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <sys/select.h>
 
+#include <chrono>
+#include <thread>
+
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -310,5 +313,21 @@ void GpioWatcher::watchLoop() {
         if (localCb) localCb(lvl, tsNs);
     }
 }
+
+// ─── GpioPeripheral ──────────────────────────────────────────────────────────
+
+GpioPeripheral::GpioPeripheral(GpioPin& controlPin, dashcam::bus::IBus& bus)
+    : m_pin(controlPin), m_bus(bus)
+{}
+
+void GpioPeripheral::reset(uint32_t pulseMs) {
+    m_pin.write(LogicLevel::LOW);
+    std::this_thread::sleep_for(std::chrono::milliseconds(pulseMs));
+    m_pin.write(LogicLevel::HIGH);
+}
+
+void GpioPeripheral::assertCS()          { m_pin.write(LogicLevel::LOW);  }
+void GpioPeripheral::releaseCS()         { m_pin.write(LogicLevel::HIGH); }
+void GpioPeripheral::setEnabled(bool on) { m_pin.write(on ? LogicLevel::HIGH : LogicLevel::LOW); }
 
 } // namespace dashcam::gpio

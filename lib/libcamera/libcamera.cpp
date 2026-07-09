@@ -108,8 +108,11 @@ static void queryFrameRates(int fd, const cameraVideoFormat& info, std::vector<c
             break;
         }
         if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
-            frate.frameRate = static_cast<float>(frmival.discrete.denominator) / frmival.discrete.numerator;
-            formats.push_back(frate);
+            if (frmival.discrete.numerator != 0) {
+                frate.frameRate = static_cast<float>(frmival.discrete.denominator)
+                                / frmival.discrete.numerator;
+                formats.push_back(frate);
+            }
         }
         frmival.index++;
     }
@@ -130,7 +133,6 @@ static void queryFrameRates(int fd, const cameraVideoFormat& info, std::vector<c
  * @param[in,out] info  cameraInfo to populate; videoFormats is replaced on each stage.
  */
 static void populateCameraVideoFormats(int fd, cameraInfo& info) {
-//    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
     if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN) return;
 
     queryPixelFormats(fd, info);
@@ -167,7 +169,6 @@ static void populateCameraVideoFormats(int fd, cameraInfo& info) {
  * @param[in,out] info  cameraInfo whose attributes vector is populated.
  */
 static void populateCameraAttributes(int fd, cameraInfo& info) {
-//    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
     if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN) {
         return;
     }

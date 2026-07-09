@@ -229,8 +229,7 @@ void Camera_GST::open() {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         if (status_.status != CAMERA_STATUS::CLOSED) {
-            status_.currentError = status_.currentError == ERROR_CODE::NONE
-                ? ERROR_CODE::CAMERA_ALREADY_OPEN : status_.currentError;
+            status_.currentError = ERROR_CODE::CAMERA_ALREADY_OPEN;
             return;
         }
     }
@@ -292,7 +291,11 @@ void Camera_GST::getCameraInfo(cameraInfo& info) const { info = info_; }
 
 void Camera_GST::setCameraAttribute(const std::string& name, const std::string& value) {
     std::lock_guard<std::mutex> lock(stateMutex_);
-    if (status_.status != CAMERA_STATUS::RUNNING) {
+    if (status_.status != CAMERA_STATUS::RUNNING || !camera_src_) {
+        // Queue in three cases: not yet started; start() is mid-construction
+        // (RUNNING claimed before camera_src_ is set); or ERROR state recovery.
+        // The late-attributes drain at the end of start() flushes these once
+        // camera_src_ is valid.
         pendingAttributes_[name] = value;
         status_.currentError = ERROR_CODE::NONE;
     } else {
@@ -424,6 +427,15 @@ void Camera_GST::start() {
         }
 
         GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
+        if (!queueSinkPad) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "failed to get queue sink pad for branch '%s'", branchName.c_str());
+            gst_element_release_request_pad(tee_, teeSrcPad);
+            gst_object_unref(teeSrcPad);
+            releaseRemaining(i + 1);
+            branchError = true;
+            break;
+        }
         GstPadLinkReturn ret = gst_pad_link(teeSrcPad, queueSinkPad);
         gst_object_unref(queueSinkPad);
 
@@ -470,8 +482,10 @@ void Camera_GST::start() {
     }
     if (ret == GST_STATE_CHANGE_ASYNC) {
         // Block until Argus/V4L2 hardware fully initialises (up to 5 s).
-        // Any setCameraAttribute() calls during this window are safely queued
-        // into pendingAttributes_ because status is still OPEN.
+        // status_ is RUNNING at this point (claimed optimistically above).
+        // With the camera_src_ null-guard in setCameraAttribute(), any concurrent
+        // attribute writes during this window are safely queued into
+        // pendingAttributes_ and drained by the late-attributes flush below.
         GstState state, pending;
         ret = gst_element_get_state(pipeline_, &state, &pending, 5 * GST_SECOND);
         if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {

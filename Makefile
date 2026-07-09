@@ -1,14 +1,26 @@
-# Respect environment CXX for cross-compilation
-CXX ?= g++
+# Respect environment CXX / NVCC for cross-compilation
+CXX  ?= g++
+NVCC ?= /usr/local/cuda/bin/nvcc
+# sm_87 = Ampere — used by all Orin-family Jetson (Nano / NX / AGX Orin).
+NVCCFLAGS := -O2 -std=c++17 -arch=sm_87 \
+             -I/usr/local/cuda/include \
+             -Ilib/libdriverstate \
+             -Ilib/liblanedetector \
+             -Ilib/libsigndetector \
+             $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0)
 
 # ─── flags ────────────────────────────────────────────────────────────────────
 
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
+            -I/usr/local/cuda/include \
             -Ilib/libcan \
+            -Ilib/libdriverstate \
+            -Ilib/libsigndetector \
             -Ilib/libcamera \
             -Ilib/libconfig \
             -Ilib/libgpio \
             -Ilib/libi2c \
+            -Ilib/liblanedetector \
             -Ilib/liblog \
             -Ilib/libmidi \
             -Ilib/librecord \
@@ -25,6 +37,7 @@ LD_BASE := $(shell pkg-config --libs \
            -pthread
 
 LD_CV   := $(shell pkg-config --libs opencv4)
+LD_TRT  := -lnvinfer -lcudart
 LD_VPI  := -lvpi
 LD_GPIO  := -lgpiod
 LD_ALSA  := -lasound
@@ -52,8 +65,14 @@ LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
 LIBSPI_SRCS    := lib/libspi/libspi.cpp
 LIBUART_SRCS   := lib/libuart/libuart.cpp
 LIBLOG_SRCS    := lib/liblog/liblog.cpp
-LIBCFG_SRCS    := lib/libconfig/libconfig.cpp
-LIBREC_SRCS    := lib/librecord/librecord.cpp
+LIBCFG_SRCS      := lib/libconfig/libconfig.cpp
+LIBLANE_SRCS     := lib/liblanedetector/liblanedetector.cpp
+LIBLANE_CU_SRCS  := lib/liblanedetector/liblanedetector_preprocess.cu
+LIBDSTATE_SRCS    := lib/libdriverstate/libdriverstate.cpp
+LIBDSTATE_CU_SRCS := lib/libdriverstate/libdriverstate_preprocess.cu
+LIBSIGN_SRCS      := lib/libsigndetector/libsigndetector.cpp
+LIBSIGN_CU_SRCS   := lib/libsigndetector/libsigndetector_preprocess.cu
+LIBREC_SRCS      := lib/librecord/librecord.cpp
 LIBSTEREO_SRCS := lib/libstereocam/libstereocam.cpp
 
 # Convenience group: all peripheral interface libs (no GStreamer / OpenCV dependency)
@@ -68,6 +87,10 @@ BUILD_DIR := bin/build_$(TIMESTAMP)
 
 define make_objs
 $(addprefix $(BUILD_DIR)/,$(1:.cpp=.o))
+endef
+
+define make_cu_objs
+$(addprefix $(BUILD_DIR)/,$(1:.cu=.o))
 endef
 
 # csi_test: raw Argus pipeline tests, no library wrappers
@@ -108,9 +131,15 @@ DEMO_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LI
 DEMO_TERM_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
                      src/tests/demo_terminal.cpp)
 
+# lane_test: live-camera lane detection smoke test (10 s run)
+LANE_TEST_OBJS := $(call make_objs,    $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
+                                        $(LIBLANE_SRCS) src/tests/test_lanedetector.cpp) \
+                  $(call make_cu_objs,  $(LIBLANE_CU_SRCS))
+
 # Always compile these; no VPI dependency.
 BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(SCAN_OBJS) $(CFG_OBJS) \
-                    $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(DEMO_OBJS) $(DEMO_TERM_OBJS))
+                    $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(DEMO_OBJS) $(DEMO_TERM_OBJS) \
+                    $(LANE_TEST_OBJS))
 
 ifneq ($(VPI_HDRS),)
 ALL_OBJS := $(sort $(BASE_OBJS) $(DASHCAM_OBJS))
@@ -132,7 +161,8 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/gpio_test \
            $(BUILD_DIR)/midi_test \
            $(BUILD_DIR)/demo_graphical \
-           $(BUILD_DIR)/demo_terminal
+           $(BUILD_DIR)/demo_terminal \
+           $(BUILD_DIR)/lane_test
 
 # dashcam requires libstereocam which requires VPI headers.
 ifneq ($(VPI_HDRS),)
@@ -182,10 +212,17 @@ $(BUILD_DIR)/midi_test: $(MIDI_OBJS)
 $(BUILD_DIR)/demo_terminal: $(DEMO_TERM_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
-# Pattern rule: mirror source tree under BUILD_DIR.
+$(BUILD_DIR)/lane_test: $(LANE_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT)
+
+# Pattern rules: mirror source tree under BUILD_DIR.
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.cu
+	@mkdir -p $(@D)
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
 
 -include $(DEPS)
 

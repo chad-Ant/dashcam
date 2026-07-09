@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <pugixml.hpp>
 
-// ─── file-local log helper ────────────────────────────────────────────────────
+// ─── file-local helpers ───────────────────────────────────────────────────────
 
 namespace {
 
@@ -20,9 +20,75 @@ static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lv
     cb(lvl, buf);
 }
 
+// Return the XML attribute string for a ConfigDataType.
+static const char* typeName(dashcam::config::ConfigDataType dt) {
+    using dashcam::config::ConfigDataType;
+    switch (dt) {
+        case ConfigDataType::Int:    return "int";
+        case ConfigDataType::Float:  return "float";
+        case ConfigDataType::Bool:   return "bool";
+        case ConfigDataType::String: return "string";
+    }
+    return "string";
+}
+
+// ─── readVar ─────────────────────────────────────────────────────────────────
+// Read a ConfigVar<T> from the child element whose tag matches v.name().
+// Numeric values outside [min, max] are clamped; a WARN is emitted.
+
+template<typename T>
+static void readVar(pugi::xml_node parent, dashcam::config::ConfigVar<T>& v,
+                    const dashcam::log::LogCallback& log) {
+    pugi::xml_node n = parent.child(v.name().c_str());
+    if (!n) return;
+
+    T parsed;
+    if constexpr (std::is_same_v<T, int>)
+        parsed = n.text().as_int(static_cast<int>(v.defaultValue()));
+    else if constexpr (std::is_same_v<T, float>)
+        parsed = static_cast<float>(n.text().as_double(static_cast<double>(v.defaultValue())));
+    else if constexpr (std::is_same_v<T, bool>)
+        parsed = n.text().as_bool(static_cast<bool>(v.defaultValue()));
+    else
+        parsed = std::string(n.text().as_string(v.defaultValue().c_str()));
+
+    if (!v.set(parsed))
+        doLog(log, dashcam::log::LogLevel::WARN,
+              "config '%s': value out of range, clamped to [min, max]",
+              v.name().c_str());
+}
+
+// ─── writeVar ────────────────────────────────────────────────────────────────
+// Append a child element named v.name() with metadata attributes and text value.
+//
+// For numeric types: type, min, max, step, default, description are attributes.
+// For bool:          type, default, description.
+// For string:        type, default, description.
+
+template<typename T>
+static void writeVar(pugi::xml_node parent, const dashcam::config::ConfigVar<T>& v) {
+    pugi::xml_node n = parent.append_child(v.name().c_str());
+    n.append_attribute("type").set_value(typeName(v.datatype()));
+    n.append_attribute("description").set_value(v.description().c_str());
+
+    if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
+        n.append_attribute("min").set_value(static_cast<double>(v.minValue()));
+        n.append_attribute("max").set_value(static_cast<double>(v.maxValue()));
+        n.append_attribute("step").set_value(static_cast<double>(v.step()));
+        n.append_attribute("default").set_value(static_cast<double>(v.defaultValue()));
+        n.text().set(static_cast<double>(static_cast<T>(v)));
+    } else if constexpr (std::is_same_v<T, bool>) {
+        n.append_attribute("default").set_value(static_cast<bool>(v.defaultValue()));
+        n.text().set(static_cast<bool>(v));
+    } else {
+        n.append_attribute("default").set_value(v.defaultValue().c_str());
+        n.text().set(static_cast<const std::string&>(v).c_str());
+    }
+}
+
 } // namespace
 
-// ─── file-local helpers ───────────────────────────────────────────────────────
+// ─── parseValueType (AttributeDictionary) ────────────────────────────────────
 
 namespace {
 
@@ -46,27 +112,33 @@ namespace dashcam::config {
 
 namespace {
 
-static void parseEncoder(pugi::xml_node node, EncoderConfig& enc) {
-    if (auto n = node.child("Bitrate"))     enc.bitrate     = n.text().as_int(enc.bitrate);
-    if (auto n = node.child("SpeedPreset")) enc.speedPreset = n.text().as_string(enc.speedPreset.c_str());
-    if (auto n = node.child("KeyIntMax"))   enc.keyIntMax   = n.text().as_int(enc.keyIntMax);
-    if (auto n = node.child("Tune"))        enc.tune        = n.text().as_string(enc.tune.c_str());
+// ── section parsers ──────────────────────────────────────────────────────────
+
+static void parseEncoder(pugi::xml_node node, EncoderConfig& enc,
+                         const dashcam::log::LogCallback& log) {
+    readVar(node, enc.bitrate,     log);
+    readVar(node, enc.speedPreset, log);
+    readVar(node, enc.keyIntMax,   log);
+    readVar(node, enc.tune,        log);
 }
 
-static void parseOverlay(pugi::xml_node node, OverlayConfig& ovl) {
-    if (auto n = node.child("Enabled"))           ovl.enabled           = n.text().as_bool(ovl.enabled);
-    if (auto n = node.child("BackgroundOpacity")) ovl.backgroundOpacity = n.text().as_float(ovl.backgroundOpacity);
-    if (auto n = node.child("FontSize"))          ovl.fontSize          = n.text().as_float(ovl.fontSize);
-    if (auto n = node.child("FontFace"))          ovl.fontFace          = n.text().as_string(ovl.fontFace.c_str());
+static void parseOverlay(pugi::xml_node node, OverlayConfig& ovl,
+                         const dashcam::log::LogCallback& log) {
+    readVar(node, ovl.enabled,           log);
+    readVar(node, ovl.backgroundOpacity, log);
+    readVar(node, ovl.fontSize,          log);
+    readVar(node, ovl.fontFace,          log);
 }
 
-static void parseCamera(pugi::xml_node node, CameraConfig& cam) {
+static void parseCamera(pugi::xml_node node, CameraConfig& cam,
+                        const dashcam::log::LogCallback& log) {
     cam.name = node.attribute("name").as_string(cam.name.c_str());
     cam.type = node.attribute("type").as_string(cam.type.c_str());
-    if (auto n = node.child("Enabled"))     cam.enabled     = n.text().as_bool(cam.enabled);
-    if (auto n = node.child("Device"))      cam.device      = n.text().as_string(cam.device.c_str());
-    if (auto n = node.child("SensorId"))    cam.sensorId    = n.text().as_int(cam.sensorId);
-    if (auto n = node.child("FormatIndex")) cam.formatIndex = n.text().as_int(cam.formatIndex);
+
+    readVar(node, cam.enabled,     log);
+    readVar(node, cam.device,      log);
+    readVar(node, cam.sensorId,    log);
+    readVar(node, cam.formatIndex, log);
 
     if (auto attrs = node.child("Attributes")) {
         for (auto attr : attrs.children("Attribute")) {
@@ -93,35 +165,40 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam) {
     }
 }
 
-static void parseSystem(pugi::xml_node node, SystemConfig& sys) {
-    if (auto n = node.child("ArchivePath"))  sys.archivePath  = n.text().as_string(sys.archivePath.c_str());
-    if (auto n = node.child("WarmupFrames")) sys.warmupFrames = n.text().as_int(sys.warmupFrames);
+static void parseSystem(pugi::xml_node node, SystemConfig& sys,
+                        const dashcam::log::LogCallback& log) {
+    readVar(node, sys.archivePath,  log);
+    readVar(node, sys.warmupFrames, log);
 }
+
+// ── section writers ──────────────────────────────────────────────────────────
 
 static void writeEncoder(pugi::xml_node parent, const EncoderConfig& enc) {
     pugi::xml_node n = parent.append_child("Encoder");
-    n.append_child("Bitrate").text().set(enc.bitrate);
-    n.append_child("SpeedPreset").text().set(enc.speedPreset.c_str());
-    n.append_child("KeyIntMax").text().set(enc.keyIntMax);
-    n.append_child("Tune").text().set(enc.tune.c_str());
+    writeVar(n, enc.bitrate);
+    writeVar(n, enc.speedPreset);
+    writeVar(n, enc.keyIntMax);
+    writeVar(n, enc.tune);
 }
 
 static void writeOverlay(pugi::xml_node parent, const OverlayConfig& ovl) {
     pugi::xml_node n = parent.append_child("Overlay");
-    n.append_child("Enabled").text().set(ovl.enabled);
-    n.append_child("BackgroundOpacity").text().set(static_cast<double>(ovl.backgroundOpacity));
-    n.append_child("FontSize").text().set(static_cast<double>(ovl.fontSize));
-    n.append_child("FontFace").text().set(ovl.fontFace.c_str());
+    writeVar(n, ovl.enabled);
+    writeVar(n, ovl.backgroundOpacity);
+    writeVar(n, ovl.fontSize);
+    writeVar(n, ovl.fontFace);
 }
 
 static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
     pugi::xml_node n = parent.append_child("Camera");
     n.append_attribute("name").set_value(cam.name.c_str());
     n.append_attribute("type").set_value(cam.type.c_str());
-    n.append_child("Enabled").text().set(cam.enabled);
-    n.append_child("Device").text().set(cam.device.c_str());
-    n.append_child("SensorId").text().set(cam.sensorId);
-    n.append_child("FormatIndex").text().set(cam.formatIndex);
+
+    writeVar(n, cam.enabled);
+    writeVar(n, cam.device);
+    writeVar(n, cam.sensorId);
+    writeVar(n, cam.formatIndex);
+
     if (!cam.attributeInfo.empty()) {
         pugi::xml_node attrs = n.append_child("Attributes");
         for (const auto& ai : cam.attributeInfo) {
@@ -136,6 +213,7 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
                 a.append_attribute("menu").set_value(ai.menuOptions.c_str());
         }
     }
+
     if (!cam.capabilities.empty()) {
         pugi::xml_node caps = n.append_child("Capabilities");
         for (const auto& [key, val] : cam.capabilities) {
@@ -148,11 +226,13 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
 
 static void writeSystem(pugi::xml_node parent, const SystemConfig& sys) {
     pugi::xml_node n = parent.append_child("System");
-    n.append_child("ArchivePath").text().set(sys.archivePath.c_str());
-    n.append_child("WarmupFrames").text().set(sys.warmupFrames);
+    writeVar(n, sys.archivePath);
+    writeVar(n, sys.warmupFrames);
 }
 
 } // namespace
+
+// ── ConfigReader ──────────────────────────────────────────────────────────────
 
 bool ConfigReader::load(const std::string& filePath, AppConfig& config,
                         const dashcam::log::LogCallback& log) {
@@ -171,15 +251,15 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
         return false;
     }
 
-    if (auto enc  = root.child("Encoder")) parseEncoder(enc, config.encoder);
-    if (auto ovl  = root.child("Overlay")) parseOverlay(ovl, config.overlay);
-    if (auto sys  = root.child("System"))  parseSystem(sys,  config.system);
+    if (auto enc = root.child("Encoder")) parseEncoder(enc, config.encoder, log);
+    if (auto ovl = root.child("Overlay")) parseOverlay(ovl, config.overlay, log);
+    if (auto sys = root.child("System"))  parseSystem (sys, config.system,  log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
         for (auto cam : cams.children("Camera")) {
             CameraConfig cc;
-            parseCamera(cam, cc);
+            parseCamera(cam, cc, log);
             config.cameras.push_back(std::move(cc));
         }
     }
@@ -242,14 +322,15 @@ bool AttributeDictionary::load(const std::string& filePath, AttributeDictionary&
     dict.entries.clear();
     pugi::xml_document doc;
     if (!doc.load_file(filePath.c_str())) {
-        doLog(log, dashcam::log::LogLevel::ERROR,
-              "cannot parse '%s'", filePath.c_str());
+        // Reuse file-local doLog via the anonymous namespace helper.
+        if (log) log(dashcam::log::LogLevel::ERROR,
+                     ("cannot parse '" + filePath + "'").c_str());
         return false;
     }
     pugi::xml_node root = doc.child("CameraAttributeDictionary");
     if (!root) {
-        doLog(log, dashcam::log::LogLevel::ERROR,
-              "missing <CameraAttributeDictionary> root in '%s'", filePath.c_str());
+        if (log) log(dashcam::log::LogLevel::ERROR,
+                     ("missing <CameraAttributeDictionary> root in '" + filePath + "'").c_str());
         return false;
     }
     for (auto node : root.children("Attribute")) {
