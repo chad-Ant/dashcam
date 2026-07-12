@@ -102,8 +102,8 @@ The stock low-level tracker configs live in `/opt/nvidia/deepstream/deepstream/s
 The 3 USB cameras (stereo pair @ 360p10 + driver cam @ 360p10) don't need DeepStream. They're low-rate, single-task, and DeepStream's value (batched inference, metadata pipeline, OSD, Smart Record) doesn't pay off at 10 fps.
 
 Recommended split:
-- **DeepStream** for the IMX296 (lane + obstacle + sign + record).
-- **Plain Python + OpenCV + raw TensorRT** (or even mediapipe on CPU) for the stereo and driver cameras. See `models-and-tensorrt.md` for the raw-TRT-in-Python skeleton.
+- **DeepStream** for the IMX296 (lane detection + obstacle detection + sign reading; inference-only).
+- **Plain Python + OpenCV + raw TensorRT** for both the USB camera recording and the stereo/driver inference cameras. (DeepStream adds complexity that doesn't pay off for the USB recording path or the low-rate stereo/driver cams; stick to raw Python TensorRT for simpler deployment and recording integration.) See `models-and-tensorrt.md` for the raw-TRT-in-Python skeleton.
 - **IPC between them** if you need fusion (e.g., "driver was distracted *and* hard braking event") — Unix domain socket, ZeroMQ, or shared memory ring.
 
 ## Python (`pyds`) skeleton for a dashcam

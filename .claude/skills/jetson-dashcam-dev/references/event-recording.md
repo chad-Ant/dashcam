@@ -160,12 +160,15 @@ This makes events queryable later without re-running inference — important sin
 - **Wear management.** Prefer larger segment files (fewer metadata writes), let the ring/aging job overwrite oldest segments, avoid tiny frequent `fsync`s. Watch `dmesg` for `mmc`/`I/O error` — the first sign of a dying card.
 - **Isolation is good:** footage on the SD card (not rootfs) means a full or failed card can't wedge the OS on the NVMe.
 
-Architecture: 1 IMX296 CSI recording at 1456×1088@30 (native res, after the 60→30 videorate drop). The 3 USB cameras (stereo @ 360p10 + driver cam @ 360p10) are *not* continuously recorded — they're inputs to inference; only their inference outputs are logged unless an event triggers.
+Architecture: The **primary footage source is a USB camera (model/specs TBD)** — its resolution and bitrate will determine actual recording throughput and SD-card lifespan. The IMX296 CSI camera is **inference-primary** (lane detection, sign reading, other AI tasks) and also outputs a **debug video stream** (low-bitrate/low-fps encode for post-hoc review of what the inference saw — not the evidentiary recording). The 3 other USB cameras (stereo @ 360p10 + driver cam @ 360p10) are inference-only; only their analysis outputs are logged unless an event triggers.
 
-At 4 Mbps continuous record of the 1456×1088@30 front stream (size is set by bitrate, not resolution):
-- ~1.8 GB/hour
-- ~14 GB / 8-hour driving day
-- ~167 GB SD card ≈ ~93 h of recording ≈ ~11 days at 8 h/day (~4 days 24/7) — the card is far smaller than the NVMe, so aging/rotation or smart-record matters *more* here
+**Capacity calculation** — depends on the final USB camera's bitrate. **Template:** if recording bitrate is B Mbps, then:
+- Throughput: B Mbps = B/8 MB/s
+- Per hour: 3600 × (B/8) MB = ~450B MB/hour ≈ 0.45B GB/hour
+- Per 8-hour day: ~3.6B GB
+- Per ~167 GB SD card: 167 / (0.45B) hours ≈ 372/B hours (scale by stream count)
+
+**Example:** if the USB camera records at 8 Mbps (typical HD dashcam), that's ~3.6 GB / 8h-day, and 167 GB ≈ ~46 days at 8 h/day. Use aggressive aging/rotation or smart-record-only (record on event, not continuous).
 
 Smart-record-only (no continuous record) is much cheaper:
 - ~30 MB per 60 s event clip (front camera only)
@@ -178,5 +181,5 @@ Recommend: smart record for the front camera, **and** keep a low-bitrate continu
 ## Honest caveats
 
 1. Software encoding 1080p30 + running inference + reading IMU + writing files: this is close to the Orin Nano budget. **Validate end-to-end performance with `tegrastats` before committing to a recording strategy.** If `x264enc` falls behind, you'll get growing latency and eventually frame drops — Smart Record's pre-event buffer becomes lies.
-2. **SD-card endurance is the thing to watch** — footage lives on the SD card by design (see Storage budgeting above). The write *rate* is trivial (~0.5 MB/s at 4 Mbps); the write *volume* over time is what wears the card (~14 GB / 8 h-day). Use a high-endurance / surveillance-rated card, pair it with power-loss-safe segmenting (journaling FS or f2fs, short `splitmuxsink` segments, flush on boundaries), and watch `dmesg` for `mmc`/I-O errors as the first sign of a dying card. The system rootfs stays on NVMe, so a worn or corrupted footage card never affects boot.
+2. **SD-card endurance depends on the final USB camera bitrate** — footage lives on the SD card by design (see Storage budgeting above). The write *rate* at the socket is not the bottleneck; the write *volume* over time is what wears the card. **Once the USB camera model is finalized**, calculate your daily write volume (see capacity template above), and use a high-endurance / surveillance-rated card accordingly. Pair it with power-loss-safe segmenting (journaling FS or f2fs, short `splitmuxsink` segments, flush on boundaries), and watch `dmesg` for `mmc`/I-O errors as the first sign of a dying card. The system rootfs stays on NVMe, so a worn or corrupted footage card never affects boot.
 3. For evidentiary use, consider also writing a hash chain or signed metadata so clips are tamper-evident.

@@ -205,7 +205,9 @@ Mission-critical AI dashcam, fully offline, in the `l4t-ml` container, headless:
 
 | Camera | Sensor | Capture | Workloads |
 |---|---|---|---|
-| Front CSI | IMX296 global shutter | **1456×1088 @ 60 fps** (device-confirmed: single RG10 mode → ISP → NV12; no 1080p mode) | Lane detection + recording (GPS+speed overlay) + event save ±30 s + sign reading throttled to 5 fps |
+| USB camera (TBA) | Model + specs TBD | Recording primary footage (resolution/bitrate TBD on final selection) | Primary dashcam video record + GPS+speed overlay + event save ±30 s |
+| IMX296 CSI | Global shutter, 1456×1088@60 (device-confirmed) | Inference-primary + debug video output | Lane detection, sign reading, other AI workloads; not the primary recording but outputs video for post-hoc debugging |
+| USB cameras (existing) | Reused laptop webcams | Stereo + driver-behavior inference | Inputs to inference; only outputs logged unless event triggers |
 | USB cam A + B | Reused laptop webcams | 360p 10 fps each | Stereo rangefinder |
 | USB cam C | Reused laptop webcam | 360p 10 fps | Driver-behavior analysis |
 
