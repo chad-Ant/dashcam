@@ -16,6 +16,7 @@
 #include "librecord.h"
 #include "libstereocam.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -131,6 +132,19 @@ static void applyCaps(dashcam::camera::Camera_GST& cam,
                 cam.setCameraAttribute(k, v);
 }
 
+// Map the XML PipelineConfig onto libcamera's own PipelineParams (libcamera
+// cannot depend on libconfig).  Must be applied before the camera's start().
+static dashcam::camera::PipelineParams
+makePipelineParams(const dashcam::config::PipelineConfig& p) {
+    dashcam::camera::PipelineParams pp;
+    pp.captureTimeoutMs     = static_cast<uint32_t>(p.captureTimeoutMs);
+    pp.stateChangeTimeoutMs = static_cast<uint32_t>(p.stateChangeTimeoutMs);
+    pp.eosTimeoutMs         = static_cast<uint32_t>(p.eosTimeoutMs);
+    pp.captureQueueDepth    = static_cast<uint32_t>(p.captureQueueDepth);
+    pp.appsinkMaxBuffers    = static_cast<uint32_t>(p.appsinkMaxBuffers);
+    return pp;
+}
+
 // ─── stereo thread (10 fps — blocking on computeDepth) ───────────────────────
 
 static void stereoLoop(dashcam::stereo::StereoRangefinder& sf,
@@ -228,17 +242,23 @@ int main(int argc, char* argv[]) {
             csiCam = std::make_unique<dashcam::camera::Camera_CSI>(csiInfo);
             csiCam->setLogCallback(log);
             csiCam->setAttributeDictionary(dict);
+            csiCam->setPipelineParams(makePipelineParams(cfg.pipeline));
             applyCaps(*csiCam, cfg, "front");
 
             recorder.setLogCallback(log);
             recorder.setOverlayConfig(cfg.overlay);
 
             const auto& fmt = csiInfo.videoFormats.at(static_cast<size_t>(roles.csiFmtIdx));
+            // Record at the configured fps, but never above the camera's native rate
+            // (software x264enc on the NVENC-less Orin Nano — halving 60→30 halves CPU).
+            float recFps = std::min(static_cast<float>(cfg.recording.recordFps), fmt.frameRate);
             uint32_t frNum, frDen;
-            dashcam::camera::Camera_GST::computeFpsRational(fmt.frameRate, frNum, frDen);
+            dashcam::camera::Camera_GST::computeFpsRational(recFps, frNum, frDen);
 
             std::string clip = cfg.system.archivePath + "/clip_" + utcTimestamp() + ".mkv";
-            GstElement* recBin = recorder.createRecordingBin(clip, frNum, frDen, cfg.encoder);
+            GstElement* recBin = recorder.createRecordingBin(
+                clip, frNum, frDen, cfg.encoder,
+                static_cast<uint32_t>(cfg.recording.queueDepth));
             if (recBin)
                 csiCam->addBranch("recording", recBin, false, false);
             else
@@ -278,6 +298,8 @@ int main(int argc, char* argv[]) {
         usbR->setLogCallback(log);
         usbL->setAttributeDictionary(dict);
         usbR->setAttributeDictionary(dict);
+        usbL->setPipelineParams(makePipelineParams(cfg.pipeline));
+        usbR->setPipelineParams(makePipelineParams(cfg.pipeline));
         applyCaps(*usbL, cfg, "stereo-left");
         applyCaps(*usbR, cfg, "stereo-right");
 
@@ -315,6 +337,7 @@ int main(int argc, char* argv[]) {
         driverCam = std::make_unique<dashcam::camera::Camera_USB>(*roles.driver);
         driverCam->setLogCallback(log);
         driverCam->setAttributeDictionary(dict);
+        driverCam->setPipelineParams(makePipelineParams(cfg.pipeline));
         applyCaps(*driverCam, cfg, "driver");
 
         driverCam->open();
@@ -362,6 +385,14 @@ int main(int argc, char* argv[]) {
 
             // Inference hook: buf contains 1080p BGRx at 60fps.
             // Lane detection runs every frame; sign recognition at ~5fps via throttle counter.
+            // When the detectors are instantiated here, map the XML rate caps onto their
+            // own config structs, e.g.:
+            //   laneCfg.targetHz      = cfg.detection.laneTargetHz;
+            //   laneCfg.laneReferenceY= cfg.detection.laneReferenceY;
+            //   signCfg.targetHz      = cfg.detection.signTargetHz;
+            //   signCfg.confThreshold = cfg.detection.signConfThreshold;
+            //   signCfg.nmsThreshold  = cfg.detection.signNmsThreshold;
+            //   driverCfg.targetHz    = cfg.detection.driverTargetHz;
 
             dashcam::camera::cameraStatus st;
             csiCam->getCameraStatus(st);

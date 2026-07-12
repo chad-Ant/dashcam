@@ -32,6 +32,16 @@
 
 namespace dashcam::i2c {
 
+/**
+ * @brief I2C master over /dev/i2c-N.
+ *
+ * @note Not thread-safe.  A single I2cBus owns one fd whose I2C_SLAVE target is
+ *       shared mutable state; use one I2cBus per thread, or serialise all calls
+ *       on a given instance externally.  Note that even per-call locking would
+ *       not make a setDevice()+send()+receive() sequence atomic against another
+ *       thread's transaction on the same bus — hold the external lock across the
+ *       whole logical transaction.
+ */
 class I2cBus : public dashcam::bus::IBus {
 public:
     I2cBus();

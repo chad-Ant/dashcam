@@ -13,23 +13,14 @@ std::string Camera_CSI::buildPipelineString(const cameraVideoFormat& fmt,
            ", height=" + std::to_string(fmt.height) +
            ", format=(string)NV12, framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
            " ! tee name=srctee"
-           " srctee. ! queue max-size-buffers=2 leaky=2 ! nvvidconv ! video/x-raw, format=(string)BGRx"
+           " srctee. ! queue max-size-buffers=" + std::to_string(params_.captureQueueDepth) +
+           " leaky=2 ! nvvidconv ! video/x-raw, format=(string)BGRx"
            " ! videoconvert ! video/x-raw, format=(string)BGR"
-           " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
+           " ! appsink name=mysink drop=true max-buffers=" + std::to_string(params_.appsinkMaxBuffers) +
+           " emit-signals=false sync=false";
 }
 
-void Camera_CSI::applyAttributeGStreamer(const std::string& name, const std::string& value) {
-    if (!camera_src_) {
-        status_.currentError = pipelineError();
-        return;
-    }
-    const auto* entry = dict_.resolve(name, "CSI");
-    if (!entry || !applyGstProperty(camera_src_, *entry, value)) {
-        status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
-        return;
-    }
-    status_.currentError = ERROR_CODE::NONE;
-}
+const char* Camera_CSI::cameraTypeTag() const { return "CSI"; }
 
 Camera_CSI::Camera_CSI(const cameraInfo& camera)
     : Camera_GST(camera) {

@@ -299,7 +299,10 @@ public:
      *
      * @pre  Status == RUNNING.
      * @note The default BGR appsink branch produces @c video/x-raw,format=BGR frames.
-     *       Required buffer size is width × height × 3 bytes.
+     *       Frames are written tightly packed (row stride = width × 3), so the
+     *       required buffer size is exactly width × height × 3 bytes even when the
+     *       source pads rows to a wider alignment.  A frame whose packed size
+     *       exceeds @p bufferSize is discarded (bytesWritten = 0).
      */
     virtual void captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) = 0;
 };

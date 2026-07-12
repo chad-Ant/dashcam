@@ -5,17 +5,22 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace dashcam::log {
 
 namespace {
 
+// Accessed via std::atomic_load/store only, so the log callback can read it on
+// any thread while init()/shutdown() publish or clear it without a data race.
 std::shared_ptr<spdlog::logger> g_logger;
 std::once_flag                  g_once;
 
@@ -29,15 +34,29 @@ spdlog::level::level_enum toSpdLevel(LogLevel lvl) {
     return spdlog::level::info;
 }
 
+// Initial level from DASHCAM_LOG_LEVEL (debug|info|warn|error|off); default debug.
+spdlog::level::level_enum levelFromEnv() {
+    const char* env = std::getenv("DASHCAM_LOG_LEVEL");
+    if (!env) return spdlog::level::debug;
+    std::string s(env);
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "info")                    return spdlog::level::info;
+    if (s == "warn" || s == "warning")  return spdlog::level::warn;
+    if (s == "error" || s == "err")     return spdlog::level::err;
+    if (s == "off")                     return spdlog::level::off;
+    return spdlog::level::debug;
+}
+
 } // namespace
 
 void init(const std::string& logDir) {
     std::call_once(g_once, [&logDir]() {
 
+    // Local time so the filename matches spdlog's local-time line timestamps.
     auto now = std::chrono::system_clock::now();
     auto tt  = std::chrono::system_clock::to_time_t(now);
     struct tm tm{};
-    gmtime_r(&tt, &tm);
+    localtime_r(&tt, &tm);
 
     char fname[256];
     std::snprintf(fname, sizeof(fname), "%s/log_%04d%02d%02d_%02d%02d%02d.txt",
@@ -56,32 +75,45 @@ void init(const std::string& logDir) {
         console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
         std::vector<spdlog::sink_ptr> sinks{console_sink, file_sink};
-        g_logger = std::make_shared<spdlog::async_logger>(
+        // overrun_oldest (not block): under log pressure drop the oldest queued
+        // messages instead of blocking producers — a slow console must never
+        // stall a capture/inference thread on this real-time box.
+        auto logger = std::make_shared<spdlog::async_logger>(
             "dashcam",
             sinks.begin(), sinks.end(),
             spdlog::thread_pool(),
-            spdlog::async_overflow_policy::block);
-        g_logger->set_level(spdlog::level::debug);
-        spdlog::register_logger(g_logger);
+            spdlog::async_overflow_policy::overrun_oldest);
+        logger->set_level(levelFromEnv());
+        spdlog::register_logger(logger);
+        // Publish atomically; the callback reads it via std::atomic_load.
+        std::atomic_store(&g_logger, logger);
     } catch (const spdlog::spdlog_ex& ex) {
         std::fprintf(stderr, "liblog: spdlog init failed: %s\n", ex.what());
-        g_logger.reset();
+        // g_logger was never published; callbacks fall back to stderr.
     }
 
     }); // call_once
 }
 
 void shutdown() {
-    if (!g_logger) return;
-    g_logger->flush();
+    // CONTRACT: all threads that call the log callback must be stopped first —
+    // tearing down the async worker while another thread logs is unsafe.
+    auto logger = std::atomic_load(&g_logger);
+    if (!logger) return;
+    logger->flush();
+    // Clear the shared pointer first so any late callback falls back to stderr
+    // instead of racing spdlog::shutdown().
+    std::atomic_store(&g_logger, std::shared_ptr<spdlog::logger>{});
     spdlog::drop("dashcam");
     spdlog::shutdown();
-    g_logger.reset();
 }
 
 LogCallback getCallback() {
     return [](LogLevel lvl, const std::string& msg) {
-        if (!g_logger) {
+        // Load once into a local: safe against a concurrent shutdown() reset,
+        // and no TOCTOU between the null-check and the log call.
+        auto logger = std::atomic_load(&g_logger);
+        if (!logger) {
             std::fprintf(stderr, "[%s] %s\n",
                 lvl == LogLevel::ERROR ? "ERROR" :
                 lvl == LogLevel::WARN  ? "WARN"  :
@@ -89,7 +121,7 @@ LogCallback getCallback() {
                 msg.c_str());
             return;
         }
-        g_logger->log(toSpdLevel(lvl), msg);
+        logger->log(toSpdLevel(lvl), msg);
     };
 }
 

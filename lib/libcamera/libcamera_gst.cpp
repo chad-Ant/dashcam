@@ -1,9 +1,12 @@
 #include "libcamera_gst.h"
+#include <gst/video/video.h>
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // ─── file-local log helper ────────────────────────────────────────────────────
 
@@ -66,7 +69,8 @@ void Camera_GST::teardownPipeline() {
             // path, so a generous window is required.
             GstBus* bus = gst_element_get_bus(pipe);
             if (bus) {
-                GstMessage* msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND,
+                GstMessage* msg = gst_bus_timed_pop_filtered(bus,
+                    params_.eosTimeoutMs * GST_MSECOND,
                     static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
                 if (msg) gst_message_unref(msg);
                 gst_object_unref(bus);
@@ -78,7 +82,8 @@ void Camera_GST::teardownPipeline() {
         // before releasing pads or unreffing elements.
         GstStateChangeReturn sc = gst_element_set_state(pipe, GST_STATE_NULL);
         if (sc == GST_STATE_CHANGE_ASYNC)
-            gst_element_get_state(pipe, nullptr, nullptr, 5 * GST_SECOND);
+            gst_element_get_state(pipe, nullptr, nullptr,
+                                  params_.stateChangeTimeoutMs * GST_MSECOND);
     }
 
     GstElement* appsinkToUnref = nullptr;
@@ -112,10 +117,20 @@ void Camera_GST::teardownPipeline() {
     branches_.clear();
     branchValves_.clear();
 
-    if (tee_)          { gst_object_unref(tee_);          tee_        = nullptr; }
-    if (camera_src_)   { gst_object_unref(camera_src_);   camera_src_ = nullptr; }
-    if (appsinkToUnref){ gst_object_unref(appsinkToUnref);               }
-    if (pipe)            gst_object_unref(pipe);
+    // Null the element handles under the lock (consistent with appsink_ above),
+    // then unref outside it.  Other threads read these pointers only under
+    // stateMutex_, so the write must be locked too.
+    GstElement* teeToUnref = nullptr;
+    GstElement* srcToUnref = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        teeToUnref = tee_;        tee_        = nullptr;
+        srcToUnref = camera_src_; camera_src_ = nullptr;
+    }
+    if (teeToUnref)     gst_object_unref(teeToUnref);
+    if (srcToUnref)     gst_object_unref(srcToUnref);
+    if (appsinkToUnref) gst_object_unref(appsinkToUnref);
+    if (pipe)           gst_object_unref(pipe);
 }
 
 void Camera_GST::setPipelineError() {
@@ -125,6 +140,69 @@ void Camera_GST::setPipelineError() {
     std::lock_guard<std::mutex> lock(stateMutex_);
     status_.status       = CAMERA_STATUS::ERROR;
     status_.currentError = pipelineError();
+}
+
+void Camera_GST::checkBusErrors() {
+    // Take a ref on the pipeline under the lock so a concurrent teardown can't
+    // free it while we poll its bus.
+    GstElement* pipeRef = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status != CAMERA_STATUS::RUNNING || !pipeline_) return;
+        pipeRef = static_cast<GstElement*>(gst_object_ref(pipeline_));
+    }
+
+    GstBus* bus = gst_element_get_bus(pipeRef);
+    bool sawError = false;
+    if (bus) {
+        // Drain every message except EOS (which teardownPipeline() waits for) so
+        // the bus queue can't grow unbounded over a long capture.  Report the
+        // first error encountered.
+        const GstMessageType drainMask =
+            static_cast<GstMessageType>(GST_MESSAGE_ANY & ~GST_MESSAGE_EOS);
+        GstMessage* msg;
+        while ((msg = gst_bus_pop_filtered(bus, drainMask)) != nullptr) {
+            if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR && !sawError) {
+                GError* err = nullptr;
+                gchar*  dbg = nullptr;
+                gst_message_parse_error(msg, &err, &dbg);
+                doLog(log_, dashcam::log::LogLevel::ERROR,
+                      "pipeline bus error on %s: %s", info_.address.c_str(),
+                      err ? err->message : "unknown");
+                if (err) g_error_free(err);
+                g_free(dbg);
+                sawError = true;
+            }
+            gst_message_unref(msg);
+        }
+        gst_object_unref(bus);
+    }
+    gst_object_unref(pipeRef);
+
+    if (sawError) {
+        // Flip to ERROR; the app observes this via getCameraStatus() and calls
+        // close() to release the pipeline.  Leave teardown to that path so we
+        // don't tear down a pipeline captureFrame() may still be reffing.
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (status_.status == CAMERA_STATUS::RUNNING) {
+            status_.status       = CAMERA_STATUS::ERROR;
+            status_.currentError = pipelineError();
+        }
+    }
+}
+
+void Camera_GST::applyAttributeGStreamer(const std::string& name,
+                                         const std::string& value) {
+    if (!camera_src_) {
+        status_.currentError = pipelineError();
+        return;
+    }
+    const AttributeEntry* entry = dict_.resolve(name, cameraTypeTag());
+    if (!entry || !applyGstProperty(camera_src_, *entry, value)) {
+        status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
+        return;
+    }
+    status_.currentError = ERROR_CODE::NONE;
 }
 
 // ─── static utilities ────────────────────────────────────────────────────────
@@ -147,6 +225,13 @@ void Camera_GST::setLogCallback(dashcam::log::LogCallback cb) {
     log_ = std::move(cb);
 }
 
+void Camera_GST::setPipelineParams(const PipelineParams& p) {
+    // Write-once before start(); read by buildPipelineString() and the
+    // state-change waits.  No lock needed as long as the documented ordering
+    // (set before start) is honoured.
+    params_ = p;
+}
+
 bool Camera_GST::applyGstProperty(GstElement* src,
                                    const AttributeEntry& entry,
                                    const std::string& value) {
@@ -167,7 +252,9 @@ bool Camera_GST::applyGstProperty(GstElement* src,
         case AttributeValueType::Float: {
             char* end = nullptr;
             float fv = std::strtof(value.c_str(), &end);
-            if (!end || end == value.c_str()) return false;
+            // Reject empty input and trailing garbage (e.g. "1.5abc"), matching
+            // the strictness of the Int path via safeStoi().
+            if (end == value.c_str() || *end != '\0') return false;
             g_object_set(G_OBJECT(src), prop, static_cast<gfloat>(fv), NULL);
             return true;
         }
@@ -240,6 +327,11 @@ void Camera_GST::open() {
     // getCameraStatus()/captureFrame() responsive on other threads.
     GError* err = nullptr;
     bool gstOk = gst_init_check(nullptr, nullptr, &err);
+    if (!gstOk) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "gst_init failed for %s: %s", info_.address.c_str(),
+              err ? err->message : "unknown");
+    }
     if (err) g_error_free(err);
 
     std::lock_guard<std::mutex> lock(stateMutex_);
@@ -346,29 +438,52 @@ void Camera_GST::start() {
     doLog(log_, dashcam::log::LogLevel::DEBUG,
           "pipeline: %s", pipelineStr.c_str());
 
+    // Publish the shared handles under stateMutex_ so status (already RUNNING) and
+    // the pointers become visible together to the concurrent captureFrame() reader,
+    // instead of being assigned bare while another thread reads them under the lock.
+    // pipeline_ is published first so setPipelineError() → teardownPipeline() can
+    // release it (and any orphaned branch bins) on every failure path below.
     GError* error = nullptr;
-    pipeline_ = gst_parse_launch(pipelineStr.c_str(), &error);
-    if (error != nullptr || pipeline_ == nullptr) {
+    GstElement* pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
+    if (error != nullptr || pipeline == nullptr) {
         if (error) g_error_free(error);
-        if (pipeline_) { gst_object_unref(pipeline_); pipeline_ = nullptr; }
-        setPipelineError();
+        if (pipeline) gst_object_unref(pipeline);
+        setPipelineError();   // pipeline_ still null; teardown frees orphan branches, sets ERROR
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        pipeline_ = pipeline;
+    }
+
+    GstElement* appsink   = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+    GstElement* cameraSrc = gst_bin_get_by_name(GST_BIN(pipeline), "camerasrc");
+    GstElement* tee       = gst_bin_get_by_name(GST_BIN(pipeline), "srctee");
+
+    if (!appsink || !cameraSrc || !tee) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "required pipeline elements not found on %s", info_.address.c_str());
+        if (appsink)   gst_object_unref(appsink);
+        if (cameraSrc) gst_object_unref(cameraSrc);
+        if (tee)       gst_object_unref(tee);
+        setPipelineError();   // tears down the published pipeline_ and orphan branches
         return;
     }
 
-    appsink_    = gst_bin_get_by_name(GST_BIN(pipeline_), "mysink");
-    camera_src_ = gst_bin_get_by_name(GST_BIN(pipeline_), "camerasrc");
-    tee_        = gst_bin_get_by_name(GST_BIN(pipeline_), "srctee");
-
-    if (!appsink_ || !camera_src_ || !tee_) {
-        doLog(log_, dashcam::log::LogLevel::ERROR,
-              "required pipeline elements not found on %s", info_.address.c_str());
-        setPipelineError();
-        return;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        appsink_    = appsink;
+        camera_src_ = cameraSrc;
+        tee_        = tee;
     }
 
     // Link each registered branch to the tee.
     // Layout per branch:  tee ! queue ! valve ! <branchBin>
     // The queue isolates backpressure; the valve enables runtime enable/disable.
+    // Valves are collected locally and published to branchValves_ under the lock
+    // after the loop, so a concurrent setBranchEnabled() never reads the map
+    // mid-insertion.
+    std::map<std::string, GstElement*> localValves;
     bool branchError = false;
     for (size_t i = 0; i < branches_.size(); ++i) {
         auto& [branchName, branchBin, branchLeaky, branchInitEnabled] = branches_[i];
@@ -453,12 +568,17 @@ void Camera_GST::start() {
         doLog(log_, dashcam::log::LogLevel::INFO,
               "branch linked: %s", branchName.c_str());
         teePads_.push_back(teeSrcPad);
-        branchValves_[branchName] = valve;
+        localValves[branchName] = valve;
     }
 
     if (branchError) {
         setPipelineError();
         return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        branchValves_ = std::move(localValves);
     }
 
     // Pre-start flush: apply pending attributes while the pipeline is in NULL state.
@@ -487,7 +607,8 @@ void Camera_GST::start() {
         // attribute writes during this window are safely queued into
         // pendingAttributes_ and drained by the late-attributes flush below.
         GstState state, pending;
-        ret = gst_element_get_state(pipeline_, &state, &pending, 5 * GST_SECOND);
+        ret = gst_element_get_state(pipeline_, &state, &pending,
+                                    params_.stateChangeTimeoutMs * GST_MSECOND);
         if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {
             setPipelineError();
             return;
@@ -527,6 +648,10 @@ void Camera_GST::stop() {
 void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) {
     bytesWritten = 0;
 
+    // Surface any runtime pipeline failure; may transition RUNNING → ERROR, in
+    // which case the state check below returns without pulling a sample.
+    checkBusErrors();
+
     // Briefly lock to check state and take a GStreamer ref on the appsink.
     // This prevents a use-after-free if stop() tears down the pipeline while
     // we're blocking inside try_pull_sample.
@@ -537,23 +662,51 @@ void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& by
         sinkRef = static_cast<GstElement*>(gst_object_ref(appsink_));
     }
 
-    // Block for up to 1 s without holding the lock.  If stop() is called
-    // concurrently, the pipeline transitions to NULL which forces appsink into
-    // flushing state and try_pull_sample returns nullptr immediately.
-    GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sinkRef), GST_SECOND);
+    // Block for up to params_.captureTimeoutMs without holding the lock.  If
+    // stop() is called concurrently, the pipeline transitions to NULL which
+    // forces appsink into flushing state and try_pull_sample returns nullptr
+    // immediately.
+    GstSample* sample = gst_app_sink_try_pull_sample(
+        GST_APP_SINK(sinkRef), params_.captureTimeoutMs * GST_MSECOND);
     gst_object_unref(sinkRef);
 
     if (!sample) return;
 
+    // Copy the frame row-by-row honouring the GStreamer stride.  videoconvert /
+    // nvvidconv pad each row up to a 4-byte-aligned stride, so for the BGR
+    // appsink stride == width*3 only when width % 4 == 0.  A raw
+    // gst_buffer_extract() of gst_buffer_get_size() bytes would shear the image
+    // (or, since the padded size exceeds width*height*3, silently drop the frame)
+    // for any width that isn't 4-aligned — e.g. odd USB modes.
     GstBuffer* gstBuffer = gst_sample_get_buffer(sample);
-    if (gstBuffer) {
-        gsize dataSize = gst_buffer_get_size(gstBuffer);
-        if (dataSize <= bufferSize) {
-            gst_buffer_extract(gstBuffer, 0, buffer, dataSize);
-            bytesWritten = static_cast<uint32_t>(dataSize);
+    GstCaps*   caps      = gst_sample_get_caps(sample);
+    GstVideoInfo  vinfo;
+    GstVideoFrame vframe;
+    if (gstBuffer && caps &&
+        gst_video_info_from_caps(&vinfo, caps) &&
+        gst_video_frame_map(&vframe, &vinfo, gstBuffer, GST_MAP_READ)) {
+
+        const guint   width  = GST_VIDEO_FRAME_WIDTH(&vframe);
+        const guint   height = GST_VIDEO_FRAME_HEIGHT(&vframe);
+        const gint    stride = GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 0);
+        const guint8* src    = static_cast<const guint8*>(GST_VIDEO_FRAME_PLANE_DATA(&vframe, 0));
+        const gsize   rowBytes = static_cast<gsize>(width) * 3;  // appsink caps are BGR
+
+        // Only the default single-plane BGR sink is supported here; bail on
+        // anything unexpected (planar, sub-row stride) rather than emit garbage.
+        if (GST_VIDEO_FRAME_N_PLANES(&vframe) == 1 && src &&
+            stride >= 0 && static_cast<gsize>(stride) >= rowBytes &&
+            rowBytes * height <= bufferSize) {
+            for (guint row = 0; row < height; ++row) {
+                std::memcpy(buffer + row * rowBytes,
+                            src + static_cast<gsize>(row) * static_cast<gsize>(stride),
+                            rowBytes);
+            }
+            bytesWritten = static_cast<uint32_t>(rowBytes * height);
             std::lock_guard<std::mutex> lock(stateMutex_);
             status_.frameCount++;
         }
+        gst_video_frame_unmap(&vframe);
     }
     gst_sample_unref(sample);
 }

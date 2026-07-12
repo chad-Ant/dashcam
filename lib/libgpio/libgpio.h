@@ -55,6 +55,10 @@ enum class EdgeTrigger  { RISING, FALLING, BOTH };
 // ─── callbacks ────────────────────────────────────────────────────────────────
 
 /// Called on the watcher thread; timestampNs is nanoseconds since boot.
+/// Keep it short and non-blocking.  Do NOT call stop()/close() or destroy the
+/// GpioWatcher from inside the callback — that runs on the watcher thread and
+/// would join the thread to itself (deadlock).  To shut down in response to an
+/// edge, signal another thread and tear down there.
 using EdgeCallback = std::function<void(LogicLevel level, int64_t timestampNs)>;
 
 // ─── GpioPin ──────────────────────────────────────────────────────────────────

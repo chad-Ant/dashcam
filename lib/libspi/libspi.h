@@ -51,10 +51,21 @@ struct SpiConfig {
     uint8_t  bitsPerWord = 8;        ///< Word width; 8 for almost all devices.
     uint32_t speedHz     = 1000000;  ///< Clock frequency in Hz.
     bool     lsbFirst    = false;    ///< MSB-first is standard; set true only if device requires it.
+    bool     noCs        = false;    ///< SPI_NO_CS: don't drive the hardware CE (use when CS is an external GPIO).
+    bool     csHigh      = false;    ///< SPI_CS_HIGH: chip-select is active-high.
 };
 
 // ─── SpiBus ───────────────────────────────────────────────────────────────────
 
+/**
+ * @brief SPI master over /dev/spidevN.N.
+ *
+ * @note Not thread-safe.  One SpiBus owns a single fd; use one instance per
+ *       thread, or serialise access externally.  When pairing with an external
+ *       GPIO chip-select (GpioPeripheral), hold that lock across the whole
+ *       assert-CS / transfer / release-CS sequence, and open with
+ *       SpiConfig::noCs so spidev doesn't also toggle its hardware CE.
+ */
 class SpiBus : public dashcam::bus::IBus {
 public:
     SpiBus();

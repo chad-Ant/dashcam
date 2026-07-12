@@ -171,6 +171,31 @@ static void parseSystem(pugi::xml_node node, SystemConfig& sys,
     readVar(node, sys.warmupFrames, log);
 }
 
+static void parsePipeline(pugi::xml_node node, PipelineConfig& p,
+                          const dashcam::log::LogCallback& log) {
+    readVar(node, p.captureTimeoutMs,     log);
+    readVar(node, p.stateChangeTimeoutMs, log);
+    readVar(node, p.eosTimeoutMs,         log);
+    readVar(node, p.captureQueueDepth,    log);
+    readVar(node, p.appsinkMaxBuffers,    log);
+}
+
+static void parseRecording(pugi::xml_node node, RecordingConfig& r,
+                           const dashcam::log::LogCallback& log) {
+    readVar(node, r.recordFps,  log);
+    readVar(node, r.queueDepth, log);
+}
+
+static void parseDetection(pugi::xml_node node, DetectionConfig& d,
+                           const dashcam::log::LogCallback& log) {
+    readVar(node, d.laneTargetHz,      log);
+    readVar(node, d.laneReferenceY,    log);
+    readVar(node, d.signTargetHz,      log);
+    readVar(node, d.signConfThreshold, log);
+    readVar(node, d.signNmsThreshold,  log);
+    readVar(node, d.driverTargetHz,    log);
+}
+
 // ── section writers ──────────────────────────────────────────────────────────
 
 static void writeEncoder(pugi::xml_node parent, const EncoderConfig& enc) {
@@ -230,6 +255,31 @@ static void writeSystem(pugi::xml_node parent, const SystemConfig& sys) {
     writeVar(n, sys.warmupFrames);
 }
 
+static void writePipeline(pugi::xml_node parent, const PipelineConfig& p) {
+    pugi::xml_node n = parent.append_child("Pipeline");
+    writeVar(n, p.captureTimeoutMs);
+    writeVar(n, p.stateChangeTimeoutMs);
+    writeVar(n, p.eosTimeoutMs);
+    writeVar(n, p.captureQueueDepth);
+    writeVar(n, p.appsinkMaxBuffers);
+}
+
+static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
+    pugi::xml_node n = parent.append_child("Recording");
+    writeVar(n, r.recordFps);
+    writeVar(n, r.queueDepth);
+}
+
+static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
+    pugi::xml_node n = parent.append_child("Detection");
+    writeVar(n, d.laneTargetHz);
+    writeVar(n, d.laneReferenceY);
+    writeVar(n, d.signTargetHz);
+    writeVar(n, d.signConfThreshold);
+    writeVar(n, d.signNmsThreshold);
+    writeVar(n, d.driverTargetHz);
+}
+
 } // namespace
 
 // ── ConfigReader ──────────────────────────────────────────────────────────────
@@ -251,9 +301,12 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
         return false;
     }
 
-    if (auto enc = root.child("Encoder")) parseEncoder(enc, config.encoder, log);
-    if (auto ovl = root.child("Overlay")) parseOverlay(ovl, config.overlay, log);
-    if (auto sys = root.child("System"))  parseSystem (sys, config.system,  log);
+    if (auto enc = root.child("Encoder"))   parseEncoder  (enc, config.encoder,   log);
+    if (auto ovl = root.child("Overlay"))   parseOverlay  (ovl, config.overlay,   log);
+    if (auto sys = root.child("System"))    parseSystem   (sys, config.system,    log);
+    if (auto pl  = root.child("Pipeline"))  parsePipeline (pl,  config.pipeline,  log);
+    if (auto rec = root.child("Recording")) parseRecording(rec, config.recording, log);
+    if (auto det = root.child("Detection")) parseDetection(det, config.detection, log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
@@ -285,6 +338,9 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
         writeCamera(cams, cam);
 
     writeSystem(root, config.system);
+    writePipeline(root, config.pipeline);
+    writeRecording(root, config.recording);
+    writeDetection(root, config.detection);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {
         doLog(log, dashcam::log::LogLevel::ERROR,

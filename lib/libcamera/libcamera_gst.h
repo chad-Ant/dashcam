@@ -7,7 +7,7 @@
  * pattern.  Concrete subclasses supply three hooks:
  *
  *  - buildPipelineString() — returns the GStreamer pipeline description string.
- *  - applyAttributeGStreamer() — translates attribute name/value to g_object_set calls.
+ *  - cameraTypeTag() — returns "CSI"/"USB" to scope attribute-dictionary lookups.
  *  - pipelineError() — returns the driver-specific ERROR_CODE for pipeline failures.
  *
  * All GStreamer state (element handles, tee pads, valve map) is owned and
@@ -66,10 +66,30 @@ namespace dashcam::camera {
  *   until the pipeline is fully constructed.
  * - Attribute writes during RUNNING may temporarily block; see applyAttributeGStreamer().
  */
+/**
+ * @brief Tunable GStreamer pipeline timing and queue depths.
+ *
+ * Defaults preserve the historical hardcoded values.  The application copies
+ * these from dashcam::config::PipelineConfig (libcamera cannot depend on
+ * libconfig — that would be circular) and installs them via
+ * Camera_GST::setPipelineParams() before start().
+ */
+struct PipelineParams {
+    uint32_t captureTimeoutMs     = 1000;  ///< captureFrame() max wait for a frame.
+    uint32_t stateChangeTimeoutMs = 5000;  ///< Async PLAYING / NULL state-change wait.
+    uint32_t eosTimeoutMs         = 5000;  ///< Teardown EOS flush wait.
+    uint32_t captureQueueDepth    = 2;     ///< appsink-branch leaky queue max-size-buffers.
+    uint32_t appsinkMaxBuffers    = 1;     ///< appsink max-buffers.
+};
+
 class Camera_GST : public iCamera {
 protected:
     cameraInfo   info_;    ///< Static device descriptor supplied at construction.
     cameraStatus status_;  ///< Mutable runtime state; updated by lifecycle methods.
+
+    /// Pipeline timing / queue tuning; read by buildPipelineString() and the
+    /// lifecycle methods.  Set via setPipelineParams() before start().
+    PipelineParams params_;
 
     GstElement* pipeline_;   ///< Top-level GstPipeline; nullptr when not running.
     GstElement* camera_src_; ///< Source element retrieved by name "camerasrc"; used for attribute writes.
@@ -145,7 +165,10 @@ protected:
      *  - Name the source element @c camerasrc  (retrieved later via gst_bin_get_by_name).
      *  - Name the tee element    @c srctee.
      *  - Name the appsink        @c mysink, configured with
-     *    @c drop=true max-buffers=1 emit-signals=false sync=false.
+     *    @c drop=true emit-signals=false sync=false and
+     *    @c max-buffers=params_.appsinkMaxBuffers.
+     *  - Size the appsink-branch @c queue with
+     *    @c max-size-buffers=params_.captureQueueDepth (keep @c leaky=2).
      *  - Output @c video/x-raw,format=BGR on the mysink branch.
      *
      * @param[in] fmt    Active capture format (width, height, pixelFormat, …).
@@ -157,19 +180,28 @@ protected:
                                             uint32_t frNum, uint32_t frDen) const = 0;
 
     /**
+     * @brief Camera-type tag ("CSI" or "USB") used to scope attribute-dictionary
+     *        resolution in applyAttributeGStreamer().
+     *
+     * @return A stable string literal identifying the concrete driver.
+     */
+    virtual const char* cameraTypeTag() const = 0;
+
+    /**
      * @brief Translate a name/value attribute pair into a GStreamer property write.
      *
      * Called both from setCameraAttribute() (when RUNNING) and from start()
-     * to flush pendingAttributes_.  Implementations should set
+     * to flush pendingAttributes_.  Resolves @p name against dict_ scoped to
+     * cameraTypeTag(), then applies the property via applyGstProperty().  Sets
      * @c status_.currentError to INVALID_ATTRIBUTE for unrecognised names or
      * unparseable values, and to NONE on success.
      *
-     * @pre camera_src_ is non-null.
-     * @param[in] name   Attribute name (case-insensitive match recommended).
+     * @pre camera_src_ is non-null (checked; sets pipelineError() otherwise).
+     * @param[in] name   Attribute name (matched case-insensitively).
      * @param[in] value  New value as a decimal string.
      */
     virtual void applyAttributeGStreamer(const std::string& name,
-                                         const std::string& value) = 0;
+                                         const std::string& value);
 
     /**
      * @brief Apply a single resolved attribute entry to a GStreamer source element.
@@ -226,6 +258,19 @@ private:
      */
     void setPipelineError();
 
+    /**
+     * @brief Drain any pending GST_MESSAGE_ERROR from the pipeline bus.
+     *
+     * There is no GLib main loop driving a bus watch, so runtime pipeline
+     * failures (sensor disconnect, Argus/encoder errors) would otherwise go
+     * unnoticed and captureFrame() would silently time out forever.  This polls
+     * the bus non-blocking; on the first error it logs the detail and
+     * transitions RUNNING → ERROR (recording pipelineError()).  Called from
+     * captureFrame().  Acquires stateMutex_ internally; must not be called with
+     * it held.
+     */
+    void checkBusErrors();
+
 public:
     /**
      * @brief Install an attribute dictionary used by setCameraAttribute() resolution.
@@ -244,6 +289,16 @@ public:
      *        Defaults to a no-op (silent) if not set.
      */
     void setLogCallback(dashcam::log::LogCallback cb);
+
+    /**
+     * @brief Install pipeline timing / queue tuning.
+     *
+     * Must be called before start() (buildPipelineString() and the state-change
+     * waits read these values).  Defaults preserve the historical behaviour.
+     *
+     * @param p  Tuning values, typically mapped from dashcam::config::PipelineConfig.
+     */
+    void setPipelineParams(const PipelineParams& p);
 
     /**
      * @brief Convert a floating-point frame rate to a reduced integer fraction.

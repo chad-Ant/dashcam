@@ -169,16 +169,18 @@ public:
      * internally during this call, so createRecordingBin() must be called
      * before addBranch() and start().
      *
-     * @param filename  Output MKV path (absolute or relative to cwd).
-     * @param frNum     Target frame rate numerator (use Camera_GST::computeFpsRational).
-     * @param frDen     Target frame rate denominator.
-     * @param enc       Encoder parameters (bitrate, speed-preset, keyIntMax, tune).
+     * @param filename    Output MKV path (absolute or relative to cwd).
+     * @param frNum       Target frame rate numerator (use Camera_GST::computeFpsRational).
+     * @param frDen       Target frame rate denominator.
+     * @param enc         Encoder parameters (bitrate, speed-preset, keyIntMax, tune).
+     * @param queueDepth  Depth (buffers) of the pre-encoder queue; from RecordingConfig::queueDepth.
      * @return Newly created GstBin (floating ref) on success; nullptr on failure.
      *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
      */
     GstElement* createRecordingBin(const std::string& filename,
                                    uint32_t frNum = 60, uint32_t frDen = 1,
-                                   const dashcam::config::EncoderConfig& enc = {});
+                                   const dashcam::config::EncoderConfig& enc = {},
+                                   uint32_t queueDepth = 3);
 
     // ─── lifecycle ─────────────────────────────────────────────────────────────
 

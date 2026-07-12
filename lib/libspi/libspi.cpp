@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -47,9 +48,13 @@ bool SpiBus::open(const std::string& device, const SpiConfig& cfg,
         return false;
     }
 
-    // Mode
+    // Mode.  noCs sets SPI_NO_CS so the controller leaves its hardware CE alone
+    // when the chip-select is driven by an external GPIO (see GpioPeripheral);
+    // csHigh sets SPI_CS_HIGH for active-high select lines.
     uint8_t mode = cfg.mode & 0x03;
     if (cfg.lsbFirst) mode |= SPI_LSB_FIRST;
+    if (cfg.noCs)     mode |= SPI_NO_CS;
+    if (cfg.csHigh)   mode |= SPI_CS_HIGH;
     if (::ioctl(m_fd, SPI_IOC_WR_MODE, &mode) < 0) {
         doLog(m_log, dashcam::log::LogLevel::ERROR,
               "SpiBus::open: SPI_IOC_WR_MODE failed: %s", ::strerror(errno));

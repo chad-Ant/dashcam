@@ -1,10 +1,11 @@
 #include "libuart.h"
 
 #include <fcntl.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -161,7 +162,7 @@ int Uart::read(uint8_t* buf, size_t len, int timeoutMs) {
     if (m_fd < 0) return -1;
 
     if (timeoutMs == 0) {
-        // Non-blocking.
+        // Non-blocking: one shot, return whatever is already buffered.
         int flags = ::fcntl(m_fd, F_GETFL, 0);
         if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
         ssize_t n = ::read(m_fd, buf, len);
@@ -169,14 +170,17 @@ int Uart::read(uint8_t* buf, size_t len, int timeoutMs) {
         return static_cast<int>(n < 0 ? (errno == EAGAIN ? 0 : -1) : n);
     }
 
-    if (timeoutMs > 0) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(m_fd, &rfds);
-        struct timeval tv{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
-        int ret = ::select(m_fd + 1, &rfds, nullptr, nullptr, &tv);
-        if (ret <= 0) return (ret == 0) ? 0 : -1;
-    }
+    // timeoutMs < 0 blocks indefinitely; > 0 waits up to that long.  The port is
+    // configured VMIN=0/VTIME=0, so a bare read() never blocks — we must wait via
+    // poll() (also fd-number safe, unlike select()) before reading.
+    struct pollfd pfd;
+    pfd.fd = m_fd; pfd.events = POLLIN; pfd.revents = 0;
+    int ret;
+    do {
+        ret = ::poll(&pfd, 1, (timeoutMs < 0) ? -1 : timeoutMs);
+    } while (ret < 0 && errno == EINTR);
+    if (ret < 0)  return -1;
+    if (ret == 0) return 0;   // timed out (only reachable when timeoutMs > 0)
 
     ssize_t n = ::read(m_fd, buf, len);
     return static_cast<int>(n < 0 ? -1 : n);
@@ -185,7 +189,10 @@ int Uart::read(uint8_t* buf, size_t len, int timeoutMs) {
 bool Uart::readLine(std::string& line, int timeoutMs) {
     if (m_fd < 0) return false;
     line.clear();
-    while (true) {
+    // Cap the accumulated length so a stream that never sends a newline (noise,
+    // a wrong-baud sensor) can't grow the string without bound.
+    constexpr size_t kMaxLine = 4096;
+    while (line.size() < kMaxLine) {
         uint8_t c;
         int n = read(&c, 1, timeoutMs);
         if (n <= 0)   return false;
@@ -193,16 +200,26 @@ bool Uart::readLine(std::string& line, int timeoutMs) {
         if (c == '\n') return true;
         line += static_cast<char>(c);
     }
+    doLog(m_log, dashcam::log::LogLevel::WARN,
+          "Uart::readLine: no newline within %zu bytes; discarding", kMaxLine);
+    return false;
 }
 
 bool Uart::write(const uint8_t* buf, size_t len) {
     if (m_fd < 0) return false;
-    ssize_t written = ::write(m_fd, buf, len);
-    if (written != static_cast<ssize_t>(len)) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
-              "Uart::write: short write (%zd/%zu): %s",
-              written, len, ::strerror(errno));
-        return false;
+    // Loop until every byte is written: a blocking write() can still return a
+    // short count on signal or under RTS/CTS backpressure.
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = ::write(m_fd, buf + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            doLog(m_log, dashcam::log::LogLevel::ERROR,
+                  "Uart::write: failed after %zu/%zu bytes: %s",
+                  total, len, ::strerror(errno));
+            return false;
+        }
+        total += static_cast<size_t>(n);
     }
     return true;
 }

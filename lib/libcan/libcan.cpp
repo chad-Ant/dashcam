@@ -3,12 +3,13 @@
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
+#include <poll.h>
 #include <sys/ioctl.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -180,9 +181,12 @@ void CanBus::setFilters(const std::vector<CanFilter>& filters) {
         }
         kf.push_back(k);
     }
-    ::setsockopt(m_fd, SOL_CAN_RAW, CAN_RAW_FILTER,
-                 kf.data(),
-                 static_cast<socklen_t>(kf.size() * sizeof(struct can_filter)));
+    if (::setsockopt(m_fd, SOL_CAN_RAW, CAN_RAW_FILTER,
+                     kf.data(),
+                     static_cast<socklen_t>(kf.size() * sizeof(struct can_filter))) < 0) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "CanBus::setFilters: CAN_RAW_FILTER failed: %s", ::strerror(errno));
+    }
 }
 
 void CanBus::setReceiveCallback(ReceiveCallback cb) {
@@ -197,16 +201,37 @@ void CanBus::setErrorCallback(ErrorCallback cb) {
 
 bool CanBus::send(const CanFrame& frame) {
     if (m_fd < 0) return false;
+
+    // Reject rather than silently truncate/downgrade — a caller sending more
+    // bytes than the frame type holds, or an FD frame on a non-FD socket, is a
+    // bug we want surfaced, not quietly corrupted data on the bus.
+    if (frame.fdFrame) {
+        if (!m_fdEnabled) {
+            doLog(m_log, dashcam::log::LogLevel::ERROR,
+                  "CanBus::send: FD frame requested but FD is not enabled on this socket");
+            return false;
+        }
+        if (frame.len > CAN_FD_DLEN) {
+            doLog(m_log, dashcam::log::LogLevel::ERROR,
+                  "CanBus::send: FD payload %u exceeds %u bytes", frame.len, CAN_FD_DLEN);
+            return false;
+        }
+    } else if (frame.len > CAN_CLASSIC_DLEN) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "CanBus::send: classic payload %u exceeds %u bytes", frame.len, CAN_CLASSIC_DLEN);
+        return false;
+    }
+
     std::lock_guard<std::mutex> lk(m_sendMtx);
 
     ssize_t written;
-    if (frame.fdFrame && m_fdEnabled) {
+    if (frame.fdFrame) {   // m_fdEnabled and length already validated above
         struct canfd_frame cf{};
         cf.can_id = frame.id;
         if (frame.extended) cf.can_id |= CAN_EFF_FLAG;
         cf.flags = 0;
         if (frame.brs) cf.flags |= CANFD_BRS;
-        cf.len = (frame.len <= CAN_FD_DLEN) ? frame.len : CAN_FD_DLEN;
+        cf.len = frame.len;
         std::memcpy(cf.data, frame.data, cf.len);
         written = ::write(m_fd, &cf, sizeof(cf));
         if (written != static_cast<ssize_t>(sizeof(cf))) {
@@ -219,7 +244,7 @@ bool CanBus::send(const CanFrame& frame) {
         cf.can_id = frame.id;
         if (frame.extended) cf.can_id |= CAN_EFF_FLAG;
         if (frame.rtr)      cf.can_id |= CAN_RTR_FLAG;
-        cf.can_dlc = (frame.len <= CAN_CLASSIC_DLEN) ? frame.len : CAN_CLASSIC_DLEN;
+        cf.can_dlc = frame.len;
         std::memcpy(cf.data, frame.data, cf.can_dlc);
         written = ::write(m_fd, &cf, sizeof(cf));
         if (written != static_cast<ssize_t>(sizeof(cf))) {
@@ -270,31 +295,40 @@ bool CanBus::isRunning() const { return m_running.load(); }
 // ─── rxLoop ───────────────────────────────────────────────────────────────────
 
 void CanBus::rxLoop() {
+    // poll() (not select()) so this keeps working when the CAN fd lands at or
+    // above FD_SETSIZE (1024) — plausible on a box running several GStreamer
+    // camera pipelines, where select() would smash the stack.
     while (m_running.load()) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(m_fd,      &rfds);
-        FD_SET(m_pipe[0], &rfds);
-        int nfds = std::max(m_fd, m_pipe[0]) + 1;
+        struct pollfd pfds[2];
+        pfds[0].fd = m_fd;      pfds[0].events = POLLIN; pfds[0].revents = 0;
+        pfds[1].fd = m_pipe[0]; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int ret = ::select(nfds, &rfds, nullptr, nullptr, nullptr);
+        int ret = ::poll(pfds, 2, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             ErrorCallback localErrCb;
             { std::lock_guard<std::mutex> lk(m_cbMtx); localErrCb = m_errCb; }
             if (localErrCb)
-                localErrCb(std::string("CanBus: select() error: ") + ::strerror(errno));
+                localErrCb(std::string("CanBus: poll() error: ") + ::strerror(errno));
             break;
         }
 
         // Wake pipe: stop() was called.
-        if (FD_ISSET(m_pipe[0], &rfds)) {
+        if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
             uint8_t buf[16];
-            ::read(m_pipe[0], buf, sizeof(buf));
+            (void)::read(m_pipe[0], buf, sizeof(buf));
             break;
         }
 
-        if (!FD_ISSET(m_fd, &rfds)) continue;
+        // A persistent error on the socket would otherwise spin the loop.
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            ErrorCallback localErrCb;
+            { std::lock_guard<std::mutex> lk(m_cbMtx); localErrCb = m_errCb; }
+            if (localErrCb) localErrCb("CanBus: socket poll error (POLLERR/POLLHUP)");
+            break;
+        }
+
+        if (!(pfds[0].revents & POLLIN)) continue;
 
         // Read into a canfd_frame-sized buffer; the return value disambiguates.
         struct canfd_frame cf{};

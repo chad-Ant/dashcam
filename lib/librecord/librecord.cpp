@@ -236,7 +236,8 @@ void Recorder::disconnect() {
 
 GstElement* Recorder::createRecordingBin(const std::string& filename,
                                           uint32_t frNum, uint32_t frDen,
-                                          const dashcam::config::EncoderConfig& enc) {
+                                          const dashcam::config::EncoderConfig& enc,
+                                          uint32_t queueDepth) {
     disconnect();
 
     std::string x264Opts =
@@ -250,7 +251,7 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
         "nvvidconv name=conv ! video/x-raw,format=(string)BGRx "
         "! cairooverlay name=cairoov "
         "! videoconvert ! video/x-raw,format=(string)I420 "
-        "! queue max-size-buffers=3 leaky=0 "
+        "! queue max-size-buffers=" + std::to_string(queueDepth) + " leaky=0 "
         "! videorate ! video/x-raw,framerate=" +
         std::to_string(frNum) + "/" + std::to_string(frDen) + " "
         "! x264enc" + x264Opts + " insert-vui=true aud=true "

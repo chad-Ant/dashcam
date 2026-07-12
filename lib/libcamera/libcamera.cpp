@@ -16,6 +16,8 @@ struct ScopedFd {
     int fd;
     explicit ScopedFd(int fd) : fd(fd) {}
     ~ScopedFd() { if (fd >= 0) ::close(fd); }
+    ScopedFd(const ScopedFd&)            = delete;  // non-copyable: prevents double-close
+    ScopedFd& operator=(const ScopedFd&) = delete;
     operator int() const { return fd; }
 };
 
@@ -137,18 +139,24 @@ static void populateCameraVideoFormats(int fd, cameraInfo& info) {
 
     queryPixelFormats(fd, info);
 
+    // Each stage expands the previous set (format → +resolution → +framerate),
+    // so the running total is bounded to MAX_VIDEO_FORMATS to cap the cross
+    // product.  A stage may overshoot by up to one query's worth of entries;
+    // trim afterwards so currentFormatIndex (uint16_t) stays addressable.
     std::vector<cameraVideoFormat> tempFormats;
     size_t tempFormatCount = info.videoFormats.size();
-    for (size_t i = 0; i < tempFormatCount; ++i) {
+    for (size_t i = 0; i < tempFormatCount && tempFormats.size() < MAX_VIDEO_FORMATS; ++i) {
         queryResolutions(fd, info.videoFormats[i], tempFormats);
     }
+    if (tempFormats.size() > MAX_VIDEO_FORMATS) tempFormats.resize(MAX_VIDEO_FORMATS);
     info.videoFormats = tempFormats;
 
     tempFormatCount = info.videoFormats.size();
     tempFormats.clear();
-    for (size_t i = 0; i < tempFormatCount; ++i) {
+    for (size_t i = 0; i < tempFormatCount && tempFormats.size() < MAX_VIDEO_FORMATS; ++i) {
         queryFrameRates(fd, info.videoFormats[i], tempFormats);
     }
+    if (tempFormats.size() > MAX_VIDEO_FORMATS) tempFormats.resize(MAX_VIDEO_FORMATS);
     info.videoFormats = tempFormats;
 }
 
@@ -229,8 +237,16 @@ static void populateCameraAttributes(int fd, cameraInfo& info) {
         attr.menuOptions.clear();
 
         if (attr.type == CAMERA_ATTRIBUTE_TYPE::MENU) {
-            for (int i = queryctrl.minimum; i <= queryctrl.maximum; ++i) {
-                if (attr.menuOptions.size() >= MAX_MENU_OPTIONS) break;
+            // Menu indices may be sparse, so scanning stops on either the option
+            // cap or a bounded span — the latter guards against a driver that
+            // misreports a huge maximum (which would otherwise spam ioctls and
+            // risk signed overflow on ++i near INT_MAX).
+            uint32_t scanned = 0;
+            for (int i = queryctrl.minimum;
+                 i <= queryctrl.maximum
+                 && attr.menuOptions.size() < MAX_MENU_OPTIONS
+                 && scanned < MAX_MENU_OPTIONS * 64u;
+                 ++i, ++scanned) {
                 struct v4l2_querymenu querymenu;
                 memset(&querymenu, 0, sizeof(querymenu));
                 querymenu.id    = queryctrl.id;

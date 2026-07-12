@@ -1,13 +1,13 @@
 #include "libgpio.h"
 
 #include <gpiod.h>
+#include <poll.h>
 #include <unistd.h>
-#include <sys/select.h>
 
 #include <chrono>
 #include <thread>
 
-#include <algorithm>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -259,7 +259,21 @@ void GpioWatcher::stop() {
             doLog(m_log, dashcam::log::LogLevel::WARN,
                   "GpioWatcher::stop: write to wake pipe failed: %s", ::strerror(errno));
     }
-    if (m_thread.joinable()) m_thread.join();
+    if (m_thread.joinable()) {
+        if (std::this_thread::get_id() == m_thread.get_id()) {
+            // stop()/close() was called from inside the edge callback, i.e. on
+            // the watcher thread itself — joining self would deadlock.  Detach
+            // instead: watchLoop() has already cleared m_running and returns
+            // without touching any member again, so this is a best-effort escape,
+            // not the supported pattern (see header).
+            doLog(m_log, dashcam::log::LogLevel::WARN,
+                  "GpioWatcher::stop: called from the edge callback; detaching "
+                  "(do not tear down from within the callback)");
+            m_thread.detach();
+        } else {
+            m_thread.join();
+        }
+    }
     doLog(m_log, dashcam::log::LogLevel::INFO, "GpioWatcher::stop: thread stopped");
 }
 
@@ -281,24 +295,31 @@ void GpioWatcher::watchLoop() {
     }
 
     while (m_running.load()) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(evtFd,     &rfds);
-        FD_SET(m_pipe[0], &rfds);
-        int nfds = std::max(evtFd, m_pipe[0]) + 1;
+        // poll() (not select()) so this survives an event fd >= FD_SETSIZE (1024),
+        // which select() cannot represent without corrupting the stack.
+        struct pollfd pfds[2];
+        pfds[0].fd = evtFd;     pfds[0].events = POLLIN; pfds[0].revents = 0;
+        pfds[1].fd = m_pipe[0]; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int ret = ::select(nfds, &rfds, nullptr, nullptr, nullptr);
+        int ret = ::poll(pfds, 2, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        if (FD_ISSET(m_pipe[0], &rfds)) {
-            uint8_t buf[16]; ::read(m_pipe[0], buf, sizeof(buf));
+        if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+            uint8_t buf[16]; (void)::read(m_pipe[0], buf, sizeof(buf));
             break;
         }
 
-        if (!FD_ISSET(evtFd, &rfds)) continue;
+        // Break on a persistent event-fd error rather than spinning on it.
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            doLog(m_log, dashcam::log::LogLevel::ERROR,
+                  "GpioWatcher: event fd poll error");
+            break;
+        }
+
+        if (!(pfds[0].revents & POLLIN)) continue;
 
         struct gpiod_line_event evt{};
         if (gpiod_line_event_read(m_line, &evt) < 0) continue; //beware of bouncing button or noisy signal

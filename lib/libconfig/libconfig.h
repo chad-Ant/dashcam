@@ -249,6 +249,47 @@ struct SystemConfig {
 };
 
 /**
+ * @brief Camera GStreamer pipeline timing and queue tuning.
+ *
+ * libcamera cannot depend on libconfig (that would be circular — libconfig.cpp
+ * includes libcamera.h), so main.cpp copies these values into a
+ * dashcam::camera::PipelineParams and calls Camera_GST::setPipelineParams().
+ * XML section: @c \<Pipeline\>
+ */
+struct PipelineConfig {
+    ConfigVar<int> captureTimeoutMs     {"CaptureTimeoutMs",     1000, 10,  10000, 10,  "captureFrame() maximum wait for a frame (ms)"};
+    ConfigVar<int> stateChangeTimeoutMs {"StateChangeTimeoutMs", 5000, 500, 30000, 100, "Async PLAYING/NULL state-change wait (ms)"};
+    ConfigVar<int> eosTimeoutMs         {"EosTimeoutMs",         5000, 500, 30000, 100, "Teardown EOS flush wait (ms)"};
+    ConfigVar<int> captureQueueDepth    {"CaptureQueueDepth",    2,    1,   32,    1,   "appsink-branch leaky queue depth (buffers)"};
+    ConfigVar<int> appsinkMaxBuffers    {"AppsinkMaxBuffers",    1,    1,   8,     1,   "appsink max-buffers (latest-frame depth)"};
+};
+
+/**
+ * @brief Recording-branch tuning.  Codec parameters live in EncoderConfig.
+ * XML section: @c \<Recording\>
+ */
+struct RecordingConfig {
+    ConfigVar<int> recordFps  {"RecordFps",  30, 1, 120, 1, "Recording framerate after videorate downsample (fps); capped at the camera rate"};
+    ConfigVar<int> queueDepth {"QueueDepth", 3,  1, 32,  1, "Recording-branch queue depth (buffers)"};
+};
+
+/**
+ * @brief Inference rate caps and thresholds — the operator-tunable subset only.
+ *
+ * Model-locked parameters (input dimensions, class counts, ImageNet mean/std)
+ * deliberately stay in each detector's own config struct so they cannot be
+ * desynced from the TRT engine via the XML file.  XML section: @c \<Detection\>
+ */
+struct DetectionConfig {
+    ConfigVar<int>   laneTargetHz      {"LaneTargetHz",      20,    0,    60,   1,     "Lane inference rate cap (Hz); 0 = unthrottled"};
+    ConfigVar<float> laneReferenceY    {"LaneReferenceY",    0.90f, 0.5f, 1.0f, 0.01f, "Row (fraction of height) where lane x-positions are sampled"};
+    ConfigVar<int>   signTargetHz      {"SignTargetHz",      5,     0,    30,   1,     "Sign inference rate cap (Hz)"};
+    ConfigVar<float> signConfThreshold {"SignConfThreshold", 0.50f, 0.0f, 1.0f, 0.01f, "Sign detection confidence threshold"};
+    ConfigVar<float> signNmsThreshold  {"SignNmsThreshold",  0.45f, 0.0f, 1.0f, 0.01f, "Sign NMS IoU threshold"};
+    ConfigVar<int>   driverTargetHz    {"DriverTargetHz",    1,     0,    30,   1,     "Driver-state inference rate cap (Hz)"};
+};
+
+/**
  * @brief Aggregated application configuration.
  * Root XML element: @c \<DashcamConfig\>
  */
@@ -257,6 +298,9 @@ struct AppConfig {
     OverlayConfig             overlay;
     std::vector<CameraConfig> cameras;
     SystemConfig              system;
+    PipelineConfig            pipeline;
+    RecordingConfig           recording;
+    DetectionConfig           detection;
 };
 
 // ─── reader / writer ─────────────────────────────────────────────────────────

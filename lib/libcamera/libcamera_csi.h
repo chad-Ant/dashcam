@@ -74,13 +74,13 @@ protected:
                                     uint32_t frNum, uint32_t frDen) const override;
 
     /**
-     * @brief Apply a CSI sensor attribute via g_object_set on nvarguscamerasrc.
+     * @brief Returns "CSI"; scopes AttributeDictionary resolution to CSI entries.
      *
-     * Resolves the attribute name via the loaded AttributeDictionary.  Supported
-     * properties include exposuretimerange, gainrange, aelock, awblock, wbmode,
-     * saturation, and the TNR/EE families.
+     * Attributes are applied by the base Camera_GST::applyAttributeGStreamer()
+     * against nvarguscamerasrc.  Supported properties include exposuretimerange,
+     * gainrange, aelock, awblock, wbmode, saturation, and the TNR/EE families.
      */
-    void applyAttributeGStreamer(const std::string& name, const std::string& value) override;
+    const char* cameraTypeTag() const override;
 
 public:
     /**

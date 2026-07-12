@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -98,21 +99,47 @@ bool I2cBus::writeReg16(uint8_t addr, uint8_t reg, uint16_t value) {
 }
 
 bool I2cBus::readReg8(uint8_t addr, uint8_t reg, uint8_t& value) {
-    if (!write(addr, &reg, 1)) return false;
-    return read(addr, &value, 1);
+    return readRegs(addr, reg, &value, 1);
 }
 
 bool I2cBus::readReg16(uint8_t addr, uint8_t reg, uint16_t& value) {
     uint8_t buf[2];
-    if (!write(addr, &reg, 1)) return false;
-    if (!read(addr, buf, 2))   return false;
+    if (!readRegs(addr, reg, buf, 2)) return false;
     value = (static_cast<uint16_t>(buf[0]) << 8) | buf[1];
     return true;
 }
 
 bool I2cBus::readRegs(uint8_t addr, uint8_t reg, uint8_t* buf, size_t len) {
-    if (!write(addr, &reg, 1)) return false;
-    return read(addr, buf, len);
+    if (m_fd < 0 || buf == nullptr || len == 0 || len > 0xFFFF) return false;
+
+    // Single I2C_RDWR transaction: write the register pointer, then read, joined
+    // by a repeated-START (no intervening STOP).  This is atomic on the bus and
+    // works with devices that require repeated-START, unlike a separate
+    // write() then read().  Requires an adapter with I2C_FUNC_I2C (standard on
+    // the Tegra controllers).
+    struct i2c_msg msgs[2];
+    msgs[0].addr  = addr;
+    msgs[0].flags = 0;                              // write
+    msgs[0].len   = 1;
+    msgs[0].buf   = &reg;
+    msgs[1].addr  = addr;
+    msgs[1].flags = I2C_M_RD;                       // read (repeated-START)
+    msgs[1].len   = static_cast<uint16_t>(len);
+    msgs[1].buf   = buf;
+
+    struct i2c_rdwr_ioctl_data xfer;
+    xfer.msgs  = msgs;
+    xfer.nmsgs = 2;
+
+    // I2C_RDWR carries the address per message and does not disturb the
+    // I2C_SLAVE state, so m_curTarget stays valid for later read()/write().
+    if (::ioctl(m_fd, I2C_RDWR, &xfer) < 0) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "I2cBus::readRegs [0x%02X reg 0x%02X, %zu bytes]: %s",
+              addr, reg, len, ::strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 bool I2cBus::scanBus(std::vector<uint8_t>& found) {
@@ -142,10 +169,20 @@ void I2cBus::setDevice(uint8_t addr) {
 }
 
 bool I2cBus::send(const uint8_t* buf, size_t len) {
+    if (m_curTarget < 0) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "I2cBus::send: no device selected — call setDevice() first");
+        return false;
+    }
     return write(static_cast<uint8_t>(m_curTarget), buf, len);
 }
 
 int I2cBus::receive(uint8_t* buf, size_t len, int /*timeoutMs*/) {
+    if (m_curTarget < 0) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "I2cBus::receive: no device selected — call setDevice() first");
+        return -1;
+    }
     return read(static_cast<uint8_t>(m_curTarget), buf, len)
         ? static_cast<int>(len) : -1;
 }
