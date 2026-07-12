@@ -86,6 +86,26 @@ struct OverlayData {
     int64_t timestampMs     = 1777633580; ///< UNIX epoch timestamp in milliseconds.
 };
 
+// ─── source memory type ───────────────────────────────────────────────────────
+
+/**
+ * @brief Memory domain of the frames the recording bin will receive from the tee.
+ *
+ * Selects the bin's inlet converter so the recorder works on either capture stack:
+ *   - NVMM   → CSI/Argus tee delivers @c video/x-raw(memory:NVMM),NV12.  The inlet
+ *              is @c nvvidconv, the only element that pulls buffers off NVMM and
+ *              (via the VIC) converts to system-memory BGRx for Cairo.
+ *   - System → USB/V4L2 tee delivers plain @c video/x-raw (YUY2/UYVY/I420/…, after
+ *              jpegdec for MJPEG cams).  The inlet is @c videoconvert, which accepts
+ *              every raw format a UVC webcam can emit — nvvidconv rejects some — and
+ *              avoids an unnecessary VIC round-trip on an already-CPU-side buffer.
+ *
+ * The caller knows the camera type (it built a Camera_CSI or Camera_USB), so it
+ * passes the matching value to createRecordingBin().  Default is NVMM to preserve
+ * the historical CSI-only behaviour.
+ */
+enum class SourceMemory { NVMM, System };
+
 // ─── Recorder ─────────────────────────────────────────────────────────────────
 
 /**
@@ -174,13 +194,26 @@ public:
      * @param frDen       Target frame rate denominator.
      * @param enc         Encoder parameters (bitrate, speed-preset, keyIntMax, tune).
      * @param queueDepth  Depth (buffers) of the pre-encoder queue; from RecordingConfig::queueDepth.
+     * @param srcMem      Memory domain of the tee frames (SourceMemory::NVMM for a
+     *                    CSI/Argus camera, SourceMemory::System for a USB/V4L2 camera).
+     *                    Selects the bin inlet (nvvidconv vs videoconvert).
+     * @param outWidth    Encoder input width; 0 = keep the source width (no scaling).
+     * @param outHeight   Encoder input height; 0 = keep the source height (no scaling).
+     *                    When BOTH are > 0 the bin downscales at the inlet — on the
+     *                    VIC for NVMM (free), via videoscale for System — before the
+     *                    Cairo overlay and the CPU x264enc.  This is the cheapest way
+     *                    to trim a secondary/debug branch's encode cost (encoder CPU
+     *                    scales with pixel rate).  Keep the source aspect ratio to
+     *                    avoid distortion (e.g. 1456x1088 → 728x544).
      * @return Newly created GstBin (floating ref) on success; nullptr on failure.
      *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
      */
     GstElement* createRecordingBin(const std::string& filename,
                                    uint32_t frNum = 60, uint32_t frDen = 1,
                                    const dashcam::config::EncoderConfig& enc = {},
-                                   uint32_t queueDepth = 3);
+                                   uint32_t queueDepth = 3,
+                                   SourceMemory srcMem = SourceMemory::NVMM,
+                                   uint32_t outWidth = 0, uint32_t outHeight = 0);
 
     // ─── lifecycle ─────────────────────────────────────────────────────────────
 

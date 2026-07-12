@@ -258,7 +258,9 @@ void Recorder::onCairoOverlayDestroyed(gpointer user_data, GObject* /*where*/) {
 GstElement* Recorder::createRecordingBin(const std::string& filename,
                                           uint32_t frNum, uint32_t frDen,
                                           const dashcam::config::EncoderConfig& enc,
-                                          uint32_t queueDepth) {
+                                          uint32_t queueDepth,
+                                          SourceMemory srcMem,
+                                          uint32_t outWidth, uint32_t outHeight) {
     disconnect();
 
     // enc.speedPreset / enc.tune are ConfigVar<std::string>: read them into
@@ -274,8 +276,30 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
     if (!tune.empty())
         x264Opts += " tune=" + tune;
 
+    // Optional inlet downscale: only when BOTH dimensions are given.  Scaling here
+    // — before Cairo and the CPU encoder — sheds the most work, and (for NVMM) it
+    // rides the VIC inside nvvidconv for free.  Keep the source aspect ratio to
+    // avoid distortion.
+    const bool scale = (outWidth > 0 && outHeight > 0);
+    const std::string wh = scale
+        ? ",width=(int)" + std::to_string(outWidth) + ",height=(int)" + std::to_string(outHeight)
+        : std::string();
+
+    // Inlet: nvvidconv for NVMM (CSI) — the only element that can pull buffers off
+    // NVMM, and it scales on the VIC — or videoconvert (+videoscale when scaling)
+    // for system memory (USB), which accepts any raw UVC format and skips a needless
+    // VIC round-trip.  Both emit BGRx[,WxH] for the Cairo overlay stage.
+    std::string inletChain;
+    if (srcMem == SourceMemory::System) {
+        inletChain = scale
+            ? "videoconvert name=conv ! videoscale ! video/x-raw,format=(string)BGRx" + wh
+            : "videoconvert name=conv ! video/x-raw,format=(string)BGRx";
+    } else {
+        inletChain = "nvvidconv name=conv ! video/x-raw,format=(string)BGRx" + wh;
+    }
+
     const std::string binDesc =
-        "nvvidconv name=conv ! video/x-raw,format=(string)BGRx "
+        inletChain + " "
         "! cairooverlay name=cairoov "
         "! videoconvert ! video/x-raw,format=(string)I420 "
         "! queue max-size-buffers=" + std::to_string(queueDepth) + " leaky=0 "
