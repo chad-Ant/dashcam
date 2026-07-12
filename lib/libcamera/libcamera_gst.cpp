@@ -402,6 +402,7 @@ void Camera_GST::setCameraVideoFormat(uint16_t formatIndex) {
         return;
     }
     status_.currentFormatIndex = formatIndex;
+    status_.currentError = ERROR_CODE::NONE;  // success clears any prior error
 }
 
 void Camera_GST::getCameraStatus(cameraStatus& status) const {
@@ -425,6 +426,11 @@ void Camera_GST::start() {
         }
         formatIndex = status_.currentFormatIndex;
         status_.status = CAMERA_STATUS::RUNNING;  // Optimistic claim; Phase 2 proceeds, or setPipelineError() reverts.
+        // Clear any stale error (e.g. a prior out-of-range setCameraVideoFormat)
+        // so a successful start() reports NONE.  Genuine failures below override
+        // this: setPipelineError() sets ERROR, and the attribute flushes set
+        // INVALID_ATTRIBUTE — both run after this point.
+        status_.currentError = ERROR_CODE::NONE;
     }
 
     const auto& fmt = info_.videoFormats[formatIndex];
@@ -554,9 +560,41 @@ void Camera_GST::start() {
         GstPadLinkReturn ret = gst_pad_link(teeSrcPad, queueSinkPad);
         gst_object_unref(queueSinkPad);
 
-        if (ret != GST_PAD_LINK_OK ||
-            !gst_element_link(queue, valve) ||
-            !gst_element_link(valve, branchBin)) {
+        // Link the branch in dataflow order: tee→queue (above), then queue→valve,
+        // then valve→branch.  queue→valve MUST be linked before valve→branch: once
+        // valve→branch is established the valve becomes caps-transparent to the
+        // branch's (system-only) sink, which would then make a strict queue→valve
+        // link fail against the NVMM tee source.
+        bool queueValveLinked = gst_element_link(queue, valve);
+
+        // valve→branch uses a relaxed pad link that skips the premature query-caps
+        // intersection.  A pre-built branch bin whose head is nvvidconv feeding a
+        // system-memory consumer (e.g. the cairo recorder in librecord) reports a
+        // *system-only* sink in NULL state — the fixed system-memory output
+        // back-propagates through the bin — so a strict gst_element_link() refuses
+        // an NVMM (CSI) tee source with NOFORMAT even though nvvidconv negotiates
+        // NVMM→system fine once PLAYING.  Hierarchy and template caps are still
+        // enforced; any real negotiation failure surfaces on the bus via
+        // checkBusErrors().  Fall back to a strict link if the branch does not
+        // expose a conventionally named "sink" ghost pad.
+        bool valveLinked = false;
+        if (queueValveLinked) {
+            GstPad* branchSink = gst_element_get_static_pad(branchBin, "sink");
+            if (branchSink) {
+                GstPad* valveSrc = gst_element_get_static_pad(valve, "src");
+                valveLinked = valveSrc &&
+                    gst_pad_link_full(valveSrc, branchSink,
+                        static_cast<GstPadLinkCheck>(GST_PAD_LINK_CHECK_HIERARCHY |
+                                                     GST_PAD_LINK_CHECK_TEMPLATE_CAPS))
+                        == GST_PAD_LINK_OK;
+                if (valveSrc) gst_object_unref(valveSrc);
+                gst_object_unref(branchSink);
+            } else {
+                valveLinked = gst_element_link(valve, branchBin);
+            }
+        }
+
+        if (ret != GST_PAD_LINK_OK || !queueValveLinked || !valveLinked) {
             doLog(log_, dashcam::log::LogLevel::ERROR,
                   "pad/element link failed for branch '%s'", branchName.c_str());
             gst_element_release_request_pad(tee_, teeSrcPad);

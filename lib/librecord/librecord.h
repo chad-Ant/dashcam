@@ -221,6 +221,17 @@ private:
 
     /** @brief GStreamer "caps-changed" callback; stores frame dimensions. */
     static void onCairoCapsChanged(GstElement*, GstCaps*, gpointer);
+
+    /**
+     * @brief GObject weak-ref notify: the cairooverlay element was finalised.
+     *
+     * Fires when the recording bin (and its cairooverlay) is destroyed — e.g.
+     * the camera pipeline is torn down (a failed start(), or stop()/close()
+     * called before disconnect()).  Nulls cairoOverlay_ and the handler IDs
+     * under overlayMutex_ so a subsequent disconnect()/~Recorder becomes a safe
+     * no-op instead of dereferencing freed memory.
+     */
+    static void onCairoOverlayDestroyed(gpointer user_data, GObject* where);
 };
 
 } // namespace dashcam::record

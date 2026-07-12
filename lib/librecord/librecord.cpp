@@ -227,9 +227,30 @@ void Recorder::disconnect() {
         videoHeight_  = 0;
     }
     if (cairoOv) {
+        // We won the claim, so the element is still alive: drop the weak ref
+        // (so onCairoOverlayDestroyed can't fire later on this Recorder) before
+        // disconnecting the signal handlers.  Both calls are outside the lock —
+        // g_signal_handler_disconnect blocks until any in-flight draw callback
+        // returns, and that callback takes overlayMutex_, so holding it here
+        // would deadlock.
+        g_object_weak_unref(G_OBJECT(cairoOv),
+                            &Recorder::onCairoOverlayDestroyed, this);
         g_signal_handler_disconnect(cairoOv, drawId);
         g_signal_handler_disconnect(cairoOv, capsId);
     }
+}
+
+void Recorder::onCairoOverlayDestroyed(gpointer user_data, GObject* /*where*/) {
+    auto* self = static_cast<Recorder*>(user_data);
+    std::lock_guard<std::mutex> lock(self->overlayMutex_);
+    // The element is being finalised: drop our handle so disconnect() no-ops.
+    // Do NOT g_signal_handler_disconnect or g_object_weak_unref here — the
+    // element's handlers and weak refs are already being torn down.
+    self->cairoOverlay_ = nullptr;
+    self->cairoDrawId_  = 0;
+    self->cairoCapsId_  = 0;
+    self->videoWidth_   = 0;
+    self->videoHeight_  = 0;
 }
 
 // ─── recording bin ────────────────────────────────────────────────────────────
@@ -240,12 +261,18 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
                                           uint32_t queueDepth) {
     disconnect();
 
+    // enc.speedPreset / enc.tune are ConfigVar<std::string>: read them into
+    // std::string locals first.  ConfigVar's implicit operator const T& is not
+    // considered in `"literal" + configvar` (operator+ template deduction) nor
+    // for member access like enc.tune.empty(), so use plain strings from here on.
+    const std::string speedPreset = enc.speedPreset;
+    const std::string tune        = enc.tune;
     std::string x264Opts =
-        " speed-preset=" + enc.speedPreset +
+        " speed-preset=" + speedPreset +
         " bitrate=" + std::to_string(enc.bitrate) +
         " key-int-max=" + std::to_string(enc.keyIntMax);
-    if (!enc.tune.empty())
-        x264Opts += " tune=" + enc.tune;
+    if (!tune.empty())
+        x264Opts += " tune=" + tune;
 
     const std::string binDesc =
         "nvvidconv name=conv ! video/x-raw,format=(string)BGRx "
@@ -293,6 +320,13 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
                                      G_CALLBACK(Recorder::onCairoDraw), this);
     gulong capsId = g_signal_connect(cairoOv, "caps-changed",
                                      G_CALLBACK(Recorder::onCairoCapsChanged), this);
+
+    // Auto-null cairoOverlay_ if the element is finalised (pipeline torn down)
+    // before disconnect() is called, so disconnect()/~Recorder never dereference
+    // a freed element.  The element stays alive via the bin; the weak ref only
+    // fires on its destruction.
+    g_object_weak_ref(G_OBJECT(cairoOv),
+                      &Recorder::onCairoOverlayDestroyed, this);
     gst_object_unref(cairoOv);
 
     {

@@ -86,7 +86,10 @@ void init(const std::string& logDir) {
         logger->set_level(levelFromEnv());
         spdlog::register_logger(logger);
         // Publish atomically; the callback reads it via std::atomic_load.
-        std::atomic_store(&g_logger, logger);
+        // g_logger is shared_ptr<spdlog::logger>; upcast the async_logger so the
+        // std::atomic_store overload deduces a single element type.
+        std::atomic_store(&g_logger,
+                          std::static_pointer_cast<spdlog::logger>(logger));
     } catch (const spdlog::spdlog_ex& ex) {
         std::fprintf(stderr, "liblog: spdlog init failed: %s\n", ex.what());
         // g_logger was never published; callbacks fall back to stderr.

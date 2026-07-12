@@ -17,7 +17,7 @@
       <Enabled>true</Enabled>
       <Device>/dev/video0</Device>
       <SensorId>0</SensorId>
-      <FormatIndex>4</FormatIndex>
+      <FormatIndex>0</FormatIndex>
       <Attributes>
         <Attribute name="Camera Controls" writable="false" readable="false" min="0" max="0" step="0" />
         <Attribute name="Group Hold" writable="true" readable="true" min="0" max="1" step="1" />

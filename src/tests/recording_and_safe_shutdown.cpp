@@ -263,10 +263,14 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Testing libcamera via " << csiInfo.address
               << " (Argus sensor-id " << csiInfo.deviceId << ")...\n";
+    // speedPreset/tune are ConfigVar<std::string>: the free operator<<(ostream,string)
+    // template won't apply ConfigVar's implicit conversion, so read into locals first.
+    const std::string encPreset = cfg.encoder.speedPreset;
+    const std::string encTune   = cfg.encoder.tune;
     std::cout << "Encoder: bitrate=" << cfg.encoder.bitrate
-              << " preset=" << cfg.encoder.speedPreset
+              << " preset=" << encPreset
               << " key-int-max=" << cfg.encoder.keyIntMax;
-    if (!cfg.encoder.tune.empty()) std::cout << " tune=" << cfg.encoder.tune;
+    if (!encTune.empty()) std::cout << " tune=" << encTune;
     std::cout << "\nWarmup frames: " << cfg.system.warmupFrames << "\n";
 
     bool t1 = test_recording_overlay(csiInfo, cfg, attrDict);
