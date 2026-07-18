@@ -11,9 +11,12 @@
 #ifndef LIBCAMERA_H
 #define LIBCAMERA_H
 
+#include "liblog.h"
 #include <cstdint>
 #include <string>
 #include <vector>
+
+namespace dashcam::camera {
 
 // ─── limits ──────────────────────────────────────────────────────────────────
 
@@ -44,7 +47,8 @@ enum class ERROR_CODE {
     CSI_PIPELINE_ERROR     = -6, ///< GStreamer pipeline construction or state-change failed (CSI/Argus path).
     CSI_ID_PARSE_ERROR     = -7, ///< Argus sensor-id could not be determined.
     USB_PIPELINE_ERROR     = -8, ///< GStreamer pipeline construction or state-change failed (USB/V4L2 path).
-    UNKNOWN_ERROR          = -9  ///< Unclassified error.
+    UNKNOWN_ERROR          = -9, ///< Unclassified error.
+    CAMERA_NOT_OPEN        = -10 ///< start() called while the camera is not in OPEN state.
 };
 
 /**
@@ -158,18 +162,26 @@ struct cameraInfo {
  * reports @c V4L2_CAP_VIDEO_CAPTURE, the function probes supported pixel
  * formats, discrete resolutions, discrete frame rates, and V4L2 controls.
  *
- * CSI cameras (driver: @c tegra-video or @c vi) receive a sequential Argus
- * sensor-id in @c cameraInfo::deviceId rather than the raw V4L2 device index.
- * USB cameras (driver: @c uvcvideo) receive the raw numeric device index.
+ * CSI cameras (driver: @c tegra-video or @c vi) receive their Argus sensor-id
+ * in @c cameraInfo::deviceId, resolved via the device tree's
+ * tegra-camera-platform module list (video-node order follows i2c probe order,
+ * which can differ from Argus order with mixed sensors).  If the device tree
+ * chain cannot be resolved, a sequential id in /dev/videoN order is assumed
+ * and a WARN is logged.  USB cameras (driver: @c uvcvideo) receive the raw
+ * numeric device index.
  *
  * @param[out] cameraList  Cleared and populated with one entry per discovered
  *                         capture device.  The vector may be empty on return
  *                         if no devices are found.
+ * @param[in]  log         Optional diagnostic callback; warns when a device's
+ *                         format cross-product exceeds MAX_VIDEO_FORMATS and
+ *                         the list is truncated.
  * @return ERROR_CODE::NONE            if at least one camera was found.
  * @return ERROR_CODE::NO_CAMERAS_FOUND if no capture devices were discovered
  *                                      or @c /dev could not be iterated.
  */
-ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList);
+ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
+                         const dashcam::log::LogCallback& log = {});
 
 // ─── interface ───────────────────────────────────────────────────────────────
 
@@ -268,6 +280,8 @@ public:
      * @pre  Status == OPEN and cameraInfo::videoFormats is not empty.
      * @post Status transitions: OPEN → RUNNING on success, OPEN → ERROR on failure.
      *       Sets CAMERA_ALREADY_RUNNING and returns immediately if already RUNNING.
+     *       Sets CAMERA_NOT_OPEN and returns immediately if the camera is in any
+     *       other non-OPEN state (CLOSED, ERROR).
      */
     virtual void start() = 0;
 
@@ -296,9 +310,87 @@ public:
      *
      * @pre  Status == RUNNING.
      * @note The default BGR appsink branch produces @c video/x-raw,format=BGR frames.
-     *       Required buffer size is width × height × 3 bytes.
+     *       Frames are written tightly packed (row stride = width × 3), so the
+     *       required buffer size is exactly width × height × 3 bytes even when the
+     *       source pads rows to a wider alignment.  A frame whose packed size
+     *       exceeds @p bufferSize is discarded (bytesWritten = 0).
      */
     virtual void captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) = 0;
 };
+
+// ─── attribute dictionary ─────────────────────────────────────────────────────
+
+/**
+ * @brief How a capability value string is converted before being handed to g_object_set().
+ */
+enum class AttributeValueType {
+    String,       ///< Pass value string directly as const char*.
+    Int,          ///< Parse as gint.
+    Float,        ///< Parse as gfloat.
+    Bool,         ///< Parse "true"/"false" or "1"/"0" as gboolean.
+    BoolFromZero, ///< Parse as int; 0 → TRUE, non-zero → FALSE (AE/AWB lock inversion).
+    RangeString,  ///< Mirror single value to "val val" as const char* (nvargus range props).
+};
+
+/**
+ * @brief One entry in the GStreamer attribute dictionary.
+ *
+ * Maps a set of alias names (as written in CameraConfig::capabilities) to the
+ * GStreamer element property name used by the camera source element, together
+ * with the required value conversion type.
+ */
+struct AttributeEntry {
+    std::string        gstProperty;                            ///< Property name passed to g_object_set().
+    std::string        type;                                   ///< Camera type filter: "CSI", "USB", or "any".
+    AttributeValueType valueType = AttributeValueType::String; ///< Value conversion type.
+    std::vector<std::string> aliases;                          ///< Recognized names, matched case-insensitively.
+};
+
+/**
+ * @brief Loaded attribute dictionary mapping capability names to GStreamer properties.
+ *
+ * Loaded once from camera_attributes.xml; passed into every Camera_GST instance via
+ * setAttributeDictionary().  The dictionary is camera-type-scoped: resolve() filters
+ * entries by "CSI", "USB", or "any" to prevent cross-driver mismatches.
+ *
+ * Typical usage:
+ * @code
+ *   dashcam::camera::AttributeDictionary dict;
+ *   dashcam::camera::AttributeDictionary::load("config/camera_attributes.xml", dict);
+ *   camera.setAttributeDictionary(dict);
+ *   camera.setCameraAttribute("exposuretimerange", "13000");
+ * @endcode
+ */
+class AttributeDictionary {
+public:
+    std::vector<AttributeEntry> entries;
+
+    /**
+     * @brief Find the entry matching @p alias for the given camera type.
+     *
+     * Alias comparison is case-insensitive.  An entry whose type is "any"
+     * matches every camera type.
+     *
+     * @param[in] alias       Capability name (e.g. from a CameraConfig::capabilities map).
+     * @param[in] cameraType  "CSI" or "USB".
+     * @return Pointer to the matching entry, or nullptr if not found.
+     */
+    const AttributeEntry* resolve(const std::string& alias,
+                                  const std::string& cameraType) const;
+
+    /**
+     * @brief Parse @p filePath (a camera_attributes.xml) into @p dict.
+     *
+     * @p dict is cleared before loading.  On error, @p dict is left empty.
+     *
+     * @param[in]  filePath  Path to the XML dictionary file.
+     * @param[out] dict      Receives parsed entries.
+     * @return @c true on success; @c false if the file cannot be read or has no root node.
+     */
+    static bool load(const std::string& filePath, AttributeDictionary& dict,
+                     const dashcam::log::LogCallback& log = {});
+};
+
+} // namespace dashcam::camera
 
 #endif // LIBCAMERA_H

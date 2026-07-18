@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <vector>
 
+using namespace dashcam::camera;
+
 void printCameraData(const cameraInfo& info) {
     std::cout << "\n======================================================\n";
     std::cout << "📷 DEVICE: " << info.address << "\n";
@@ -10,8 +12,7 @@ void printCameraData(const cameraInfo& info) {
     switch (info.type) {
         case CAMERA_TYPE::CSI: std::cout << "Jetson CSI (tegra-video / vi)"; break;
         case CAMERA_TYPE::USB: std::cout << "USB Webcam (uvcvideo)"; break;
-        case CAMERA_TYPE::GIGE: std::cout << "GigE Network Camera"; break;
-        default: std::cout << "Unknown"; break;
+        case CAMERA_TYPE::UNKNOWN: std::cout << "Unknown"; break;
     }
     std::cout << "\n======================================================\n";
     
@@ -48,7 +49,7 @@ int main() {
     // ONE LINE OF CODE does all the heavy lifting!
     ERROR_CODE status = getCameraList(myCameras);
 
-    if (status != ERROR_CODE::SUCCESS) {
+    if (status != ERROR_CODE::NONE) {
         std::cerr << "❌ ERROR: The camera discovery process failed.\n";
         return -1;
     }

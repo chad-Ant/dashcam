@@ -1,7 +1,7 @@
 #include "libcamera_usb.h"
-#include <algorithm>
-#include <cctype>
 #include <linux/videodev2.h>
+
+namespace dashcam::camera {
 
 // ─── private helper ──────────────────────────────────────────────────────────
 
@@ -49,46 +49,18 @@ std::string Camera_USB::buildPipelineString(const cameraVideoFormat& fmt,
     return "v4l2src name=camerasrc device=" + info_.address +
            " ! " + formatCaps +
            " ! tee name=srctee"
-           " srctee. ! queue ! videoconvert ! video/x-raw, format=(string)BGR"
-           " ! appsink name=mysink drop=true max-buffers=1 emit-signals=false sync=false";
+           " srctee. ! queue max-size-buffers=" + std::to_string(params_.captureQueueDepth) +
+           " leaky=2 ! videoconvert ! video/x-raw, format=(string)BGR"
+           " ! appsink name=mysink drop=true max-buffers=" + std::to_string(params_.appsinkMaxBuffers) +
+           " emit-signals=false sync=false";
 }
 
-/// Supported attribute names (case-insensitive) and their v4l2src GObject property mappings:
-///   "brightness"  → brightness  (integer; range depends on device)
-///   "contrast"    → contrast    (integer; range depends on device)
-///   "saturation"  → saturation  (integer; range depends on device)
-void Camera_USB::applyAttributeGStreamer(const std::string& name, const std::string& value) {
-    if (!camera_src_) {
-        status_.currentError = pipelineError();
-        return;
-    }
-
-    std::string lowerName = name;
-    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
-                   [](unsigned char c){ return std::tolower(c); });
-
-    int intVal = 0;
-    if (!safeStoi(value, intVal)) {
-        status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
-        return;
-    }
-
-    if (lowerName == "brightness") {
-        g_object_set(G_OBJECT(camera_src_), "brightness", intVal, NULL);
-    } else if (lowerName == "contrast") {
-        g_object_set(G_OBJECT(camera_src_), "contrast", intVal, NULL);
-    } else if (lowerName == "saturation") {
-        g_object_set(G_OBJECT(camera_src_), "saturation", intVal, NULL);
-    } else {
-        status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
-        return;
-    }
-
-    status_.currentError = ERROR_CODE::NONE;
-}
+const char* Camera_USB::cameraTypeTag() const { return "USB"; }
 
 // ─── lifecycle ───────────────────────────────────────────────────────────────
 
 Camera_USB::Camera_USB(const cameraInfo& camera)
     : Camera_GST(camera) {
 }
+
+} // namespace dashcam::camera

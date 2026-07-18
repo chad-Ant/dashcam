@@ -32,6 +32,8 @@
 #include "libcamera_gst.h"
 #include <string>
 
+namespace dashcam::camera {
+
 /**
  * @brief iCamera implementation for USB UVC cameras via GStreamer v4l2src.
  *
@@ -66,16 +68,13 @@ protected:
                                     uint32_t frNum, uint32_t frDen) const override;
 
     /**
-     * @brief Apply a UVC camera attribute via g_object_set on v4l2src.
+     * @brief Returns "USB"; scopes AttributeDictionary resolution to USB entries.
      *
-     * Supported names (case-insensitive):
-     *   - "brightness"  → brightness GObject property
-     *   - "contrast"    → contrast GObject property
-     *   - "saturation"  → saturation GObject property
-     *
-     * Value must parse as a decimal integer; other names set INVALID_ATTRIBUTE.
+     * Attributes are applied by the base Camera_GST::applyAttributeGStreamer()
+     * against v4l2src.  Supported names (case-insensitive) include brightness,
+     * contrast, and saturation; unrecognised names set INVALID_ATTRIBUTE.
      */
-    void applyAttributeGStreamer(const std::string& name, const std::string& value) override;
+    const char* cameraTypeTag() const override;
 
 public:
     /**
@@ -86,5 +85,7 @@ public:
 
     ~Camera_USB() override = default;
 };
+
+} // namespace dashcam::camera
 
 #endif // LIBCAMERA_USB_H

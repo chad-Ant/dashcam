@@ -28,13 +28,21 @@ sr_config.cacheSize = 60      # seconds of pre-event cache (we want 30 + headroo
 sr_config.dirpath = "/data/events"
 sr_config.fileNamePrefix = "event"
 sr_ctx = pyds.NvDsSRContext()
-pyds.NvDsSRCreate(sr_ctx, sr_config)
+pyds.NvDsSRCreate(sr_ctx, sr_config)      # fills sr_ctx; check the returned NvDsSRStatus
 # attach sr_ctx.recordbin into the pipeline as a sink branch
 # ... when the IMU thread detects a hard event:
-sr_params = pyds.NvDsSRStart(sr_ctx, 30, 30, None)   # 30s pre, 30s post
+session_id = pyds.NvDsSRSessionId()
+status = pyds.NvDsSRStart(sr_ctx, session_id, 30, 30, None)  # see signature below
 ```
 
-Reference: NVIDIA's `deepstream-testsr` Python sample is the closest example.
+**Verified C API** (`gst-nvdssr.h` — the pyds bindings mirror this arg order):
+```c
+NvDsSRStatus NvDsSRCreate(NvDsSRContext **ctx, NvDsSRInitParams *params);
+NvDsSRStatus NvDsSRStart (NvDsSRContext *ctx, NvDsSRSessionId *sessionId,
+                          guint startTime, guint duration, gpointer userData);
+NvDsSRStatus NvDsSRStop  (NvDsSRContext *ctx, NvDsSRSessionId sessionId);
+```
+`NvDsSRStart` takes **five** args — note the `sessionId` (returned, later passed to `NvDsSRStop`). `startTime` = seconds *before* now, `duration` = seconds *after* start; so 30/30 saves `t-30 … t+30` (≈60 s total). If `duration=0`, recording stops after `defaultDuration` from `NvDsSRCreate`. Confirm the exact pyds wrapper (especially how `sessionId` is passed) against the DS 7.1 **`deepstream-testsr`** Python sample — the key point is the 5-arg shape, not the 3-arg call an earlier draft used.
 
 ## Option 2: Pure GStreamer ring buffer
 
@@ -44,7 +52,7 @@ Approach: continuously encode and write a sliding window of small files (e.g., 5
 
 ```bash
 gst-launch-1.0 nvarguscamerasrc sensor-id=0 ! \
-  'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1' ! \
+  'video/x-raw(memory:NVMM),width=1456,height=1088,framerate=60/1' ! \
   nvvidconv ! 'video/x-raw,format=I420,framerate=30/1' ! \
   videorate ! 'video/x-raw,format=I420,framerate=30/1' ! \
   x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 ! \
@@ -142,18 +150,29 @@ When persisting an event clip, also persist a metadata JSON:
 
 This makes events queryable later without re-running inference — important since the user is fully offline and may want to surface "events where I exceeded the speed limit" or similar.
 
-## Storage budgeting (Orin Nano + 1.2 TB)
+## Storage budgeting
 
-Architecture: 1 IMX296 CSI recording at 1080p30 (after the 60→30 videorate drop). The 3 USB cameras (stereo @ 360p10 + driver cam @ 360p10) are *not* continuously recorded — they're inputs to inference; only their inference outputs are logged unless an event triggers.
+**Storage decision:** footage goes on the **SD card** (`mmcblk0`, currently mounted at `/media/jetson/backup`, ~167 GB usable; a dedicated footage directory there is TBD). The ~1 TB system NVMe (`nvme0n1p1`, rootfs `/`) stays for OS/software; the second NVMe (`nvme1n1`) holds swap + ~103 GB free. Footage-on-SD is exactly what commercial dashcams do — the card choice and write pattern are what make it robust:
 
-At 4 Mbps continuous record of the 1080p30 front stream:
-- ~1.8 GB/hour
-- ~14 GB / 8-hour driving day
-- Fills 1.2 TB in ~85 days of continuous recording
+- **Throughput is a non-issue at these bitrates.** A single 4 Mbps H.264 stream is ~0.5 MB/s; even a modest Class-10/U1 card (~10 MB/s sustained) has 20× headroom. SD write-throttling only matters at 4K/high-Mbps, not here.
+- **Endurance is the real constraint.** Continuous record writes ~14 GB/8 h-day (~43 GB/day 24/7); a consumer card's TBW is spent fast. Use a **high-endurance / surveillance-rated microSD** (SanDisk High Endurance, Samsung PRO Endurance) or an industrial card, and plan to monitor + replace it.
+- **Power-loss safety.** A dashcam loses power abruptly at ignition-off, mid-write. Use a **crash-tolerant, flash-friendly filesystem** (f2fs, or ext4 with journaling), mount `noatime`, and let `splitmuxsink` finalize each segment atomically so only the in-progress segment can be lost — never the whole recording. Consider an ignition-sense GPIO → graceful-stop, or a supercap-backed clean shutdown.
+- **Wear management.** Prefer larger segment files (fewer metadata writes), let the ring/aging job overwrite oldest segments, avoid tiny frequent `fsync`s. Watch `dmesg` for `mmc`/`I/O error` — the first sign of a dying card.
+- **Isolation is good:** footage on the SD card (not rootfs) means a full or failed card can't wedge the OS on the NVMe.
+
+Architecture: The **primary footage source is a USB camera (model/specs TBD)** — its resolution and bitrate will determine actual recording throughput and SD-card lifespan. The IMX296 CSI camera is **inference-primary** (lane detection, sign reading, other AI tasks) and also outputs a **debug video stream** (low-bitrate/low-fps encode for post-hoc review of what the inference saw — not the evidentiary recording). The 3 other USB cameras (stereo @ 360p10 + driver cam @ 360p10) are inference-only; only their analysis outputs are logged unless an event triggers.
+
+**Capacity calculation** — depends on the final USB camera's bitrate. **Template:** if recording bitrate is B Mbps, then:
+- Throughput: B Mbps = B/8 MB/s
+- Per hour: 3600 × (B/8) MB = ~450B MB/hour ≈ 0.45B GB/hour
+- Per 8-hour day: ~3.6B GB
+- Per ~167 GB SD card: 167 / (0.45B) hours ≈ 372/B hours (scale by stream count)
+
+**Example:** if the USB camera records at 8 Mbps (typical HD dashcam), that's ~3.6 GB / 8h-day, and 167 GB ≈ ~46 days at 8 h/day. Use aggressive aging/rotation or smart-record-only (record on event, not continuous).
 
 Smart-record-only (no continuous record) is much cheaper:
 - ~30 MB per 60 s event clip (front camera only)
-- 1.2 TB = ~40,000 events stored
+- ~167 GB ≈ ~5,000+ events stored
 
 If you want to also persist USB-camera footage during events: a 60 s event clip from each USB cam at 360p10 MJPEG-recoded is tiny (~5 MB). Bundle them into the event directory.
 
@@ -162,5 +181,5 @@ Recommend: smart record for the front camera, **and** keep a low-bitrate continu
 ## Honest caveats
 
 1. Software encoding 1080p30 + running inference + reading IMU + writing files: this is close to the Orin Nano budget. **Validate end-to-end performance with `tegrastats` before committing to a recording strategy.** If `x264enc` falls behind, you'll get growing latency and eventually frame drops — Smart Record's pre-event buffer becomes lies.
-2. NVMe storage is required for sustained writes. eMMC / SD card will throttle or wear out quickly with continuous video.
+2. **SD-card endurance depends on the final USB camera bitrate** — footage lives on the SD card by design (see Storage budgeting above). The write *rate* at the socket is not the bottleneck; the write *volume* over time is what wears the card. **Once the USB camera model is finalized**, calculate your daily write volume (see capacity template above), and use a high-endurance / surveillance-rated card accordingly. Pair it with power-loss-safe segmenting (journaling FS or f2fs, short `splitmuxsink` segments, flush on boundaries), and watch `dmesg` for `mmc`/I-O errors as the first sign of a dying card. The system rootfs stays on NVMe, so a worn or corrupted footage card never affects boot.
 3. For evidentiary use, consider also writing a hash chain or signed metadata so clips are tamper-evident.

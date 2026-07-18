@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DashcamConfig>
+  <Encoder>
+    <Bitrate>8000</Bitrate>
+    <SpeedPreset>ultrafast</SpeedPreset>
+    <KeyIntMax>60</KeyIntMax>
+    <Tune></Tune>
+  </Encoder>
+  <Overlay>
+    <Enabled>true</Enabled>
+    <BackgroundOpacity>0.5</BackgroundOpacity>
+    <FontSize>14</FontSize>
+    <FontFace>Monospace Bold</FontFace>
+  </Overlay>
+  <Cameras>
+    <Camera name="csi0" type="CSI">
+      <Enabled>true</Enabled>
+      <Device>/dev/video0</Device>
+      <SensorId>0</SensorId>
+      <FormatIndex>0</FormatIndex>
+      <Attributes>
+        <Attribute name="Camera Controls" writable="false" readable="false" min="0" max="0" step="0" />
+        <Attribute name="Group Hold" writable="true" readable="true" min="0" max="1" step="1" />
+        <Attribute name="Sensor Mode" writable="true" readable="true" min="0" max="0" step="0" />
+        <Attribute name="Gain" writable="true" readable="true" min="0" max="0" step="0" />
+        <Attribute name="Exposure" writable="true" readable="true" min="0" max="0" step="0" />
+        <Attribute name="Frame Rate" writable="true" readable="true" min="0" max="0" step="0" />
+        <Attribute name="Bypass Mode" writable="true" readable="true" min="0" max="1" step="1" menu="0;1" />
+        <Attribute name="Override Enable" writable="true" readable="true" min="0" max="1" step="1" menu="0;1" />
+        <Attribute name="Height Align" writable="true" readable="true" min="1" max="16" step="1" />
+        <Attribute name="Size Align" writable="true" readable="true" min="0" max="2" step="1" menu="1;65536;131072" />
+        <Attribute name="Write ISP format" writable="true" readable="true" min="1" max="1" step="1" />
+        <Attribute name="Low Latency Mode" writable="true" readable="true" min="0" max="1" step="1" />
+        <Attribute name="Preferred Stride" writable="true" readable="true" min="0" max="65535" step="1" />
+        <Attribute name="Override capture timeout ms" writable="true" readable="true" min="-1" max="2147483648" step="1" />
+        <Attribute name="Sensor Modes" writable="false" readable="true" min="0" max="30" step="1" />
+      </Attributes>
+    </Camera>
+    <Camera name="usb0" type="USB">
+      <Enabled>true</Enabled>
+      <Device>/dev/video1</Device>
+      <SensorId>0</SensorId>
+      <FormatIndex>0</FormatIndex>
+      <Attributes>
+        <Attribute name="User Controls" writable="false" readable="false" min="0" max="0" step="0" />
+        <Attribute name="Brightness" writable="true" readable="true" min="0" max="255" step="1" />
+        <Attribute name="Contrast" writable="true" readable="true" min="0" max="255" step="1" />
+        <Attribute name="Saturation" writable="true" readable="true" min="0" max="255" step="1" />
+        <Attribute name="White Balance, Automatic" writable="true" readable="true" min="0" max="1" step="1" />
+        <Attribute name="Gain" writable="true" readable="true" min="0" max="255" step="1" />
+        <Attribute name="Power Line Frequency" writable="true" readable="true" min="0" max="2" step="1" menu="Disabled;50 Hz;60 Hz" />
+        <Attribute name="White Balance Temperature" writable="true" readable="true" min="0" max="10000" step="1" />
+        <Attribute name="Sharpness" writable="true" readable="true" min="0" max="255" step="1" />
+        <Attribute name="Backlight Compensation" writable="true" readable="true" min="0" max="1" step="1" />
+        <Attribute name="Camera Controls" writable="false" readable="false" min="0" max="0" step="0" />
+        <Attribute name="Auto Exposure" writable="true" readable="true" min="0" max="3" step="1" menu="Manual Mode;Aperture Priority Mode" />
+        <Attribute name="Exposure Time, Absolute" writable="true" readable="true" min="1" max="10000" step="1" />
+        <Attribute name="Exposure, Dynamic Framerate" writable="true" readable="true" min="0" max="1" step="1" />
+      </Attributes>
+    </Camera>
+  </Cameras>
+  <System>
+    <FootagePath>/user/output/footage</FootagePath>
+    <WarmupFrames>9</WarmupFrames>
+  </System>
+</DashcamConfig>

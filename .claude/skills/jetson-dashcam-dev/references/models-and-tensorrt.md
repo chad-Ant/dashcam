@@ -25,7 +25,7 @@ Convert an ONNX model to a serialized engine:
   --onnx=yolov8s.onnx \
   --saveEngine=yolov8s_fp16.engine \
   --fp16 \
-  --workspace=2048 \
+  --memPoolSize=workspace:2048 \
   --minShapes=images:1x3x640x640 \
   --optShapes=images:1x3x640x640 \
   --maxShapes=images:1x3x640x640 \
@@ -35,7 +35,7 @@ Convert an ONNX model to a serialized engine:
 Flag notes:
 - `--fp16` — use FP16 where supported. ~2× throughput vs FP32 with negligible accuracy loss for most CV models. Default choice on Jetson.
 - `--int8` — INT8 quantization. ~2× more throughput vs FP16. Requires a calibration dataset; quality varies by model. Worth pursuing for production after FP16 baseline works.
-- `--workspace=2048` — MB. Bumps the max workspace TRT can use during build. 2 GB is reasonable on Orin Nano (don't go past 4 GB or you'll OOM during build).
+- `--memPoolSize=workspace:2048` — workspace pool in MiB. Bumps the max workspace TRT can use during build. 2 GB is reasonable on Orin Nano (don't go past 4 GB or you'll OOM during build). **TRT 10 note:** the old `--workspace=N` flag is deprecated (warns) / removed — the migration guide replaces it with `--memPoolSize=workspace:<size>`; you can append a unit, e.g. `workspace:2048MiB`. If you copy an old command with `--workspace`, that's a bug on JP 6.2 (TRT 10.3).
 - `--shapes` flags — required for dynamic-shape ONNX models. For dashcam, you typically use fixed batch=1 fixed input size, so all three (`min`/`opt`/`max`) match.
 - Don't pass `--useDLACore=N` on Orin Nano (no DLA).
 
@@ -68,7 +68,7 @@ For the dashcam's primary detector (cars, lanes, signs), the user has a YOLOv8 m
 
 YOLOv8 outputs one tensor `[1, 84, 8400]` (4 box coords + 80 classes). DeepStream doesn't natively understand this; you need a custom output parser. Two paths:
 
-- **Use NVIDIA's `nvdsinfer_custom_impl_Yolo` library** — supports many YOLO variants. Build from `https://github.com/marcoslucianops/DeepStream-Yolo` (community, well-maintained), point `parse-bbox-func-name` and `custom-lib-path` at it.
+- **Use NVIDIA's `nvdsinfer_custom_impl_Yolo` library** — supports many YOLO variants. Build from `https://github.com/marcoslucianops/DeepStream-Yolo` (community, well-maintained); point `parse-bbox-func-name` and `custom-lib-path` at it. Confirm the branch/tag you check out targets **DeepStream 7.1 / TensorRT 10.3** (it's built against a specific DS version — using a mismatched one is a common cause of parser load or symbol errors).
 - **Write your own parser** — implement `NvDsInferParseCustomYoloV8` in C++. More code, more control. Necessary if you trained on a custom class set with non-default output shape.
 
 For dashcam v0.1, use DeepStream-Yolo. Saves a week.
@@ -83,7 +83,7 @@ trtexec \
   --saveEngine=yolov8s_int8.engine \
   --int8 \
   --calib=calib_cache.bin \
-  --workspace=2048
+  --memPoolSize=workspace:2048
 ```
 
 `trtexec` will look for image inputs to calibrate with via the network's input bindings. For non-trivial calibration (the usual case), use the Python API with a custom `IInt8EntropyCalibrator2` that yields preprocessed batches from your dataset. Search for "TensorRT INT8 calibrator example" in NVIDIA's `TensorRT/samples/python/` directory.

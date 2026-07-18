@@ -31,6 +31,9 @@ RUN apt-get update && apt-get install -y \
     libv4l-dev \
     libgpiod-dev \
     gpiod \
+    libpugixml-dev \
+    libspdlog-dev \
+    libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/app

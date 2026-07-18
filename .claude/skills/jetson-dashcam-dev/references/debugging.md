@@ -11,7 +11,7 @@ free -h                              # RAM and swap usage
 df -h /data /                        # disk space — full disk silently breaks recording
 ```
 
-If swap is being used heavily during inference, that alone explains most "it's slow" problems.
+If swap is being used during inference, that alone explains most "it's slow" problems — and since swap here is on a dedicated NVMe with low `vm.swappiness`, any swap-in at all means RAM is nearly exhausted, not opportunistic paging.
 
 ## Step 1: `tegrastats` / `jtop`
 
@@ -24,10 +24,10 @@ tegrastats --interval 1000
 
 What to look for:
 - `RAM` near max → memory pressure; check for leaks, reduce batch size, reduce model.
-- `SWAP` non-zero during steady-state → swapping; will cause frame stutter.
+- `SWAP` non-zero during steady-state → RAM near-exhausted (low `vm.swappiness` here, so swap only engages under real pressure); will cause frame stutter. Shrink model/batch/input.
 - `CPU` cores at 100% → likely software encoding (no NVENC) saturating.
 - `GR3D_FREQ` (GPU) at 99% → inference is the bottleneck; smaller model or reduced input size.
-- `CPU@`/`SOC@` near 87 °C → thermal throttling imminent, fan / cooling problem.
+- `CPU@`/`SOC@` in the 90s °C → thermal throttling imminent (throttle trips are ~99 °C on this device; Tj max ~100 °C), fan / cooling problem.
 
 `jtop` is a TUI on top of `tegrastats` — `sudo pip install -U jetson-stats`, then `jtop`. Easier to read.
 
@@ -83,7 +83,7 @@ If `ldd` reports any of these "not found", the typical causes — in order of li
 
 1. **Wrong Python wheel source.** Plain `pip install torch` pulls x86 wheels that don't run on aarch64 at all, or aarch64 wheels for the wrong CUDA version. Use the Jetson AI Lab index for JP 6.2 / CUDA 12.6:
    ```bash
-   pip install --extra-index-url https://pypi.jetson-ai-lab.dev/jp6/cu126 \
+   pip install --extra-index-url https://pypi.jetson-ai-lab.io/jp6/cu126 \
        torch torchvision onnxruntime-gpu
    ```
 2. **`LD_LIBRARY_PATH` doesn't include Tegra paths.** Should include `/usr/lib/aarch64-linux-gnu/tegra` and `/usr/local/cuda/lib64`. Most l4t images set this up automatically.
@@ -118,14 +118,14 @@ If the pipeline runs but is slow / drops frames:
 |---|---|
 | `WARNING: erroneous pipeline: no element "nvarguscamerasrc"` | Container missing nv plugins, or running on non-l4t image |
 | `Could not initialize Argus camera provider` | nvargus-daemon crashed; restart it |
-| `libnvinfer.so.10: cannot open shared object file` | Tegra library path not exposed, or wrong-arch / wrong-CUDA Python wheel — verify `LD_LIBRARY_PATH` includes `/usr/lib/aarch64-linux-gnu/tegra`; reinstall Python deps from `https://pypi.jetson-ai-lab.dev/jp6/cu126` |
+| `libnvinfer.so.10: cannot open shared object file` | Tegra library path not exposed, or wrong-arch / wrong-CUDA Python wheel — verify `LD_LIBRARY_PATH` includes `/usr/lib/aarch64-linux-gnu/tegra`; reinstall Python deps from `https://pypi.jetson-ai-lab.io/jp6/cu126` |
 | `libnvds_amqp_proto.so: cannot open` | DeepStream protocol adapter missing; usually harmless if you don't use Kafka/AMQP — set `disable-prebuilt-init=1` or remove the broker config |
-| `NvDsInfer Error: NVDSINFER_CUDA_ERROR` during engine build | Often OOM. Verify swap is on, drop `--workspace` to 1024, ensure no other heavy processes |
+| `NvDsInfer Error: NVDSINFER_CUDA_ERROR` during engine build | Often OOM. Verify swap is on, lower the workspace pool (`--memPoolSize=workspace:1024`), ensure no other heavy processes |
 | `nvbuf_utils: Failed to create NvBufSurface` | Out of NVMM buffer pool; usually means the pipeline isn't releasing buffers — check for accidentally held refs in your pad probes |
 | `Failed to query video capabilities: Inappropriate ioctl for device` | Wrong device node (e.g., trying v4l2-ctl on a `/dev/video*` that's a CSI sub-device, not a capture node) |
 | `gst-stream-error-quark: Internal data stream error` | Generic GStreamer error; rerun with `GST_DEBUG=3` to find the real culprit |
 | Pipeline runs once then hangs on next start | Argus daemon needs restart after unclean shutdown |
-| TensorRT engine build hangs at 100% RAM | Building too large a workspace; reduce `--workspace=2048`, ensure swap is on |
+| TensorRT engine build hangs at 100% RAM | Building too large a workspace; reduce it (`--memPoolSize=workspace:2048`; TRT 10 renamed `--workspace`), ensure swap is on |
 
 ## Useful one-liners
 

@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Camera attribute dictionary.
+  Maps alias names (as written in CameraConfig::capabilities) to the GStreamer
+  element property name used by the source element (nvarguscamerasrc / v4l2src).
+
+  Attributes:
+    gstProperty  — property name passed to g_object_set().
+    type         — "CSI" | "USB" | "any".
+    valueType    — how the value string is converted:
+                     string        pass value directly as const char*
+                     int           parse as gint
+                     float         parse as gfloat
+                     bool          "true"/"false" or "1"/"0" → gboolean
+                     bool_from_zero  int; 0→TRUE, non-zero→FALSE (AE/AWB lock inversion)
+                     range_string  mirror single value to "val val" (nvargus range props)
+
+  Alias matching is case-insensitive.  Add new entries here; no recompile needed.
+-->
+<CameraAttributeDictionary>
+
+  <!-- ── CSI (nvarguscamerasrc) ──────────────────────────────────────────────── -->
+
+  <!-- Exposure time in nanoseconds; single value is mirrored to "min max" range -->
+  <Attribute gstProperty="exposuretimerange" type="CSI" valueType="range_string">
+    <Alias>exposure time, absolute</Alias>
+    <Alias>exposure</Alias>
+    <Alias>exposuretimerange</Alias>
+    <Alias>exposure_time_range</Alias>
+  </Attribute>
+
+  <!-- Analogue gain; single value is mirrored to "min max" range -->
+  <Attribute gstProperty="gainrange" type="CSI" valueType="range_string">
+    <Alias>gain</Alias>
+    <Alias>gainrange</Alias>
+    <Alias>gain_range</Alias>
+  </Attribute>
+
+  <!-- AE lock: value 0 → AE running (aelock=FALSE), non-zero → AE locked (aelock=TRUE) -->
+  <Attribute gstProperty="aelock" type="CSI" valueType="bool_from_zero">
+    <Alias>auto exposure</Alias>
+    <Alias>aelock</Alias>
+    <Alias>ae_lock</Alias>
+  </Attribute>
+
+  <!-- AWB lock: same zero / non-zero semantics as aelock -->
+  <Attribute gstProperty="awblock" type="CSI" valueType="bool_from_zero">
+    <Alias>white balance, automatic</Alias>
+    <Alias>awblock</Alias>
+    <Alias>awb_lock</Alias>
+  </Attribute>
+
+  <!-- White-balance mode (0=off 1=auto 2=incandescent 3=fluorescent … see Argus docs) -->
+  <Attribute gstProperty="wbmode" type="CSI" valueType="int">
+    <Alias>wbmode</Alias>
+    <Alias>wb_mode</Alias>
+    <Alias>white_balance_mode</Alias>
+  </Attribute>
+
+  <!-- Colour saturation scalar (0.0 – 2.0; 1.0 = neutral) -->
+  <Attribute gstProperty="saturation" type="CSI" valueType="float">
+    <Alias>saturation</Alias>
+    <Alias>colorsaturation</Alias>
+    <Alias>color_saturation</Alias>
+  </Attribute>
+
+  <!-- Temporal noise reduction mode (0=off 1=fast 2=high-quality) -->
+  <Attribute gstProperty="tnr-mode" type="CSI" valueType="int">
+    <Alias>tnr-mode</Alias>
+    <Alias>tnr_mode</Alias>
+    <Alias>noise_reduction_mode</Alias>
+  </Attribute>
+
+  <!-- Temporal noise reduction strength (-1=auto  0.0–1.0=manual) -->
+  <Attribute gstProperty="tnr-strength" type="CSI" valueType="float">
+    <Alias>tnr-strength</Alias>
+    <Alias>tnr_strength</Alias>
+    <Alias>noise_reduction_strength</Alias>
+  </Attribute>
+
+  <!-- Edge-enhancement mode (0=off 1=fast 2=high-quality) -->
+  <Attribute gstProperty="ee-mode" type="CSI" valueType="int">
+    <Alias>ee-mode</Alias>
+    <Alias>ee_mode</Alias>
+    <Alias>edge_enhancement_mode</Alias>
+  </Attribute>
+
+  <!-- Edge-enhancement strength (-1=auto  0.0–1.0=manual) -->
+  <Attribute gstProperty="ee-strength" type="CSI" valueType="float">
+    <Alias>ee-strength</Alias>
+    <Alias>ee_strength</Alias>
+    <Alias>edge_enhancement_strength</Alias>
+  </Attribute>
+
+  <!-- ── USB (v4l2src GObject properties) ────────────────────────────────────── -->
+
+  <Attribute gstProperty="brightness" type="USB" valueType="int">
+    <Alias>brightness</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="contrast" type="USB" valueType="int">
+    <Alias>contrast</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="saturation" type="USB" valueType="int">
+    <Alias>saturation</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="hue" type="USB" valueType="int">
+    <Alias>hue</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="sharpness" type="USB" valueType="int">
+    <Alias>sharpness</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="gamma" type="USB" valueType="int">
+    <Alias>gamma</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="gain" type="USB" valueType="int">
+    <Alias>gain</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="white-balance-temperature" type="USB" valueType="int">
+    <Alias>white_balance_temperature</Alias>
+    <Alias>white balance temperature</Alias>
+    <Alias>white-balance-temperature</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="backlight-compensation" type="USB" valueType="int">
+    <Alias>backlight_compensation</Alias>
+    <Alias>backlight compensation</Alias>
+    <Alias>backlight-compensation</Alias>
+  </Attribute>
+
+  <Attribute gstProperty="exposure" type="USB" valueType="int">
+    <Alias>exposure</Alias>
+    <Alias>exposure_absolute</Alias>
+    <Alias>exposure absolute</Alias>
+  </Attribute>
+
+</CameraAttributeDictionary>

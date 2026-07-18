@@ -1,1 +1,6 @@
 bin/build*
+logs/*
+archive/*
+# Recorded videos land in the archive dir (/user/dashcam == repo root under the dev
+# mount), so keep stray recordings out of git.
+*.mkv

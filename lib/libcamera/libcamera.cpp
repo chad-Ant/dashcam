@@ -1,19 +1,26 @@
 #include "libcamera.h"
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
 
+namespace dashcam::camera {
+
 struct ScopedFd {
     int fd;
     explicit ScopedFd(int fd) : fd(fd) {}
     ~ScopedFd() { if (fd >= 0) ::close(fd); }
+    ScopedFd(const ScopedFd&)            = delete;  // non-copyable: prevents double-close
+    ScopedFd& operator=(const ScopedFd&) = delete;
     operator int() const { return fd; }
 };
 
@@ -106,8 +113,11 @@ static void queryFrameRates(int fd, const cameraVideoFormat& info, std::vector<c
             break;
         }
         if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
-            frate.frameRate = static_cast<float>(frmival.discrete.denominator) / frmival.discrete.numerator;
-            formats.push_back(frate);
+            if (frmival.discrete.numerator != 0) {
+                frate.frameRate = static_cast<float>(frmival.discrete.denominator)
+                                / frmival.discrete.numerator;
+                formats.push_back(frate);
+            }
         }
         frmival.index++;
     }
@@ -126,26 +136,47 @@ static void queryFrameRates(int fd, const cameraVideoFormat& info, std::vector<c
  *
  * @param[in]     fd    Open, readable V4L2 file descriptor.
  * @param[in,out] info  cameraInfo to populate; videoFormats is replaced on each stage.
+ * @param[in]     log   Optional diagnostic callback; warns when the format
+ *                      cross-product exceeds MAX_VIDEO_FORMATS and gets truncated.
  */
-static void populateCameraVideoFormats(int fd, cameraInfo& info) {
-//    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
+static void populateCameraVideoFormats(int fd, cameraInfo& info,
+                                       const dashcam::log::LogCallback& log) {
     if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN) return;
 
     queryPixelFormats(fd, info);
 
+    // Each stage expands the previous set (format → +resolution → +framerate),
+    // so the running total is bounded to MAX_VIDEO_FORMATS to cap the cross
+    // product.  A stage may overshoot by up to one query's worth of entries;
+    // trim afterwards so currentFormatIndex (uint16_t) stays addressable.
+    // Truncation is legal but must not be silent — a C270 already enumerates
+    // ~227 modes, so a richer device would silently lose capture modes.
+    bool truncated = false;
     std::vector<cameraVideoFormat> tempFormats;
     size_t tempFormatCount = info.videoFormats.size();
-    for (size_t i = 0; i < tempFormatCount; ++i) {
+    size_t i = 0;
+    for (; i < tempFormatCount && tempFormats.size() < MAX_VIDEO_FORMATS; ++i) {
         queryResolutions(fd, info.videoFormats[i], tempFormats);
     }
+    if (i < tempFormatCount || tempFormats.size() > MAX_VIDEO_FORMATS) truncated = true;
+    if (tempFormats.size() > MAX_VIDEO_FORMATS) tempFormats.resize(MAX_VIDEO_FORMATS);
     info.videoFormats = tempFormats;
 
     tempFormatCount = info.videoFormats.size();
     tempFormats.clear();
-    for (size_t i = 0; i < tempFormatCount; ++i) {
+    for (i = 0; i < tempFormatCount && tempFormats.size() < MAX_VIDEO_FORMATS; ++i) {
         queryFrameRates(fd, info.videoFormats[i], tempFormats);
     }
+    if (i < tempFormatCount || tempFormats.size() > MAX_VIDEO_FORMATS) truncated = true;
+    if (tempFormats.size() > MAX_VIDEO_FORMATS) tempFormats.resize(MAX_VIDEO_FORMATS);
     info.videoFormats = tempFormats;
+
+    if (truncated && log) {
+        log(dashcam::log::LogLevel::WARN,
+            info.address + ": video format list capped at "
+            + std::to_string(MAX_VIDEO_FORMATS)
+            + " entries; some capture modes were not enumerated");
+    }
 }
 
 /**
@@ -165,7 +196,6 @@ static void populateCameraVideoFormats(int fd, cameraInfo& info) {
  * @param[in,out] info  cameraInfo whose attributes vector is populated.
  */
 static void populateCameraAttributes(int fd, cameraInfo& info) {
-//    if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN || info.type == CAMERA_TYPE::GIGE) {
     if (fd < 0 || info.type == CAMERA_TYPE::UNKNOWN) {
         return;
     }
@@ -226,8 +256,16 @@ static void populateCameraAttributes(int fd, cameraInfo& info) {
         attr.menuOptions.clear();
 
         if (attr.type == CAMERA_ATTRIBUTE_TYPE::MENU) {
-            for (int i = queryctrl.minimum; i <= queryctrl.maximum; ++i) {
-                if (attr.menuOptions.size() >= MAX_MENU_OPTIONS) break;
+            // Menu indices may be sparse, so scanning stops on either the option
+            // cap or a bounded span — the latter guards against a driver that
+            // misreports a huge maximum (which would otherwise spam ioctls and
+            // risk signed overflow on ++i near INT_MAX).
+            uint32_t scanned = 0;
+            for (int i = queryctrl.minimum;
+                 i <= queryctrl.maximum
+                 && attr.menuOptions.size() < MAX_MENU_OPTIONS
+                 && scanned < MAX_MENU_OPTIONS * 64u;
+                 ++i, ++scanned) {
                 struct v4l2_querymenu querymenu;
                 memset(&querymenu, 0, sizeof(querymenu));
                 querymenu.id    = queryctrl.id;
@@ -248,7 +286,61 @@ static void populateCameraAttributes(int fd, cameraInfo& info) {
     }
 }
 
-ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
+/**
+ * @brief Resolve a CSI video node's Argus sensor-id from the device tree.
+ *
+ * /dev/videoN ordering follows i2c PROBE order, which is NOT the Argus
+ * enumeration order: Argus numbers sensors by their index in the
+ * tegra-camera-platform module list.  With mixed sensors on the two CSI ports
+ * the two orders genuinely diverge (observed: IMX296 on i2c bus 9 probes
+ * before IMX219 on bus 10, yet IMX219 is module0 → Argus sensor-id 0), so a
+ * sequential count would silently open the wrong camera.
+ *
+ * Chain: V4L2 card string "vi-output, imx219 10-0010" → i2c device name →
+ * /sys/bus/i2c/devices/<dev>/of_node symlink → sensor DT path → index of the
+ * tegra-camera-platform module whose drivernode0 names that same path.
+ *
+ * @param[in] card  V4L2 capability card string of the vi-output node.
+ * @return Argus sensor-id (module index), or -1 if the chain cannot be
+ *         resolved (caller falls back to sequential numbering).
+ */
+static int argusIdFromCard(const std::string& card) {
+    const std::string::size_type sp = card.find_last_of(' ');
+    if (sp == std::string::npos) return -1;
+    const std::string i2cDev = card.substr(sp + 1);          // e.g. "10-0010"
+    if (i2cDev.empty()) return -1;
+
+    char link[PATH_MAX];
+    const std::string ofNode = "/sys/bus/i2c/devices/" + i2cDev + "/of_node";
+    const ssize_t n = ::readlink(ofNode.c_str(), link, sizeof(link) - 1);
+    if (n <= 0) return -1;
+    link[n] = '\0';
+
+    // Both the symlink target and the module entry contain
+    // ".../devicetree/base/<sensor DT path>" — compare the tails.
+    static constexpr const char kBase[] = "devicetree/base";
+    const std::string sensorPath(link);
+    const std::string::size_type sb = sensorPath.find(kBase);
+    if (sb == std::string::npos) return -1;
+    const std::string sensorTail = sensorPath.substr(sb + sizeof(kBase) - 1);
+
+    for (int k = 0; k < MAX_CAMERAS; ++k) {
+        std::ifstream f("/proc/device-tree/tegra-camera-platform/modules/module"
+                        + std::to_string(k) + "/drivernode0/sysfs-device-tree");
+        if (!f) break;   // modules are contiguous; first miss ends the scan
+        std::string mod((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+        while (!mod.empty() && (mod.back() == '\0' || mod.back() == '\n'))
+            mod.pop_back();
+        const std::string::size_type mb = mod.find(kBase);
+        if (mb == std::string::npos) continue;
+        if (mod.substr(mb + sizeof(kBase) - 1) == sensorTail) return k;
+    }
+    return -1;
+}
+
+ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
+                         const dashcam::log::LogCallback& log) {
     cameraList.clear();
 
     // Enumerate /dev/videoN nodes via the filesystem so we're not limited to video0..15.
@@ -272,7 +364,18 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
             videoPaths.push_back(it->path());
         }
     }
-    std::sort(videoPaths.begin(), videoPaths.end());
+    // Sort by the numeric suffix, not lexicographically: path ordering would
+    // put video10 before video2, which scrambles the CSI sensor-id assignment
+    // below on systems with more than 9 video nodes (4 UVC cameras plus their
+    // metadata nodes get there easily).  The suffix is all digits — verified
+    // during the scan above.
+    auto videoIndex = [](const std::filesystem::path& p) {
+        return std::strtoul(p.filename().string().c_str() + 5, nullptr, 10);
+    };
+    std::sort(videoPaths.begin(), videoPaths.end(),
+              [&videoIndex](const std::filesystem::path& a, const std::filesystem::path& b) {
+                  return videoIndex(a) < videoIndex(b);
+              });
 
     // CSI cameras are addressed by Argus sensor-id (0-based among CSI cameras),
     // which is independent of the /dev/videoN numbering.
@@ -299,8 +402,17 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
         uint32_t parsedDevId = static_cast<uint32_t>(std::strtoul(devicePath.filename().string().c_str() + 5, nullptr, 10));
 
         if (driverName == "tegra-video" || driverName == "vi") {
-            info.type     = CAMERA_TYPE::CSI;
-            info.deviceId = csiSensorCount++;
+            info.type = CAMERA_TYPE::CSI;
+            const std::string cardName(reinterpret_cast<const char*>(cap.card));
+            const int argusId = argusIdFromCard(cardName);
+            info.deviceId = (argusId >= 0) ? static_cast<uint32_t>(argusId)
+                                           : csiSensorCount;
+            if (argusId < 0 && log)
+                log(dashcam::log::LogLevel::WARN,
+                    devicePath.string() + ": Argus sensor-id not resolvable from"
+                    " device tree; assuming sequential id "
+                    + std::to_string(csiSensorCount));
+            csiSensorCount++;
         } else if (driverName == "uvcvideo") {
             info.type     = CAMERA_TYPE::USB;
             info.deviceId = parsedDevId;
@@ -310,7 +422,7 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
         }
 
         populateCameraAttributes(fd, info);
-        populateCameraVideoFormats(fd, info);
+        populateCameraVideoFormats(fd, info, log);
         cameraList.push_back(info);
     }
 
@@ -319,3 +431,5 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList) {
     }
     return ERROR_CODE::NONE;
 }
+
+} // namespace dashcam::camera
