@@ -77,8 +77,7 @@ int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
 
     // ── liblog: start async file logger; also feed last N messages to HUD ────
-    fs::create_directories("./logs");
-    dashcam::log::init("./logs");
+    dashcam::log::init();  // build-local logs: <exe_dir>/logs (init creates the dir)
     auto fileLog = dashcam::log::getCallback();
 
     struct LogEntry { LvL lvl; std::string msg; };
@@ -94,13 +93,14 @@ int main(int argc, char* argv[]) {
 
     log(LvL::INFO, "demo_graphical starting");
 
-    // ── libconfig: parse dashcam.xml; built-in defaults on failure ────────────
+    // ── libconfig: build-local config (<exe_dir>/config), seeded with defaults ──
+    const std::string cfgDir = dashcam::config::configDir();
     dashcam::config::AppConfig cfg;
-    bool cfgOk = dashcam::config::ConfigReader::load("config/dashcam.xml", cfg, fileLog);
-    log(LvL::INFO, cfgOk ? "config: dashcam.xml loaded" : "config: using defaults");
+    bool cfgOk = dashcam::config::ConfigReader::loadOrCreate(cfgDir + "/dashcam.xml", cfg, fileLog);
+    log(LvL::INFO, cfgOk ? "config: loaded/created" : "config: using defaults");
 
     dashcam::camera::AttributeDictionary dict;
-    dashcam::camera::AttributeDictionary::load("config/camera_attributes.xml", dict, fileLog);
+    dashcam::camera::AttributeDictionary::load(cfgDir + "/camera_attributes.xml", dict, fileLog);
 
     // ── libcamera: enumerate devices; prefer CSI, fall back to first USB ─────
     std::vector<dashcam::camera::cameraInfo> camList;
@@ -205,6 +205,11 @@ int main(int argc, char* argv[]) {
     uint64_t frameCount = 0;
     auto tStart = std::chrono::steady_clock::now();
 
+    // encoder.speedPreset is ConfigVar<std::string>; read into a local so the HUD's
+    // `"literal" + value` concatenation compiles (implicit conversion isn't applied
+    // to operator+ deduction).
+    const std::string encPreset = cfg.encoder.speedPreset;
+
     while (!g_quit.load()) {
         gstCam->captureFrame(frameBuf.data(), bufBytes, written);
         if (written == 0) continue;
@@ -257,7 +262,7 @@ int main(int argc, char* argv[]) {
             "libconfig",
             "  source   " + std::string(cfgOk ? "dashcam.xml" : "(defaults)"),
             "  bitrate  " + std::to_string(cfg.encoder.bitrate) + " kbps",
-            "  preset   " + cfg.encoder.speedPreset,
+            "  preset   " + encPreset,
             "  overlay  " + std::string(cfg.overlay.enabled ? "on" : "off"),
         };
         drawPanel(display,

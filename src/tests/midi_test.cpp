@@ -27,7 +27,7 @@ int main(int argc, char* argv[]) {
     const std::string soundsDir = (argc > 1) ? argv[1] : "/data/sounds";
     const std::string device    = (argc > 2) ? argv[2] : "default";
 
-    dashcam::log::init("/tmp");
+    dashcam::log::init();  // build-local logs: <exe_dir>/logs
     auto log = dashcam::log::getCallback();
 
     dashcam::midi::MidiPlayer player;

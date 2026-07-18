@@ -74,7 +74,7 @@ namespace dashcam::record {
  *   - Top-left:     speed, acceleration
  *   - Top-right:    heading + cardinal direction
  *   - Bottom-left:  latitude, longitude, altitude
- *   - Bottom-right: UTC date and time
+ *   - Bottom-right: local date and time (host timezone, TZ/ /etc/localtime)
  */
 struct OverlayData {
     double  latitude        = 10.7725;    ///< WGS-84 latitude in decimal degrees.
@@ -83,7 +83,9 @@ struct OverlayData {
     float   speedKmh        = 1.5f;       ///< Ground speed in kilometres per hour.
     float   accelerationMs2 = 0.0f;       ///< Longitudinal acceleration in m/s² (+ve = forward).
     float   headingDeg      = 90.0f;      ///< True heading in degrees (0 = North, clockwise).
-    int64_t timestampMs     = 1777633580; ///< UNIX epoch timestamp in milliseconds.
+    int64_t timestampMs     = 1777633580000LL; ///< UNIX epoch timestamp in milliseconds.
+                                               ///< (Previous default was the SECONDS value,
+                                               ///< which rendered as 1970-01-21 on the overlay.)
 };
 
 // ─── source memory type ───────────────────────────────────────────────────────
@@ -178,10 +180,12 @@ public:
      * to BGRx system memory before the Cairo overlay stage.  The internal chain:
      * @verbatim
      *   nvvidconv ! video/x-raw,format=BGRx
-     *     ! cairooverlay
-     *     ! videoconvert ! video/x-raw,format=I420
-     *     ! queue ! videorate ! video/x-raw,framerate=N/D
-     *     ! x264enc ! h264parse ! matroskamux ! filesink
+     *     ! videorate skip-to-first=true             ← rate-limit FIRST: Cairo,
+     *     ! video/x-raw,framerate=N/D                  videoconvert and x264enc all
+     *     ! cairooverlay                               run at the target rate, not
+     *     ! videoconvert ! video/x-raw,format=I420     the sensor rate; skip-to-first
+     *     ! queue ! x264enc                            avoids a freeze-frame intro
+     *     ! h264parse ! matroskamux offset-to-zero=true ! filesink
      * @endverbatim
      *
      * Pass the returned pointer to Camera_GST::addBranch() and then call
@@ -205,6 +209,12 @@ public:
      *                    to trim a secondary/debug branch's encode cost (encoder CPU
      *                    scales with pixel rate).  Keep the source aspect ratio to
      *                    avoid distortion (e.g. 1456x1088 → 728x544).
+     * @param overlay     When true (default) the telemetry Cairo overlay is drawn.
+     *                    When false the Cairo stage is omitted entirely — the inlet
+     *                    converts straight to I420 for the encoder (no Cairo, no BGRx
+     *                    round-trip: cheaper), and setOverlayData()/setOverlayConfig()
+     *                    have no effect.  Use for feeds that don't need telemetry,
+     *                    e.g. a raw debug recording.
      * @return Newly created GstBin (floating ref) on success; nullptr on failure.
      *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
      */
@@ -213,7 +223,8 @@ public:
                                    const dashcam::config::EncoderConfig& enc = {},
                                    uint32_t queueDepth = 3,
                                    SourceMemory srcMem = SourceMemory::NVMM,
-                                   uint32_t outWidth = 0, uint32_t outHeight = 0);
+                                   uint32_t outWidth = 0, uint32_t outHeight = 0,
+                                   bool overlay = true);
 
     // ─── lifecycle ─────────────────────────────────────────────────────────────
 

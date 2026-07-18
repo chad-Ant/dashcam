@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y \
     gpiod \
     libpugixml-dev \
     libspdlog-dev \
+    libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/app

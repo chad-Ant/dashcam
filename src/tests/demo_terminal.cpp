@@ -40,8 +40,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, onSignal);
     gst_init(&argc, &argv);
 
-    fs::create_directories("./logs");
-    dashcam::log::init("./logs");
+    dashcam::log::init();  // build-local logs: <exe_dir>/logs (init creates the dir)
     s_log = dashcam::log::getCallback();
 
     s_log(LvL::INFO, "=== Dashcam Library Demo (terminal) ===");
@@ -49,7 +48,7 @@ int main(int argc, char* argv[]) {
 
     // ── [1/4] liblog ─────────────────────────────────────────────────────────
     section(1, N, "liblog");
-    s_log(LvL::INFO, "  init(\"./logs\")  OK");
+    s_log(LvL::INFO, "  init()  OK -> " + dashcam::log::logDir());
 
     const struct { LvL lvl; const char* tag; } levels[] = {
         {LvL::DEBUG, "DEBUG"}, {LvL::INFO, "INFO"},
@@ -62,10 +61,13 @@ int main(int argc, char* argv[]) {
     // ── [2/4] libconfig ──────────────────────────────────────────────────────
     section(2, N, "libconfig");
 
+    // Build-local config: <exe_dir>/config/dashcam.xml, created with defaults if absent.
+    const std::string cfgDir  = dashcam::config::configDir();
+    const std::string cfgPath = cfgDir + "/dashcam.xml";
     dashcam::config::AppConfig cfg;
-    bool cfgOk = dashcam::config::ConfigReader::load("config/dashcam.xml", cfg, s_log);
-    s_log(LvL::INFO, std::string("  ConfigReader::load(\"config/dashcam.xml\")  ") +
-          (cfgOk ? "OK" : "(missing — defaults)"));
+    bool cfgOk = dashcam::config::ConfigReader::loadOrCreate(cfgPath, cfg, s_log);
+    s_log(LvL::INFO, "  ConfigReader::loadOrCreate(\"" + cfgPath + "\")  " +
+          std::string(cfgOk ? "OK" : "FAIL"));
 
     {
         std::ostringstream o;
@@ -82,8 +84,14 @@ int main(int argc, char* argv[]) {
         o << "  encoder.keyIntMax   = " << cfg.encoder.keyIntMax;
         s_log(LvL::INFO, o.str());
     }
+    // These fields are ConfigVar<std::string>; read into std::string locals so the
+    // ternary member access (.empty()) and `"literal" + value` concatenation work
+    // (ConfigVar's implicit conversion isn't considered in those contexts).
+    const std::string encTune     = cfg.encoder.tune;
+    const std::string fontFace    = cfg.overlay.fontFace;
+    const std::string footagePath = cfg.system.footagePath;
     s_log(LvL::INFO, std::string("  encoder.tune        = ") +
-          (cfg.encoder.tune.empty() ? "(none)" : cfg.encoder.tune));
+          (encTune.empty() ? std::string("(none)") : encTune));
     s_log(LvL::INFO, std::string("  overlay.enabled     = ") +
           (cfg.overlay.enabled ? "true" : "false"));
     {
@@ -91,8 +99,8 @@ int main(int argc, char* argv[]) {
         o << "  overlay.fontSize    = " << cfg.overlay.fontSize;
         s_log(LvL::INFO, o.str());
     }
-    s_log(LvL::INFO, "  overlay.fontFace    = " + cfg.overlay.fontFace);
-    s_log(LvL::INFO, "  system.archivePath  = " + cfg.system.archivePath);
+    s_log(LvL::INFO, "  overlay.fontFace    = " + fontFace);
+    s_log(LvL::INFO, "  system.footagePath  = " + footagePath);
     {
         std::ostringstream o;
         o << "  system.warmupFrames = " << cfg.system.warmupFrames;
@@ -118,7 +126,7 @@ int main(int argc, char* argv[]) {
     }
 
     dashcam::camera::AttributeDictionary dict;
-    dashcam::camera::AttributeDictionary::load("config/camera_attributes.xml", dict, s_log);
+    dashcam::camera::AttributeDictionary::load(cfgDir + "/camera_attributes.xml", dict, s_log);
     {
         std::ostringstream o;
         o << "  AttributeDictionary entries: " << dict.entries.size();
@@ -197,7 +205,7 @@ int main(int argc, char* argv[]) {
         cfg.cameras.push_back(cc);
     }
 
-    bool cfgSaved = dashcam::config::ConfigReader::save("config/dashcam.xml", cfg, s_log);
+    bool cfgSaved = dashcam::config::ConfigReader::save(cfgPath, cfg, s_log);
     {
         std::ostringstream o;
         o << "  config/dashcam.xml updated with " << cfg.cameras.size()

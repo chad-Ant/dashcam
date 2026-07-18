@@ -89,8 +89,11 @@ static CameraRoles assignRoles(const std::vector<dashcam::camera::cameraInfo>& f
     // Config-driven pass: match by device path + role name.
     for (const auto& cc : cfg.cameras) {
         if (!cc.enabled) continue;
+        // ConfigVar<std::string> has no .empty(); copy-init a local (the implicit
+        // operator const T& isn't considered for member access like .empty()).
+        const std::string dev = cc.device;
         for (const auto& info : found) {
-            if (!cc.device.empty() && info.address != cc.device) continue;
+            if (!dev.empty() && info.address != dev) continue;
             if (claimed(&info)) continue;
             bool ok = false;
             if (cc.type == "CSI" && !roles.csi) {
@@ -142,7 +145,37 @@ makePipelineParams(const dashcam::config::PipelineConfig& p) {
     pp.eosTimeoutMs         = static_cast<uint32_t>(p.eosTimeoutMs);
     pp.captureQueueDepth    = static_cast<uint32_t>(p.captureQueueDepth);
     pp.appsinkMaxBuffers    = static_cast<uint32_t>(p.appsinkMaxBuffers);
+    pp.branchQueueDepth     = static_cast<uint32_t>(p.branchQueueDepth);
     return pp;
+}
+
+// Map the XML LogConfig onto liblog's own LogParams (liblog cannot depend on
+// libconfig).  Consumed by dashcam::log::init(); DASHCAM_LOG_LEVEL still
+// overrides the level at runtime.
+static dashcam::log::LogParams
+makeLogParams(const dashcam::config::LogConfig& l) {
+    dashcam::log::LogParams lp;
+    lp.queueSize     = static_cast<uint32_t>(l.queueSize);
+    lp.rotateSizeKb  = static_cast<uint32_t>(l.rotateSizeKb);
+    lp.rotateFiles   = static_cast<uint32_t>(l.rotateFiles);
+    lp.flushEverySec = static_cast<uint32_t>(l.flushEverySec);
+    lp.level         = l.level;
+    lp.flushOn       = l.flushOn;
+    return lp;
+}
+
+// Apply the per-camera whole-output downscale / framerate cap (OutWidth /
+// OutHeight / OutFps) from the config.  Must run before start(); the scale sits
+// before the tee, so it affects the appsink feed and every branch.  Camera_USB
+// ignores it (v4l2src cannot rescale).
+static void applyOutputScale(dashcam::camera::Camera_GST& cam,
+                             const dashcam::config::AppConfig& cfg,
+                             const std::string& roleName) {
+    for (const auto& cc : cfg.cameras)
+        if (cc.name == roleName)
+            cam.setOutputResolution(static_cast<uint32_t>(static_cast<int>(cc.outWidth)),
+                                    static_cast<uint32_t>(static_cast<int>(cc.outHeight)),
+                                    cc.outFps);
 }
 
 // ─── stereo thread (10 fps — blocking on computeDepth) ───────────────────────
@@ -192,23 +225,51 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  onSignal);
     gst_init(&argc, &argv);
 
-    // ── logger ────────────────────────────────────────────────────────────────
-    dashcam::log::init("/data/logs");
+    // ── config + attribute dictionary (before the logger, so <Log> can shape it) ──
+    // getCallback() is usable before init() — it falls back to stderr — and the
+    // returned callback re-resolves the logger on every call, so `log` upgrades
+    // automatically once init() runs below.  The config is read from the media
+    // configs dir (/user/output/configs), so the operator can edit it on the card.
+    // If that mount is unavailable (SD card removed) resolveStorageDir() falls back
+    // to the build-local <exe_dir>/config the build seeds.  loadOrCreate() seeds a
+    // default config there on the first run.
     auto log = dashcam::log::getCallback();
-    doLog(log, dashcam::log::LogLevel::INFO, "dashcam starting");
-
-    // ── config + attribute dictionary ─────────────────────────────────────────
     dashcam::config::AppConfig cfg;
     dashcam::camera::AttributeDictionary dict;
-    if (!dashcam::config::ConfigReader::load("config/dashcam.xml", cfg, log))
-        doLog(log, dashcam::log::LogLevel::WARN, "config load failed; using defaults");
-    if (!dashcam::camera::AttributeDictionary::load("config/camera_attributes.xml", dict, log))
+    const std::string configsDir = dashcam::config::resolveStorageDir(
+        dashcam::config::kDefaultConfigsDir, dashcam::config::kFallbackConfigsName, log);
+    const std::string cfgPath = configsDir + "/dashcam.xml";
+    if (!dashcam::config::ConfigReader::loadOrCreate(cfgPath, cfg, log))
+        doLog(log, dashcam::log::LogLevel::WARN, "config load/create failed; using defaults");
+
+    // ── logger ────────────────────────────────────────────────────────────────
+    // Logs land in /user/output/logs.  The log DIRECTORY stays a compile-time
+    // default (a config field naming it would be unusable if the mount holding
+    // the config is gone), but the tuning comes from <Log> in the config.  If the
+    // mount is unavailable (SD card removed) this falls back to build-local
+    // <exe_dir>/logs.
+    const std::string logDir = dashcam::config::resolveStorageDir(
+        dashcam::config::kDefaultLogDir, dashcam::config::kFallbackLogName, log);
+    dashcam::log::init(logDir, makeLogParams(cfg.log));
+    doLog(log, dashcam::log::LogLevel::INFO, "dashcam starting");
+    // Attribute dictionary is informational (discovered metadata).  Prefer the media
+    // configs dir; fall back to the build-local copy the build seeds if the card has
+    // none yet (loadOrCreate only seeds dashcam.xml, not camera_attributes.xml).
+    std::string attrPath = configsDir + "/camera_attributes.xml";
+    if (!fs::exists(attrPath))
+        attrPath = dashcam::config::configDir() + "/camera_attributes.xml";
+    if (!dashcam::camera::AttributeDictionary::load(attrPath, dict, log))
         doLog(log, dashcam::log::LogLevel::WARN, "attribute dictionary not loaded");
-    fs::create_directories(cfg.system.archivePath);
+
+    // Recorded video -> footage dir, resolved to build-local <exe_dir>/footage if the
+    // configured mount is unavailable, so a removed SD card degrades instead of
+    // losing data.
+    const std::string footageDir = dashcam::config::resolveStorageDir(
+        cfg.system.footagePath, dashcam::config::kFallbackFootageName, log);
 
     // ── camera discovery ──────────────────────────────────────────────────────
     std::vector<dashcam::camera::cameraInfo> found;
-    if (dashcam::camera::getCameraList(found) != dashcam::camera::ERROR_CODE::NONE || found.empty()) {
+    if (dashcam::camera::getCameraList(found, log) != dashcam::camera::ERROR_CODE::NONE || found.empty()) {
         doLog(log, dashcam::log::LogLevel::ERROR, "no cameras discovered; aborting");
         dashcam::log::shutdown();
         return 1;
@@ -226,7 +287,7 @@ int main(int argc, char* argv[]) {
             cc.sensorId = static_cast<int>(info.deviceId);
             cfg.cameras.push_back(cc);
         }
-        dashcam::config::ConfigReader::save("config/dashcam.xml", cfg, log);
+        dashcam::config::ConfigReader::save(cfgPath, cfg, log);
     }
 
     CameraRoles roles = assignRoles(found, cfg, log);
@@ -244,6 +305,7 @@ int main(int argc, char* argv[]) {
             csiCam->setAttributeDictionary(dict);
             csiCam->setPipelineParams(makePipelineParams(cfg.pipeline));
             applyCaps(*csiCam, cfg, "front");
+            applyOutputScale(*csiCam, cfg, "front");
 
             recorder.setLogCallback(log);
             recorder.setOverlayConfig(cfg.overlay);
@@ -255,10 +317,18 @@ int main(int argc, char* argv[]) {
             uint32_t frNum, frDen;
             dashcam::camera::Camera_GST::computeFpsRational(recFps, frNum, frDen);
 
-            std::string clip = cfg.system.archivePath + "/clip_" + utcTimestamp() + ".mkv";
+            std::string clip = footageDir + "/clip_" + utcTimestamp() + ".mkv";
+            // recordWidth/Height: optional config downscale at the bin inlet
+            // (VIC — cheap) before overlay + CPU encoder; 0/0 = native.
+            // overlay=cfg.overlay.enabled: disabling the overlay in config
+            // omits the whole Cairo/BGRx stage, not just the drawing.
             GstElement* recBin = recorder.createRecordingBin(
                 clip, frNum, frDen, cfg.encoder,
-                static_cast<uint32_t>(cfg.recording.queueDepth));
+                static_cast<uint32_t>(cfg.recording.queueDepth),
+                dashcam::record::SourceMemory::NVMM,
+                static_cast<uint32_t>(static_cast<int>(cfg.recording.recordWidth)),
+                static_cast<uint32_t>(static_cast<int>(cfg.recording.recordHeight)),
+                cfg.overlay.enabled);
             if (recBin)
                 csiCam->addBranch("recording", recBin, false, false);
             else

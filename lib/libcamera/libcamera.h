@@ -47,7 +47,8 @@ enum class ERROR_CODE {
     CSI_PIPELINE_ERROR     = -6, ///< GStreamer pipeline construction or state-change failed (CSI/Argus path).
     CSI_ID_PARSE_ERROR     = -7, ///< Argus sensor-id could not be determined.
     USB_PIPELINE_ERROR     = -8, ///< GStreamer pipeline construction or state-change failed (USB/V4L2 path).
-    UNKNOWN_ERROR          = -9  ///< Unclassified error.
+    UNKNOWN_ERROR          = -9, ///< Unclassified error.
+    CAMERA_NOT_OPEN        = -10 ///< start() called while the camera is not in OPEN state.
 };
 
 /**
@@ -161,18 +162,26 @@ struct cameraInfo {
  * reports @c V4L2_CAP_VIDEO_CAPTURE, the function probes supported pixel
  * formats, discrete resolutions, discrete frame rates, and V4L2 controls.
  *
- * CSI cameras (driver: @c tegra-video or @c vi) receive a sequential Argus
- * sensor-id in @c cameraInfo::deviceId rather than the raw V4L2 device index.
- * USB cameras (driver: @c uvcvideo) receive the raw numeric device index.
+ * CSI cameras (driver: @c tegra-video or @c vi) receive their Argus sensor-id
+ * in @c cameraInfo::deviceId, resolved via the device tree's
+ * tegra-camera-platform module list (video-node order follows i2c probe order,
+ * which can differ from Argus order with mixed sensors).  If the device tree
+ * chain cannot be resolved, a sequential id in /dev/videoN order is assumed
+ * and a WARN is logged.  USB cameras (driver: @c uvcvideo) receive the raw
+ * numeric device index.
  *
  * @param[out] cameraList  Cleared and populated with one entry per discovered
  *                         capture device.  The vector may be empty on return
  *                         if no devices are found.
+ * @param[in]  log         Optional diagnostic callback; warns when a device's
+ *                         format cross-product exceeds MAX_VIDEO_FORMATS and
+ *                         the list is truncated.
  * @return ERROR_CODE::NONE            if at least one camera was found.
  * @return ERROR_CODE::NO_CAMERAS_FOUND if no capture devices were discovered
  *                                      or @c /dev could not be iterated.
  */
-ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList);
+ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
+                         const dashcam::log::LogCallback& log = {});
 
 // ─── interface ───────────────────────────────────────────────────────────────
 
@@ -271,6 +280,8 @@ public:
      * @pre  Status == OPEN and cameraInfo::videoFormats is not empty.
      * @post Status transitions: OPEN → RUNNING on success, OPEN → ERROR on failure.
      *       Sets CAMERA_ALREADY_RUNNING and returns immediately if already RUNNING.
+     *       Sets CAMERA_NOT_OPEN and returns immediately if the camera is in any
+     *       other non-OPEN state (CLOSED, ERROR).
      */
     virtual void start() = 0;
 

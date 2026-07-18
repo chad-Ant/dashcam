@@ -1,9 +1,12 @@
 #include "libcamera.h"
 #include "libconfig.h"
 #include <algorithm>
+#include <climits>
 #include <cstdarg>
 #include <cstdio>
+#include <filesystem>
 #include <pugixml.hpp>
+#include <unistd.h>
 
 // ─── file-local helpers ───────────────────────────────────────────────────────
 
@@ -18,6 +21,37 @@ static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lv
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     cb(lvl, buf);
+}
+
+// "<name>" directory next to the running executable (independent of the cwd),
+// e.g. the bin/build_<ts>/<name> of the build this binary came from.  Falls back
+// to a cwd-relative "<name>" if the executable path can't be read.
+static std::string exeRelativeDirImpl(const std::string& name) {
+    char buf[PATH_MAX];
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return name;
+    buf[n] = '\0';
+    std::string exe(buf);
+    std::string::size_type slash = exe.find_last_of('/');
+    std::string base = (slash == std::string::npos) ? std::string(".") : exe.substr(0, slash);
+    return base + "/" + name;
+}
+
+static std::string exeRelativeConfigDir() { return exeRelativeDirImpl("config"); }
+
+// True if `dir` can be created and actually written to.  Creates it if missing,
+// then writes and removes a probe file — this catches a removed SD card / stale or
+// read-only mount (ENOENT / EROFS / EIO) that a plain exists() check would miss.
+static bool dirWritable(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);   // no error if it already exists
+    const std::string probe = dir + "/.dashcam_write_probe";
+    FILE* f = std::fopen(probe.c_str(), "w");
+    if (!f) return false;
+    bool ok = (std::fputc('x', f) != EOF);
+    if (std::fclose(f) != 0) ok = false;            // deferred write errors surface here
+    std::remove(probe.c_str());
+    return ok;
 }
 
 // Return the XML attribute string for a ConfigDataType.
@@ -71,12 +105,24 @@ static void writeVar(pugi::xml_node parent, const dashcam::config::ConfigVar<T>&
     n.append_attribute("type").set_value(typeName(v.datatype()));
     n.append_attribute("description").set_value(v.description().c_str());
 
-    if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
-        n.append_attribute("min").set_value(static_cast<double>(v.minValue()));
-        n.append_attribute("max").set_value(static_cast<double>(v.maxValue()));
-        n.append_attribute("step").set_value(static_cast<double>(v.step()));
-        n.append_attribute("default").set_value(static_cast<double>(v.defaultValue()));
-        n.text().set(static_cast<double>(static_cast<T>(v)));
+    if constexpr (std::is_same_v<T, int>) {
+        // Write ints as ints so pugixml formats them exactly (e.g. "8000").
+        n.append_attribute("min").set_value(v.minValue());
+        n.append_attribute("max").set_value(v.maxValue());
+        n.append_attribute("step").set_value(v.step());
+        n.append_attribute("default").set_value(v.defaultValue());
+        n.text().set(static_cast<int>(v));
+    } else if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {  // float
+        // pugixml formats a bare double at ~17 significant figures, so 0.85f becomes
+        // "0.85000002384185791" — noise that defeats the self-documenting config.
+        // Config granularity (steps ≥ 0.01) never needs more than a few digits, so
+        // write floats at a modest precision to keep the file clean and diff-friendly.
+        constexpr int kPrec = 6;
+        n.append_attribute("min").set_value(static_cast<double>(v.minValue()), kPrec);
+        n.append_attribute("max").set_value(static_cast<double>(v.maxValue()), kPrec);
+        n.append_attribute("step").set_value(static_cast<double>(v.step()), kPrec);
+        n.append_attribute("default").set_value(static_cast<double>(v.defaultValue()), kPrec);
+        n.text().set(static_cast<double>(static_cast<T>(v)), kPrec);
     } else if constexpr (std::is_same_v<T, bool>) {
         n.append_attribute("default").set_value(static_cast<bool>(v.defaultValue()));
         n.text().set(static_cast<bool>(v));
@@ -128,6 +174,8 @@ static void parseOverlay(pugi::xml_node node, OverlayConfig& ovl,
     readVar(node, ovl.backgroundOpacity, log);
     readVar(node, ovl.fontSize,          log);
     readVar(node, ovl.fontFace,          log);
+    readVar(node, ovl.labelPadX,         log);
+    readVar(node, ovl.labelPadY,         log);
 }
 
 static void parseCamera(pugi::xml_node node, CameraConfig& cam,
@@ -139,6 +187,9 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam,
     readVar(node, cam.device,      log);
     readVar(node, cam.sensorId,    log);
     readVar(node, cam.formatIndex, log);
+    readVar(node, cam.outWidth,    log);
+    readVar(node, cam.outHeight,   log);
+    readVar(node, cam.outFps,      log);
 
     if (auto attrs = node.child("Attributes")) {
         for (auto attr : attrs.children("Attribute")) {
@@ -167,7 +218,7 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam,
 
 static void parseSystem(pugi::xml_node node, SystemConfig& sys,
                         const dashcam::log::LogCallback& log) {
-    readVar(node, sys.archivePath,  log);
+    readVar(node, sys.footagePath,  log);
     readVar(node, sys.warmupFrames, log);
 }
 
@@ -178,12 +229,25 @@ static void parsePipeline(pugi::xml_node node, PipelineConfig& p,
     readVar(node, p.eosTimeoutMs,         log);
     readVar(node, p.captureQueueDepth,    log);
     readVar(node, p.appsinkMaxBuffers,    log);
+    readVar(node, p.branchQueueDepth,     log);
+}
+
+static void parseLog(pugi::xml_node node, LogConfig& l,
+                     const dashcam::log::LogCallback& log) {
+    readVar(node, l.queueSize,     log);
+    readVar(node, l.rotateSizeKb,  log);
+    readVar(node, l.rotateFiles,   log);
+    readVar(node, l.flushEverySec, log);
+    readVar(node, l.level,         log);
+    readVar(node, l.flushOn,       log);
 }
 
 static void parseRecording(pugi::xml_node node, RecordingConfig& r,
                            const dashcam::log::LogCallback& log) {
-    readVar(node, r.recordFps,  log);
-    readVar(node, r.queueDepth, log);
+    readVar(node, r.recordFps,    log);
+    readVar(node, r.queueDepth,   log);
+    readVar(node, r.recordWidth,  log);
+    readVar(node, r.recordHeight, log);
 }
 
 static void parseDetection(pugi::xml_node node, DetectionConfig& d,
@@ -212,6 +276,8 @@ static void writeOverlay(pugi::xml_node parent, const OverlayConfig& ovl) {
     writeVar(n, ovl.backgroundOpacity);
     writeVar(n, ovl.fontSize);
     writeVar(n, ovl.fontFace);
+    writeVar(n, ovl.labelPadX);
+    writeVar(n, ovl.labelPadY);
 }
 
 static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
@@ -223,6 +289,9 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
     writeVar(n, cam.device);
     writeVar(n, cam.sensorId);
     writeVar(n, cam.formatIndex);
+    writeVar(n, cam.outWidth);
+    writeVar(n, cam.outHeight);
+    writeVar(n, cam.outFps);
 
     if (!cam.attributeInfo.empty()) {
         pugi::xml_node attrs = n.append_child("Attributes");
@@ -251,7 +320,7 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
 
 static void writeSystem(pugi::xml_node parent, const SystemConfig& sys) {
     pugi::xml_node n = parent.append_child("System");
-    writeVar(n, sys.archivePath);
+    writeVar(n, sys.footagePath);
     writeVar(n, sys.warmupFrames);
 }
 
@@ -262,12 +331,25 @@ static void writePipeline(pugi::xml_node parent, const PipelineConfig& p) {
     writeVar(n, p.eosTimeoutMs);
     writeVar(n, p.captureQueueDepth);
     writeVar(n, p.appsinkMaxBuffers);
+    writeVar(n, p.branchQueueDepth);
+}
+
+static void writeLog(pugi::xml_node parent, const LogConfig& l) {
+    pugi::xml_node n = parent.append_child("Log");
+    writeVar(n, l.queueSize);
+    writeVar(n, l.rotateSizeKb);
+    writeVar(n, l.rotateFiles);
+    writeVar(n, l.flushEverySec);
+    writeVar(n, l.level);
+    writeVar(n, l.flushOn);
 }
 
 static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
     pugi::xml_node n = parent.append_child("Recording");
     writeVar(n, r.recordFps);
     writeVar(n, r.queueDepth);
+    writeVar(n, r.recordWidth);
+    writeVar(n, r.recordHeight);
 }
 
 static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
@@ -307,6 +389,7 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
     if (auto pl  = root.child("Pipeline"))  parsePipeline (pl,  config.pipeline,  log);
     if (auto rec = root.child("Recording")) parseRecording(rec, config.recording, log);
     if (auto det = root.child("Detection")) parseDetection(det, config.detection, log);
+    if (auto lg  = root.child("Log"))       parseLog      (lg,  config.log,       log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
@@ -341,6 +424,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writePipeline(root, config.pipeline);
     writeRecording(root, config.recording);
     writeDetection(root, config.detection);
+    writeLog(root, config.log);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {
         doLog(log, dashcam::log::LogLevel::ERROR,
@@ -348,6 +432,47 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
         return false;
     }
     return true;
+}
+
+bool ConfigReader::loadOrCreate(const std::string& filePath, AppConfig& config,
+                                const dashcam::log::LogCallback& log) {
+    std::error_code ec;
+    if (std::filesystem::exists(filePath, ec))
+        return load(filePath, config, log);
+
+    // Missing: create the parent directory and seed a default-valued config.
+    std::filesystem::path p(filePath);
+    if (p.has_parent_path())
+        std::filesystem::create_directories(p.parent_path(), ec);
+
+    AppConfig defaults;                 // built-in defaults
+    if (!save(filePath, defaults, log)) // save() reports its own error
+        return false;
+
+    doLog(log, dashcam::log::LogLevel::INFO,
+          "config '%s' not found — created with default values", filePath.c_str());
+    config = defaults;
+    return true;
+}
+
+std::string configDir() { return exeRelativeConfigDir(); }
+
+std::string exeRelativeDir(const std::string& name) { return exeRelativeDirImpl(name); }
+
+std::string resolveStorageDir(const std::string& preferred,
+                              const std::string& fallbackName,
+                              const dashcam::log::LogCallback& log) {
+    if (dirWritable(preferred))
+        return preferred;
+
+    const std::string fallback = exeRelativeDirImpl(fallbackName);
+    doLog(log, dashcam::log::LogLevel::WARN,
+          "storage '%s' unavailable (SD card removed?) — falling back to build-local '%s'",
+          preferred.c_str(), fallback.c_str());
+    // Best-effort create; if even this fails there is nothing writable to use.
+    std::error_code ec;
+    std::filesystem::create_directories(fallback, ec);
+    return fallback;
 }
 
 } // namespace dashcam::config

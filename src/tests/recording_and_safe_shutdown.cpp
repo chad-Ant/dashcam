@@ -73,10 +73,13 @@ bool test_recording_overlay(const cameraInfo& info,
     if (fs::exists(filename)) fs::remove(filename);
 
     const auto& fmt = info.videoFormats[fmtIdx];
+    // Record at the configured fps, never above the sensor rate — encoding a
+    // 60 fps sensor natively is the classic no-NVENC CPU footgun.
+    const float recFps = std::min(static_cast<float>(cfg.recording.recordFps), fmt.frameRate);
     uint32_t frNum, frDen;
-    Camera_GST::computeFpsRational(fmt.frameRate, frNum, frDen);
+    Camera_GST::computeFpsRational(recFps, frNum, frDen);
     std::cout << "  fps rational: " << frNum << "/" << frDen
-              << " (from frameRate=" << fmt.frameRate << ")\n";
+              << " (record " << recFps << " from sensor " << fmt.frameRate << ")\n";
 
     GstElement* recBin = recorder.createRecordingBin(filename, frNum, frDen, cfg.encoder);
     if (!recBin) {
@@ -93,7 +96,10 @@ bool test_recording_overlay(const cameraInfo& info,
     if (!checkRunning(cam, "Test 1")) return false;
     std::cout << "  Pipeline RUNNING.\n";
 
-    std::vector<uint8_t> buffer(1280 * 720 * 4);
+    // Size the capture buffer from the ACTIVE format: captureFrame() discards
+    // frames larger than the buffer, so a hardcoded 720p buffer silently
+    // starves the appsink loop when the camera runs its native mode.
+    std::vector<uint8_t> buffer((size_t)fmt.width * fmt.height * 3 + 64);
     int frames = 0;
     uint32_t written = 0;
 
@@ -144,6 +150,10 @@ bool test_recording_overlay(const cameraInfo& info,
     uintmax_t size = fs::exists(filename) ? fs::file_size(filename) : 0;
     std::cout << "  File size: " << size / 1024 << " KB\n";
     ffprobe_streams(filename);
+    if (frames == 0) {
+        std::cerr << "  FAIL: appsink delivered no frames during recording\n";
+        return false;
+    }
     return size > 100000;
 }
 
@@ -164,10 +174,11 @@ bool test_graceful_mid_recording_stop(const cameraInfo& info,
     if (fs::exists(filename)) fs::remove(filename);
 
     const auto& fmt2 = info.videoFormats[fmtIdx];
+    const float recFps2 = std::min(static_cast<float>(cfg.recording.recordFps), fmt2.frameRate);
     uint32_t frNum2, frDen2;
-    Camera_GST::computeFpsRational(fmt2.frameRate, frNum2, frDen2);
+    Camera_GST::computeFpsRational(recFps2, frNum2, frDen2);
     std::cout << "  fps rational: " << frNum2 << "/" << frDen2
-              << " (from frameRate=" << fmt2.frameRate << ")\n";
+              << " (record " << recFps2 << " from sensor " << fmt2.frameRate << ")\n";
 
     GstElement* recBin = recorder.createRecordingBin(filename, frNum2, frDen2, cfg.encoder);
     if (!recBin) {
@@ -183,7 +194,7 @@ bool test_graceful_mid_recording_stop(const cameraInfo& info,
     if (!checkRunning(cam, "Test 2")) return false;
     std::cout << "  Pipeline RUNNING.\n";
 
-    std::vector<uint8_t> buffer(1280 * 720 * 4);
+    std::vector<uint8_t> buffer((size_t)fmt2.width * fmt2.height * 3 + 64);
     int frames = 0;
     uint32_t written = 0;
 
@@ -223,6 +234,10 @@ bool test_graceful_mid_recording_stop(const cameraInfo& info,
     uintmax_t size = fs::exists(filename) ? fs::file_size(filename) : 0;
     std::cout << "  File size: " << size / 1024 << " KB\n";
     if (size <= 50000) return false;
+    if (frames == 0) {
+        std::cerr << "  FAIL: appsink delivered no frames during recording\n";
+        return false;
+    }
 
     // Verify the file is a valid, playable MKV and print stream details.
     std::cout << "  Validating with ffprobe...\n";

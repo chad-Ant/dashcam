@@ -66,8 +66,8 @@ static void parseFontFace(const std::string& fontFace,
 static void drawCornerLabel(cairo_t* cr, const char* text,
                              bool rightAligned, bool bottomAligned,
                              double frameW, double frameH,
-                             double bgOpacity) {
-    const double xpad = 12.0, ypad = 8.0;
+                             double bgOpacity,
+                             double xpad, double ypad) {
 
     cairo_font_extents_t fe;
     cairo_font_extents(cr, &fe);
@@ -177,10 +177,10 @@ void Recorder::renderOverlay(cairo_t* cr) {
 
     time_t epochSec = static_cast<time_t>(od.timestampMs / 1000LL);
     struct tm tmBuf;
-    gmtime_r(&epochSec, &tmBuf);
+    localtime_r(&epochSec, &tmBuf);
     char dateBuf[16], timeBuf[16];
     std::strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", &tmBuf);
-    std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S UTC", &tmBuf);
+    std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S %Z", &tmBuf);
 
     char buf[128];
 
@@ -190,24 +190,26 @@ void Recorder::renderOverlay(cairo_t* cr) {
     cairo_set_font_size(cr, static_cast<double>(ocfg.fontSize));
 
     const double opacity = static_cast<double>(ocfg.backgroundOpacity);
+    const double padX    = static_cast<double>(ocfg.labelPadX);
+    const double padY    = static_cast<double>(ocfg.labelPadY);
 
     std::snprintf(buf, sizeof(buf), "SPD %.1f km/h\nACC %+.1f m/s2",
                   static_cast<double>(od.speedKmh),
                   static_cast<double>(od.accelerationMs2));
-    drawCornerLabel(cr, buf, false, false, w, h, opacity);
+    drawCornerLabel(cr, buf, false, false, w, h, opacity, padX, padY);
 
     std::snprintf(buf, sizeof(buf), "HDG %03.0f %s",
                   static_cast<double>(od.headingDeg), headingToCardinal(od.headingDeg));
-    drawCornerLabel(cr, buf, true, false, w, h, opacity);
+    drawCornerLabel(cr, buf, true, false, w, h, opacity, padX, padY);
 
     std::snprintf(buf, sizeof(buf), "LAT %.6f %c\nLON %.6f %c\nALT %.1f m",
                   std::abs(od.latitude),  od.latitude  >= 0.0 ? 'N' : 'S',
                   std::abs(od.longitude), od.longitude >= 0.0 ? 'E' : 'W',
                   od.altitudeM);
-    drawCornerLabel(cr, buf, false, true, w, h, opacity);
+    drawCornerLabel(cr, buf, false, true, w, h, opacity, padX, padY);
 
     std::snprintf(buf, sizeof(buf), "%s\n%s", dateBuf, timeBuf);
-    drawCornerLabel(cr, buf, true, true, w, h, opacity);
+    drawCornerLabel(cr, buf, true, true, w, h, opacity, padX, padY);
 }
 
 // ─── lifecycle ────────────────────────────────────────────────────────────────
@@ -260,7 +262,8 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
                                           const dashcam::config::EncoderConfig& enc,
                                           uint32_t queueDepth,
                                           SourceMemory srcMem,
-                                          uint32_t outWidth, uint32_t outHeight) {
+                                          uint32_t outWidth, uint32_t outHeight,
+                                          bool overlay) {
     disconnect();
 
     // enc.speedPreset / enc.tune are ConfigVar<std::string>: read them into
@@ -285,28 +288,51 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
         ? ",width=(int)" + std::to_string(outWidth) + ",height=(int)" + std::to_string(outHeight)
         : std::string();
 
+    // Inlet output format: BGRx when overlaying (Cairo draws on BGRx), else I420
+    // straight into the encoder — skipping Cairo and a BGRx round-trip.
+    const std::string inFmt = overlay ? "BGRx" : "I420";
+    const std::string inletCaps = "video/x-raw,format=(string)" + inFmt + wh;
+
     // Inlet: nvvidconv for NVMM (CSI) — the only element that can pull buffers off
     // NVMM, and it scales on the VIC — or videoconvert (+videoscale when scaling)
     // for system memory (USB), which accepts any raw UVC format and skips a needless
-    // VIC round-trip.  Both emit BGRx[,WxH] for the Cairo overlay stage.
+    // VIC round-trip.
     std::string inletChain;
     if (srcMem == SourceMemory::System) {
         inletChain = scale
-            ? "videoconvert name=conv ! videoscale ! video/x-raw,format=(string)BGRx" + wh
-            : "videoconvert name=conv ! video/x-raw,format=(string)BGRx";
+            ? "videoconvert name=conv ! videoscale ! " + inletCaps
+            : "videoconvert name=conv ! " + inletCaps;
     } else {
-        inletChain = "nvvidconv name=conv ! video/x-raw,format=(string)BGRx" + wh;
+        inletChain = "nvvidconv name=conv ! " + inletCaps;
     }
 
+    // Cairo overlay stage (BGRx → draw → back to I420); omitted entirely when
+    // overlay=false (the inlet already produced I420).
+    const std::string overlayStage = overlay
+        ? " ! cairooverlay name=cairoov ! videoconvert ! video/x-raw,format=(string)I420"
+        : std::string();
+
+    // videorate sits at the INLET, not in front of the encoder: everything
+    // downstream of it (Cairo draw, BGRx→I420 videoconvert, x264) then runs at
+    // the target rate instead of the sensor rate.  On a 60 fps sensor recorded
+    // at 30 that halves the whole software chain's cost — significant on a box
+    // with no NVENC.
+    //
+    // skip-to-first: the recording valve typically opens a couple of seconds
+    // after the pipeline starts (camera warmup), so the first buffer arrives
+    // with a non-zero running time.  Default videorate would backfill segment
+    // start → first PTS with duplicates of that frame — a freeze-frame intro.
+    // offset-to-zero then shifts the muxed timestamps back so the file still
+    // starts at 0 instead of at the warmup offset.
     const std::string binDesc =
-        inletChain + " "
-        "! cairooverlay name=cairoov "
-        "! videoconvert ! video/x-raw,format=(string)I420 "
-        "! queue max-size-buffers=" + std::to_string(queueDepth) + " leaky=0 "
-        "! videorate ! video/x-raw,framerate=" +
-        std::to_string(frNum) + "/" + std::to_string(frDen) + " "
+        inletChain +
+        " ! videorate skip-to-first=true ! video/x-raw,framerate=" +
+        std::to_string(frNum) + "/" + std::to_string(frDen) +
+        overlayStage +
+        " ! queue max-size-buffers=" + std::to_string(queueDepth) + " leaky=0 "
         "! x264enc" + x264Opts + " insert-vui=true aud=true "
-        "! h264parse ! matroskamux ! filesink name=fsink sync=false async=false";
+        "! h264parse ! matroskamux offset-to-zero=true "
+        "! filesink name=fsink sync=false async=false";
 
     doLog(log_, dashcam::log::LogLevel::INFO,
           "createRecordingBin pipeline: %s", binDesc.c_str());
@@ -324,10 +350,22 @@ GstElement* Recorder::createRecordingBin(const std::string& filename,
     }
 
     GstElement* fsink = gst_bin_get_by_name(GST_BIN(bin), "fsink");
-    if (fsink) {
-        g_object_set(G_OBJECT(fsink), "location", filename.c_str(), NULL);
-        gst_object_unref(fsink);
+    if (!fsink) {
+        // Should be impossible after a successful parse, but a bin without its
+        // filesink location would only fail later at PLAYING with a confusing
+        // "no location" error — fail loudly here instead.
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "could not find filesink element in recording bin");
+        gst_object_unref(bin);
+        return nullptr;
     }
+    g_object_set(G_OBJECT(fsink), "location", filename.c_str(), NULL);
+    gst_object_unref(fsink);
+
+    // No-overlay bin: no cairooverlay element, so no signals to wire up.
+    // cairoOverlay_ stays null, so disconnect()/~Recorder are no-ops.
+    if (!overlay)
+        return bin;
 
     // gst_bin_get_by_name returns an owned ref (+1).  Release it immediately so
     // the bin remains the sole owner; the raw pointer stays valid for the bin's

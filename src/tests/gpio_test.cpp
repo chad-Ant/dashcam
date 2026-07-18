@@ -38,7 +38,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, onSignal);
 
     fs::create_directories("./logs");
-    dashcam::log::init("./logs");
+    dashcam::log::init();  // build-local logs: <exe_dir>/logs
     auto log = dashcam::log::getCallback();
 
     log(LvL::INFO, "=== GPIO / UART / I2C / SPI test ===");

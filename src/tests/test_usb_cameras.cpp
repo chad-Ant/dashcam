@@ -20,6 +20,12 @@ using namespace dashcam::camera;
 
 namespace fs = std::filesystem;
 
+// Attribute dictionary shared by the attribute tests (3-5); loaded once in
+// main() from config/camera_attributes.xml.  Camera_GST resolves attribute
+// names against this dictionary, so tests must install it via
+// setAttributeDictionary() before exercising setCameraAttribute().
+static AttributeDictionary g_dict;
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 static bool checkRunning(Camera_USB& cam, const char* phase) {
@@ -68,9 +74,22 @@ static int minFrames(const cameraVideoFormat& fmt, int duration_s) {
 static bool test_open_close(const cameraInfo& info) {
     std::cout << "\n--- Test 1: Open/Close Lifecycle ---\n";
     Camera_USB cam(info);
+    cameraStatus st;
+
+    // start() before open() must be refused with CAMERA_NOT_OPEN and no
+    // status transition.
+    cam.start();
+    cam.getCameraStatus(st);
+    if (st.status != CAMERA_STATUS::CLOSED ||
+        st.currentError != ERROR_CODE::CAMERA_NOT_OPEN) {
+        std::cerr << "  start() before open(): expected CLOSED + CAMERA_NOT_OPEN,"
+                  << " got status=" << static_cast<int>(st.status)
+                  << " error=" << static_cast<int>(st.currentError) << "\n";
+        return false;
+    }
+    std::cout << "  start() before open() -> refused (CAMERA_NOT_OPEN)\n";
 
     cam.open();
-    cameraStatus st;
     cam.getCameraStatus(st);
     if (st.status != CAMERA_STATUS::OPEN) {
         std::cerr << "  open() did not reach OPEN (status=" << static_cast<int>(st.status)
@@ -126,6 +145,7 @@ static bool test_attribute_before_start(const cameraInfo& info) {
     if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
 
     Camera_USB cam(info);
+    cam.setAttributeDictionary(g_dict);
     cam.setCameraAttribute("brightness", "128");
     cam.open();
     cam.setCameraVideoFormat(0);
@@ -149,6 +169,7 @@ static bool test_attribute_while_running(const cameraInfo& info) {
     if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
 
     Camera_USB cam(info);
+    cam.setAttributeDictionary(g_dict);
     cam.open();
     cam.setCameraVideoFormat(0);
     cam.start();
@@ -172,6 +193,7 @@ static bool test_attribute_invalid(const cameraInfo& info) {
     if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
 
     Camera_USB cam(info);
+    cam.setAttributeDictionary(g_dict);
     cam.open();
     cam.setCameraVideoFormat(0);
     cam.start();
@@ -436,6 +458,11 @@ static bool test_dual_independent_stop(const cameraInfo& info0, const cameraInfo
 int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
     fs::create_directories("./archive");
+
+    if (!AttributeDictionary::load("config/camera_attributes.xml", g_dict)) {
+        std::cerr << "WARNING: config/camera_attributes.xml not loaded; "
+                     "attribute tests (3-5) will fail.\n";
+    }
 
     std::vector<cameraInfo> cameras;
     if (getCameraList(cameras) != ERROR_CODE::NONE || cameras.empty()) {

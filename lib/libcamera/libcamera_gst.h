@@ -21,6 +21,7 @@
 #include "liblog.h"
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
@@ -80,6 +81,8 @@ struct PipelineParams {
     uint32_t eosTimeoutMs         = 5000;  ///< Teardown EOS flush wait.
     uint32_t captureQueueDepth    = 2;     ///< appsink-branch leaky queue max-size-buffers.
     uint32_t appsinkMaxBuffers    = 1;     ///< appsink max-buffers.
+    uint32_t branchQueueDepth     = 2;     ///< Leaky (inference) branch queue max-size-buffers;
+                                           ///< blocking (recording) branches keep GStreamer defaults.
 };
 
 class Camera_GST : public iCamera {
@@ -90,6 +93,15 @@ protected:
     /// Pipeline timing / queue tuning; read by buildPipelineString() and the
     /// lifecycle methods.  Set via setPipelineParams() before start().
     PipelineParams params_;
+
+    /// Optional scaled-output override read by buildPipelineString().  0 = disabled
+    /// (use the selected format's native dimensions / rate).  Honoured by the CSI
+    /// driver, which inserts a VIC nvvidconv downscale + videorate before the tee so
+    /// the *whole* camera output (appsink feed and every branch) is scaled; see
+    /// setOutputResolution().  Set before start().
+    uint32_t outWidth_  = 0;  ///< Scaled output width in pixels; 0 = native.
+    uint32_t outHeight_ = 0;  ///< Scaled output height in pixels; 0 = native.
+    float    outFps_    = 0.0f;  ///< Scaled output frame rate; 0 = native sensor rate.
 
     GstElement* pipeline_;   ///< Top-level GstPipeline; nullptr when not running.
     GstElement* camera_src_; ///< Source element retrieved by name "camerasrc"; used for attribute writes.
@@ -137,6 +149,17 @@ protected:
     /// released) and during attribute application (unavoidable, locks GStreamer
     /// property writes).
     mutable std::mutex stateMutex_;
+
+    /// True from the optimistic RUNNING claim in start() until construction
+    /// finishes (success path or setPipelineError()).  Guarded by stateMutex_.
+    /// stop() waits for this to clear (via startCv_) so a concurrent
+    /// stop()/close() can never tear down a pipeline that start() is still
+    /// assembling outside the lock (use-after-free on the half-built pipeline).
+    bool starting_ = false;
+
+    /// Signalled when starting_ clears.  The wait is bounded in practice:
+    /// start() always terminates via its state-change timeouts.
+    mutable std::condition_variable startCv_;
 
     /// Loaded attribute dictionary used by applyAttributeGStreamer() to resolve
     /// capability names to GStreamer property names.  Set via setAttributeDictionary()
@@ -266,8 +289,9 @@ private:
      * unnoticed and captureFrame() would silently time out forever.  This polls
      * the bus non-blocking; on the first error it logs the detail and
      * transitions RUNNING → ERROR (recording pipelineError()).  Called from
-     * captureFrame().  Acquires stateMutex_ internally; must not be called with
-     * it held.
+     * captureFrame() and getCameraStatus(), so even a recording-only camera
+     * (no captureFrame() consumer) surfaces pipeline death via status polling.
+     * Acquires stateMutex_ internally; must not be called with it held.
      */
     void checkBusErrors();
 
@@ -299,6 +323,26 @@ public:
      * @param p  Tuning values, typically mapped from dashcam::config::PipelineConfig.
      */
     void setPipelineParams(const PipelineParams& p);
+
+    /**
+     * @brief Request a scaled camera output instead of the format's native size/rate.
+     *
+     * Applies to the ENTIRE output — the appsink/inference feed and every branch off
+     * the tee — because the scale happens before the tee.  On the CSI/Argus driver
+     * the sensor still runs at its native mode; an nvvidconv (VIC) downscale and a
+     * videorate cap are inserted, so this is cheap (VIC scaling is ~free) and keeps
+     * buffers on NVMM.  Must be called before start().
+     *
+     * @param width   Output width in pixels; 0 keeps the format's native width.
+     * @param height  Output height in pixels; 0 keeps the format's native height.
+     * @param fps     Output frame rate; 0 keeps the native sensor rate. Capped by
+     *                videorate, so it may only *reduce* the rate, never raise it.
+     *
+     * @note Honoured by Camera_CSI (Argus ISP/VIC).  Camera_USB ignores it — a
+     *       v4l2 source cannot rescale; use a librecord/videoscale downscale per
+     *       branch for USB instead.
+     */
+    void setOutputResolution(uint32_t width, uint32_t height, float fps = 0.0f);
 
     /**
      * @brief Convert a floating-point frame rate to a reduced integer fraction.
@@ -357,7 +401,12 @@ public:
      */
     void start() override;
 
-    /** @copydoc iCamera::stop() */
+    /**
+     * @copydoc iCamera::stop()
+     * @note If a concurrent start() is still constructing the pipeline, stop()
+     *       blocks until that construction finishes (bounded by the start()
+     *       state-change timeouts), then tears the pipeline down normally.
+     */
     void stop() override;
 
     /** @copydoc iCamera::captureFrame() */
@@ -391,7 +440,8 @@ public:
      *      and returns without modification.
      *
      * @post Branches are linked during start().  On a failed start(), all branches
-     *       are torn down by teardownPipeline().
+     *       are torn down by teardownPipeline().  Bins registered but never
+     *       started are freed by close() or the destructor.
      */
     void addBranch(const std::string& name, GstElement* sinkBin,
                    bool leaky = false, bool initialEnabled = true);

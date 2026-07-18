@@ -158,7 +158,7 @@ public:
 
         const int32_t n = engine_->getNbIOTensors();
         for (int32_t i = 0; i < n; ++i) {
-            const char* name = engine_->getTensorName(i);
+            const char* name = engine_->getIOTensorName(i);
             if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT
                 && inputName_.empty())
                 inputName_ = name;

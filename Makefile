@@ -7,7 +7,7 @@ NVCCFLAGS := -O2 -std=c++17 -arch=sm_87 \
              -Ilib/libdriverstate \
              -Ilib/liblanedetector \
              -Ilib/libsigndetector \
-             $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0)
+             $(filter-out -pthread,$(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0))
 
 # ─── flags ────────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ LD_BASE := $(shell pkg-config --libs \
            -pthread
 
 LD_CV   := $(shell pkg-config --libs opencv4)
-LD_TRT  := -lnvinfer -lcudart
+LD_TRT  := -L/usr/local/cuda/lib -L/usr/local/cuda/lib64 -lnvinfer -lcudart
 LD_VPI  := -lvpi
 LD_GPIO  := -lgpiod
 LD_ALSA  := -lasound
@@ -103,6 +103,18 @@ USB_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) src/t
 REC_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
                 src/tests/recording_and_safe_shutdown.cpp)
 
+# dual_record_test: USB primary (overlay) + CSI debug (downscaled) recording to archive/
+DUAL_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
+                src/tests/test_dual_recording.cpp)
+
+# single_record_test: one-camera-at-a-time record + capture validation (CSI|USB by index)
+SINGLE_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
+                src/tests/test_single_record.cpp)
+
+# dashcam_v0_1: v0.1 app — USB primary + IMX296 debug recording until SIGINT (no VPI)
+V01_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
+                src/dashcam_v0_1.cpp)
+
 # scan_cameras: enumerate all V4L2 devices
 SCAN_OBJS := $(call make_objs, $(LIBCAM_CORE_SRCS) src/tests/scan_cameras.cpp)
 
@@ -111,6 +123,13 @@ CFG_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCFG_SRCS) $(LIBCAM_CORE_SRCS) 
 
 # midi_test: WAV playback smoke test
 MIDI_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBMIDI_SRCS) src/tests/midi_test.cpp)
+
+# liblog_test: async file + console logger smoke test
+LIBLOG_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) src/tests/test_liblog.cpp)
+
+# write_default_config: build tool that emits a default-valued dashcam.xml,
+# used to seed each build's config/ directory (see the `all` target).
+WRITECFG_OBJS := $(call make_objs, $(LIBCFG_SRCS) src/tools/write_default_config.cpp)
 
 # can_test: SocketCAN send/receive loopback test
 CAN_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAN_SRCS) src/tests/can_test.cpp)
@@ -137,9 +156,9 @@ LANE_TEST_OBJS := $(call make_objs,    $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SR
                   $(call make_cu_objs,  $(LIBLANE_CU_SRCS))
 
 # Always compile these; no VPI dependency.
-BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(SCAN_OBJS) $(CFG_OBJS) \
-                    $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(DEMO_OBJS) $(DEMO_TERM_OBJS) \
-                    $(LANE_TEST_OBJS))
+BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(DUAL_OBJS) $(SINGLE_OBJS) $(V01_OBJS) $(SCAN_OBJS) $(CFG_OBJS) \
+                    $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) $(WRITECFG_OBJS) \
+                    $(DEMO_OBJS) $(DEMO_TERM_OBJS) $(LANE_TEST_OBJS))
 
 ifneq ($(VPI_HDRS),)
 ALL_OBJS := $(sort $(BASE_OBJS) $(DASHCAM_OBJS))
@@ -155,11 +174,15 @@ DEPS := $(ALL_OBJS:.o=.d)
 TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/usb_test \
            $(BUILD_DIR)/recording_test \
+           $(BUILD_DIR)/dual_record_test \
+           $(BUILD_DIR)/single_record_test \
+           $(BUILD_DIR)/dashcam_v0_1 \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
            $(BUILD_DIR)/gpio_test \
            $(BUILD_DIR)/midi_test \
+           $(BUILD_DIR)/liblog_test \
            $(BUILD_DIR)/demo_graphical \
            $(BUILD_DIR)/demo_terminal \
            $(BUILD_DIR)/lane_test
@@ -171,11 +194,28 @@ endif
 
 .PHONY: all clean run
 
-all: $(TARGETS)
+# Each build gets its own logs/ and config/ directories.  Binaries resolve
+# <exe_dir>/logs and <exe_dir>/config at runtime (dashcam::log::init() /
+# dashcam::config::configDir()), so a build's binaries use their own tree.  The
+# config/ dir is seeded with a default-valued dashcam.xml (and the attribute
+# dictionary); libconfig also recreates the defaults on demand at runtime.
+all: $(TARGETS) | $(BUILD_DIR)/logs $(BUILD_DIR)/config
 ifeq ($(VPI_HDRS),)
 	@echo "NOTE: VPI headers not found — dashcam target skipped (install libnvvpi-dev)"
 endif
-	@echo "Built all targets in $(BUILD_DIR)/"
+	@echo "Built all targets in $(BUILD_DIR)/ (logs -> $(BUILD_DIR)/logs/, config -> $(BUILD_DIR)/config/)"
+
+$(BUILD_DIR)/logs:
+	@mkdir -p $@
+
+$(BUILD_DIR)/write_default_config: $(WRITECFG_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/config: $(BUILD_DIR)/write_default_config
+	@mkdir -p $@
+	@test -f $@/dashcam.xml || $(BUILD_DIR)/write_default_config $@/dashcam.xml
+	@cp -n config/camera_attributes.xml $@/ 2>/dev/null || true
+	@echo "Seeded $@/ (default dashcam.xml + camera_attributes.xml)"
 
 ifneq ($(VPI_HDRS),)
 $(BUILD_DIR)/dashcam: $(DASHCAM_OBJS)
@@ -189,6 +229,15 @@ $(BUILD_DIR)/usb_test: $(USB_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/recording_test: $(REC_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/dual_record_test: $(DUAL_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/single_record_test: $(SINGLE_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/dashcam_v0_1: $(V01_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)
@@ -208,6 +257,9 @@ $(BUILD_DIR)/gpio_test: $(GPIO_OBJS)
 
 $(BUILD_DIR)/midi_test: $(MIDI_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_ALSA)
+
+$(BUILD_DIR)/liblog_test: $(LIBLOG_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/demo_terminal: $(DEMO_TERM_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)

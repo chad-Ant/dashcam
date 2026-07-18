@@ -60,7 +60,7 @@
     </Camera>
   </Cameras>
   <System>
-    <ArchivePath>./archive</ArchivePath>
+    <FootagePath>/user/output/footage</FootagePath>
     <WarmupFrames>9</WarmupFrames>
   </System>
 </DashcamConfig>
