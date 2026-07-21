@@ -1,12 +1,13 @@
 #include "librecord.h"
-#include <cairo/cairo.h>
-#include <gst/video/video.h>
+
+#include <linux/videodev2.h>
+
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
-#include <cstring>
 #include <ctime>
-#include <string>
 
 namespace dashcam::record {
 
@@ -23,104 +24,35 @@ static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lv
     cb(lvl, buf);
 }
 
-// ─── Cairo helpers (file-local) ───────────────────────────────────────────────
+// ─── telemetry formatting (same content the Cairo overlay drew) ───────────────
 
 static const char* headingToCardinal(float deg) {
-    // 8-point compass; each sector is 45°, offset by 22.5° so N spans [−22.5, 22.5].
-    int sector = static_cast<int>((deg + 22.5f) / 45.0f) % 8;
-    static const char* const names[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
-    return names[sector < 0 ? sector + 8 : sector];
+    static const char* kCardinals[] = {
+        "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+    const int idx = static_cast<int>(std::lround(deg / 45.0f)) & 7;
+    return kCardinals[idx];
 }
 
-// Parse a Pango-style font description ("Family Bold Italic") into Cairo primitives.
-// Called once in setOverlayConfig(); results are cached to avoid per-frame parsing.
-static void parseFontFace(const std::string& fontFace,
-                          std::string& family, int& weight, int& slant) {
-    weight = CAIRO_FONT_WEIGHT_NORMAL;
-    slant  = CAIRO_FONT_SLANT_NORMAL;
-    family = fontFace;
-
-    struct Suffix { const char* str; int w; int s; };
-    static const Suffix kSuffixes[] = {
-        { "Bold Italic",  CAIRO_FONT_WEIGHT_BOLD,   CAIRO_FONT_SLANT_ITALIC  },
-        { "Bold Oblique", CAIRO_FONT_WEIGHT_BOLD,   CAIRO_FONT_SLANT_OBLIQUE },
-        { "Italic",       CAIRO_FONT_WEIGHT_NORMAL, CAIRO_FONT_SLANT_ITALIC  },
-        { "Oblique",      CAIRO_FONT_WEIGHT_NORMAL, CAIRO_FONT_SLANT_OBLIQUE },
-        { "Bold",         CAIRO_FONT_WEIGHT_BOLD,   CAIRO_FONT_SLANT_NORMAL  },
-    };
-    for (const auto& sx : kSuffixes) {
-        std::size_t len = std::strlen(sx.str);
-        if (family.size() > len &&
-            family.compare(family.size() - len, len, sx.str) == 0) {
-            weight = sx.w;
-            slant  = sx.s;
-            family.resize(family.size() - len);
-            while (!family.empty() && family.back() == ' ') family.pop_back();
-            break;
-        }
-    }
+// ASS timestamp: H:MM:SS.CC (centiseconds).
+static std::string assTime(int64_t ns) {
+    if (ns < 0) ns = 0;
+    const int64_t cs = ns / 10000000;   // centiseconds
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%d:%02d:%02d.%02d",
+                  static_cast<int>(cs / 360000),
+                  static_cast<int>((cs / 6000) % 60),
+                  static_cast<int>((cs / 100) % 60),
+                  static_cast<int>(cs % 100));
+    return buf;
 }
 
-// Render multi-line text with a semi-transparent background box at one corner.
-// rightAligned/bottomAligned select which corner; frameW/H are the video dimensions.
-static void drawCornerLabel(cairo_t* cr, const char* text,
-                             bool rightAligned, bool bottomAligned,
-                             double frameW, double frameH,
-                             double bgOpacity,
-                             double xpad, double ypad) {
+// ─── construction / destruction ───────────────────────────────────────────────
 
-    cairo_font_extents_t fe;
-    cairo_font_extents(cr, &fe);
+Recorder::Recorder()  = default;
 
-    char lineBufs[4][128];
-    int  nLines = 0;
-    for (const char* p = text; *p && nLines < 4; ) {
-        const char* nl  = std::strchr(p, '\n');
-        std::size_t len = nl ? static_cast<std::size_t>(nl - p) : std::strlen(p);
-        if (len >= sizeof(lineBufs[0])) len = sizeof(lineBufs[0]) - 1;
-        std::memcpy(lineBufs[nLines], p, len);
-        lineBufs[nLines][len] = '\0';
-        ++nLines;
-        p = nl ? nl + 1 : p + std::strlen(p);
-    }
+Recorder::~Recorder() { stopRecording(); }
 
-    double maxW = 0.0;
-    for (int i = 0; i < nLines; ++i) {
-        cairo_text_extents_t te;
-        cairo_text_extents(cr, lineBufs[i], &te);
-        maxW = std::max(maxW, te.x_advance);
-    }
-
-    double boxW = maxW + 2.0 * xpad;
-    double boxH = fe.height * static_cast<double>(nLines) + 2.0 * ypad;
-    double boxX = rightAligned  ? frameW - boxW : 0.0;
-    double boxY = bottomAligned ? frameH - boxH : 0.0;
-
-    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, bgOpacity);
-    cairo_rectangle(cr, boxX, boxY, boxW, boxH);
-    cairo_fill(cr);
-
-    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-    for (int i = 0; i < nLines; ++i) {
-        cairo_move_to(cr, boxX + xpad,
-                      boxY + ypad + fe.ascent + static_cast<double>(i) * fe.height);
-        cairo_show_text(cr, lineBufs[i]);
-    }
-}
-
-// ─── Recorder ─────────────────────────────────────────────────────────────────
-
-Recorder::Recorder() = default;
-
-Recorder::~Recorder() {
-    disconnect();
-}
-
-void Recorder::setLogCallback(dashcam::log::LogCallback cb) {
-    log_ = std::move(cb);
-}
-
-// ─── overlay data ─────────────────────────────────────────────────────────────
+// ─── telemetry accessors ──────────────────────────────────────────────────────
 
 void Recorder::setOverlayData(const OverlayData& data) {
     std::lock_guard<std::mutex> lock(overlayMutex_);
@@ -135,270 +67,342 @@ OverlayData Recorder::getOverlayData() const {
 void Recorder::setOverlayConfig(const dashcam::config::OverlayConfig& cfg) {
     std::lock_guard<std::mutex> lock(overlayMutex_);
     overlayConfig_ = cfg;
-    parseFontFace(cfg.fontFace, cachedFontFamily_, cachedFontWeight_, cachedFontSlant_);
 }
 
-// ─── Cairo signal callbacks ───────────────────────────────────────────────────
-
-void Recorder::onCairoDraw(GstElement* /*overlay*/, cairo_t* cr,
-                            GstClockTime /*ts*/, GstClockTime /*dur*/,
-                            gpointer user_data) {
-    static_cast<Recorder*>(user_data)->renderOverlay(cr);
+void Recorder::setLogCallback(dashcam::log::LogCallback cb) {
+    log_ = std::move(cb);
 }
 
-void Recorder::onCairoCapsChanged(GstElement* /*overlay*/, GstCaps* caps,
-                                   gpointer user_data) {
-    GstVideoInfo info;
-    if (!gst_video_info_from_caps(&info, caps)) return;
-    auto* self = static_cast<Recorder*>(user_data);
-    std::lock_guard<std::mutex> lock(self->overlayMutex_);
-    self->videoWidth_  = GST_VIDEO_INFO_WIDTH(&info);
-    self->videoHeight_ = GST_VIDEO_INFO_HEIGHT(&info);
-}
+// ─── ASS sidecar ──────────────────────────────────────────────────────────────
 
-void Recorder::renderOverlay(cairo_t* cr) {
-    OverlayData od;
-    dashcam::config::OverlayConfig ocfg;
-    std::string fontFamily;
-    int         fontWeight, fontSlant;
-    double w, h;
+void Recorder::writeAssHeader() {
+    dashcam::config::OverlayConfig cfg;
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        if (!overlayConfig_.enabled) return;
-        od         = overlayData_;
-        ocfg       = overlayConfig_;
-        fontFamily = cachedFontFamily_;
-        fontWeight = cachedFontWeight_;
-        fontSlant  = cachedFontSlant_;
-        w          = static_cast<double>(videoWidth_);
-        h          = static_cast<double>(videoHeight_);
+        cfg = overlayConfig_;
     }
-    if (w == 0.0 || h == 0.0) return;
 
-    time_t epochSec = static_cast<time_t>(od.timestampMs / 1000LL);
+    // Font size scales with the video resolution: OverlayConfig::fontSize is
+    // the size at 720p and PlayResY tracks the real height, so the rendered
+    // text keeps the same proportion of the frame at any resolution.
+    const float scale   = static_cast<float>(videoH_) / 720.0f;
+    const int   fontPx  = std::max(4, static_cast<int>(std::lround(
+                              static_cast<float>(cfg.fontSize) * scale)));
+    const int   marginX = static_cast<int>(std::lround((float)cfg.labelPadX * scale));
+    const int   marginY = static_cast<int>(std::lround((float)cfg.labelPadY * scale));
+    const int   boxPad  = std::max(1, static_cast<int>(std::lround(
+                              (float)cfg.labelPadY * scale * 0.5f)));
+
+    // ASS alpha: 00 = opaque, FF = transparent.
+    const float opacity = std::min(1.0f, std::max(0.0f, (float)cfg.backgroundOpacity));
+    const int   alpha   = static_cast<int>(std::lround((1.0f - opacity) * 255.0f));
+
+    // "Monospace Bold" (Pango-style) → font name + bold flag.
+    std::string face = cfg.fontFace;
+    int bold = 0;
+    const auto b = face.find(" Bold");
+    if (b != std::string::npos) { bold = -1; face.erase(b, 5); }
+    if (face.empty()) face = "Monospace";
+
+    assFile_ << "[Script Info]\n"
+                "Title: dashcam telemetry\n"
+                "ScriptType: v4.00+\n"
+                "PlayResX: " << videoW_ << "\n"
+                "PlayResY: " << videoH_ << "\n"
+                "WrapStyle: 2\n"
+                "ScaledBorderAndShadow: yes\n\n";
+
+    // BorderStyle=3 draws an opaque box (BackColour) behind the text — the
+    // overlay rectangle; Outline doubles as the box padding.
+    // Alignment (numpad): 7=TL, 9=TR, 1=BL, 3=BR — the four corners.
+    assFile_ << "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding\n";
+    char alphaHex[8];
+    std::snprintf(alphaHex, sizeof(alphaHex), "%02X", alpha);
+    const int aligns[4] = { 7, 9, 1, 3 };
+    static const char* names[4] = { "TL", "TR", "BL", "BR" };
+    for (int i = 0; i < 4; ++i) {
+        assFile_ << "Style: " << names[i] << "," << face << "," << fontPx
+                 << ",&H00FFFFFF,&H00FFFFFF,&H" << alphaHex << "000000,&H"
+                 << alphaHex << "000000," << bold
+                 << ",0,0,0,100,100,0,0,3," << boxPad << ",0,"
+                 << aligns[i] << "," << marginX << "," << marginX << ","
+                 << marginY << ",1\n";
+    }
+
+    assFile_ << "\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+                "MarginV, Effect, Text\n";
+}
+
+void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
+                              int64_t wallNowMs, bool stale) {
+    const std::string t0 = assTime(posNs);
+    const std::string t1 = assTime(posNs + durNs);
+    char buf[192];
+
+    // Stale telemetry is no longer trustworthy: draw a dash in place of the
+    // motion/position fields rather than a frozen (and now misleading) reading.
+    if (stale) {
+        assFile_ << "Dialogue: 0," << t0 << "," << t1
+                 << ",TL,,0,0,0,,SPD -- km/h\\NACC -- m/s2\n";
+        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",TR,,0,0,0,,HDG --\n";
+        assFile_ << "Dialogue: 0," << t0 << "," << t1
+                 << ",BL,,0,0,0,,LAT --\\NLON --\\NALT --\n";
+    } else {
+        std::snprintf(buf, sizeof(buf), "SPD %.1f km/h\\NACC %+.1f m/s2",
+                      static_cast<double>(od.speedKmh),
+                      static_cast<double>(od.accelerationMs2));
+        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",TL,,0,0,0,," << buf << "\n";
+
+        std::snprintf(buf, sizeof(buf), "HDG %03.0f %s",
+                      static_cast<double>(od.headingDeg), headingToCardinal(od.headingDeg));
+        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",TR,,0,0,0,," << buf << "\n";
+
+        std::snprintf(buf, sizeof(buf), "LAT %.6f %c\\NLON %.6f %c\\NALT %.1f m",
+                      std::abs(od.latitude),  od.latitude  >= 0.0 ? 'N' : 'S',
+                      std::abs(od.longitude), od.longitude >= 0.0 ? 'E' : 'W',
+                      od.altitudeM);
+        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",BL,,0,0,0,," << buf << "\n";
+    }
+
+    // The bottom-right clock is the device wall clock, not GPS telemetry, so it
+    // stays live even when the telemetry snapshot has gone stale.
+    time_t epochSec = static_cast<time_t>(wallNowMs / 1000LL);
     struct tm tmBuf;
     localtime_r(&epochSec, &tmBuf);
     char dateBuf[16], timeBuf[16];
     std::strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", &tmBuf);
     std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S %Z", &tmBuf);
+    assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",BR,,0,0,0,,"
+             << dateBuf << "\\N" << timeBuf << "\n";
 
-    char buf[128];
-
-    cairo_select_font_face(cr, fontFamily.c_str(),
-                           static_cast<cairo_font_slant_t>(fontSlant),
-                           static_cast<cairo_font_weight_t>(fontWeight));
-    cairo_set_font_size(cr, static_cast<double>(ocfg.fontSize));
-
-    const double opacity = static_cast<double>(ocfg.backgroundOpacity);
-    const double padX    = static_cast<double>(ocfg.labelPadX);
-    const double padY    = static_cast<double>(ocfg.labelPadY);
-
-    std::snprintf(buf, sizeof(buf), "SPD %.1f km/h\nACC %+.1f m/s2",
-                  static_cast<double>(od.speedKmh),
-                  static_cast<double>(od.accelerationMs2));
-    drawCornerLabel(cr, buf, false, false, w, h, opacity, padX, padY);
-
-    std::snprintf(buf, sizeof(buf), "HDG %03.0f %s",
-                  static_cast<double>(od.headingDeg), headingToCardinal(od.headingDeg));
-    drawCornerLabel(cr, buf, true, false, w, h, opacity, padX, padY);
-
-    std::snprintf(buf, sizeof(buf), "LAT %.6f %c\nLON %.6f %c\nALT %.1f m",
-                  std::abs(od.latitude),  od.latitude  >= 0.0 ? 'N' : 'S',
-                  std::abs(od.longitude), od.longitude >= 0.0 ? 'E' : 'W',
-                  od.altitudeM);
-    drawCornerLabel(cr, buf, false, true, w, h, opacity, padX, padY);
-
-    std::snprintf(buf, sizeof(buf), "%s\n%s", dateBuf, timeBuf);
-    drawCornerLabel(cr, buf, true, true, w, h, opacity, padX, padY);
+    assFile_.flush();
 }
 
-// ─── lifecycle ────────────────────────────────────────────────────────────────
+// ─── subtitle / bus thread ────────────────────────────────────────────────────
 
-void Recorder::disconnect() {
-    GstElement* cairoOv = nullptr;
-    gulong drawId = 0, capsId = 0;
+void Recorder::subtitleLoop() {
+    float   rateHz;
+    bool    writeAss;
+    int64_t staleMs;
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        cairoOv       = cairoOverlay_;
-        drawId        = cairoDrawId_;
-        capsId        = cairoCapsId_;
-        cairoOverlay_ = nullptr;
-        cairoDrawId_  = 0;
-        cairoCapsId_  = 0;
-        videoWidth_   = 0;
-        videoHeight_  = 0;
+        rateHz   = (float)overlayConfig_.subtitleRateHz;
+        writeAss = (bool)overlayConfig_.enabled && assFile_.is_open();
+        staleMs  = (int64_t)(int)overlayConfig_.staleTimeoutMs;
     }
-    if (cairoOv) {
-        // We won the claim, so the element is still alive: drop the weak ref
-        // (so onCairoOverlayDestroyed can't fire later on this Recorder) before
-        // disconnecting the signal handlers.  Both calls are outside the lock —
-        // g_signal_handler_disconnect blocks until any in-flight draw callback
-        // returns, and that callback takes overlayMutex_, so holding it here
-        // would deadlock.
-        g_object_weak_unref(G_OBJECT(cairoOv),
-                            &Recorder::onCairoOverlayDestroyed, this);
-        g_signal_handler_disconnect(cairoOv, drawId);
-        g_signal_handler_disconnect(cairoOv, capsId);
-    }
-}
+    if (rateHz <= 0.0f) rateHz = 5.0f;
+    const auto interval =
+        std::chrono::milliseconds(static_cast<int64_t>(1000.0f / rateHz));
+    const int64_t durNs = static_cast<int64_t>(1e9 / rateHz);
 
-void Recorder::onCairoOverlayDestroyed(gpointer user_data, GObject* /*where*/) {
-    auto* self = static_cast<Recorder*>(user_data);
-    std::lock_guard<std::mutex> lock(self->overlayMutex_);
-    // The element is being finalised: drop our handle so disconnect() no-ops.
-    // Do NOT g_signal_handler_disconnect or g_object_weak_unref here — the
-    // element's handlers and weak refs are already being torn down.
-    self->cairoOverlay_ = nullptr;
-    self->cairoDrawId_  = 0;
-    self->cairoCapsId_  = 0;
-    self->videoWidth_   = 0;
-    self->videoHeight_  = 0;
-}
+    GstBus* bus = gst_element_get_bus(pipeline_);
+    int64_t lastPos = -1;
 
-// ─── recording bin ────────────────────────────────────────────────────────────
+    while (!stopFlag_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(interval);
 
-GstElement* Recorder::createRecordingBin(const std::string& filename,
-                                          uint32_t frNum, uint32_t frDen,
-                                          const dashcam::config::EncoderConfig& enc,
-                                          uint32_t queueDepth,
-                                          SourceMemory srcMem,
-                                          uint32_t outWidth, uint32_t outHeight,
-                                          bool overlay) {
-    disconnect();
-
-    // enc.speedPreset / enc.tune are ConfigVar<std::string>: read them into
-    // std::string locals first.  ConfigVar's implicit operator const T& is not
-    // considered in `"literal" + configvar` (operator+ template deduction) nor
-    // for member access like enc.tune.empty(), so use plain strings from here on.
-    const std::string speedPreset = enc.speedPreset;
-    const std::string tune        = enc.tune;
-    std::string x264Opts =
-        " speed-preset=" + speedPreset +
-        " bitrate=" + std::to_string(enc.bitrate) +
-        " key-int-max=" + std::to_string(enc.keyIntMax);
-    if (!tune.empty())
-        x264Opts += " tune=" + tune;
-
-    // Optional inlet downscale: only when BOTH dimensions are given.  Scaling here
-    // — before Cairo and the CPU encoder — sheds the most work, and (for NVMM) it
-    // rides the VIC inside nvvidconv for free.  Keep the source aspect ratio to
-    // avoid distortion.
-    const bool scale = (outWidth > 0 && outHeight > 0);
-    const std::string wh = scale
-        ? ",width=(int)" + std::to_string(outWidth) + ",height=(int)" + std::to_string(outHeight)
-        : std::string();
-
-    // Inlet output format: BGRx when overlaying (Cairo draws on BGRx), else I420
-    // straight into the encoder — skipping Cairo and a BGRx round-trip.
-    const std::string inFmt = overlay ? "BGRx" : "I420";
-    const std::string inletCaps = "video/x-raw,format=(string)" + inFmt + wh;
-
-    // Inlet: nvvidconv for NVMM (CSI) — the only element that can pull buffers off
-    // NVMM, and it scales on the VIC — or videoconvert (+videoscale when scaling)
-    // for system memory (USB), which accepts any raw UVC format and skips a needless
-    // VIC round-trip.
-    std::string inletChain;
-    if (srcMem == SourceMemory::System) {
-        inletChain = scale
-            ? "videoconvert name=conv ! videoscale ! " + inletCaps
-            : "videoconvert name=conv ! " + inletCaps;
-    } else {
-        inletChain = "nvvidconv name=conv ! " + inletCaps;
-    }
-
-    // Cairo overlay stage (BGRx → draw → back to I420); omitted entirely when
-    // overlay=false (the inlet already produced I420).
-    const std::string overlayStage = overlay
-        ? " ! cairooverlay name=cairoov ! videoconvert ! video/x-raw,format=(string)I420"
-        : std::string();
-
-    // videorate sits at the INLET, not in front of the encoder: everything
-    // downstream of it (Cairo draw, BGRx→I420 videoconvert, x264) then runs at
-    // the target rate instead of the sensor rate.  On a 60 fps sensor recorded
-    // at 30 that halves the whole software chain's cost — significant on a box
-    // with no NVENC.
-    //
-    // skip-to-first: the recording valve typically opens a couple of seconds
-    // after the pipeline starts (camera warmup), so the first buffer arrives
-    // with a non-zero running time.  Default videorate would backfill segment
-    // start → first PTS with duplicates of that frame — a freeze-frame intro.
-    // offset-to-zero then shifts the muxed timestamps back so the file still
-    // starts at 0 instead of at the warmup offset.
-    const std::string binDesc =
-        inletChain +
-        " ! videorate skip-to-first=true ! video/x-raw,framerate=" +
-        std::to_string(frNum) + "/" + std::to_string(frDen) +
-        overlayStage +
-        " ! queue max-size-buffers=" + std::to_string(queueDepth) + " leaky=0 "
-        "! x264enc" + x264Opts + " insert-vui=true aud=true "
-        "! h264parse ! matroskamux offset-to-zero=true "
-        "! filesink name=fsink sync=false async=false";
-
-    doLog(log_, dashcam::log::LogLevel::INFO,
-          "createRecordingBin pipeline: %s", binDesc.c_str());
-
-    GError*     err = nullptr;
-    GstElement* bin = gst_parse_bin_from_description(binDesc.c_str(), TRUE, &err);
-    if (!bin || err) {
-        if (err) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
-                  "gst_parse_bin_from_description failed: %s", err->message);
-            g_error_free(err);
+        // Bus errors (device unplugged, negotiation failure mid-stream) latch
+        // the session unhealthy; the application polls isRecording().
+        if (bus) {
+            while (GstMessage* msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR)) {
+                GError* err = nullptr;
+                gst_message_parse_error(msg, &err, nullptr);
+                doLog(log_, dashcam::log::LogLevel::ERROR,
+                      "recording pipeline error: %s", err ? err->message : "?");
+                if (err) g_error_free(err);
+                gst_message_unref(msg);
+                healthy_.store(false);
+            }
         }
-        if (bin) gst_object_unref(bin);
-        return nullptr;
+
+        if (!writeAss) continue;
+
+        gint64 pos = 0;
+        if (!gst_element_query_position(pipeline_, GST_FORMAT_TIME, &pos))
+            continue;                       // not producing yet
+        if (pos <= lastPos) continue;       // keep event times monotonic
+        lastPos = pos;
+
+        OverlayData od;
+        {
+            std::lock_guard<std::mutex> lock(overlayMutex_);
+            od = overlayData_;
+        }
+
+        const int64_t nowMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        // Stale when the snapshot's own capture time is older than the window
+        // (a timestamp in the future is treated as fresh).  staleMs==0 disables.
+        const bool stale = staleMs > 0 && (nowMs - od.timestampMs) > staleMs;
+
+        writeAssSample(pos, durNs, od, nowMs, stale);
     }
 
-    GstElement* fsink = gst_bin_get_by_name(GST_BIN(bin), "fsink");
-    if (!fsink) {
-        // Should be impossible after a successful parse, but a bin without its
-        // filesink location would only fail later at PLAYING with a confusing
-        // "no location" error — fail loudly here instead.
+    if (bus) gst_object_unref(bus);
+}
+
+// ─── recording lifecycle ──────────────────────────────────────────────────────
+
+bool Recorder::startRecording(const std::string& devicePath,
+                              const RecordingFormat& fmt,
+                              const std::string& filename,
+                              uint32_t maxFps,
+                              uint32_t eosTimeoutMs) {
+    if (pipeline_) {
         doLog(log_, dashcam::log::LogLevel::ERROR,
-              "could not find filesink element in recording bin");
-        gst_object_unref(bin);
-        return nullptr;
+              "startRecording: session already active");
+        return false;
     }
-    g_object_set(G_OBJECT(fsink), "location", filename.c_str(), NULL);
-    gst_object_unref(fsink);
-
-    // No-overlay bin: no cairooverlay element, so no signals to wire up.
-    // cairoOverlay_ stays null, so disconnect()/~Recorder are no-ops.
-    if (!overlay)
-        return bin;
-
-    // gst_bin_get_by_name returns an owned ref (+1).  Release it immediately so
-    // the bin remains the sole owner; the raw pointer stays valid for the bin's
-    // lifetime, matching the non-owning semantics documented for cairoOverlay_.
-    GstElement* cairoOv = gst_bin_get_by_name(GST_BIN(bin), "cairoov");
-    if (!cairoOv) {
+    if (fmt.width == 0 || fmt.height == 0 || !(fmt.fps > 0.0f)) {
         doLog(log_, dashcam::log::LogLevel::ERROR,
-              "could not find cairooverlay element in recording bin");
-        gst_object_unref(bin);
-        return nullptr;
+              "startRecording: invalid format %ux%u@%.1f",
+              fmt.width, fmt.height, static_cast<double>(fmt.fps));
+        return false;
     }
 
-    gulong drawId = g_signal_connect(cairoOv, "draw",
-                                     G_CALLBACK(Recorder::onCairoDraw), this);
-    gulong capsId = g_signal_connect(cairoOv, "caps-changed",
-                                     G_CALLBACK(Recorder::onCairoCapsChanged), this);
+    // Strict precompressed gate: this recorder exists to avoid software
+    // encoding on a box with no NVENC.  Raw formats need an encoder → refuse.
+    const bool mjpeg = fmt.v4l2PixFmt == V4L2_PIX_FMT_MJPEG;
+    const bool h264  = fmt.v4l2PixFmt == V4L2_PIX_FMT_H264;
+    if (!mjpeg && !h264) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "startRecording: pixel format %c%c%c%c is raw — only precompressed "
+              "UVC streams (MJPG/H264) are recordable on Orin Nano (no NVENC)",
+              fmt.v4l2PixFmt & 0xff, (fmt.v4l2PixFmt >> 8) & 0xff,
+              (fmt.v4l2PixFmt >> 16) & 0xff, (fmt.v4l2PixFmt >> 24) & 0xff);
+        return false;
+    }
 
-    // Auto-null cairoOverlay_ if the element is finalised (pipeline torn down)
-    // before disconnect() is called, so disconnect()/~Recorder never dereference
-    // a freed element.  The element stays alive via the bin; the weak ref only
-    // fires on its destruction.
-    g_object_weak_ref(G_OBJECT(cairoOv),
-                      &Recorder::onCairoOverlayDestroyed, this);
-    gst_object_unref(cairoOv);
+    gint frNum = 30, frDen = 1;
+    gst_util_double_to_fraction(static_cast<double>(fmt.fps), &frNum, &frDen);
 
+    std::string desc = "v4l2src name=camerasrc device=" + devicePath;
+    if (mjpeg) {
+        desc += " ! image/jpeg, width=" + std::to_string(fmt.width) +
+                ", height=" + std::to_string(fmt.height) +
+                ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen);
+        // MJPEG frames are intra-only: dropping them to cap the rate is safe.
+        if (maxFps > 0 && static_cast<float>(maxFps) < fmt.fps)
+            desc += " ! videorate drop-only=true max-rate=" + std::to_string(maxFps);
+    } else {
+        desc += " ! video/x-h264, width=" + std::to_string(fmt.width) +
+                ", height=" + std::to_string(fmt.height) +
+                ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
+                " ! h264parse";
+    }
+    desc += " ! queue max-size-buffers=8 leaky=0"
+            " ! matroskamux offset-to-zero=true"
+            " ! filesink name=fsink sync=false async=false location=\"" +
+            filename + "\"";
+
+    doLog(log_, dashcam::log::LogLevel::INFO, "recording pipeline: %s", desc.c_str());
+
+    GError* err = nullptr;
+    pipeline_ = gst_parse_launch(desc.c_str(), &err);
+    if (!pipeline_ || err) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "recording pipeline parse failed: %s", err ? err->message : "?");
+        if (err) g_error_free(err);
+        if (pipeline_) { gst_object_unref(pipeline_); pipeline_ = nullptr; }
+        return false;
+    }
+
+    videoW_       = fmt.width;
+    videoH_       = fmt.height;
+    eosTimeoutMs_ = eosTimeoutMs;
+
+    if (gst_element_set_state(pipeline_, GST_STATE_PLAYING)
+            == GST_STATE_CHANGE_FAILURE) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "recording pipeline refused to start on %s", devicePath.c_str());
+        gst_element_set_state(pipeline_, GST_STATE_NULL);
+        gst_object_unref(pipeline_);
+        pipeline_ = nullptr;
+        return false;
+    }
+
+    // ASS sidecar next to the recording: clip.mkv → clip.ass.
+    bool assEnabled;
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        cairoOverlay_ = cairoOv;
-        cairoDrawId_  = drawId;
-        cairoCapsId_  = capsId;
+        assEnabled = (bool)overlayConfig_.enabled;
+    }
+    if (assEnabled) {
+        assPath_ = filename;
+        const auto dot = assPath_.find_last_of('.');
+        const auto sep = assPath_.find_last_of('/');
+        if (dot != std::string::npos && (sep == std::string::npos || dot > sep))
+            assPath_.erase(dot);
+        assPath_ += ".ass";
+        assFile_.open(assPath_, std::ios::trunc);
+        if (assFile_.is_open()) {
+            writeAssHeader();
+            doLog(log_, dashcam::log::LogLevel::INFO,
+                  "telemetry sidecar: %s", assPath_.c_str());
+        } else {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "cannot open telemetry sidecar %s — recording without it",
+                  assPath_.c_str());
+        }
     }
 
-    return bin;
+    stopFlag_.store(false);
+    healthy_.store(true);
+    subThread_ = std::thread(&Recorder::subtitleLoop, this);
+    return true;
+}
+
+void Recorder::stopRecording() {
+    if (!pipeline_) return;
+
+    stopFlag_.store(true, std::memory_order_release);
+    if (subThread_.joinable()) subThread_.join();
+
+    // EOS → matroskamux writes duration/cues → wait for the EOS to reach the
+    // sink (bounded), then tear down.
+    gst_element_send_event(pipeline_, gst_event_new_eos());
+    GstBus* bus = gst_element_get_bus(pipeline_);
+    if (bus) {
+        GstMessage* msg = gst_bus_timed_pop_filtered(
+            bus, eosTimeoutMs_ * GST_MSECOND,
+            static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+        if (!msg) {
+            doLog(log_, dashcam::log::LogLevel::WARN,
+                  "EOS flush timed out after %u ms; forcing teardown", eosTimeoutMs_);
+        } else {
+            if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+                GError* err = nullptr;
+                gst_message_parse_error(msg, &err, nullptr);
+                doLog(log_, dashcam::log::LogLevel::ERROR,
+                      "error during EOS flush: %s", err ? err->message : "?");
+                if (err) g_error_free(err);
+            }
+            gst_message_unref(msg);
+        }
+        gst_object_unref(bus);
+    }
+
+    gst_element_set_state(pipeline_, GST_STATE_NULL);
+    gst_object_unref(pipeline_);
+    pipeline_ = nullptr;
+    healthy_.store(false);
+
+    if (assFile_.is_open()) {
+        assFile_.flush();
+        assFile_.close();
+        doLog(log_, dashcam::log::LogLevel::INFO,
+              "telemetry sidecar closed: %s", assPath_.c_str());
+    }
+}
+
+bool Recorder::isRecording() const {
+    return pipeline_ != nullptr && healthy_.load(std::memory_order_relaxed);
 }
 
 } // namespace dashcam::record

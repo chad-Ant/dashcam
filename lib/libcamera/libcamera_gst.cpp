@@ -157,15 +157,18 @@ void Camera_GST::teardownPipeline() {
     // Null the element handles under the lock (consistent with appsink_ above),
     // then unref outside it.  Other threads read these pointers only under
     // stateMutex_, so the write must be locked too.
-    GstElement* teeToUnref = nullptr;
-    GstElement* srcToUnref = nullptr;
+    GstElement* teeToUnref   = nullptr;
+    GstElement* srcToUnref   = nullptr;
+    GstElement* valveToUnref = nullptr;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        teeToUnref = tee_;        tee_        = nullptr;
-        srcToUnref = camera_src_; camera_src_ = nullptr;
+        teeToUnref   = tee_;        tee_        = nullptr;
+        srcToUnref   = camera_src_; camera_src_ = nullptr;
+        valveToUnref = capValve_;   capValve_   = nullptr;
     }
     if (teeToUnref)     gst_object_unref(teeToUnref);
     if (srcToUnref)     gst_object_unref(srcToUnref);
+    if (valveToUnref)   gst_object_unref(valveToUnref);
     if (appsinkToUnref) gst_object_unref(appsinkToUnref);
     if (pipe)           gst_object_unref(pipe);
 }
@@ -357,7 +360,8 @@ Camera_GST::Camera_GST(const cameraInfo& camera)
       pipeline_(nullptr),
       camera_src_(nullptr),
       appsink_(nullptr),
-      tee_(nullptr) {
+      tee_(nullptr),
+      capValve_(nullptr) {
 }
 
 Camera_GST::~Camera_GST() {
@@ -544,13 +548,15 @@ void Camera_GST::start() {
     GstElement* appsink   = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
     GstElement* cameraSrc = gst_bin_get_by_name(GST_BIN(pipeline), "camerasrc");
     GstElement* tee       = gst_bin_get_by_name(GST_BIN(pipeline), "srctee");
+    GstElement* capValve  = gst_bin_get_by_name(GST_BIN(pipeline), "capvalve");
 
-    if (!appsink || !cameraSrc || !tee) {
+    if (!appsink || !cameraSrc || !tee || !capValve) {
         doLog(log_, dashcam::log::LogLevel::ERROR,
               "required pipeline elements not found on %s", info_.address.c_str());
         if (appsink)   gst_object_unref(appsink);
         if (cameraSrc) gst_object_unref(cameraSrc);
         if (tee)       gst_object_unref(tee);
+        if (capValve)  gst_object_unref(capValve);
         setPipelineError();   // tears down the published pipeline_ and orphan branches
         return;
     }
@@ -560,6 +566,7 @@ void Camera_GST::start() {
         appsink_    = appsink;
         camera_src_ = cameraSrc;
         tee_        = tee;
+        capValve_   = capValve;
     }
 
     // Link each registered branch to the tee.
@@ -859,6 +866,20 @@ GstElement* Camera_GST::getTee() const {
     // weakly-ordered ARM).
     std::lock_guard<std::mutex> lock(stateMutex_);
     return tee_;
+}
+
+// The capture chain (queue ! [nvvidconv !] videoconvert ! appsink) converts
+// every frame on the CPU even when nobody calls captureFrame().  Disabling it
+// drops buffers at the valve so the converters idle; captureFrame() times out
+// while disabled.  drop-mode=1 keeps EOS flowing for teardown.
+void Camera_GST::setCaptureEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (!capValve_ || status_.status != CAMERA_STATUS::RUNNING) {
+        status_.currentError = ERROR_CODE::CAMERA_NOT_OPEN;
+        return;
+    }
+    g_object_set(G_OBJECT(capValve_), "drop", enabled ? FALSE : TRUE, NULL);
+    status_.currentError = ERROR_CODE::NONE;
 }
 
 // Valve drop=true discards buffers without flushing — timestamps remain

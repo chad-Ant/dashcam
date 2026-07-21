@@ -1,47 +1,56 @@
 /**
  * @file librecord.h
- * @brief Cairo telemetry overlay and GStreamer recording branch for any Camera_GST camera.
+ * @brief UVC compressed-passthrough recorder with an ASS telemetry sidecar.
  *
- * Recorder is camera-type-agnostic.  It produces a self-contained GstBin that
- * can be handed to any Camera_GST::addBranch() call — CSI, USB, or any future
- * subclass.  The bin accepts whatever format the tee emits (NV12/NVMM from CSI,
- * BGRx/YUYV from USB) because nvvidconv at the bin's inlet handles format and
- * memory-type conversion before the cairo overlay stage.
+ * Records the ALREADY-COMPRESSED stream of a UVC camera (MJPEG or H.264)
+ * straight into a Matroska file — no decode, no re-encode.  On Orin Nano
+ * (which has no NVENC) this removes the software x264 stage entirely; the CPU
+ * cost of recording drops to container muxing.
+ *
+ * Telemetry is no longer burned into the video.  Instead the Recorder writes
+ * an Advanced SubStation Alpha (.ass) sidecar with the SAME name as the
+ * recording (clip.mkv → clip.ass) containing the same four-corner layout the
+ * old Cairo overlay drew:
+ *   - Top-left:     speed, acceleration
+ *   - Top-right:    heading + cardinal direction
+ *   - Bottom-left:  latitude, longitude, altitude
+ *   - Bottom-right: local date and time (host timezone)
+ * Corner positions, box opacity and padding come from OverlayConfig; the font
+ * size scales with the video resolution (OverlayConfig::fontSize is the size
+ * at 720p, PlayResY tracks the actual height).  Players (mpv, VLC, ffmpeg)
+ * auto-load the sidecar; `ffmpeg -i clip.mkv -vf ass=clip.ass` burns it in
+ * for export.
+ *
+ * The Recorder owns its own small GStreamer pipeline:
+ * @verbatim
+ *   v4l2src device=/dev/videoN
+ *     ! image/jpeg,width,height,framerate     (or video/x-h264 ! h264parse)
+ *     [! videorate drop-only=true max-rate=N]  (MJPEG only: frame-drop cap)
+ *     ! queue ! matroskamux ! filesink
+ * @endverbatim
+ * so recording no longer attaches to a Camera_GST tee — do NOT open the same
+ * device with Camera_USB while recording (V4L2 devices are exclusive).
+ * CSI/Argus sources are deliberately unsupported: they only produce raw
+ * frames, and raw recording would require the software encoder this design
+ * removes.  startRecording() rejects any non-compressed pixel format.
  *
  * Typical usage:
  * @code
- *   Camera_CSI cam(info);
- *   cam.setAttributeDictionary(attrDict);
+ *   dashcam::record::Recorder rec;
+ *   rec.setLogCallback(log);
+ *   rec.setOverlayConfig(cfg.overlay);        // subtitle style + cadence
  *
- *   dashcam::record::Recorder recorder;
- *   recorder.setOverlayConfig(cfg.overlay);
+ *   dashcam::record::RecordingFormat fmt;     // from cameraInfo::videoFormats
+ *   fmt.v4l2PixFmt = V4L2_PIX_FMT_MJPEG;
+ *   fmt.width = 1280; fmt.height = 720; fmt.fps = 30.0f;
  *
- *   GstElement* bin = recorder.createRecordingBin("clip.mkv", frNum, frDen, cfg.encoder);
- *   cam.addBranch("recording", bin, false, false);   // valve starts closed
- *   cam.open();
- *   cam.start();
- *
- *   cam.setBranchEnabled("recording", true);
- *   while (running) {
- *       cam.captureFrame(buf, size, written);
- *       recorder.setOverlayData({lat, lon, alt, spd, acc, hdg, tsMs});
- *   }
- *
- *   recorder.disconnect();   // MUST be called before cam.stop() / cam.close()
- *   cam.stop();
- *   cam.close();
+ *   rec.startRecording("/dev/video2", fmt, "clip.mkv");
+ *   while (running)
+ *       rec.setOverlayData({lat, lon, alt, spd, acc, hdg, epochMs()});
+ *   rec.stopRecording();                      // EOS-finalises clip.mkv + clip.ass
  * @endcode
  *
- * @warning disconnect() MUST be called before the camera pipeline is torn down
- *          (before stop() or close()).  The Cairo "draw" signal fires on the
- *          GStreamer streaming thread; if the pipeline transitions to NULL while
- *          a draw callback is in flight, the cairo_t* and GstElement* become
- *          dangling pointers and the process will crash.  The Recorder destructor
- *          also calls disconnect() as a safety net, but relying on it is a bug.
- *
- * @note Requires GStreamer ≥ 1.20, Cairo, and the NVIDIA Jetson GStreamer plugins
- *       (nvvidconv) on Orin Nano / JetPack 6.2.
- * @note Orin Nano has no NVENC; x264enc (software) is used for encoding.
+ * @note Requires GStreamer ≥ 1.20.  No Cairo, no NVIDIA elements.
  */
 
 #ifndef LIBRECORD_H
@@ -50,31 +59,23 @@
 #include "libconfig.h"
 #include "liblog.h"
 #include <gst/gst.h>
+#include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <mutex>
 #include <string>
-
-// Forward-declare cairo_t so the private callbacks can reference it without
-// pulling the full Cairo headers into every translation unit that includes this header.
-typedef struct _cairo cairo_t;
+#include <thread>
 
 namespace dashcam::record {
 
 // ─── telemetry payload ────────────────────────────────────────────────────────
 
 /**
- * @brief Telemetry snapshot rendered as a four-corner overlay on recorded video.
+ * @brief Telemetry snapshot logged to the ASS sidecar at SubtitleRateHz.
  *
- * Written by the application thread via Recorder::setOverlayData(); read by the
- * GStreamer streaming thread inside the Cairo "draw" callback.  The Recorder
- * copies the struct under a mutex on each write/read, so it is safe to call
- * setOverlayData() from any thread at any time while the pipeline is running.
- *
- * Corner layout:
- *   - Top-left:     speed, acceleration
- *   - Top-right:    heading + cardinal direction
- *   - Bottom-left:  latitude, longitude, altitude
- *   - Bottom-right: local date and time (host timezone, TZ/ /etc/localtime)
+ * Written by the application thread via Recorder::setOverlayData(); sampled by
+ * the Recorder's subtitle thread.  The struct is copied under a mutex on each
+ * write/read, so setOverlayData() is safe from any thread at any time.
  */
 struct OverlayData {
     double  latitude        = 10.7725;    ///< WGS-84 latitude in decimal degrees.
@@ -84,198 +85,136 @@ struct OverlayData {
     float   accelerationMs2 = 0.0f;       ///< Longitudinal acceleration in m/s² (+ve = forward).
     float   headingDeg      = 90.0f;      ///< True heading in degrees (0 = North, clockwise).
     int64_t timestampMs     = 1777633580000LL; ///< UNIX epoch timestamp in milliseconds.
-                                               ///< (Previous default was the SECONDS value,
-                                               ///< which rendered as 1970-01-21 on the overlay.)
 };
 
-// ─── source memory type ───────────────────────────────────────────────────────
+// ─── recording format ─────────────────────────────────────────────────────────
 
 /**
- * @brief Memory domain of the frames the recording bin will receive from the tee.
+ * @brief The UVC stream to record — copy the fields from the chosen
+ *        cameraInfo::videoFormats entry.
  *
- * Selects the bin's inlet converter so the recorder works on either capture stack:
- *   - NVMM   → CSI/Argus tee delivers @c video/x-raw(memory:NVMM),NV12.  The inlet
- *              is @c nvvidconv, the only element that pulls buffers off NVMM and
- *              (via the VIC) converts to system-memory BGRx for Cairo.
- *   - System → USB/V4L2 tee delivers plain @c video/x-raw (YUY2/UYVY/I420/…, after
- *              jpegdec for MJPEG cams).  The inlet is @c videoconvert, which accepts
- *              every raw format a UVC webcam can emit — nvvidconv rejects some — and
- *              avoids an unnecessary VIC round-trip on an already-CPU-side buffer.
- *
- * The caller knows the camera type (it built a Camera_CSI or Camera_USB), so it
- * passes the matching value to createRecordingBin().  Default is NVMM to preserve
- * the historical CSI-only behaviour.
+ * Only compressed formats are accepted: V4L2_PIX_FMT_MJPEG or
+ * V4L2_PIX_FMT_H264.  Raw formats (YUYV & friends) are rejected by
+ * startRecording() — recording them would need a software encoder.
  */
-enum class SourceMemory { NVMM, System };
+struct RecordingFormat {
+    uint32_t v4l2PixFmt = 0;   ///< V4L2 fourcc (V4L2_PIX_FMT_MJPEG / _H264).
+    uint32_t width      = 0;   ///< Frame width in pixels.
+    uint32_t height     = 0;   ///< Frame height in pixels.
+    float    fps        = 0.0f;///< Camera frame rate for this format.
+};
 
 // ─── Recorder ─────────────────────────────────────────────────────────────────
 
 /**
- * @brief Manages one Cairo-overlaid recording branch for a Camera_GST camera.
- *
- * Each Recorder instance handles exactly one recording bin at a time.  Create a
- * new Recorder (or call disconnect() and createRecordingBin() again) to start a
- * new recording session.
+ * @brief One recording session at a time: compressed UVC video to MKV plus an
+ *        ASS telemetry sidecar.
  *
  * Thread safety:
- *   - setOverlayData() and getOverlayData() are safe to call from any thread.
- *   - setOverlayConfig() is safe before start() and between stop()/start() cycles.
- *     Calling it while the pipeline is RUNNING is also safe (protected by the
- *     same mutex) but the change takes effect on the next rendered frame.
- *   - createRecordingBin() and disconnect() must be called from the same thread
- *     that calls Camera_GST lifecycle methods (they are not re-entrant).
+ *   - setOverlayData()/getOverlayData() are safe from any thread.
+ *   - setOverlayConfig()/setLogCallback() must be called before
+ *     startRecording() (they configure the session).
+ *   - startRecording()/stopRecording() are not re-entrant; call them from the
+ *     application's control thread.
  */
 class Recorder {
 public:
     Recorder();
 
-    /**
-     * @brief Destructor; calls disconnect() if signal handlers are still connected.
-     *
-     * @warning If the camera pipeline has already been destroyed at this point
-     *          the behaviour is undefined.  Always call disconnect() explicitly
-     *          before camera.stop() / camera.close().
-     */
+    /** @brief Destructor; stops any active recording (EOS-finalised). */
     ~Recorder();
 
     Recorder(const Recorder&)            = delete;
     Recorder& operator=(const Recorder&) = delete;
 
-    // ─── overlay data ──────────────────────────────────────────────────────────
+    // ─── telemetry ─────────────────────────────────────────────────────────────
 
-    /**
-     * @brief Replace the current telemetry snapshot.  Thread-safe.
-     * @param data  New telemetry values; copied under the internal mutex.
-     */
+    /** @brief Replace the current telemetry snapshot.  Thread-safe. */
     void setOverlayData(const OverlayData& data);
 
-    /**
-     * @brief Return a copy of the current telemetry snapshot.  Thread-safe.
-     */
+    /** @brief Return a copy of the current telemetry snapshot.  Thread-safe. */
     OverlayData getOverlayData() const;
 
     /**
-     * @brief Replace the overlay rendering configuration.
+     * @brief Set the subtitle style + cadence configuration.
      *
-     * Thread-safe.  Changes take effect on the next rendered frame.
-     * May be called before or during recording.
-     *
-     * @param cfg  Font, size, opacity, and enabled flag.
+     * Call before startRecording(); the ASS header is written at start.
+     * OverlayConfig::enabled=false suppresses the sidecar entirely.
      */
     void setOverlayConfig(const dashcam::config::OverlayConfig& cfg);
 
-    /**
-     * @brief Inject a log callback for pipeline construction diagnostics.
-     *        Defaults to a no-op (silent) if not set.
-     */
+    /** @brief Inject a log callback.  Defaults to silent. */
     void setLogCallback(dashcam::log::LogCallback cb);
 
-    // ─── recording bin ─────────────────────────────────────────────────────────
+    // ─── recording lifecycle ───────────────────────────────────────────────────
 
     /**
-     * @brief Create the GstBin that writes an MKV file with a telemetry overlay.
+     * @brief Start recording a UVC camera's compressed stream.
      *
-     * The returned bin accepts the camera tee's native format on its ghost sink
-     * pad.  nvvidconv at the inlet converts from NV12/NVMM (CSI) or BGRx (USB)
-     * to BGRx system memory before the Cairo overlay stage.  The internal chain:
-     * @verbatim
-     *   nvvidconv ! video/x-raw,format=BGRx
-     *     ! videorate skip-to-first=true             ← rate-limit FIRST: Cairo,
-     *     ! video/x-raw,framerate=N/D                  videoconvert and x264enc all
-     *     ! cairooverlay                               run at the target rate, not
-     *     ! videoconvert ! video/x-raw,format=I420     the sensor rate; skip-to-first
-     *     ! queue ! x264enc                            avoids a freeze-frame intro
-     *     ! h264parse ! matroskamux offset-to-zero=true ! filesink
-     * @endverbatim
-     *
-     * Pass the returned pointer to Camera_GST::addBranch() and then call
-     * Camera_GST::start().  The Recorder connects the Cairo signal handlers
-     * internally during this call, so createRecordingBin() must be called
-     * before addBranch() and start().
-     *
-     * @param filename    Output MKV path (absolute or relative to cwd).
-     * @param frNum       Target frame rate numerator (use Camera_GST::computeFpsRational).
-     * @param frDen       Target frame rate denominator.
-     * @param enc         Encoder parameters (bitrate, speed-preset, keyIntMax, tune).
-     * @param queueDepth  Depth (buffers) of the pre-encoder queue; from RecordingConfig::queueDepth.
-     * @param srcMem      Memory domain of the tee frames (SourceMemory::NVMM for a
-     *                    CSI/Argus camera, SourceMemory::System for a USB/V4L2 camera).
-     *                    Selects the bin inlet (nvvidconv vs videoconvert).
-     * @param outWidth    Encoder input width; 0 = keep the source width (no scaling).
-     * @param outHeight   Encoder input height; 0 = keep the source height (no scaling).
-     *                    When BOTH are > 0 the bin downscales at the inlet — on the
-     *                    VIC for NVMM (free), via videoscale for System — before the
-     *                    Cairo overlay and the CPU x264enc.  This is the cheapest way
-     *                    to trim a secondary/debug branch's encode cost (encoder CPU
-     *                    scales with pixel rate).  Keep the source aspect ratio to
-     *                    avoid distortion (e.g. 1456x1088 → 728x544).
-     * @param overlay     When true (default) the telemetry Cairo overlay is drawn.
-     *                    When false the Cairo stage is omitted entirely — the inlet
-     *                    converts straight to I420 for the encoder (no Cairo, no BGRx
-     *                    round-trip: cheaper), and setOverlayData()/setOverlayConfig()
-     *                    have no effect.  Use for feeds that don't need telemetry,
-     *                    e.g. a raw debug recording.
-     * @return Newly created GstBin (floating ref) on success; nullptr on failure.
-     *         Ownership transfers to the pipeline via addBranch() / gst_bin_add().
+     * @param devicePath  V4L2 device node (e.g. "/dev/video2").
+     * @param fmt         Compressed format to capture (MJPEG or H264 only —
+     *                    anything else is rejected with an ERROR log).
+     * @param filename    Output MKV path; the ASS sidecar is written next to
+     *                    it with the extension replaced (clip.mkv → clip.ass).
+     * @param maxFps      MJPEG only: cap the recorded rate by dropping frames
+     *                    (videorate drop-only) — dropping intra-only JPEG
+     *                    frames is lossless-safe.  0 = record at camera rate.
+     *                    Ignored for H264 (dropping would corrupt GOPs).
+     * @param eosTimeoutMs  How long stopRecording() waits for the EOS to
+     *                    flush before forcing teardown.
+     * @return true when the pipeline reached PLAYING; false on any failure
+     *         (bad format, busy device, negotiation error) — details logged.
      */
-    GstElement* createRecordingBin(const std::string& filename,
-                                   uint32_t frNum = 60, uint32_t frDen = 1,
-                                   const dashcam::config::EncoderConfig& enc = {},
-                                   uint32_t queueDepth = 3,
-                                   SourceMemory srcMem = SourceMemory::NVMM,
-                                   uint32_t outWidth = 0, uint32_t outHeight = 0,
-                                   bool overlay = true);
-
-    // ─── lifecycle ─────────────────────────────────────────────────────────────
+    bool startRecording(const std::string& devicePath,
+                        const RecordingFormat& fmt,
+                        const std::string& filename,
+                        uint32_t maxFps = 0,
+                        uint32_t eosTimeoutMs = 4000);
 
     /**
-     * @brief Disconnect the Cairo "draw" and "caps-changed" signal handlers.
+     * @brief Stop the session: EOS-finalise the MKV, close the ASS sidecar.
      *
-     * Safe to call multiple times (no-op if already disconnected).  Must be
-     * called before the camera pipeline is torn down (before stop() or close())
-     * to prevent the streaming thread from calling into a freed cairo_t*.
+     * Safe to call when not recording (no-op).  After it returns the files
+     * are complete and playable.
      */
-    void disconnect();
+    void stopRecording();
+
+    /**
+     * @brief True while a started session is healthy (pipeline running, no
+     *        bus error observed).  A bus error is logged and latches false.
+     */
+    bool isRecording() const;
 
 private:
+    // ── configuration / telemetry state ──────────────────────────────────────
     dashcam::log::LogCallback      log_{};
     OverlayData                    overlayData_;
     dashcam::config::OverlayConfig overlayConfig_;
     mutable std::mutex             overlayMutex_;
 
-    /// Non-owning pointer to the cairooverlay element inside the recording bin.
-    /// Valid from createRecordingBin() until disconnect().
-    GstElement* cairoOverlay_ = nullptr;
-    gulong      cairoDrawId_  = 0;  ///< "draw" signal handler ID; 0 when disconnected.
-    gulong      cairoCapsId_  = 0;  ///< "caps-changed" signal handler ID; 0 when disconnected.
-    int         videoWidth_   = 0;  ///< Frame width set by the caps-changed callback.
-    int         videoHeight_  = 0;  ///< Frame height set by the caps-changed callback.
+    // ── session state ────────────────────────────────────────────────────────
+    GstElement*       pipeline_ = nullptr;
+    std::ofstream     assFile_;
+    std::string       assPath_;
+    uint32_t          videoW_ = 0, videoH_ = 0;
+    uint32_t          eosTimeoutMs_ = 4000;
+    std::thread       subThread_;
+    std::atomic<bool> stopFlag_{false};
+    std::atomic<bool> healthy_{false};
 
-    /// Cached font parse result (derived from overlayConfig_.fontFace in setOverlayConfig).
-    /// Protected by overlayMutex_; snapshotted in renderOverlay() alongside overlayConfig_.
-    std::string cachedFontFamily_;
-    int         cachedFontWeight_ = 0;  ///< cairo_font_weight_t
-    int         cachedFontSlant_  = 0;  ///< cairo_font_slant_t
+    /// Subtitle/bus thread: samples telemetry at SubtitleRateHz, appends ASS
+    /// Dialogue events timed by pipeline position, and polls the bus for errors.
+    void subtitleLoop();
 
-    /** @brief Render all four corner labels onto @p cr for the current frame. */
-    void renderOverlay(cairo_t* cr);
+    /// Write the ASS header ([Script Info] + four corner styles) for videoW/H.
+    void writeAssHeader();
 
-    /** @brief GStreamer "draw" signal callback; delegates to renderOverlay(). */
-    static void onCairoDraw(GstElement*, cairo_t*, GstClockTime, GstClockTime, gpointer);
-
-    /** @brief GStreamer "caps-changed" callback; stores frame dimensions. */
-    static void onCairoCapsChanged(GstElement*, GstCaps*, gpointer);
-
-    /**
-     * @brief GObject weak-ref notify: the cairooverlay element was finalised.
-     *
-     * Fires when the recording bin (and its cairooverlay) is destroyed — e.g.
-     * the camera pipeline is torn down (a failed start(), or stop()/close()
-     * called before disconnect()).  Nulls cairoOverlay_ and the handler IDs
-     * under overlayMutex_ so a subsequent disconnect()/~Recorder becomes a safe
-     * no-op instead of dereferencing freed memory.
-     */
-    static void onCairoOverlayDestroyed(gpointer user_data, GObject* where);
+    /// Append one telemetry sample (4 Dialogue events) at video time @p posNs.
+    /// The bottom-right clock is drawn from @p wallNowMs (the device clock, so
+    /// it stays live regardless of telemetry age); when @p stale is true the
+    /// motion/position fields render as a dash instead of a frozen reading.
+    void writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
+                        int64_t wallNowMs, bool stale);
 };
 
 } // namespace dashcam::record

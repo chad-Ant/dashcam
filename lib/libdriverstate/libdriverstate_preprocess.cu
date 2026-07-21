@@ -1,5 +1,4 @@
 #include "libdriverstate_preprocess.h"
-#include <cstdio>
 
 namespace dashcam::driver {
 
@@ -10,7 +9,8 @@ __device__ __forceinline__ static float ldgByte(const uint8_t* p) {
 __global__ static void preprocessKernel(
     const uint8_t* __restrict__ src,
     float*         __restrict__ dst,
-    int srcW, int srcH,
+    int srcW,
+    int roiX, int roiY, int roiW, int roiH,
     int dstW, int dstH,
     float meanR, float meanG, float meanB,
     float stdR,  float stdG,  float stdB)
@@ -19,17 +19,19 @@ __global__ static void preprocessKernel(
     const int dy = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
     if (dx >= dstW || dy >= dstH) return;
 
-    const float scaleX = static_cast<float>(srcW) / dstW;
-    const float scaleY = static_cast<float>(srcH) / dstH;
-    const float sx = (dx + 0.5f) * scaleX - 0.5f;
-    const float sy = (dy + 0.5f) * scaleY - 0.5f;
+    // Map the destination pixel into the ROI; clamp samples to the ROI so the
+    // model never sees pixels outside the crop.
+    const float scaleX = static_cast<float>(roiW) / dstW;
+    const float scaleY = static_cast<float>(roiH) / dstH;
+    const float sx = roiX + (dx + 0.5f) * scaleX - 0.5f;
+    const float sy = roiY + (dy + 0.5f) * scaleY - 0.5f;
 
     const int   ix = static_cast<int>(floorf(sx));
     const int   iy = static_cast<int>(floorf(sy));
-    const int   x0 = max(0, min(ix,     srcW - 1));
-    const int   x1 = max(0, min(ix + 1, srcW - 1));
-    const int   y0 = max(0, min(iy,     srcH - 1));
-    const int   y1 = max(0, min(iy + 1, srcH - 1));
+    const int   x0 = max(roiX, min(ix,     roiX + roiW - 1));
+    const int   x1 = max(roiX, min(ix + 1, roiX + roiW - 1));
+    const int   y0 = max(roiY, min(iy,     roiY + roiH - 1));
+    const int   y1 = max(roiY, min(iy + 1, roiY + roiH - 1));
     const float fx = sx - static_cast<float>(ix);
     const float fy = sy - static_cast<float>(iy);
 
@@ -52,25 +54,27 @@ __global__ static void preprocessKernel(
     dst[2 * plane + idx] = (bv / 255.0f - meanB) / stdB;
 }
 
-void launchPreprocessKernel(
+cudaError_t launchPreprocessKernel(
     const uint8_t* dSrc, float* dDst,
     int srcW, int srcH,
+    int roiX, int roiY, int roiW, int roiH,
     int dstW, int dstH,
     float meanR, float meanG, float meanB,
     float stdR,  float stdG,  float stdB,
     cudaStream_t stream)
 {
+    if (roiW < 1 || roiH < 1 || roiX < 0 || roiY < 0 ||
+        roiX + roiW > srcW || roiY + roiH > srcH)
+        return cudaErrorInvalidValue;
+
     const dim3 block(16, 16);
     const dim3 grid((dstW + 15) / 16, (dstH + 15) / 16);
 
     preprocessKernel<<<grid, block, 0, stream>>>(
-        dSrc, dDst, srcW, srcH, dstW, dstH,
+        dSrc, dDst, srcW, roiX, roiY, roiW, roiH, dstW, dstH,
         meanR, meanG, meanB, stdR, stdG, stdB);
 
-    const cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        std::fprintf(stderr, "[libdriverstate] preprocess kernel launch failed: %s\n",
-                     cudaGetErrorString(err));
+    return cudaGetLastError();
 }
 
 } // namespace dashcam::driver

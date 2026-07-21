@@ -176,6 +176,8 @@ static void parseOverlay(pugi::xml_node node, OverlayConfig& ovl,
     readVar(node, ovl.fontFace,          log);
     readVar(node, ovl.labelPadX,         log);
     readVar(node, ovl.labelPadY,         log);
+    readVar(node, ovl.subtitleRateHz,    log);
+    readVar(node, ovl.staleTimeoutMs,    log);
 }
 
 static void parseCamera(pugi::xml_node node, CameraConfig& cam,
@@ -252,12 +254,44 @@ static void parseRecording(pugi::xml_node node, RecordingConfig& r,
 
 static void parseDetection(pugi::xml_node node, DetectionConfig& d,
                            const dashcam::log::LogCallback& log) {
+    readVar(node, d.laneEnginePath,    log);
     readVar(node, d.laneTargetHz,      log);
+    readVar(node, d.laneBranchMaxFps,  log);
+    readVar(node, d.laneInputCropTop,  log);
+    readVar(node, d.laneInputCropBottom, log);
     readVar(node, d.laneReferenceY,    log);
     readVar(node, d.signTargetHz,      log);
     readVar(node, d.signConfThreshold, log);
     readVar(node, d.signNmsThreshold,  log);
+    readVar(node, d.driverEnginePath,  log);
     readVar(node, d.driverTargetHz,    log);
+    readVar(node, d.driverBranchMaxFps, log);
+    readVar(node, d.driverDrowsyThreshold, log);
+    readVar(node, d.driverFaceDetection, log);
+    readVar(node, d.driverFaceModelPath, log);
+    readVar(node, d.driverFaceScore,     log);
+}
+
+static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
+                             const dashcam::log::LogCallback& log) {
+    readVar(node, s.scoreInitial,       log);
+    readVar(node, s.scoreUpper,         log);
+    readVar(node, s.scoreLower,         log);
+    readVar(node, s.drowsyChunkSec,     log);
+    readVar(node, s.drowsyChunkPenalty, log);
+    readVar(node, s.awakeChunkSec,      log);
+    readVar(node, s.awakeChunkReward,   log);
+    readVar(node, s.laneDepartThresh,   log);
+    readVar(node, s.laneReturnSec,      log);
+    readVar(node, s.laneDriftPenalty,   log);
+    readVar(node, s.capDecayPerHour,    log);
+    readVar(node, s.capDecayFloor,      log);
+    readVar(node, s.cautionScore,       log);
+    readVar(node, s.warningScore,       log);
+    readVar(node, s.fatigueScore,       log);
+    readVar(node, s.fatigueSustainSec,  log);
+    readVar(node, s.acuteAlertSec,      log);
+    readVar(node, s.noFaceFreezes,      log);
 }
 
 // ── section writers ──────────────────────────────────────────────────────────
@@ -278,6 +312,8 @@ static void writeOverlay(pugi::xml_node parent, const OverlayConfig& ovl) {
     writeVar(n, ovl.fontFace);
     writeVar(n, ovl.labelPadX);
     writeVar(n, ovl.labelPadY);
+    writeVar(n, ovl.subtitleRateHz);
+    writeVar(n, ovl.staleTimeoutMs);
 }
 
 static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
@@ -354,12 +390,44 @@ static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
 
 static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
     pugi::xml_node n = parent.append_child("Detection");
+    writeVar(n, d.laneEnginePath);
     writeVar(n, d.laneTargetHz);
+    writeVar(n, d.laneBranchMaxFps);
+    writeVar(n, d.laneInputCropTop);
+    writeVar(n, d.laneInputCropBottom);
     writeVar(n, d.laneReferenceY);
     writeVar(n, d.signTargetHz);
     writeVar(n, d.signConfThreshold);
     writeVar(n, d.signNmsThreshold);
+    writeVar(n, d.driverEnginePath);
     writeVar(n, d.driverTargetHz);
+    writeVar(n, d.driverBranchMaxFps);
+    writeVar(n, d.driverDrowsyThreshold);
+    writeVar(n, d.driverFaceDetection);
+    writeVar(n, d.driverFaceModelPath);
+    writeVar(n, d.driverFaceScore);
+}
+
+static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) {
+    pugi::xml_node n = parent.append_child("DriverScore");
+    writeVar(n, s.scoreInitial);
+    writeVar(n, s.scoreUpper);
+    writeVar(n, s.scoreLower);
+    writeVar(n, s.drowsyChunkSec);
+    writeVar(n, s.drowsyChunkPenalty);
+    writeVar(n, s.awakeChunkSec);
+    writeVar(n, s.awakeChunkReward);
+    writeVar(n, s.laneDepartThresh);
+    writeVar(n, s.laneReturnSec);
+    writeVar(n, s.laneDriftPenalty);
+    writeVar(n, s.capDecayPerHour);
+    writeVar(n, s.capDecayFloor);
+    writeVar(n, s.cautionScore);
+    writeVar(n, s.warningScore);
+    writeVar(n, s.fatigueScore);
+    writeVar(n, s.fatigueSustainSec);
+    writeVar(n, s.acuteAlertSec);
+    writeVar(n, s.noFaceFreezes);
 }
 
 } // namespace
@@ -389,6 +457,8 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
     if (auto pl  = root.child("Pipeline"))  parsePipeline (pl,  config.pipeline,  log);
     if (auto rec = root.child("Recording")) parseRecording(rec, config.recording, log);
     if (auto det = root.child("Detection")) parseDetection(det, config.detection, log);
+    if (auto ds  = root.child("DriverScore"))
+        parseDriverScore(ds, config.driverScore, log);
     if (auto lg  = root.child("Log"))       parseLog      (lg,  config.log,       log);
 
     if (auto cams = root.child("Cameras")) {
@@ -424,6 +494,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writePipeline(root, config.pipeline);
     writeRecording(root, config.recording);
     writeDetection(root, config.detection);
+    writeDriverScore(root, config.driverScore);
     writeLog(root, config.log);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {

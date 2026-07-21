@@ -202,16 +202,18 @@ struct EncoderConfig {
 };
 
 /**
- * @brief Cairo overlay rendering parameters.
+ * @brief Telemetry sidecar (ASS) rendering parameters.
  * XML section: @c \<Overlay\>
  */
 struct OverlayConfig {
-    ConfigVar<bool>        enabled           {"Enabled",           true,                           "Render telemetry overlay on recorded video"};
-    ConfigVar<float>       backgroundOpacity {"BackgroundOpacity", 0.85f, 0.0f,  1.0f,  0.05f,  "Alpha of the semi-transparent label backing [0=transparent, 1=opaque]"};
-    ConfigVar<float>       fontSize          {"FontSize",          14.0f, 4.0f,  72.0f, 0.5f,   "Label font size in points"};
-    ConfigVar<std::string> fontFace          {"FontFace",          "Monospace Bold",               "Pango font description string"};
-    ConfigVar<float>       labelPadX         {"LabelPadX",         12.0f, 0.0f,  64.0f, 1.0f,   "Horizontal padding inside overlay label boxes (px)"};
-    ConfigVar<float>       labelPadY         {"LabelPadY",         8.0f,  0.0f,  64.0f, 1.0f,   "Vertical padding inside overlay label boxes (px)"};
+    ConfigVar<bool>        enabled           {"Enabled",           true,                           "Write the ASS telemetry sidecar next to each recording"};
+    ConfigVar<float>       backgroundOpacity {"BackgroundOpacity", 0.85f, 0.0f,  1.0f,  0.05f,  "Alpha of the label backing box [0=transparent, 1=opaque]"};
+    ConfigVar<float>       fontSize          {"FontSize",          14.0f, 4.0f,  72.0f, 0.5f,   "Label font size at 720p; scales with the video resolution"};
+    ConfigVar<std::string> fontFace          {"FontFace",          "Monospace Bold",               "Font name; a trailing ' Bold' sets the bold flag"};
+    ConfigVar<float>       labelPadX         {"LabelPadX",         12.0f, 0.0f,  64.0f, 1.0f,   "Horizontal label margin from the frame edge (px at 720p)"};
+    ConfigVar<float>       labelPadY         {"LabelPadY",         8.0f,  0.0f,  64.0f, 1.0f,   "Vertical label margin / box padding (px at 720p)"};
+    ConfigVar<float>       subtitleRateHz    {"SubtitleRateHz",    5.0f,  0.5f,  30.0f, 0.5f,   "Telemetry samples per second written to the ASS sidecar"};
+    ConfigVar<int>         staleTimeoutMs    {"StaleTimeoutMs",    2000,  0,     60000, 100,    "Telemetry age (ms) past which motion/position fields render as a dash; 0 = never stale (the clock always stays live)"};
 };
 
 /**
@@ -354,12 +356,51 @@ struct RecordingConfig {
  * desynced from the TRT engine via the XML file.  XML section: @c \<Detection\>
  */
 struct DetectionConfig {
+    ConfigVar<std::string> laneEnginePath {"LaneEnginePath", "models/culane_res18_fp16.engine", "UFLD v2 TensorRT engine path — must be built with trtexec INSIDE the runtime container (engines are TRT-version-locked)"};
     ConfigVar<int>   laneTargetHz      {"LaneTargetHz",      20,    0,    60,   1,     "Lane inference rate cap (Hz); 0 = unthrottled"};
+    ConfigVar<int>   laneBranchMaxFps  {"LaneBranchMaxFps",  20,    0,    120,  1,     "Lane branch inlet frame-rate cap (fps, videorate drop-only) so conversion runs below the sensor rate; 0 = uncapped"};
+    ConfigVar<float> laneInputCropTop  {"LaneInputCropTop",  0.50f,   0.0f, 0.9f, 0.01f,   "Fraction of frame height cropped off the top inside the lane branch (0.5 = keep lower half)"};
+    ConfigVar<float> laneInputCropBottom {"LaneInputCropBottom", 0.2059f, 0.0f, 0.9f, 0.0001f, "Fraction of frame height additionally cropped off the bottom of the lane branch (0.2059 = 224 rows on the 1088-row IMX296, leaving a 320-row mid band)"};
     ConfigVar<float> laneReferenceY    {"LaneReferenceY",    0.90f, 0.5f, 1.0f, 0.01f, "Row (fraction of height) where lane x-positions are sampled"};
     ConfigVar<int>   signTargetHz      {"SignTargetHz",      5,     0,    30,   1,     "Sign inference rate cap (Hz)"};
     ConfigVar<float> signConfThreshold {"SignConfThreshold", 0.50f, 0.0f, 1.0f, 0.01f, "Sign detection confidence threshold"};
     ConfigVar<float> signNmsThreshold  {"SignNmsThreshold",  0.45f, 0.0f, 1.0f, 0.01f, "Sign NMS IoU threshold"};
-    ConfigVar<int>   driverTargetHz    {"DriverTargetHz",    1,     0,    30,   1,     "Driver-state inference rate cap (Hz)"};
+    ConfigVar<std::string> driverEnginePath {"DriverEnginePath", "models/drowsiness_resnet18_fp16.engine", "Drowsiness classifier TensorRT engine path — must be built with trtexec INSIDE the runtime container (engines are TRT-version-locked)"};
+    ConfigVar<int>   driverTargetHz    {"DriverTargetHz",    2,     0,    30,   1,     "Driver-state inference rate cap (Hz)"};
+    ConfigVar<int>   driverBranchMaxFps {"DriverBranchMaxFps", 2,   0,    120,  1,     "Driver-state branch inlet frame-rate cap (fps, videorate drop-only); UVC cameras cannot deliver 2 fps natively so the branch drops to it; 0 = uncapped"};
+    ConfigVar<float> driverDrowsyThreshold {"DriverDrowsyThreshold", 0.50f, 0.0f, 1.0f, 0.01f, "P(drowsy) at or above which the driver state reports DROWSY"};
+    ConfigVar<bool>  driverFaceDetection {"DriverFaceDetection", true, "Viola-Jones face detect + crop before drowsiness classification (matches the model's face-crop training data); no-face frames skip classification"};
+    ConfigVar<std::string> driverFaceModelPath {"DriverFaceModelPath", "models/face_detection_yunet_2023mar.onnx", "YuNet DNN face-detection model (ONNX) for driver face detection (vendored OpenCV Zoo face_detection_yunet_2023mar); robust to tilted/off-axis faces from a low dashboard mount"};
+    ConfigVar<float> driverFaceScore {"DriverFaceScore", 0.60f, 0.0f, 1.0f, 0.01f, "YuNet detection confidence threshold; lower accepts more off-axis faces (fewer no-face dropouts) at the cost of occasional false boxes"};
+};
+
+/**
+ * @brief Long-horizon driver-fatigue scoring (libdriverstate FatigueScorer).
+ * XML section: @c \<DriverScore\>.  Score runs 100 (fresh) down past 0
+ * (fatigued); drowsiness deducts per completed chunk, wakefulness heals more
+ * slowly, drowsiness-correlated lane drift deducts extra, and the score cap
+ * decays with time-on-task.  The acute micro-sleep alert is separate and
+ * NEVER replaced by the score.
+ */
+struct DriverScoreConfig {
+    ConfigVar<float> scoreInitial {"ScoreInitial", 100.0f, 0.0f, 1000.0f, 1.0f, "Starting / reset fatigue score"};
+    ConfigVar<float> scoreUpper   {"ScoreUpper",   100.0f, 0.0f, 1000.0f, 1.0f, "Score cap before time-on-task decay"};
+    ConfigVar<float> scoreLower   {"ScoreLower",   -10.0f, -1000.0f, 0.0f, 1.0f, "Hard score floor"};
+    ConfigVar<float> drowsyChunkSec     {"DrowsyChunkSec",     10.0f, 1.0f, 600.0f, 1.0f, "Seconds of CONTINUOUS drowsiness per deduction; recovering mid-chunk costs nothing"};
+    ConfigVar<float> drowsyChunkPenalty {"DrowsyChunkPenalty", 10.0f, 0.0f, 100.0f, 1.0f, "Points deducted per completed drowsy chunk"};
+    ConfigVar<float> awakeChunkSec      {"AwakeChunkSec",      10.0f, 1.0f, 600.0f, 1.0f, "Seconds of continuous wakefulness per reward"};
+    ConfigVar<float> awakeChunkReward   {"AwakeChunkReward",    5.0f, 0.0f, 100.0f, 1.0f, "Points restored per completed awake chunk (asymmetric on purpose: fatigue builds faster than it heals)"};
+    ConfigVar<float> laneDepartThresh {"LaneDepartThresh", 0.80f, 0.10f, 2.0f, 0.05f, "|lateral offset| counting as drifting onto/across a lane line (0 centred, 1 on the line)"};
+    ConfigVar<float> laneReturnSec    {"LaneReturnSec",    10.0f, 1.0f, 120.0f, 1.0f, "A departure during a drowsy episode that returns within this window deducts LaneDriftPenalty (longer = deliberate lane change, no deduction)"};
+    ConfigVar<float> laneDriftPenalty {"LaneDriftPenalty", 10.0f, 0.0f, 100.0f, 1.0f, "Points deducted per drowsiness-correlated lane drift (once per drowsy episode)"};
+    ConfigVar<float> capDecayPerHour {"CapDecayPerHour", 10.0f, 0.0f, 100.0f, 1.0f, "Score-cap reduction per full driving hour (time-on-task fatigue)"};
+    ConfigVar<float> capDecayFloor   {"CapDecayFloor",   50.0f, 0.0f, 1000.0f, 1.0f, "Cap never decays below this"};
+    ConfigVar<float> cautionScore {"CautionScore", 60.0f, -1000.0f, 1000.0f, 1.0f, "Below this: CAUTION (subtle cue)"};
+    ConfigVar<float> warningScore {"WarningScore", 30.0f, -1000.0f, 1000.0f, 1.0f, "Below this: WARNING (repeated alert)"};
+    ConfigVar<float> fatigueScore {"FatigueScore",  0.0f, -1000.0f, 1000.0f, 1.0f, "At/below this: fatigue zone"};
+    ConfigVar<float> fatigueSustainSec {"FatigueSustainSec", 300.0f, 0.0f, 3600.0f, 10.0f, "Continuous seconds in the fatigue zone before the high-confidence FATIGUE alarm"};
+    ConfigVar<float> acuteAlertSec {"AcuteAlertSec", 2.0f, 0.5f, 60.0f, 0.5f, "Sustained seconds of instantaneous DROWSY before the immediate micro-sleep alert (independent of the score)"};
+    ConfigVar<bool>  noFaceFreezes {"NoFaceFreezes", true, "No-face frames freeze the score (a blocked/averted camera is not drowsiness); false accrues awake instead"};
 };
 
 /**
@@ -374,6 +415,7 @@ struct AppConfig {
     PipelineConfig            pipeline;
     RecordingConfig           recording;
     DetectionConfig           detection;
+    DriverScoreConfig         driverScore;
     LogConfig                 log;
 };
 

@@ -1,16 +1,24 @@
 /**
  * @file liblanedetector.h
- * @brief GStreamer-integrated TensorRT lane detector.
+ * @brief GStreamer-integrated TensorRT lane detector (UFLD v2).
  *
  * Plugs into a Camera_GST pipeline as a leaky branch via addBranch().  An
  * internal inference thread pulls BGR frames from the branch's appsink,
- * preprocesses them on the GPU (CUDA kernel), runs TRT inference (UFLD v1),
- * decodes lane boundaries, and stores the result for poll().
+ * preprocesses them on the GPU (CUDA kernel: bottom-crop + resize + normalise),
+ * runs TRT inference (Ultra-Fast-Lane-Detection v2), decodes the row/column
+ * anchor heads into lane boundaries, and stores the result for poll().
  *
- * Engine build (once, on the target Jetson):
+ * Engine build (once, INSIDE the l4t-ml container that runs this app — TRT
+ * engines are locked to the exact TensorRT version that built them, and the
+ * container's TRT differs from the host's):
  * @code
- *   trtexec --onnx=ufld.onnx --saveEngine=models/ufld.engine --fp16
+ *   /usr/src/tensorrt/bin/trtexec --onnx=ufldv2_culane_res18_320x1600.onnx \
+ *       --saveEngine=models/culane_res18_fp16.engine --fp16 \
+ *       --memPoolSize=workspace:512M --builderOptimizationLevel=2
  * @endcode
+ * The engine's IO signature is validated against LaneDetectorConfig at load:
+ * input (1,3,H,W) float32 and the four UFLD v2 outputs loc_row / loc_col /
+ * exist_row / exist_col.
  *
  * Typical lifecycle:
  * @code
@@ -49,6 +57,7 @@
 #include <string>
 #include <vector>
 #include <gst/gst.h>
+#include "liblog.h"
 
 namespace dashcam::lane {
 
@@ -77,6 +86,18 @@ struct LaneResult {
     ///      (drifted off-road).  Treat as an error — do not use as an index.
     int8_t currentLaneIndex = -1;
 
+    /// Lateral projection of the vehicle centre inside its current lane,
+    /// sampled at laneReferenceY: 0 = centred, -1 = on the left boundary,
+    /// +1 = on the right boundary.  |value| near 1 means the vehicle is
+    /// drifting onto a lane line — the driver-fatigue scorer consumes this
+    /// (see libdriverstate).  Only meaningful when lateralValid is true.
+    float lateralOffset = 0.0f;
+
+    /// True when lateralOffset was computed this frame: >= 2 boundaries
+    /// detected AND the vehicle centre lies inside a lane
+    /// (currentLaneIndex >= 0).
+    bool lateralValid = false;
+
     /// One entry per lane.  Size == numLanes.
     std::vector<LaneDirection> laneAllowedDirections;
 };
@@ -84,24 +105,61 @@ struct LaneResult {
 // ─── configuration ────────────────────────────────────────────────────────────
 
 struct LaneDetectorConfig {
-    /// Path to the serialised TRT engine (built with trtexec on this Jetson).
+    /// Path to the serialised TRT engine.  Must be built with trtexec inside
+    /// the SAME container (TRT version) that runs this library.
     std::string enginePath;
 
     /// Model input dimensions — must match the engine's input tensor.
-    uint32_t modelInputW = 800;
-    uint32_t modelInputH = 288;
+    /// UFLD v2 CULane res18: 1600×320.
+    uint32_t modelInputW = 1600;
+    uint32_t modelInputH = 320;
 
-    // ── UFLD v1 postprocessing ────────────────────────────────────────────────
+    // ── UFLD v2 head geometry (culane_res18 defaults) ─────────────────────────
 
-    /// Number of column grid cells (griding_num).
-    /// Class index == gridingNum means "no lane at this row".
-    int gridingNum    = 100;
+    /// Location grid cells of the row-anchor head (num_cell_row).
+    int numCellRow    = 200;
 
-    /// Number of row-anchor sample positions.  Must be ≤ 56.
-    int numRowAnchors = 56;
+    /// Row-anchor sample positions (num_row).
+    int numRowAnchors = 72;
 
-    /// Number of lane boundary lines predicted by the model.
+    /// Location grid cells of the column-anchor head (num_cell_col).
+    int numCellCol    = 100;
+
+    /// Column-anchor sample positions (num_col).
+    int numColAnchors = 81;
+
+    /// Lane slots predicted by the model.  UFLD v2 fixes the semantics:
+    /// slots 1,2 = ego-adjacent boundaries (row head), 0,3 = outer (col head).
     int numLanes      = 4;
+
+    /// Fraction of the ORIGINAL frame height the model should see (bottom),
+    /// reproducing the training Resize(H/crop_ratio)+crop.  When inputCropTop
+    /// already removed part of the frame, the preprocess ROI compensates so
+    /// the model's effective view stays as close to this as the branch crop
+    /// allows.
+    float cropRatio   = 0.6f;
+
+    /// Fraction of the frame height cropped off the TOP inside the lane
+    /// branch, before conversion/preprocess (0 = full frame, 0.5 = keep the
+    /// lower half).  Cuts VIC/CPU conversion and H2D cost; lanes live in the
+    /// lower half anyway.
+    float inputCropTop = 0.5f;
+
+    /// Fraction of the frame height additionally cropped off the BOTTOM of
+    /// the branch (0 = none).  With inputCropTop this selects a mid-frame
+    /// band — e.g. 0.5 top + 0.2059 bottom on the 1088-row IMX296 keeps rows
+    /// [544, 864): a 320-row band that matches the model input height, so the
+    /// preprocess does no vertical resampling at all.
+    float inputCropBottom = 0.0f;
+
+    /// Frame-rate cap applied at the branch inlet (videorate drop-only), so
+    /// conversion elements run at most this often instead of the sensor rate.
+    /// 0 = uncapped.  Keep >= targetHz.
+    uint32_t branchMaxFps = 20;
+
+    /// First row anchor as a fraction of source height; anchors are
+    /// linspace(rowAnchorStart, 1.0, numRowAnchors) like the UFLD v2 demo.
+    float rowAnchorStart = 0.42f;
 
     /// Source-image y-position (fraction of height) where boundary x-coords
     /// are sampled to determine lane widths and vehicle position.
@@ -116,16 +174,23 @@ struct LaneDetectorConfig {
     float meanR = 0.485f, meanG = 0.456f, meanB = 0.406f;
     float stdR  = 0.229f, stdG  = 0.224f, stdB  = 0.225f;
 
-    /// GStreamer element chain inserted inside the branch bin before the BGR
-    /// appsink.  Must accept whatever format the camera tee emits and convert
-    /// it to video/x-raw in system memory ready for videoconvert.
-    ///
-    /// CSI cameras (NV12/NVMM from nvarguscamerasrc tee):
-    ///   "nvvidconv ! video/x-raw,format=BGRx ! videoconvert"
-    /// USB cameras (YUYV/MJPEG-decoded frames in system memory):
-    ///   "videoconvert"
-    std::string gstConversion =
-        "nvvidconv ! video/x-raw,format=BGRx ! videoconvert";
+    /// True when the camera tee emits NVMM (CSI/nvarguscamerasrc) buffers,
+    /// false for system memory (USB v4l2src / file playback).  Selects the
+    /// auto-built conversion chain: nvvidconv (VIC crop+convert in one pass)
+    /// vs videocrop+videoconvert.
+    bool sourceIsNVMM = true;
+
+    /// Optional override of the auto-built conversion chain (advanced).  When
+    /// non-empty it is used verbatim and MUST deliver BGR frames of exactly
+    /// width × (height − (inputCropTop+inputCropBottom)·height) — the appsink
+    /// caps pin that size, and rate limiting/cropping become the override's
+    /// responsibility.
+    std::string gstConversion;
+
+    /// Log sink, wired like the other dashcam libraries.  Defaults to the
+    /// process-wide liblog callback so construction-time errors are visible;
+    /// replace via LaneDetector::setLogCallback().
+    dashcam::log::LogCallback log = dashcam::log::getCallback();
 };
 
 // ─── detector ─────────────────────────────────────────────────────────────────
@@ -135,17 +200,20 @@ class LaneDetectorImpl;
 /**
  * @brief TensorRT lane detector driven by the GStreamer pipeline.
  *
- * Frame path: camera tee → leaky queue → sign bin appsink →
+ * Frame path: camera tee → leaky queue → lane bin appsink →
  *   inference thread: cudaMemcpyAsync → CUDA kernel → TRT enqueueV3 →
- *   UFLD decode → latestResult_ (polled by caller).
+ *   UFLD v2 decode (row + column anchor heads) → latestResult_ (polled).
  */
 class LaneDetector {
 public:
     /**
-     * @param srcWidth   Source frame width (tee output resolution).
-     * @param srcHeight  Source frame height.
+     * @param srcWidth   FULL source frame width (tee output resolution).
+     * @param srcHeight  FULL source frame height.  The branch applies
+     *                   config.inputCropTop internally — pass the uncropped
+     *                   tee resolution here.
      * @param config     Engine path and model parameters.
-     * @throws std::runtime_error on engine load or CUDA allocation failure.
+     * @throws std::runtime_error on engine load, engine/config mismatch, or
+     *         CUDA allocation failure.
      */
     LaneDetector(uint32_t srcWidth, uint32_t srcHeight,
                  const LaneDetectorConfig& config);
@@ -179,6 +247,9 @@ public:
 
     /** @brief Return the most recent lane result (thread-safe). */
     LaneResult poll() const;
+
+    /** @brief Replace the log sink (same pattern as the other libraries). */
+    void setLogCallback(dashcam::log::LogCallback cb);
 
 private:
     std::unique_ptr<LaneDetectorImpl> impl_;

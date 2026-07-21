@@ -1,5 +1,4 @@
 #include "liblanedetector_preprocess.h"
-#include <cstdio>
 
 namespace dashcam::lane {
 
@@ -11,12 +10,13 @@ __device__ __forceinline__ static float ldgByte(const uint8_t* p) {
 }
 
 // Each thread handles one output pixel.
-// One kernel launch replaces: CPU bilinear loop + normalise + channel reorder.
+// One kernel launch replaces: CPU crop + bilinear + normalise + channel reorder.
 __global__ static void preprocessKernel(
     const uint8_t* __restrict__ src,
     float*         __restrict__ dst,
     int srcW, int srcH,
     int dstW, int dstH,
+    float srcYOff, float srcYScale,
     float meanR, float meanG, float meanB,
     float stdR,  float stdG,  float stdB)
 {
@@ -25,11 +25,12 @@ __global__ static void preprocessKernel(
     if (dx >= dstW || dy >= dstH) return;
 
     // align_corners=false: map output pixel centre to source pixel centre.
+    // The vertical axis samples a caller-selected ROI (UFLD v2 keeps only the
+    // bottom crop_ratio of the frame): sy = srcYOff + (dy+0.5)·srcYScale − 0.5.
     const float scaleX = static_cast<float>(srcW) / dstW;
-    const float scaleY = static_cast<float>(srcH) / dstH;
 
     const float sx = (dx + 0.5f) * scaleX - 0.5f;
-    const float sy = (dy + 0.5f) * scaleY - 0.5f;
+    const float sy = srcYOff + (dy + 0.5f) * srcYScale - 0.5f;
 
     // Use floorf for the integer part so negative coordinates (e.g. sx=-0.25
     // when upsampling) floor to -1, making x0=x1=0 after clamping and giving
@@ -66,10 +67,11 @@ __global__ static void preprocessKernel(
     dst[2 * plane + idx] = (bv / 255.0f - meanB) / stdB;
 }
 
-void launchPreprocessKernel(
+cudaError_t launchPreprocessKernel(
     const uint8_t* dSrc, float* dDst,
     int srcW, int srcH,
     int dstW, int dstH,
+    float srcYOff, float srcYScale,
     float meanR, float meanG, float meanB,
     float stdR,  float stdG,  float stdB,
     cudaStream_t stream)
@@ -81,15 +83,13 @@ void launchPreprocessKernel(
     preprocessKernel<<<grid, block, 0, stream>>>(
         dSrc, dDst,
         srcW, srcH, dstW, dstH,
+        srcYOff, srcYScale,
         meanR, meanG, meanB,
         stdR,  stdG,  stdB);
 
-    // Catch launch errors (invalid grid/block config, resource limits, etc.).
-    // Async execution errors surface later at cudaStreamSynchronize.
-    const cudaError_t launchErr = cudaGetLastError();
-    if (launchErr != cudaSuccess)
-        std::fprintf(stderr, "[liblanedetector] preprocess kernel launch failed: %s\n",
-                     cudaGetErrorString(launchErr));
+    // Launch errors (invalid grid/block config, resource limits) surface here;
+    // async execution errors surface later at cudaStreamSynchronize.
+    return cudaGetLastError();
 }
 
 } // namespace dashcam::lane

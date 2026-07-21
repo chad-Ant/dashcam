@@ -1,29 +1,36 @@
 /**
  * @file libdriverstate.h
- * @brief GStreamer-integrated TensorRT driver state classifier.
+ * @brief GStreamer-integrated TensorRT drowsiness classifier (binary ResNet18).
  *
  * Plugs into a Camera_GST pipeline as a leaky branch via addBranch().  An
- * internal inference thread pulls BGR frames from the branch's appsink,
- * preprocesses on the GPU, runs TRT inference, applies softmax over the
- * three output logits, and stores the winning class and its confidence for
- * poll().
+ * internal inference thread pulls BGR frames from the branch's appsink, runs
+ * YuNet DNN face detection (OpenCV FaceDetectorYN, CPU) and crops to the
+ * largest detected face — matching the face-crop training data — then
+ * preprocesses on the GPU (resize to 224×224 + ImageNet normalisation), runs
+ * TRT inference, applies a sigmoid to the model's single output logit, and
+ * stores the resulting drowsiness probability for poll().  Frames with no
+ * detectable face skip classification and report faceDetected = false.
  *
- * Detected states: NEUTRAL, SLEEPY, DISTRACTED.
+ * Model: fine-tuned ResNet18, binary Drowsy-vs-Natural classification
+ * (huggingface.co/Teen-Different/Driver-Drowsiness-Detection, Dataset 1:
+ * 224×224 RGB face crops, ImageNet mean/std, BCEWithLogitsLoss → the engine
+ * outputs ONE raw logit; sigmoid is applied here, not in the graph).
  *
- * Engine build (once, on the target Jetson):
+ * Engine build (once, INSIDE the l4t-ml container that runs this app — TRT
+ * engines are locked to the exact TensorRT version that built them):
  * @code
- *   trtexec --onnx=models/model_driverstate.onnx \
- *            --saveEngine=models/model_driverstate.engine \
- *            --fp16
+ *   /usr/src/tensorrt/bin/trtexec --onnx=drowsiness_resnet18.onnx \
+ *       --saveEngine=models/drowsiness_resnet18_fp16.engine --fp16 \
+ *       --memPoolSize=workspace:512M --builderOptimizationLevel=2
  * @endcode
  *
- * Typical lifecycle — attach to USB cam C (driver-facing camera):
+ * Typical lifecycle — attach to the driver-facing USB camera:
  * @code
  *   DriverStateConfig cfg;
- *   cfg.enginePath = "models/model_driverstate.engine";
- *   DriverStateDetector detector(640, 360, cfg);
+ *   cfg.enginePath = "models/drowsiness_resnet18_fp16.engine";
+ *   DriverStateDetector detector(640, 480, cfg);
  *
- *   cam.addBranch("driverstate", detector.createBin(), true);
+ *   cam.addBranch("driverstate", detector.createBin(), true);  // leaky queue
  *   cam.open();
  *   cam.setCameraVideoFormat(idx);
  *   cam.start();
@@ -31,79 +38,320 @@
  *
  *   while (running) {
  *       DriverStateResult r = detector.poll();
- *       if (r.valid) { // r.state, r.confidence }
+ *       if (r.valid && r.state == DriverState::DROWSY) { // alert }
  *   }
  *
- *   cam.stop();
- *   detector.stop();
+ *   cam.stop();       // forces appsink flush → inference thread drains
+ *   detector.stop();  // joins inference thread
  *   cam.close();
  * @endcode
  *
  * @note A Camera_GST stop()/start() cycle clears all branches.  Call
  *       createBin() again and re-register before each subsequent cam.start().
  * @note poll() is thread-safe; all other methods are not.
- * @note At 1 Hz the GPU duty cycle for this model is < 0.3% — negligible.
+ * @note Sigmoid polarity: sigmoid(logit) = P(natural), NOT P(drowsy) as the
+ *       model card loosely suggests — established empirically against
+ *       labelled dataset samples (see DriverStateConfig::positiveIsDrowsy).
+ *       A live bench spot-check (eyes open vs closed) remains worthwhile.
+ * @note At 2 Hz the GPU duty cycle for this model is well under 1% —
+ *       negligible next to the lane detector.
  */
 
 #ifndef LIBDRIVERSTATE_H
 #define LIBDRIVERSTATE_H
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <gst/gst.h>
+#include "liblog.h"
 
 namespace dashcam::driver {
 
 // ─── result types ─────────────────────────────────────────────────────────────
 
 enum class DriverState : uint8_t {
-    NEUTRAL    = 0,
-    SLEEPY     = 1,
-    DISTRACTED = 2,
+    NATURAL = 0,   ///< Alert / normal driving posture.
+    DROWSY  = 1,   ///< Drowsiness detected (probability ≥ drowsyThreshold).
+};
+
+/// Long-horizon fatigue assessment derived from the running score (see
+/// FatigueScorer).  Complements — never replaces — the caller's acute
+/// micro-sleep alert on the instantaneous DriverState.
+enum class FatigueLevel : uint8_t {
+    OK      = 0,   ///< score >= cautionScore.
+    CAUTION = 1,   ///< score in [warningScore, cautionScore): subtle cue.
+    WARNING = 2,   ///< score in (fatigueScore, warningScore): repeated alert.
+    FATIGUE = 3,   ///< score <= fatigueScore SUSTAINED fatigueSustainSec:
+                   ///< high-confidence fatigue — strong "pull over" alarm.
 };
 
 struct DriverStateResult {
-    /// Predicted driver state.
-    DriverState state = DriverState::NEUTRAL;
+    /// Thresholded classification of the most recent frame.
+    DriverState state = DriverState::NATURAL;
 
-    /// Softmax probability of the predicted state in [0, 1].
-    float confidence = 0.0f;
+    /// P(drowsy) in [0, 1] — sigmoid of the model's logit.  Prefer this over
+    /// state for downstream smoothing/hysteresis (e.g. alert only after N
+    /// consecutive polls above threshold).
+    float drowsyProbability = 0.0f;
 
-    /// false until the first inference frame completes.
-    /// Always check this before acting on state/confidence.
+    /// True when the classifier ran on a face region: a face was detected in
+    /// this frame, or within the last faceHoldSec (last-known box reused —
+    /// a hard head-droop can still momentarily defeat the detector, so brief
+    /// dropouts keep classifying).  Always true when face detection is
+    /// disabled.  When
+    /// false the classifier did NOT run: state/drowsyProbability are reset
+    /// to NATURAL/0.  A sustained false means the camera cannot see a face.
+    bool faceDetected = false;
+
+    /// false until the first frame completes (classified or no-face).
+    /// Always check this before acting on the other fields.
     bool valid = false;
+
+    // ── long-horizon fatigue score (see FatigueScorer) ────────────────────────
+
+    /// Running fatigue score: scoreInitial (100) = fresh, <= fatigueScore (0)
+    /// = fatigued.  Updated every inference tick; clamped to
+    /// [scoreLower, fatigueCap].
+    float fatigueScore = 100.0f;
+
+    /// Current upper clamp on the score: starts at scoreUpper and decays
+    /// capDecayPerHour per driving hour (time-on-task fatigue), floored at
+    /// capDecayFloor.  Reset together with the score.
+    float fatigueCap = 100.0f;
+
+    /// Tiered assessment of fatigueScore (FATIGUE requires the score to hold
+    /// in the fatigue zone for fatigueSustainSec — no single-dip alarms).
+    FatigueLevel fatigueLevel = FatigueLevel::OK;
+};
+
+// ─── fatigue scoring ──────────────────────────────────────────────────────────
+
+/// Tuning for the FatigueScorer.  All time windows in seconds, all scores in
+/// points.  Defaults implement the agreed design: -10 per completed 10 s of
+/// drowsiness, +5 per completed 10 s awake, -10 per drowsiness-correlated
+/// lane drift, cap decaying 10/driving-hour, FATIGUE after 5 min in the zone.
+struct FatigueScoreConfig {
+    float scoreInitial = 100.0f;  ///< Starting / reset score.
+    float scoreUpper   = 100.0f;  ///< Cap before time-on-task decay.
+    float scoreLower   = -10.0f;  ///< Hard floor.
+
+    /// A drowsy episode must COMPLETE each full chunk of this many seconds to
+    /// deduct drowsyChunkPenalty; recovering mid-chunk discards the partial
+    /// (recover within the window → no deduction).
+    float drowsyChunkSec     = 10.0f;
+    float drowsyChunkPenalty = 10.0f;
+
+    /// Awake accrual, symmetric to the above: each completed chunk of awake
+    /// time earns awakeChunkReward (asymmetric on purpose — fatigue builds
+    /// faster than it heals).
+    float awakeChunkSec    = 10.0f;
+    float awakeChunkReward = 5.0f;
+
+    // ── drowsiness-correlated lane drift (fed via setLaneOffset) ─────────────
+
+    /// |lateralOffset| at or above which the vehicle counts as drifting onto /
+    /// across a lane line (liblanedetector units: 0 centred, ±1 on the line).
+    float laneDepartThresh = 0.8f;
+
+    /// The drift-and-jerk-back signature: a departure that BEGINS during a
+    /// drowsy episode and returns under laneDepartThresh within this many
+    /// seconds deducts laneDriftPenalty (once per episode).  Longer
+    /// excursions are treated as deliberate lane changes — no deduction.
+    float laneReturnSec    = 10.0f;
+    float laneDriftPenalty = 10.0f;
+
+    // ── time-on-task decay ───────────────────────────────────────────────────
+
+    /// Every full driving hour lowers the score cap by this much...
+    float capDecayPerHour = 10.0f;
+    /// ...but never below this floor.
+    float capDecayFloor   = 50.0f;
+
+    // ── level thresholds ─────────────────────────────────────────────────────
+
+    float cautionScore = 60.0f;   ///< Below this: CAUTION.
+    float warningScore = 30.0f;   ///< Below this: WARNING.
+    float fatigueScore = 0.0f;    ///< At/below this: fatigue zone.
+
+    /// The score must stay in the fatigue zone this long, uninterrupted,
+    /// before FATIGUE is reported (implementation A: the high-confidence
+    /// alarm needs 5 min of persistence; it must never cry wolf).
+    float fatigueSustainSec = 300.0f;
+
+    /// No-face frames freeze the score (neither accrual runs): a blocked or
+    /// averted camera is not evidence of drowsiness.  False resumes awake
+    /// accrual during no-face instead.
+    bool noFaceFreezes = true;
+};
+
+/**
+ * @brief Long-horizon driver-fatigue score (100 awake .. <= 0 fatigued).
+ *
+ * Pure, deterministic state machine — every entry point takes an explicit
+ * timestamp so tests can drive synthetic timelines (hours in microseconds).
+ * DriverStateDetector embeds one and ticks it from the inference thread;
+ * it is exposed here for direct construction in tests.
+ *
+ * Thread-safe: all methods lock an internal mutex.
+ */
+class FatigueScorer {
+public:
+    using TimePoint = std::chrono::steady_clock::time_point;
+
+    /// @throws std::runtime_error on inconsistent config (bad ordering of
+    ///         thresholds, non-positive windows, ...).
+    explicit FatigueScorer(const FatigueScoreConfig& cfg, TimePoint now);
+
+    /// Feed one classifier tick.  valid=false ticks are ignored;
+    /// faceDetected=false ticks freeze (or accrue awake — see
+    /// FatigueScoreConfig::noFaceFreezes).
+    void update(bool valid, bool faceDetected, bool drowsy, TimePoint now);
+
+    /// Feed the latest lane lateral offset (liblanedetector's
+    /// LaneResult::lateralOffset).  Invalid samples disarm any drift in
+    /// progress (boundaries lost — cannot confirm the return).
+    void laneOffset(float offset, bool offsetValid, TimePoint now);
+
+    /// Reset to a fresh session: score/cap restored, session clock zeroed
+    /// (deliberate: a reset after a real break IS a fresh session).
+    void reset(TimePoint now);
+
+    float        score() const;
+    float        cap()   const;
+    FatigueLevel level() const;
+
+private:
+    void   applyCapDecay(TimePoint now);   // callers hold mutex_
+    void   clampScore();
+    void   updateLevel(TimePoint now);
+
+    FatigueScoreConfig cfg_;
+    mutable std::mutex mutex_;
+
+    float     score_;
+    float     cap_;
+    TimePoint sessionStart_;
+
+    // Episode accrual (chunk-quantised; partial chunks discard on transition).
+    bool      drowsyRun_   = false;
+    bool      awakeRun_    = false;
+    TimePoint drowsyStart_{};
+    TimePoint awakeStart_{};
+    int       drowsyChunksPaid_ = 0;
+    int       awakeChunksPaid_  = 0;
+
+    // Drowsiness-correlated lane drift (once per drowsy episode).
+    bool      driftArmed_   = false;   // departure seen, awaiting return
+    bool      driftPaid_    = false;   // this episode already deducted
+    TimePoint departTime_{};
+
+    // FATIGUE sustain gate.
+    bool         inFatigueZone_ = false;
+    TimePoint    fatigueZoneSince_{};
+    FatigueLevel level_ = FatigueLevel::OK;
 };
 
 // ─── configuration ────────────────────────────────────────────────────────────
 
 struct DriverStateConfig {
-    /// Path to the serialised TRT engine (built with trtexec on this Jetson).
+    /// Path to the serialised TRT engine.  Must be built with trtexec inside
+    /// the SAME container (TRT version) that runs this library.
     std::string enginePath;
 
     /// Model input dimensions — must match the engine's input tensor.
-    /// Classification models are commonly 224×224; adjust to match training.
+    /// The drowsiness ResNet18 was trained on 224×224 face crops.
     uint32_t modelInputW = 224;
     uint32_t modelInputH = 224;
 
     /// Inference rate cap in Hz.  0 = run as fast as the pipeline allows.
-    /// 1 Hz is sufficient for driver alertness monitoring and costs < 0.3%
-    /// of the Orin Nano's GPU budget.
-    uint32_t targetHz = 1;
+    /// 2 Hz is the design rate for driver monitoring on this rig.
+    uint32_t targetHz = 2;
 
-    /// Apply softmax to the model's raw output logits before extracting the
-    /// winning class.  Set false if the model already includes a softmax layer.
-    bool applySoftmax = true;
+    /// Frame-rate cap applied at the branch inlet (videorate drop-only), so
+    /// conversion elements run at most this often instead of the camera rate.
+    /// 0 = uncapped.  Keep >= targetHz.  UVC cameras cannot deliver 2 fps
+    /// natively (C270 minimum is 5), so the branch does the dropping.
+    uint32_t branchMaxFps = 2;
 
-    /// ImageNet normalisation (must match training).
+    /// P(drowsy) at or above which state == DROWSY.
+    float drowsyThreshold = 0.5f;
+
+    /// Sigmoid polarity.  FALSE (default): a positive logit indicates
+    /// Natural, i.e. sigmoid(logit) = P(natural) and this library reports
+    /// 1 − sigmoid as P(drowsy).  Determined empirically (2026-07-21) against
+    /// labelled Driver Drowsiness Dataset samples — alert faces saturate the
+    /// sigmoid toward 1 — and consistent with the dataset's alphabetical
+    /// class order (Drowsy=0, Non Drowsy=1) under BCEWithLogitsLoss.  Note
+    /// this CONTRADICTS the model card's loose "logit predicting drowsiness"
+    /// wording; set true only if a bench check shows the opposite.
+    bool positiveIsDrowsy = false;
+
+    // ── YuNet DNN face crop (matches the face-crop training data) ─────────────
+
+    /// Detect the driver's face (OpenCV YuNet DNN, CPU) and crop the classifier
+    /// input to it.  YuNet is far more robust to tilted / off-axis / partially
+    /// closed faces than a Haar cascade — important for a camera mounted low on
+    /// the dashboard or steering column, which sees the face from below.
+    /// Frames with no face skip classification and report faceDetected = false.
+    /// A few ms per frame on one CPU core at 640×480 — negligible at 2 fps.
+    bool faceDetection = true;
+
+    /// YuNet face-detection model (ONNX).  A copy of OpenCV Zoo's
+    /// face_detection_yunet_2023mar.onnx is vendored under models/ next to the
+    /// TRT engines.
+    std::string faceModelPath = "models/face_detection_yunet_2023mar.onnx";
+
+    /// YuNet detection confidence in [0, 1]; boxes below this are discarded.
+    /// Lower accepts more off-axis / partially-occluded faces (fewer NO-FACE
+    /// dropouts) at the cost of occasional false boxes.
+    float faceScoreThreshold = 0.6f;
+
+    /// Margin added on each side of the detected face box before cropping,
+    /// as a fraction of the box side.  The training crops are loose face
+    /// crops, not tight detector boxes.
+    float faceMarginFrac = 0.2f;
+
+    /// Smallest face accepted, as a fraction of the frame height.  Rejects
+    /// spurious small detections in cabin clutter.
+    float faceMinSizeFrac = 0.15f;
+
+    /// When detection fails, keep classifying the LAST-KNOWN face region for
+    /// this many seconds before reporting faceDetected = false.  Even YuNet can
+    /// momentarily drop a hard head-droop / heavy occlusion — exactly the
+    /// frames that matter — while a belted driver's face barely moves, so the
+    /// last box stays valid.  0 disables the hold.
+    float faceHoldSec = 3.0f;
+
+    /// Fallback framing when faceDetection is false: centre-crop the source
+    /// frame to a square before the 224×224 resize, avoiding anamorphic
+    /// distortion of a 4:3/16:9 frame.
+    bool centerCropSquare = true;
+
+    // ── ImageNet normalisation (must match training) ──────────────────────────
+
     float meanR = 0.485f, meanG = 0.456f, meanB = 0.406f;
     float stdR  = 0.229f, stdG  = 0.224f, stdB  = 0.225f;
 
-    /// GStreamer conversion chain inserted before the BGR appsink.
-    /// USB cameras (YUYV / MJPEG-decoded) deliver system-memory frames so
-    /// a plain videoconvert is sufficient.  For a CSI source use
-    /// "nvvidconv ! video/x-raw,format=BGRx ! videoconvert" instead.
-    std::string gstConversion = "videoconvert";
+    /// True when the camera tee emits NVMM (CSI/nvarguscamerasrc) buffers,
+    /// false (default) for system memory — the driver camera is USB/UVC.
+    bool sourceIsNVMM = false;
+
+    /// Optional override of the auto-built conversion chain (advanced).  When
+    /// non-empty it is used verbatim and MUST deliver BGR frames of exactly
+    /// srcWidth × srcHeight; rate limiting becomes the override's
+    /// responsibility.
+    std::string gstConversion;
+
+    /// Long-horizon fatigue-score tuning (see FatigueScorer).
+    FatigueScoreConfig score;
+
+    /// Log sink, wired like the other dashcam libraries.  Defaults to the
+    /// process-wide liblog callback so construction-time errors are visible;
+    /// replace via DriverStateDetector::setLogCallback().
+    dashcam::log::LogCallback log = dashcam::log::getCallback();
 };
 
 // ─── detector ─────────────────────────────────────────────────────────────────
@@ -111,11 +359,11 @@ struct DriverStateConfig {
 class DriverStateImpl;
 
 /**
- * @brief TensorRT driver state classifier driven by the GStreamer pipeline.
+ * @brief TensorRT drowsiness classifier driven by the GStreamer pipeline.
  *
  * Frame path: camera tee → leaky queue → branch bin appsink →
- *   inference thread: cudaMemcpyAsync → CUDA kernel → TRT enqueueV3 →
- *   softmax + argmax → DriverStateResult (polled by caller).
+ *   inference thread: cudaMemcpyAsync → CUDA kernel (crop+resize+normalise) →
+ *   TRT enqueueV3 → sigmoid + threshold → DriverStateResult (polled).
  */
 class DriverStateDetector {
 public:
@@ -123,7 +371,8 @@ public:
      * @param srcWidth   Source frame width (tee output resolution).
      * @param srcHeight  Source frame height.
      * @param config     Engine path and model parameters.
-     * @throws std::runtime_error on engine load or CUDA allocation failure.
+     * @throws std::runtime_error on engine load, engine/config mismatch, or
+     *         CUDA allocation failure.
      */
     DriverStateDetector(uint32_t srcWidth, uint32_t srcHeight,
                         const DriverStateConfig& config);
@@ -135,12 +384,13 @@ public:
     /**
      * @brief Create the GstBin to pass to Camera_GST::addBranch().
      *
-     * Ownership of the returned element transfers to the camera pipeline.
+     * The returned bin contains the conversion chain and an appsink.
+     * Ownership transfers to the camera pipeline via addBranch().
      * Call before cam.start().  May be called again after cam.stop() to
      * re-register the branch for the next start() cycle.
      *
      * @return Floating GstElement* (GstBin with a sink ghost pad),
-     *         or nullptr if element construction fails.
+     *         or nullptr if GStreamer element construction fails.
      */
     GstElement* createBin();
 
@@ -150,13 +400,31 @@ public:
     /**
      * @brief Stop the inference thread.
      *
-     * Call after cam.stop() so the appsink is in flushing state before
-     * the thread is joined.
+     * Recommended order: cam.stop() first (puts appsink into flushing so the
+     * thread drains immediately), then detector.stop() (joins the thread).
      */
     void stop();
 
     /** @brief Return the most recent driver state result (thread-safe). */
     DriverStateResult poll() const;
+
+    /**
+     * @brief Feed the latest lane lateral offset into the fatigue scorer
+     *        (bridge from liblanedetector's LaneResult::lateralOffset /
+     *        lateralValid — this library deliberately has no compile-time
+     *        dependency on the lane detector).  Thread-safe.
+     */
+    void setLaneOffset(float offset, bool offsetValid);
+
+    /**
+     * @brief Reset the fatigue score to a fresh session (score and cap back
+     *        to full, session clock zeroed).  Wire to a GPIO button in a
+     *        later version; software-triggered for now.  Thread-safe.
+     */
+    void resetScore();
+
+    /** @brief Replace the log sink (same pattern as the other libraries). */
+    void setLogCallback(dashcam::log::LogCallback cb);
 
 private:
     std::unique_ptr<DriverStateImpl> impl_;

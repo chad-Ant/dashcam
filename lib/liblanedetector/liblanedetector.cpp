@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -19,22 +20,18 @@
 
 namespace dashcam::lane {
 
-// ─── UFLD v1 row anchors ─────────────────────────────────────────────────────
-static constexpr int kMaxRowAnchors = 56;
-static constexpr float kRowAnchors[kMaxRowAnchors] = {
-    0.400000f, 0.410909f, 0.421818f, 0.432727f, 0.443636f, 0.454545f,
-    0.465455f, 0.476364f, 0.487273f, 0.498182f, 0.509091f, 0.520000f,
-    0.530909f, 0.541818f, 0.552727f, 0.563636f, 0.574545f, 0.585455f,
-    0.596364f, 0.607273f, 0.618182f, 0.629091f, 0.640000f, 0.650909f,
-    0.661818f, 0.672727f, 0.683636f, 0.694545f, 0.705455f, 0.716364f,
-    0.727273f, 0.738182f, 0.749091f, 0.760000f, 0.770909f, 0.781818f,
-    0.792727f, 0.803636f, 0.814545f, 0.825455f, 0.836364f, 0.847273f,
-    0.858182f, 0.869091f, 0.880000f, 0.890909f, 0.901818f, 0.912727f,
-    0.923636f, 0.934545f, 0.945455f, 0.956364f, 0.967273f, 0.978182f,
-    0.989091f, 1.000000f,
-};
+// ─── file-local log helper (same pattern as librecord) ───────────────────────
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
+                  const char* fmt, ...) {
+    if (!cb) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    cb(lvl, buf);
+}
 
 static void cudaCheck(cudaError_t err, const char* what) {
     if (err != cudaSuccess)
@@ -43,11 +40,18 @@ static void cudaCheck(cudaError_t err, const char* what) {
             + ": " + cudaGetErrorString(err));
 }
 
+// TRT build/runtime diagnostics routed into the library's log callback.
 class TrtLogger : public nvinfer1::ILogger {
 public:
+    const dashcam::log::LogCallback* cb = nullptr;
+
     void log(Severity severity, const char* msg) noexcept override {
-        if (severity <= Severity::kWARNING)
-            std::fprintf(stderr, "[TRT/lane] %s\n", msg);
+        if (severity > Severity::kWARNING) return;
+        const auto lvl = severity == Severity::kWARNING
+            ? dashcam::log::LogLevel::WARN
+            : dashcam::log::LogLevel::ERROR;
+        if (cb && *cb) (*cb)(lvl, std::string("[TRT/lane] ") + msg);
+        else std::fprintf(stderr, "[TRT/lane] %s\n", msg);
     }
 };
 
@@ -56,8 +60,11 @@ public:
 class LaneDetectorImpl {
 public:
     LaneDetectorConfig config_;
+    dashcam::log::LogCallback log_;   // before logger_: TrtLogger points at it
     uint32_t           srcW_;
-    uint32_t           srcH_;
+    uint32_t           srcH_;         // branch-cropped height (buffer/caps size)
+    uint32_t           cropTopPx_    = 0;
+    uint32_t           cropBottomPx_ = 0;
 
     // ── TRT ──────────────────────────────────────────────────────────────────
     TrtLogger                    logger_;
@@ -65,17 +72,26 @@ public:
     nvinfer1::ICudaEngine*       engine_  = nullptr;
     nvinfer1::IExecutionContext* ctx_     = nullptr;
     std::string                  inputName_;
-    std::string                  outputName_;
+
+    // UFLD v2 output tensors, fixed order.
+    enum OutIdx { kLocRow = 0, kLocCol, kExistRow, kExistCol, kNumOuts };
+    static constexpr const char* kOutNames[kNumOuts] = {
+        "loc_row", "loc_col", "exist_row", "exist_col" };
 
     // ── CUDA ─────────────────────────────────────────────────────────────────
-    cudaStream_t stream_     = nullptr;
-    void*        dSrcBGR_    = nullptr;
-    void*        dInput_     = nullptr;
-    void*        dOutput_    = nullptr;
-    size_t       srcBytes_   = 0;
-    size_t       inputBytes_ = 0;
-    size_t       outputBytes_= 0;
-    float*       hOutput_    = nullptr;  // pinned
+    cudaStream_t stream_          = nullptr;
+    void*        dSrcBGR_         = nullptr;
+    void*        dInput_          = nullptr;
+    void*        dOut_[kNumOuts]  = {};
+    float*       hOut_[kNumOuts]  = {};  // pinned
+    size_t       srcBytes_        = 0;
+    size_t       inputBytes_      = 0;
+    size_t       outBytes_[kNumOuts] = {};
+
+    // Preprocess vertical ROI (training transform: resize H/cropRatio, keep
+    // bottom modelInputH rows) expressed in cropped-frame source pixels.
+    float preYOff_   = 0.0f;
+    float preYScale_ = 1.0f;
 
     // ── GStreamer ─────────────────────────────────────────────────────────────
     GstElement* appsink_ = nullptr;  // ref held via gst_bin_get_by_name
@@ -91,35 +107,84 @@ public:
 
     // ── internal types ────────────────────────────────────────────────────────
 
+    // y is normalised (fraction of the model's implied full frame) — decode
+    // geometry is scale-invariant, so pixels are never needed vertically.
+    struct Pt { float x, y; };
+
+    // Least-squares line x = slope·y + intercept over all decoded points.
     struct Boundary {
-        float x1 = 0, y1 = 0;
-        float x2 = 0, y2 = 0;
+        float slope = 0, intercept = 0;
         bool  detected = false;
 
         float xAtY(float y) const {
-            if (!detected || std::abs(y1 - y2) < 1.0f) return 0.0f;
-            return x1 + (x2 - x1) * (y1 - y) / (y1 - y2);
+            return detected ? slope * y + intercept : 0.0f;
         }
     };
 
     // ── construction / destruction ────────────────────────────────────────────
 
     LaneDetectorImpl(uint32_t srcW, uint32_t srcH, const LaneDetectorConfig& cfg)
-        : config_(cfg), srcW_(srcW), srcH_(srcH)
+        : config_(cfg), log_(cfg.log), srcW_(srcW), srcH_(srcH)
     {
+        logger_.cb = &log_;
+
         if (config_.enginePath.empty())
             throw std::runtime_error("liblanedetector: enginePath is empty");
-        if (config_.numRowAnchors > kMaxRowAnchors)
-            throw std::runtime_error("liblanedetector: numRowAnchors > 56");
+        if (srcW_ == 0 || srcH_ == 0)
+            throw std::runtime_error("liblanedetector: source dimensions are 0");
+        if (config_.numLanes != 4)
+            throw std::runtime_error("liblanedetector: UFLD v2 decode requires "
+                                     "numLanes == 4 (slots 1,2 row / 0,3 col)");
+        if (config_.numRowAnchors < 2 || config_.numColAnchors < 2 ||
+            config_.numCellRow < 2 || config_.numCellCol < 2)
+            throw std::runtime_error("liblanedetector: head geometry must be >= 2");
+        if (!(config_.cropRatio > 0.0f) || config_.cropRatio > 1.0f)
+            throw std::runtime_error("liblanedetector: cropRatio must be in (0, 1]");
+        if (config_.inputCropTop < 0.0f || config_.inputCropTop > 0.9f)
+            throw std::runtime_error("liblanedetector: inputCropTop must be in [0, 0.9]");
+        if (config_.inputCropBottom < 0.0f || config_.inputCropBottom > 0.9f)
+            throw std::runtime_error("liblanedetector: inputCropBottom must be in [0, 0.9]");
+
+        // Branch crop: even row counts for NVMM/NV12 chroma alignment.
+        cropTopPx_    = static_cast<uint32_t>(
+            std::lround(srcH * config_.inputCropTop)) & ~1u;
+        cropBottomPx_ = static_cast<uint32_t>(
+            std::lround(srcH * config_.inputCropBottom)) & ~1u;
+        if (cropTopPx_ + cropBottomPx_ + 64 > srcH)
+            throw std::runtime_error("liblanedetector: crop leaves fewer than "
+                                     "64 rows of frame");
+        srcH_ = srcH - cropTopPx_ - cropBottomPx_;
+
+        // The model should see the bottom cropRatio of the ORIGINAL frame.
+        // Inside the branch-cropped band that region is cropRatio/keptFrac of
+        // the height — clamped to 1 when the branch already cropped more than
+        // the training transform would have (then the whole band is used; a
+        // bottom crop always lands here since it removes training-visible
+        // rows deliberately, e.g. the bonnet).
+        const float keptFrac  = static_cast<float>(srcH_) / srcH;
+        const float effRatio  = std::min(1.0f, config_.cropRatio / keptFrac);
+        const int resizedH =
+            static_cast<int>(std::lround(config_.modelInputH / effRatio));
+        const int cropTopRows = resizedH - static_cast<int>(config_.modelInputH);
+        preYScale_ = static_cast<float>(srcH_) / static_cast<float>(resizedH);
+        preYOff_   = static_cast<float>(cropTopRows) * preYScale_;
 
         try {
             loadEngine();
             allocBuffers();
             cudaCheck(cudaStreamCreate(&stream_), "cudaStreamCreate");
+            bindTensors();
         } catch (...) {
             cleanup();
             throw;
         }
+
+        doLog(log_, dashcam::log::LogLevel::INFO,
+              "lane detector ready: %ux%u tee -> crop top %u + bottom %u -> "
+              "%ux%u branch, model %ux%u, branch cap %u fps, infer cap %u Hz",
+              srcW_, srcH, cropTopPx_, cropBottomPx_, srcW_, srcH_,
+              config_.modelInputW, config_.modelInputH,
+              config_.branchMaxFps, config_.targetHz);
     }
 
     ~LaneDetectorImpl() {
@@ -130,8 +195,10 @@ public:
     void cleanup() noexcept {
         cudaFree(dSrcBGR_);       dSrcBGR_  = nullptr;
         cudaFree(dInput_);        dInput_   = nullptr;
-        cudaFree(dOutput_);       dOutput_  = nullptr;
-        cudaFreeHost(hOutput_);   hOutput_  = nullptr;
+        for (int i = 0; i < kNumOuts; ++i) {
+            cudaFree(dOut_[i]);      dOut_[i] = nullptr;
+            cudaFreeHost(hOut_[i]);  hOut_[i] = nullptr;
+        }
         if (stream_)  { cudaStreamDestroy(stream_);       stream_  = nullptr; }
         if (appsink_) { gst_object_unref(appsink_);       appsink_ = nullptr; }
         delete ctx_;     ctx_     = nullptr;
@@ -141,67 +208,171 @@ public:
 
     // ── engine loading ────────────────────────────────────────────────────────
 
+    static std::string dimsStr(const nvinfer1::Dims& d) {
+        std::string s = "(";
+        for (int i = 0; i < d.nbDims; ++i)
+            s += (i ? "," : "") + std::to_string(d.d[i]);
+        return s + ")";
+    }
+
+    void expectDims(const char* name, const nvinfer1::Dims& got,
+                    std::initializer_list<int64_t> want) const {
+        bool ok = got.nbDims == static_cast<int32_t>(want.size());
+        int  i  = 0;
+        for (int64_t w : want) ok = ok && got.d[i++] == w;
+        if (!ok) {
+            std::string wanted = "(";
+            i = 0;
+            for (int64_t w : want) wanted += (i++ ? "," : "") + std::to_string(w);
+            wanted += ")";
+            throw std::runtime_error(std::string("liblanedetector: tensor '")
+                + name + "' has dims " + dimsStr(got) + ", config expects "
+                + wanted + " — engine/config mismatch");
+        }
+    }
+
+    // Streaming file reader for deserializeCudaEngine: avoids holding the
+    // whole serialized engine (~800 MB for this model) in host memory while
+    // the device weights are allocated — on 8 GB unified RAM the buffered
+    // path can double the peak and OOM under desktop memory pressure.
+    class FileStreamReader : public nvinfer1::IStreamReader {
+    public:
+        explicit FileStreamReader(const std::string& path)
+            : f_(path, std::ios::binary) {}
+        bool ok() const { return f_.is_open(); }
+        int64_t read(void* dst, int64_t nbBytes) noexcept override {
+            f_.read(static_cast<char*>(dst), nbBytes);
+            return f_.gcount();
+        }
+    private:
+        std::ifstream f_;
+    };
+
     void loadEngine() {
-        std::ifstream file(config_.enginePath, std::ios::binary | std::ios::ate);
-        if (!file.is_open())
+        FileStreamReader reader(config_.enginePath);
+        if (!reader.ok())
             throw std::runtime_error("liblanedetector: cannot open engine: "
-                                     + config_.enginePath);
-        const auto size = file.tellg();
-        if (size <= 0)
-            throw std::runtime_error("liblanedetector: engine file empty or not "
-                                     "seekable: " + config_.enginePath);
-        file.seekg(0);
-        std::vector<char> data(static_cast<size_t>(size));
-        if (!file.read(data.data(), size))
-            throw std::runtime_error("liblanedetector: engine read failed: "
                                      + config_.enginePath);
 
         runtime_ = nvinfer1::createInferRuntime(logger_);
         if (!runtime_)
             throw std::runtime_error("liblanedetector: createInferRuntime failed");
 
-        engine_ = runtime_->deserializeCudaEngine(data.data(), data.size());
+        engine_ = runtime_->deserializeCudaEngine(reader);
         if (!engine_)
-            throw std::runtime_error("liblanedetector: deserializeCudaEngine failed — "
-                                     "build with trtexec on this Jetson module");
+            throw std::runtime_error("liblanedetector: deserializeCudaEngine failed "
+                                     "— common causes: TRT-version mismatch (engines "
+                                     "are locked to the builder version; rebuild with "
+                                     "trtexec inside the runtime container) or CUDA "
+                                     "out-of-memory (see [TRT/lane] log lines)");
 
         ctx_ = engine_->createExecutionContext();
         if (!ctx_)
             throw std::runtime_error("liblanedetector: createExecutionContext failed");
 
+        // One float32 input (1,3,H,W).
         const int32_t n = engine_->getNbIOTensors();
         for (int32_t i = 0; i < n; ++i) {
             const char* name = engine_->getIOTensorName(i);
-            if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT
-                && inputName_.empty())
+            if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT) {
+                if (!inputName_.empty())
+                    throw std::runtime_error("liblanedetector: engine has more "
+                                             "than one input tensor");
                 inputName_ = name;
-            else if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT
-                     && outputName_.empty())
-                outputName_ = name;
+            }
         }
-        if (inputName_.empty() || outputName_.empty())
-            throw std::runtime_error("liblanedetector: engine must have one input "
-                                     "and one output tensor");
+        if (inputName_.empty())
+            throw std::runtime_error("liblanedetector: engine has no input tensor");
+        expectDims(inputName_.c_str(), engine_->getTensorShape(inputName_.c_str()),
+                   { 1, 3, config_.modelInputH, config_.modelInputW });
+
+        // The four UFLD v2 heads, matched by name and validated by shape.
+        const int64_t L  = config_.numLanes;
+        const int64_t R  = config_.numRowAnchors;
+        const int64_t C  = config_.numColAnchors;
+        const std::initializer_list<int64_t> want[kNumOuts] = {
+            { 1, config_.numCellRow, R, L },   // loc_row
+            { 1, config_.numCellCol, C, L },   // loc_col
+            { 1, 2,                  R, L },   // exist_row
+            { 1, 2,                  C, L },   // exist_col
+        };
+        for (int o = 0; o < kNumOuts; ++o) {
+            const char* name = kOutNames[o];
+            bool found = false;
+            for (int32_t i = 0; i < n && !found; ++i)
+                found = std::string(engine_->getIOTensorName(i)) == name;
+            if (!found ||
+                engine_->getTensorIOMode(name) != nvinfer1::TensorIOMode::kOUTPUT)
+                throw std::runtime_error(std::string("liblanedetector: engine has "
+                    "no output tensor '") + name + "' — not a UFLD v2 engine?");
+            if (engine_->getTensorDataType(name) != nvinfer1::DataType::kFLOAT)
+                throw std::runtime_error(std::string("liblanedetector: output '")
+                    + name + "' is not float32");
+            expectDims(name, engine_->getTensorShape(name), want[o]);
+        }
     }
 
-    // ── buffer allocation ─────────────────────────────────────────────────────
+    // ── buffer allocation / binding ───────────────────────────────────────────
 
     void allocBuffers() {
-        srcBytes_    = static_cast<size_t>(srcW_) * srcH_ * 3;
-        inputBytes_  = static_cast<size_t>(config_.modelInputW)
-                     * config_.modelInputH * 3 * sizeof(float);
-        outputBytes_ = static_cast<size_t>(config_.numLanes)
-                     * (config_.gridingNum + 1)
-                     * config_.numRowAnchors * sizeof(float);
+        srcBytes_   = static_cast<size_t>(srcW_) * srcH_ * 3;
+        inputBytes_ = static_cast<size_t>(config_.modelInputW)
+                    * config_.modelInputH * 3 * sizeof(float);
 
-        cudaCheck(cudaMalloc(&dSrcBGR_,  srcBytes_),   "cudaMalloc dSrcBGR");
-        cudaCheck(cudaMalloc(&dInput_,   inputBytes_),  "cudaMalloc dInput");
-        cudaCheck(cudaMalloc(&dOutput_,  outputBytes_), "cudaMalloc dOutput");
-        cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&hOutput_), outputBytes_),
-                  "cudaMallocHost hOutput");
+        const size_t L = static_cast<size_t>(config_.numLanes);
+        outBytes_[kLocRow]   = static_cast<size_t>(config_.numCellRow)
+                             * config_.numRowAnchors * L * sizeof(float);
+        outBytes_[kLocCol]   = static_cast<size_t>(config_.numCellCol)
+                             * config_.numColAnchors * L * sizeof(float);
+        outBytes_[kExistRow] = 2u * config_.numRowAnchors * L * sizeof(float);
+        outBytes_[kExistCol] = 2u * config_.numColAnchors * L * sizeof(float);
+
+        cudaCheck(cudaMalloc(&dSrcBGR_, srcBytes_),   "cudaMalloc dSrcBGR");
+        cudaCheck(cudaMalloc(&dInput_,  inputBytes_), "cudaMalloc dInput");
+        for (int i = 0; i < kNumOuts; ++i) {
+            cudaCheck(cudaMalloc(&dOut_[i], outBytes_[i]), "cudaMalloc dOut");
+            cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&hOut_[i]),
+                                     outBytes_[i]),        "cudaMallocHost hOut");
+        }
+    }
+
+    // Tensor addresses never change — bind once at construction.
+    void bindTensors() {
+        if (!ctx_->setTensorAddress(inputName_.c_str(), dInput_))
+            throw std::runtime_error("liblanedetector: setTensorAddress(input) failed");
+        for (int i = 0; i < kNumOuts; ++i)
+            if (!ctx_->setTensorAddress(kOutNames[i], dOut_[i]))
+                throw std::runtime_error(std::string("liblanedetector: "
+                    "setTensorAddress(") + kOutNames[i] + ") failed");
     }
 
     // ── GStreamer bin ─────────────────────────────────────────────────────────
+
+    std::string conversionChain() const {
+        if (!config_.gstConversion.empty()) return config_.gstConversion;
+
+        std::string chain;
+        if (config_.branchMaxFps > 0)
+            chain += "videorate drop-only=true max-rate="
+                   + std::to_string(config_.branchMaxFps) + " ! ";
+        if (config_.sourceIsNVMM) {
+            // VIC does crop + NV12→BGRx in one pass.  nvvidconv top/bottom are
+            // rectangle COORDINATES: keep rows [top, top + branchH).
+            chain += "nvvidconv";
+            if (cropTopPx_ > 0 || cropBottomPx_ > 0)
+                chain += " top="    + std::to_string(cropTopPx_)
+                       + " bottom=" + std::to_string(cropTopPx_ + srcH_)
+                       + " left=0 right=" + std::to_string(srcW_);
+            chain += " ! video/x-raw,format=BGRx ! videoconvert";
+        } else {
+            // videocrop top/bottom are AMOUNTS removed from each edge.
+            if (cropTopPx_ > 0 || cropBottomPx_ > 0)
+                chain += "videocrop top=" + std::to_string(cropTopPx_)
+                       + " bottom=" + std::to_string(cropBottomPx_) + " ! ";
+            chain += "videoconvert";
+        }
+        return chain;
+    }
 
     GstElement* createBin() {
         if (appsink_) { gst_object_unref(appsink_); appsink_ = nullptr; }
@@ -209,46 +380,50 @@ public:
         const std::string sinkName =
             "lanesink_" + std::to_string(sCounter.fetch_add(1));
 
-        const std::string desc = config_.gstConversion
-            + " ! video/x-raw,format=BGR"
-              " ! appsink name=" + sinkName
+        // Width/height are pinned to the cropped branch dimensions: a
+        // mismatched tee resolution must fail caps negotiation loudly rather
+        // than let the fixed-size H2D copy read out of bounds.
+        const std::string desc = conversionChain()
+            + " ! video/x-raw,format=BGR,width=" + std::to_string(srcW_)
+            + ",height=" + std::to_string(srcH_)
+            + " ! appsink name=" + sinkName
             + " drop=true max-buffers=1 emit-signals=false sync=false";
 
         GError*     err = nullptr;
         GstElement* bin = gst_parse_bin_from_description(
             desc.c_str(), /*ghost_unlinked=*/TRUE, &err);
         if (err || !bin) {
-            if (err) {
-                std::fprintf(stderr, "[liblanedetector] bin parse failed: %s\n",
-                             err->message);
-                g_error_free(err);
-            }
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "lane bin parse failed: %s", err ? err->message : "?");
+            if (err) g_error_free(err);
             if (bin) gst_object_unref(bin);
             return nullptr;
         }
 
         appsink_ = gst_bin_get_by_name(GST_BIN(bin), sinkName.c_str());
         if (!appsink_) {
-            std::fprintf(stderr, "[liblanedetector] appsink '%s' not found\n",
-                         sinkName.c_str());
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "lane appsink '%s' not found", sinkName.c_str());
             gst_object_unref(bin);
             return nullptr;
         }
 
+        doLog(log_, dashcam::log::LogLevel::DEBUG,
+              "lane bin: %s", desc.c_str());
         return bin;
     }
 
     // ── inference thread ──────────────────────────────────────────────────────
 
     void inferenceLoop() {
-        using Clock    = std::chrono::steady_clock;
-        using Duration = std::chrono::duration<double>;
+        using Clock = std::chrono::steady_clock;
 
         // Allow the first frame to run immediately.
         auto lastInfer = Clock::now() - std::chrono::seconds(1);
         const double minInterval = config_.targetHz > 0
             ? 1.0 / config_.targetHz
             : 0.0;
+        bool sizeWarned = false;
 
         while (!stopFlag_.load(std::memory_order_relaxed)) {
             if (!appsink_) break;
@@ -267,19 +442,32 @@ public:
             lastInfer = now;
 
             GstBuffer* buf = gst_sample_get_buffer(sample);
+            if (!buf) { gst_sample_unref(sample); continue; }
+
             GstMapInfo map;
             if (!gst_buffer_map(buf, &map, GST_MAP_READ)) {
                 gst_sample_unref(sample);
                 continue;
             }
 
-            LaneResult result = runInference(map.data);
+            LaneResult result;
+            const bool sizeOk = map.size == srcBytes_;
+            if (sizeOk) {
+                result = runInference(map.data);
+            } else if (!sizeWarned) {
+                sizeWarned = true;
+                doLog(log_, dashcam::log::LogLevel::ERROR,
+                      "lane frame size %zu != expected %zu (%ux%ux3) — "
+                      "frames skipped", map.size, srcBytes_, srcW_, srcH_);
+            }
 
             gst_buffer_unmap(buf, &map);
             gst_sample_unref(sample);
 
-            std::lock_guard<std::mutex> lk(resultMutex_);
-            latestResult_ = std::move(result);
+            if (sizeOk) {
+                std::lock_guard<std::mutex> lk(resultMutex_);
+                latestResult_ = std::move(result);
+            }
         }
     }
 
@@ -288,83 +476,195 @@ public:
     LaneResult runInference(const uint8_t* bgr) {
         if (cudaMemcpyAsync(dSrcBGR_, bgr, srcBytes_,
                             cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
-            std::fprintf(stderr, "[liblanedetector] H2D memcpy failed\n");
+            doLog(log_, dashcam::log::LogLevel::ERROR, "lane H2D memcpy failed");
             return {};
         }
 
-        launchPreprocessKernel(
+        // From here on the stream may reference the caller's mapped frame
+        // (H2D in flight): every exit must synchronize first so the caller
+        // can safely unmap.
+        bool ok = true;
+
+        const cudaError_t launchErr = launchPreprocessKernel(
             static_cast<const uint8_t*>(dSrcBGR_),
             static_cast<float*>(dInput_),
             static_cast<int>(srcW_), static_cast<int>(srcH_),
             static_cast<int>(config_.modelInputW),
             static_cast<int>(config_.modelInputH),
+            preYOff_, preYScale_,
             config_.meanR, config_.meanG, config_.meanB,
             config_.stdR,  config_.stdG,  config_.stdB,
             stream_);
-
-        if (!ctx_->setTensorAddress(inputName_.c_str(),  dInput_) ||
-            !ctx_->setTensorAddress(outputName_.c_str(), dOutput_)) {
-            std::fprintf(stderr, "[liblanedetector] setTensorAddress failed\n");
-            return {};
-        }
-        if (!ctx_->enqueueV3(stream_)) {
-            std::fprintf(stderr, "[liblanedetector] enqueueV3 failed\n");
-            return {};
+        if (launchErr != cudaSuccess) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "lane preprocess launch failed: %s",
+                  cudaGetErrorString(launchErr));
+            ok = false;
         }
 
-        if (cudaMemcpyAsync(hOutput_, dOutput_, outputBytes_,
-                            cudaMemcpyDeviceToHost, stream_) != cudaSuccess) {
-            std::fprintf(stderr, "[liblanedetector] D2H memcpy failed\n");
-            return {};
+        if (ok && !ctx_->enqueueV3(stream_)) {
+            doLog(log_, dashcam::log::LogLevel::ERROR, "lane enqueueV3 failed");
+            ok = false;
         }
+
+        if (ok) {
+            for (int i = 0; i < kNumOuts; ++i) {
+                if (cudaMemcpyAsync(hOut_[i], dOut_[i], outBytes_[i],
+                                    cudaMemcpyDeviceToHost, stream_) != cudaSuccess) {
+                    doLog(log_, dashcam::log::LogLevel::ERROR,
+                          "lane D2H memcpy failed");
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
         if (cudaStreamSynchronize(stream_) != cudaSuccess) {
-            std::fprintf(stderr, "[liblanedetector] sync failed\n");
+            doLog(log_, dashcam::log::LogLevel::ERROR, "lane stream sync failed");
             return {};
         }
+        if (!ok) return {};
 
         return decode();
     }
 
-    // ── UFLD postprocessing ───────────────────────────────────────────────────
+    // ── UFLD v2 postprocessing ────────────────────────────────────────────────
+    //
+    // Output layouts (batch dropped, row-major):
+    //   loc_row  [G=numCellRow][K=numRowAnchors][L]  location logits
+    //   exist_row[2]           [K]               [L]  0=absent, 1=present
+    //   loc_col  [G=numCellCol][K=numColAnchors][L]
+    //   exist_col[2]           [K]               [L]
+    // Lane slots: 1,2 decode via the row head, 0,3 via the column head
+    // (fixed by the UFLD v2 architecture / reference demo).
+    //
+    // All y values are fractions of the model's implied full frame; the lane
+    // count / ego-lane geometry is scale-invariant, so no pixel mapping of y
+    // is ever needed (and the branch crop drops out entirely).
 
-    Boundary decodeBoundary(int laneIdx) const {
-        const int G = config_.gridingNum;
-        const int R = config_.numRowAnchors;
-        const float* base = hOutput_ + laneIdx * (G + 1) * R;
+    float rowAnchorY(int k) const {
+        const float a = config_.rowAnchorStart;
+        return a + (1.0f - a) * static_cast<float>(k)
+                 / static_cast<float>(config_.numRowAnchors - 1);
+    }
 
-        struct Pt { float x, y; };
-        std::vector<Pt> pts;
-        pts.reserve(static_cast<size_t>(R));
-
-        for (int r = 0; r < R; ++r) {
-            int   bestCol = 0;
-            float bestVal = base[0 * R + r];
-            for (int g = 1; g <= G; ++g) {
-                const float v = base[g * R + r];
-                if (v > bestVal) { bestVal = v; bestCol = g; }
-            }
-            if (bestCol == G) continue;
-
-            const float normX = (static_cast<float>(bestCol) + 0.5f) / G;
-            pts.push_back({ normX * srcW_, kRowAnchors[r] * srcH_ });
+    // Soft local argmax over cells [g*-1, g*+1] (demo local_width = 1):
+    // returns the sub-cell location in grid units, offset by +0.5.
+    static float softLocalArgmax(const float* loc, int G, int stride, int off,
+                                 int gStar) {
+        const int lo = std::max(0, gStar - 1);
+        const int hi = std::min(G - 1, gStar + 1);
+        float m = loc[lo * stride + off];
+        for (int g = lo + 1; g <= hi; ++g)
+            m = std::max(m, loc[g * stride + off]);
+        float se = 0.0f, acc = 0.0f;
+        for (int g = lo; g <= hi; ++g) {
+            const float e = std::exp(loc[g * stride + off] - m);
+            se  += e;
+            acc += e * static_cast<float>(g);
         }
+        return acc / se + 0.5f;
+    }
 
-        if (pts.size() < 2) return {};
+    // Decode one lane slot from the row head: x in pixels, y normalised.
+    std::vector<Pt> lanePointsRow(int lane) const {
+        const int G = config_.numCellRow;
+        const int K = config_.numRowAnchors;
+        const int L = config_.numLanes;
+        const float* loc   = hOut_[kLocRow];
+        const float* exist = hOut_[kExistRow];
 
+        int existCount = 0;
+        for (int k = 0; k < K; ++k)
+            if (exist[1 * K * L + k * L + lane] > exist[0 * K * L + k * L + lane])
+                ++existCount;
+
+        std::vector<Pt> pts;
+        if (existCount * 2 <= K) return pts;    // demo: sum > K/2
+        pts.reserve(static_cast<size_t>(existCount));
+
+        for (int k = 0; k < K; ++k) {
+            if (exist[1 * K * L + k * L + lane] <= exist[0 * K * L + k * L + lane])
+                continue;
+            const int off = k * L + lane;
+            int   gStar = 0;
+            float best  = loc[off];
+            for (int g = 1; g < G; ++g) {
+                const float v = loc[g * K * L + off];
+                if (v > best) { best = v; gStar = g; }
+            }
+            const float cell = softLocalArgmax(loc, G, K * L, off, gStar);
+            pts.push_back({ cell / (G - 1) * srcW_, rowAnchorY(k) });
+        }
+        return pts;
+    }
+
+    // Decode one lane slot from the column head.
+    std::vector<Pt> lanePointsCol(int lane) const {
+        const int G = config_.numCellCol;
+        const int K = config_.numColAnchors;
+        const int L = config_.numLanes;
+        const float* loc   = hOut_[kLocCol];
+        const float* exist = hOut_[kExistCol];
+
+        int existCount = 0;
+        for (int k = 0; k < K; ++k)
+            if (exist[1 * K * L + k * L + lane] > exist[0 * K * L + k * L + lane])
+                ++existCount;
+
+        std::vector<Pt> pts;
+        if (existCount * 4 <= K) return pts;    // demo: sum > K/4
+        pts.reserve(static_cast<size_t>(existCount));
+
+        for (int k = 0; k < K; ++k) {
+            if (exist[1 * K * L + k * L + lane] <= exist[0 * K * L + k * L + lane])
+                continue;
+            const int off = k * L + lane;
+            int   gStar = 0;
+            float best  = loc[off];
+            for (int g = 1; g < G; ++g) {
+                const float v = loc[g * K * L + off];
+                if (v > best) { best = v; gStar = g; }
+            }
+            const float cell = softLocalArgmax(loc, G, K * L, off, gStar);
+            const float x = static_cast<float>(k)
+                          / static_cast<float>(K - 1) * srcW_;
+            pts.push_back({ x, cell / (G - 1) });
+        }
+        return pts;
+    }
+
+    // Least-squares fit x = slope·y + intercept over ALL decoded points —
+    // steadier than an endpoint fit when markings curve or one anchor jumps.
+    Boundary boundaryFromPts(const std::vector<Pt>& pts) const {
+        const size_t n = pts.size();
+        if (n < 2) return {};
+        float meanX = 0, meanY = 0;
+        for (const Pt& p : pts) { meanX += p.x; meanY += p.y; }
+        meanX /= n; meanY /= n;
+        float covYX = 0, varY = 0;
+        for (const Pt& p : pts) {
+            covYX += (p.y - meanY) * (p.x - meanX);
+            varY  += (p.y - meanY) * (p.y - meanY);
+        }
+        if (varY < 1e-6f) return {};   // no vertical spread — not a boundary
         Boundary b;
-        b.x1 = pts.back().x;  b.y1 = pts.back().y;
-        b.x2 = pts.front().x; b.y2 = pts.front().y;
-        b.detected = true;
+        b.slope     = covYX / varY;
+        b.intercept = meanX - b.slope * meanY;
+        b.detected  = true;
         return b;
     }
 
     LaneResult decode() const {
         std::vector<Boundary> bounds;
         bounds.reserve(static_cast<size_t>(config_.numLanes));
-        for (int i = 0; i < config_.numLanes; ++i)
-            bounds.push_back(decodeBoundary(i));
+        for (int i = 0; i < config_.numLanes; ++i) {
+            const bool rowSlot = (i == 1 || i == 2);
+            bounds.push_back(boundaryFromPts(
+                rowSlot ? lanePointsRow(i) : lanePointsCol(i)));
+        }
 
-        const float refY = srcH_ * config_.laneReferenceY;
+        const float refY = config_.laneReferenceY;   // normalised
         std::vector<float> xs;
         for (const auto& b : bounds)
             if (b.detected) xs.push_back(b.xAtY(refY));
@@ -380,6 +680,14 @@ public:
         for (uint8_t i = 0; i + 1 < static_cast<uint8_t>(xs.size()); ++i) {
             if (vehicleX >= xs[i] && vehicleX <= xs[i + 1]) {
                 result.currentLaneIndex = static_cast<int8_t>(i);
+                // Lateral projection inside the ego lane: -1 on the left
+                // boundary, 0 centred, +1 on the right boundary.
+                const float centre    = 0.5f * (xs[i] + xs[i + 1]);
+                const float halfWidth = 0.5f * (xs[i + 1] - xs[i]);
+                if (halfWidth > 1.0f) {   // degenerate/crossed boundaries guard
+                    result.lateralOffset = (vehicleX - centre) / halfWidth;
+                    result.lateralValid  = true;
+                }
                 break;
             }
         }
@@ -392,6 +700,7 @@ public:
     // ── thread control ────────────────────────────────────────────────────────
 
     void start() {
+        if (inferThread_.joinable()) return;   // already running
         stopFlag_.store(false, std::memory_order_relaxed);
         inferThread_ = std::thread(&LaneDetectorImpl::inferenceLoop, this);
     }
@@ -408,6 +717,7 @@ public:
 };
 
 std::atomic<int> LaneDetectorImpl::sCounter{0};
+constexpr const char* LaneDetectorImpl::kOutNames[];
 
 // ─── LaneDetector public API ──────────────────────────────────────────────────
 
@@ -422,5 +732,9 @@ GstElement* LaneDetector::createBin()       { return impl_->createBin(); }
 void        LaneDetector::start()           { impl_->start(); }
 void        LaneDetector::stop()            { impl_->stop(); }
 LaneResult  LaneDetector::poll() const      { return impl_->poll(); }
+
+void LaneDetector::setLogCallback(dashcam::log::LogCallback cb) {
+    impl_->log_ = std::move(cb);
+}
 
 } // namespace dashcam::lane

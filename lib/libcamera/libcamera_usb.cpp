@@ -50,7 +50,8 @@ std::string Camera_USB::buildPipelineString(const cameraVideoFormat& fmt,
            " ! " + formatCaps +
            " ! tee name=srctee"
            " srctee. ! queue max-size-buffers=" + std::to_string(params_.captureQueueDepth) +
-           " leaky=2 ! videoconvert ! video/x-raw, format=(string)BGR"
+           " leaky=2 ! valve name=capvalve drop-mode=1"
+           " ! videoconvert ! video/x-raw, format=(string)BGR"
            " ! appsink name=mysink drop=true max-buffers=" + std::to_string(params_.appsinkMaxBuffers) +
            " emit-signals=false sync=false";
 }

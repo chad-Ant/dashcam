@@ -107,6 +107,7 @@ protected:
     GstElement* camera_src_; ///< Source element retrieved by name "camerasrc"; used for attribute writes.
     GstElement* appsink_;    ///< Default BGR output sink; pulled by captureFrame().
     GstElement* tee_;        ///< Fan-out tee element; nullptr when not running.
+    GstElement* capValve_;   ///< Valve gating the capture (appsink) conversion chain.
 
     /**
      * @struct BranchEntry
@@ -464,6 +465,20 @@ public:
      *       Sets INVALID_ATTRIBUTE if the name is not found.
      */
     void setBranchEnabled(const std::string& name, bool enabled);
+
+    /**
+     * @brief Enable/disable the capture (appsink) conversion chain at runtime.
+     *
+     * The default capture path converts EVERY frame to BGR on the CPU even
+     * when captureFrame() is never called.  Applications that consume the
+     * camera only through branches should disable capture after any warmup
+     * pulls; the valve then drops frames before the converters, idling them.
+     * captureFrame() times out while disabled; re-enable before pulling again.
+     * Capture starts enabled on every start().
+     *
+     * @pre  Status == RUNNING.  Sets CAMERA_NOT_OPEN otherwise.
+     */
+    void setCaptureEnabled(bool enabled);
 };
 
 } // namespace dashcam::camera

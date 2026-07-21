@@ -88,6 +88,8 @@ static bool test_roundtrip() {
     src.overlay.fontSize    = 18.0f;
     src.overlay.labelPadX   = 20.0f;
     src.overlay.labelPadY   = 16.0f;
+    src.overlay.subtitleRateHz = 2.0f;
+    src.overlay.staleTimeoutMs = 1500;
     src.recording.recordWidth  = 1280;
     src.recording.recordHeight = 720;
     src.system.footagePath  = "/mnt/ssd/footage";
@@ -99,6 +101,37 @@ static bool test_roundtrip() {
     src.log.flushEverySec = 3;
     src.log.level         = "info";
     src.log.flushOn       = "error";
+    src.detection.laneEnginePath   = "models/custom_lane.engine";
+    src.detection.laneTargetHz     = 15;
+    src.detection.laneBranchMaxFps = 30;
+    src.detection.laneInputCropTop = 0.40f;
+    src.detection.laneInputCropBottom = 0.10f;
+    src.detection.driverEnginePath      = "models/custom_drowsy.engine";
+    src.detection.driverTargetHz        = 4;
+    src.detection.driverBranchMaxFps    = 5;
+    src.detection.driverDrowsyThreshold = 0.65f;
+    src.detection.driverFaceDetection   = false;
+    src.detection.driverFaceModelPath   = "models/custom_yunet.onnx";
+    src.detection.driverFaceScore       = 0.75f;
+
+    src.driverScore.scoreInitial       = 90.0f;
+    src.driverScore.scoreUpper         = 95.0f;
+    src.driverScore.scoreLower         = -20.0f;
+    src.driverScore.drowsyChunkSec     = 15.0f;
+    src.driverScore.drowsyChunkPenalty = 12.0f;
+    src.driverScore.awakeChunkSec      = 20.0f;
+    src.driverScore.awakeChunkReward   = 4.0f;
+    src.driverScore.laneDepartThresh   = 0.70f;
+    src.driverScore.laneReturnSec      = 12.0f;
+    src.driverScore.laneDriftPenalty   = 8.0f;
+    src.driverScore.capDecayPerHour    = 5.0f;
+    src.driverScore.capDecayFloor      = 40.0f;
+    src.driverScore.cautionScore       = 55.0f;
+    src.driverScore.warningScore       = 25.0f;
+    src.driverScore.fatigueScore       = -5.0f;
+    src.driverScore.fatigueSustainSec  = 120.0f;
+    src.driverScore.acuteAlertSec      = 3.0f;
+    src.driverScore.noFaceFreezes      = false;
 
     CameraConfig csi;
     csi.name        = "front";
@@ -135,6 +168,8 @@ static bool test_roundtrip() {
     check(eq(dst.overlay.fontSize, 18.0f),    "overlay.fontSize round-trip");
     check(eq(dst.overlay.labelPadX, 20.0f),   "overlay.labelPadX round-trip");
     check(eq(dst.overlay.labelPadY, 16.0f),   "overlay.labelPadY round-trip");
+    check(eq(dst.overlay.subtitleRateHz, 2.0f), "overlay.subtitleRateHz round-trip");
+    check(dst.overlay.staleTimeoutMs == 1500,   "overlay.staleTimeoutMs round-trip");
     check(dst.recording.recordWidth  == 1280, "recording.recordWidth round-trip");
     check(dst.recording.recordHeight == 720,  "recording.recordHeight round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
@@ -146,6 +181,45 @@ static bool test_roundtrip() {
     check(dst.log.flushEverySec == 3,         "log.flushEverySec round-trip");
     check(dst.log.level         == "info",    "log.level round-trip");
     check(dst.log.flushOn       == "error",   "log.flushOn round-trip");
+    check(dst.detection.laneEnginePath == "models/custom_lane.engine",
+                                              "detection.laneEnginePath round-trip");
+    check(dst.detection.laneTargetHz     == 15, "detection.laneTargetHz round-trip");
+    check(dst.detection.laneBranchMaxFps == 30, "detection.laneBranchMaxFps round-trip");
+    check(eq(dst.detection.laneInputCropTop, 0.40f),
+                                              "detection.laneInputCropTop round-trip");
+    check(eq(dst.detection.laneInputCropBottom, 0.10f),
+                                              "detection.laneInputCropBottom round-trip");
+    check(dst.detection.driverEnginePath == "models/custom_drowsy.engine",
+                                              "detection.driverEnginePath round-trip");
+    check(dst.detection.driverTargetHz     == 4, "detection.driverTargetHz round-trip");
+    check(dst.detection.driverBranchMaxFps == 5, "detection.driverBranchMaxFps round-trip");
+    check(eq(dst.detection.driverDrowsyThreshold, 0.65f),
+                                              "detection.driverDrowsyThreshold round-trip");
+    check(dst.detection.driverFaceDetection == false,
+                                              "detection.driverFaceDetection round-trip");
+    check(dst.detection.driverFaceModelPath == "models/custom_yunet.onnx",
+                                              "detection.driverFaceModelPath round-trip");
+    check(eq(dst.detection.driverFaceScore, 0.75f),
+                                              "detection.driverFaceScore round-trip");
+
+    check(eq(dst.driverScore.scoreInitial, 90.0f),       "driverScore.scoreInitial round-trip");
+    check(eq(dst.driverScore.scoreUpper, 95.0f),         "driverScore.scoreUpper round-trip");
+    check(eq(dst.driverScore.scoreLower, -20.0f),        "driverScore.scoreLower round-trip");
+    check(eq(dst.driverScore.drowsyChunkSec, 15.0f),     "driverScore.drowsyChunkSec round-trip");
+    check(eq(dst.driverScore.drowsyChunkPenalty, 12.0f), "driverScore.drowsyChunkPenalty round-trip");
+    check(eq(dst.driverScore.awakeChunkSec, 20.0f),      "driverScore.awakeChunkSec round-trip");
+    check(eq(dst.driverScore.awakeChunkReward, 4.0f),    "driverScore.awakeChunkReward round-trip");
+    check(eq(dst.driverScore.laneDepartThresh, 0.70f),   "driverScore.laneDepartThresh round-trip");
+    check(eq(dst.driverScore.laneReturnSec, 12.0f),      "driverScore.laneReturnSec round-trip");
+    check(eq(dst.driverScore.laneDriftPenalty, 8.0f),    "driverScore.laneDriftPenalty round-trip");
+    check(eq(dst.driverScore.capDecayPerHour, 5.0f),     "driverScore.capDecayPerHour round-trip");
+    check(eq(dst.driverScore.capDecayFloor, 40.0f),      "driverScore.capDecayFloor round-trip");
+    check(eq(dst.driverScore.cautionScore, 55.0f),       "driverScore.cautionScore round-trip");
+    check(eq(dst.driverScore.warningScore, 25.0f),       "driverScore.warningScore round-trip");
+    check(eq(dst.driverScore.fatigueScore, -5.0f),       "driverScore.fatigueScore round-trip");
+    check(eq(dst.driverScore.fatigueSustainSec, 120.0f), "driverScore.fatigueSustainSec round-trip");
+    check(eq(dst.driverScore.acuteAlertSec, 3.0f),       "driverScore.acuteAlertSec round-trip");
+    check(dst.driverScore.noFaceFreezes == false,        "driverScore.noFaceFreezes round-trip");
 
     check(dst.cameras.size() == 2,            "cameras count == 2");
     if (dst.cameras.size() >= 2) {
