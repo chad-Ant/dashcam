@@ -119,6 +119,7 @@ Each finding: file/line (or code region) → what's wrong → why it bites on *t
 | ONNX, TensorRT, `trtexec`, `.engine`, model conversion, YOLO, FP16, INT8, calibration, `--memPoolSize` | `references/models-and-tensorrt.md` |
 | review this code, is this correct, find bugs, Power of Ten, thread safety, buffer leak, race | `references/code-review.md` |
 | broken, error message, "no element X", crash, segfault, OOM, ImportError, `libnvinfer.so.X: cannot open` | `references/debugging.md` |
+| **this repo's actual v0.3 code** — `dashcam_v0_3.cpp`, the `lib*` components (libcamera/librecord/liblanedetector/libdriverstate/libconfig/liblog), the `resolveCameraConfiguration` camera configuration setter + recognised profiles, the `l4t-ml-gpio` build/run, "how does the dashcam do X", "add a camera role" | `references/v0_3-implementation.md` |
 
 Multiple may apply; read all that match.
 
@@ -199,20 +200,29 @@ Triage order (full version in `references/debugging.md`):
 4. `GST_DEBUG=3 gst-launch-1.0 …` for negotiation failures ("could not link X to Y").
 5. `ldd` the failing binary; on JP 6.2, TRT-linked code expects `libnvinfer.so.10`, `libnvonnxparser.so.10`, `libcudart.so.12`, `libcudnn.so.9`.
 
-## Closing reminder — the concrete build
+## Closing reminder — the concrete build (v0.3 as shipped)
 
-Mission-critical AI dashcam, fully offline, in the `l4t-ml` container, headless:
+Mission-critical AI dashcam, fully offline, in the `l4t-ml-gpio` container, headless. **v0.3 is
+built and running** — `src/dashcam_v0_3.cpp` + the `lib*` components. Full architecture in
+`references/v0_3-implementation.md`; read it before touching dashcam code. What v0.3 actually does:
 
-| Camera | Sensor | Capture | Workloads |
-|---|---|---|---|
-| USB camera (TBA) | Model + specs TBD | Recording primary footage (resolution/bitrate TBD on final selection) | Primary dashcam video record + GPS+speed overlay + event save ±30 s |
-| IMX296 CSI | Global shutter, 1456×1088@60 (device-confirmed) | Inference-primary + debug video output | Lane detection, sign reading, other AI workloads; not the primary recording but outputs video for post-hoc debugging |
-| USB cameras (existing) | Reused laptop webcams | Stereo + driver-behavior inference | Inputs to inference; only outputs logged unless event triggers |
-| USB cam A + B | Reused laptop webcams | 360p 10 fps each | Stereo rangefinder |
-| USB cam C | Reused laptop webcam | 360p 10 fps | Driver-behavior analysis |
+| Camera | Sensor | Role (assigned at init by `resolveCameraConfiguration`) |
+|---|---|---|
+| Road-facing USB UVC | UVC MJPEG/H.264 (e.g. C270 @ 1280×720p30) | **Primary recording** — compressed passthrough → MKV + `.ass` telemetry sidecar (`librecord`; no encode) |
+| IMX296 CSI | Global shutter, 1456×1088@60 (device-confirmed) | **Lane detection** — UFLD v2 TensorRT on a leaky NVMM branch (`liblanedetector`); not recorded |
+| Driver-facing USB UVC | Reused webcam, raw YUYV (pinned `<Camera name="cabin">` or auto spare) | **Drowsiness + fatigue** — YuNet face-crop + ResNet18 @ 2 Hz + `FatigueScorer` (`libdriverstate`) |
 
-Total: 1 CSI + 3 USB. Architecture notes that follow:
-- The IMX296 stream is **multi-tasked** — one capture, multiple inference branches at different framerates via `tee` + `videorate` (or DeepStream `nvinfer interval=N`). See `references/deepstream-pipelines.md`.
-- Capture at 60 fps for motion-rich inference, but `videorate` **down to 30 fps before the encoder** — 60 fps software encode is ~2× the CPU of 30 fps. The extra frames help lane/optical-flow AI, not recorded evidence.
-- Global shutter is ideal for sign reading (no rolling-shutter skew) and optical-flow / geometric features.
+The init-phase configuration setter recognises the profile from what's plugged in — 1 USB →
+`RECORD-ONLY`; 1 USB + IMX296 → `RECORD + LANES`; add a driver cam → `… + DRIVER-MONITOR`. Every
+role degrades independently. Architecture facts to respect:
+- **No software encoder anywhere in v0.3.** Recording is UVC *compressed passthrough* — the recorder
+  owns its own `v4l2src ! matroskamux ! filesink` pipeline and cannot share a device with the driver
+  camera (V4L2 is exclusive). This is why the record/driver split exists.
+- The IMX296 stream is **branch-multi-tasked** via the `Camera_GST` `tee` — capture once, fan out to
+  leaky inference branches (`addBranch`), with `setCaptureEnabled(false)` idling the unused BGR path.
+- **TRT engines (`culane_res18`, `drowsiness_resnet18`) are built with `trtexec` inside this
+  container on this Orin Nano** — never assume portability. YuNet is ONNX (CPU, OpenCV).
+- **Not yet in v0.3** (repo has the libs, planned for later / the production `dashcam` target): sign
+  reading (`libsigndetector`), stereo rangefinding (`libstereocam`, needs VPI), GPS/CAN/GPIO alarm
+  wiring. Don't describe these as running.
 - Recommendations should fit *this* headless architecture, not generic NVIDIA cloud demos.
