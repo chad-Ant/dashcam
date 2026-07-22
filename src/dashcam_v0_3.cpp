@@ -87,6 +87,10 @@ static constexpr float kAlertClearSec  = 2.0f;
 // Sustained no-face before the "driver not visible" notice (the detector
 // already bridges short dropouts with its faceHoldSec grace window).
 static constexpr float kNoFaceSec      = 5.0f;
+// While the high-confidence FATIGUE level is latched, re-raise the "pull over"
+// alarm every this-many seconds — a one-shot alert a fatigued driver misses is
+// no alert.  (A GPIO/audio alarm would repeat on the same cadence.)
+static constexpr float kFatigueRealertSec = 30.0f;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -180,6 +184,7 @@ makeDriverConfig(const dashcam::config::DetectionConfig& d,
     c.faceDetection      = (bool)d.driverFaceDetection;
     c.faceModelPath      = (std::string)d.driverFaceModelPath;
     c.faceScoreThreshold = (float)d.driverFaceScore;
+    c.faceDetectScale    = (float)d.driverFaceDetectScale;
     c.sourceIsNVMM       = false;               // driver camera is USB/UVC
     c.score           = makeScoreConfig(s);
     c.log             = log;
@@ -331,12 +336,15 @@ int main(int argc, char* argv[]) {
             }
             break;
         }
-        if (!drvInfo && drvFmtIdx < 0 && cabinEnabled)
-            if (std::none_of(cams.begin(), cams.end(), [&](const cameraInfo& c) {
-                    return c.type == CAMERA_TYPE::USB && c.address == cabinDev; }))
-                log(dashcam::log::LogLevel::ERROR,
-                    "pinned cabin camera " + cabinDev + " not found — "
-                    "driver monitoring OFF");
+        // Reached here inside the pinned branch, so cabinEnabled is true and a
+        // null drvInfo means the pin was unusable.  Distinguish "device absent"
+        // (logged here) from "device present but no YUYV format" (logged above).
+        if (!drvInfo &&
+            std::none_of(cams.begin(), cams.end(), [&](const cameraInfo& c) {
+                return c.type == CAMERA_TYPE::USB && c.address == cabinDev; }))
+            log(dashcam::log::LogLevel::ERROR,
+                "pinned cabin camera " + cabinDev + " not found — "
+                "driver monitoring OFF");
     }
 
     // Recording camera: first precompressed-capable USB that the driver
@@ -572,6 +580,7 @@ int main(int argc, char* argv[]) {
 
     // Fatigue-level transition tracking (score itself lives in the detector).
     auto lastLevel = dashcam::driver::FatigueLevel::OK;
+    auto lastFatigueAlarm = clock::now();
 
     while (g_run.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -647,23 +656,34 @@ int main(int argc, char* argv[]) {
             }
 
             // Long-horizon fatigue tier transitions (score-driven, graded).
+            using dashcam::driver::FatigueLevel;
             if (dr.valid && dr.fatigueLevel != lastLevel) {
-                using dashcam::driver::FatigueLevel;
                 const std::string msg =
                     std::string("fatigue level ") + levelStr(lastLevel) + " -> "
                     + levelStr(dr.fatigueLevel)
                     + " (score=" + std::to_string((int)dr.fatigueScore)
                     + "/" + std::to_string((int)dr.fatigueCap) + ")";
-                if (dr.fatigueLevel == FatigueLevel::FATIGUE)
+                if (dr.fatigueLevel == FatigueLevel::FATIGUE) {
                     // Strong alarm hook (repeating chime / voice prompt) here.
                     log(dashcam::log::LogLevel::ERROR,
                         "DRIVER FATIGUE — high-confidence, sustained: pull "
                         "over when safe. " + msg);
-                else if (dr.fatigueLevel > lastLevel)
+                    lastFatigueAlarm = clock::now();
+                } else if (dr.fatigueLevel > lastLevel)
                     log(dashcam::log::LogLevel::WARN, msg);
                 else
                     log(dashcam::log::LogLevel::INFO, msg + " (recovering)");
                 lastLevel = dr.fatigueLevel;
+            }
+            // Re-raise the FATIGUE alarm while it stays latched (a missed
+            // one-shot is no alert).
+            if (dr.valid && dr.fatigueLevel == FatigueLevel::FATIGUE &&
+                secondsSince(lastFatigueAlarm) >= kFatigueRealertSec) {
+                lastFatigueAlarm = clock::now();
+                log(dashcam::log::LogLevel::ERROR,
+                    "DRIVER FATIGUE — still fatigued (score="
+                    + std::to_string((int)dr.fatigueScore)
+                    + "): pull over when safe.");
             }
         }
 

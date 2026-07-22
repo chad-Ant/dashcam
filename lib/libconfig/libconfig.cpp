@@ -270,6 +270,7 @@ static void parseDetection(pugi::xml_node node, DetectionConfig& d,
     readVar(node, d.driverFaceDetection, log);
     readVar(node, d.driverFaceModelPath, log);
     readVar(node, d.driverFaceScore,     log);
+    readVar(node, d.driverFaceDetectScale, log);
 }
 
 static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
@@ -406,6 +407,7 @@ static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
     writeVar(n, d.driverFaceDetection);
     writeVar(n, d.driverFaceModelPath);
     writeVar(n, d.driverFaceScore);
+    writeVar(n, d.driverFaceDetectScale);
 }
 
 static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) {

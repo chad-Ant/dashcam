@@ -372,6 +372,7 @@ struct DetectionConfig {
     ConfigVar<bool>  driverFaceDetection {"DriverFaceDetection", true, "Viola-Jones face detect + crop before drowsiness classification (matches the model's face-crop training data); no-face frames skip classification"};
     ConfigVar<std::string> driverFaceModelPath {"DriverFaceModelPath", "models/face_detection_yunet_2023mar.onnx", "YuNet DNN face-detection model (ONNX) for driver face detection (vendored OpenCV Zoo face_detection_yunet_2023mar); robust to tilted/off-axis faces from a low dashboard mount"};
     ConfigVar<float> driverFaceScore {"DriverFaceScore", 0.60f, 0.0f, 1.0f, 0.01f, "YuNet detection confidence threshold; lower accepts more off-axis faces (fewer no-face dropouts) at the cost of occasional false boxes"};
+    ConfigVar<float> driverFaceDetectScale {"DriverFaceDetectScale", 0.5f, 0.25f, 1.0f, 0.05f, "Run YuNet on the frame downscaled by this factor (detection cost ~quadratic, so 0.5 ~= a quarter of the CPU); the classifier still crops from full resolution. Default 0.5 validated to keep 100% recall at a low dashboard mount; 1.0 = no downscale"};
 };
 
 /**

@@ -201,9 +201,17 @@ class FatigueScorer {
 public:
     using TimePoint = std::chrono::steady_clock::time_point;
 
-    /// @throws std::runtime_error on inconsistent config (bad ordering of
-    ///         thresholds, non-positive windows, ...).
-    explicit FatigueScorer(const FatigueScoreConfig& cfg, TimePoint now);
+    /// Consistent snapshot of the three published values under ONE lock —
+    /// prefer this to three separate score()/cap()/level() calls on the hot
+    /// path (and so a reader never straddles an update).
+    struct Snapshot { float score; float cap; FatigueLevel level; };
+
+    /// Inconsistent config (mis-ordered thresholds, non-positive windows, ...)
+    /// is CLAMPED to a safe, consistent set rather than rejected — a config
+    /// typo must never disable driver monitoring.  A non-empty log receives one
+    /// WARN describing the clamp.  Never throws.
+    explicit FatigueScorer(const FatigueScoreConfig& cfg, TimePoint now,
+                           dashcam::log::LogCallback log = {});
 
     /// Feed one classifier tick.  valid=false ticks are ignored;
     /// faceDetected=false ticks freeze (or accrue awake — see
@@ -211,19 +219,24 @@ public:
     void update(bool valid, bool faceDetected, bool drowsy, TimePoint now);
 
     /// Feed the latest lane lateral offset (liblanedetector's
-    /// LaneResult::lateralOffset).  Invalid samples disarm any drift in
-    /// progress (boundaries lost — cannot confirm the return).
+    /// LaneResult::lateralOffset).  Invalid samples HOLD any drift in progress
+    /// (a lane crossing itself destabilises boundary detection — the strongest
+    /// signal must survive a brief validity gap); the return is confirmed by a
+    /// later valid in-lane sample and the laneReturnSec timeout still bounds it.
     void laneOffset(float offset, bool offsetValid, TimePoint now);
 
     /// Reset to a fresh session: score/cap restored, session clock zeroed
     /// (deliberate: a reset after a real break IS a fresh session).
     void reset(TimePoint now);
 
+    Snapshot     snapshot() const;
     float        score() const;
     float        cap()   const;
     FatigueLevel level() const;
 
 private:
+    static void sanitize(FatigueScoreConfig& c,
+                         const dashcam::log::LogCallback& log);
     void   applyCapDecay(TimePoint now);   // callers hold mutex_
     void   clampScore();
     void   updateLevel(TimePoint now);
@@ -308,6 +321,16 @@ struct DriverStateConfig {
     /// Lower accepts more off-axis / partially-occluded faces (fewer NO-FACE
     /// dropouts) at the cost of occasional false boxes.
     float faceScoreThreshold = 0.6f;
+
+    /// Run YuNet on the frame downscaled by this factor (0.25–1.0), then map
+    /// the detected box back to full resolution for the crop.  Detection cost
+    /// scales ~quadratically, so 0.5 ≈ a quarter of the CPU; the classifier
+    /// still crops from the full-resolution frame, so its input is unchanged.
+    /// Default 0.5: validated on-device (2026-07-21) to hold 100% face-detect
+    /// recall even at a low dashboard mount / off-axis face, at ~11 ms vs
+    /// ~51 ms/frame full-res.  Raise toward 1.0 only if detection misses a
+    /// small / distant face; 1.0 disables the downscale (and its resize).
+    float faceDetectScale = 0.5f;
 
     /// Margin added on each side of the detected face box before cropping,
     /// as a fraction of the box side.  The training crops are loose face

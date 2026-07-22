@@ -59,25 +59,41 @@ public:
 
 // ─── FatigueScorer ───────────────────────────────────────────────────────────
 
-FatigueScorer::FatigueScorer(const FatigueScoreConfig& cfg, TimePoint now)
+// Clamp an inconsistent config into a safe, consistent one instead of
+// rejecting it: a mistyped <DriverScore> value must never disable driver
+// monitoring.  Emits one WARN if anything was changed.
+void FatigueScorer::sanitize(FatigueScoreConfig& c,
+                             const dashcam::log::LogCallback& log) {
+    bool changed = false;
+    auto fix = [&](float& field, float value) { field = value; changed = true; };
+
+    if (c.drowsyChunkSec   <= 0.0f) fix(c.drowsyChunkSec,   10.0f);
+    if (c.awakeChunkSec    <= 0.0f) fix(c.awakeChunkSec,    10.0f);
+    if (c.laneReturnSec    <= 0.0f) fix(c.laneReturnSec,    10.0f);
+    if (c.laneDepartThresh <= 0.0f) fix(c.laneDepartThresh, 0.8f);
+    if (c.fatigueSustainSec < 0.0f) fix(c.fatigueSustainSec, 0.0f);
+    if (c.capDecayPerHour   < 0.0f) fix(c.capDecayPerHour,   0.0f);
+
+    // Score range: keep scoreLower <= scoreUpper, then clamp initial into it.
+    if (c.scoreUpper < c.scoreLower)   fix(c.scoreUpper, c.scoreLower);
+    const float clampedInit = std::max(c.scoreLower,
+                                       std::min(c.scoreInitial, c.scoreUpper));
+    if (clampedInit != c.scoreInitial) fix(c.scoreInitial, clampedInit);
+    if (c.capDecayFloor > c.scoreUpper) fix(c.capDecayFloor, c.scoreUpper);
+
+    // Level thresholds must be strictly ordered fatigue < warning < caution.
+    if (!(c.warningScore > c.fatigueScore)) fix(c.warningScore, c.fatigueScore + 1.0f);
+    if (!(c.cautionScore > c.warningScore)) fix(c.cautionScore, c.warningScore + 1.0f);
+
+    if (changed && log)
+        log(dashcam::log::LogLevel::WARN,
+            "driver score config was inconsistent — clamped to safe values");
+}
+
+FatigueScorer::FatigueScorer(const FatigueScoreConfig& cfg, TimePoint now,
+                             dashcam::log::LogCallback log)
     : cfg_(cfg) {
-    if (cfg_.drowsyChunkSec <= 0.0f || cfg_.awakeChunkSec <= 0.0f)
-        throw std::runtime_error("FatigueScorer: chunk windows must be > 0");
-    if (cfg_.laneReturnSec <= 0.0f || cfg_.laneDepartThresh <= 0.0f)
-        throw std::runtime_error("FatigueScorer: lane-drift windows must be > 0");
-    if (cfg_.fatigueSustainSec < 0.0f || cfg_.capDecayPerHour < 0.0f)
-        throw std::runtime_error("FatigueScorer: sustain/decay must be >= 0");
-    if (!(cfg_.fatigueScore < cfg_.warningScore
-          && cfg_.warningScore < cfg_.cautionScore))
-        throw std::runtime_error("FatigueScorer: thresholds must satisfy "
-                                 "fatigueScore < warningScore < cautionScore");
-    if (!(cfg_.scoreLower <= cfg_.scoreInitial
-          && cfg_.scoreInitial <= cfg_.scoreUpper))
-        throw std::runtime_error("FatigueScorer: need "
-                                 "scoreLower <= scoreInitial <= scoreUpper");
-    if (cfg_.capDecayFloor > cfg_.scoreUpper)
-        throw std::runtime_error("FatigueScorer: capDecayFloor must be "
-                                 "<= scoreUpper");
+    sanitize(cfg_, log);   // never throws; a config typo must not disable us
     reset(now);
 }
 
@@ -148,13 +164,17 @@ void FatigueScorer::update(bool valid, bool faceDetected, bool drowsy,
             drowsyChunksPaid_ = chunks;
         }
     } else if (treatAwake) {
-        if (!awakeRun_) {
+        drowsyRun_ = false;   // partial drowsy chunk discarded — recovering
+                              // within the window costs nothing
+        if (!awakeRun_ || score_ >= cap_) {
+            // Start (or, while pinned at the cap, keep restarting) the awake
+            // episode: no reward accrues at the cap, so holding the baseline at
+            // `now` means a later deduction heals promptly instead of waiting
+            // out phantom chunks that "elapsed" with nothing to add.
             awakeRun_        = true;
             awakeStart_      = now;
             awakeChunksPaid_ = 0;
         }
-        drowsyRun_ = false;   // partial drowsy chunk discarded — recovering
-                              // within the window costs nothing
         const int chunks = static_cast<int>(
             std::chrono::duration<float>(now - awakeStart_).count()
             / cfg_.awakeChunkSec);
@@ -175,7 +195,11 @@ void FatigueScorer::update(bool valid, bool faceDetected, bool drowsy,
 void FatigueScorer::laneOffset(float offset, bool offsetValid, TimePoint now) {
     std::lock_guard<std::mutex> lk(mutex_);
     if (!offsetValid) {
-        driftArmed_ = false;   // boundaries lost — cannot confirm a return
+        // Boundaries momentarily lost.  Do NOT disarm: a lane CROSSING — the
+        // strongest drift signal — is exactly what destabilises detection, so
+        // dropping the arm here would forfeit the very events we want.  Hold
+        // the armed state; the laneReturnSec timeout (checked on the next valid
+        // sample) still bounds it, and a later in-lane sample confirms return.
         return;
     }
     const bool outside = std::fabs(offset) >= cfg_.laneDepartThresh;
@@ -206,6 +230,10 @@ void FatigueScorer::laneOffset(float offset, bool offsetValid, TimePoint now) {
     }
 }
 
+FatigueScorer::Snapshot FatigueScorer::snapshot() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return {score_, cap_, level_};
+}
 float FatigueScorer::score() const {
     std::lock_guard<std::mutex> lk(mutex_);
     return score_;
@@ -236,7 +264,9 @@ public:
     // ── YuNet DNN face detection (inference-thread only) ─────────────────────
     cv::Ptr<cv::FaceDetectorYN> faceDet_;
     cv::Mat                     facesMat_;    // reused detection output, no alloc
+    cv::Mat                     detectMat_;   // reused downscaled input (scale<1)
     int                         faceMinSidePx_ = 0;
+    int                         detW_ = 0, detH_ = 0;   // YuNet input size
 
     // Last successful detection, for the faceHoldSec grace window.
     std::chrono::steady_clock::time_point lastFaceTime_{};
@@ -287,7 +317,7 @@ public:
 
     DriverStateImpl(uint32_t srcW, uint32_t srcH, const DriverStateConfig& cfg)
         : config_(cfg), log_(cfg.log), srcW_(srcW), srcH_(srcH),
-          scorer_(cfg.score, std::chrono::steady_clock::now())
+          scorer_(cfg.score, std::chrono::steady_clock::now(), cfg.log)
     {
         logger_.cb = &log_;
 
@@ -309,14 +339,23 @@ public:
         if (config_.faceScoreThreshold < 0.0f || config_.faceScoreThreshold > 1.0f)
             throw std::runtime_error("libdriverstate: faceScoreThreshold must be "
                                      "in [0, 1]");
+        if (config_.faceDetectScale < 0.25f || config_.faceDetectScale > 1.0f)
+            throw std::runtime_error("libdriverstate: faceDetectScale must be "
+                                     "in [0.25, 1]");
         if (config_.faceHoldSec < 0.0f)
             throw std::runtime_error("libdriverstate: faceHoldSec must be >= 0");
 
         if (config_.faceDetection) {
+            // Run YuNet on a (possibly) downscaled frame; the box is mapped back
+            // to full resolution for the crop, so classification is unaffected.
+            detW_ = std::max(64, static_cast<int>(
+                std::lround(srcW_ * config_.faceDetectScale)));
+            detH_ = std::max(64, static_cast<int>(
+                std::lround(srcH_ * config_.faceDetectScale)));
             try {
                 faceDet_ = cv::FaceDetectorYN::create(
                     config_.faceModelPath, "",
-                    cv::Size(static_cast<int>(srcW_), static_cast<int>(srcH_)),
+                    cv::Size(detW_, detH_),
                     config_.faceScoreThreshold, /*nmsThreshold=*/0.3f,
                     /*topK=*/5000);
             } catch (const cv::Exception& e) {
@@ -573,8 +612,21 @@ public:
         const cv::Mat frame(static_cast<int>(srcH_), static_cast<int>(srcW_),
                             CV_8UC3,
                             const_cast<uint8_t*>(bgr));   // wraps, no copy
-        faceDet_->detect(frame, facesMat_);
+
+        // Detect on the (possibly downscaled) frame; YuNet cost scales with the
+        // input area, so faceDetectScale<1 trades detection resolution for CPU.
+        const cv::Mat* det = &frame;
+        if (detW_ != static_cast<int>(srcW_) || detH_ != static_cast<int>(srcH_)) {
+            cv::resize(frame, detectMat_, cv::Size(detW_, detH_), 0, 0,
+                       cv::INTER_AREA);
+            det = &detectMat_;
+        }
+        faceDet_->detect(*det, facesMat_);
         if (facesMat_.empty() || facesMat_.rows == 0) return false;
+
+        // Map detector-space boxes back to full resolution.
+        const float sx = static_cast<float>(srcW_) / static_cast<float>(detW_);
+        const float sy = static_cast<float>(srcH_) / static_cast<float>(detH_);
 
         // Each YuNet row is [x, y, w, h, 5×(landmark x,y), score] (CV_32F).
         // Pick the largest box that clears the min-size filter (the driver is
@@ -583,7 +635,7 @@ public:
         float bestArea = -1.0f;
         for (int i = 0; i < facesMat_.rows; ++i) {
             const float* r = facesMat_.ptr<float>(i);
-            const float w = r[2], h = r[3];
+            const float w = r[2] * sx, h = r[3] * sy;   // full-res dimensions
             if (std::max(w, h) < static_cast<float>(faceMinSidePx_)) continue;
             const float area = w * h;
             if (area > bestArea) { bestArea = area; bestRow = i; }
@@ -591,8 +643,8 @@ public:
         if (bestRow < 0) return false;
 
         const float* r = facesMat_.ptr<float>(bestRow);
-        const int bx = static_cast<int>(r[0]), by = static_cast<int>(r[1]);
-        const int bw = static_cast<int>(r[2]), bh = static_cast<int>(r[3]);
+        const int bx = static_cast<int>(r[0] * sx), by = static_cast<int>(r[1] * sy);
+        const int bw = static_cast<int>(r[2] * sx), bh = static_cast<int>(r[3] * sy);
 
         // Square side with margin, capped at the frame's short side.
         const int frameMin = static_cast<int>(std::min(srcW_, srcH_));
@@ -626,6 +678,7 @@ public:
             ? 0.95 / config_.targetHz
             : 0.0;
         bool sizeWarned = false;
+        bool procWarned = false;
 
         while (!stopFlag_.load(std::memory_order_relaxed)) {
             if (!appsink_) break;
@@ -654,6 +707,10 @@ public:
 
             DriverStateResult result;
             const bool sizeOk = map.size == srcBytes_;
+            // OpenCV (YuNet detect) can throw on a malformed frame; a throw out
+            // of this thread would std::terminate the whole process (recording
+            // and lanes too), so contain it here and drop just this frame.
+            try {
             if (sizeOk) {
                 bool haveFace = true;
                 if (config_.faceDetection) {
@@ -691,9 +748,10 @@ public:
                 // results — e.g. CUDA failures — are ignored by the scorer).
                 scorer_.update(result.valid, result.faceDetected,
                                result.state == DriverState::DROWSY, now);
-                result.fatigueScore = scorer_.score();
-                result.fatigueCap   = scorer_.cap();
-                result.fatigueLevel = scorer_.level();
+                const FatigueScorer::Snapshot fs = scorer_.snapshot();
+                result.fatigueScore = fs.score;
+                result.fatigueCap   = fs.cap;
+                result.fatigueLevel = fs.level;
                 if (++frameCount_ % kTimingLogEvery == 0) {
                     doLog(log_, dashcam::log::LogLevel::DEBUG,
                           "driver state timing over %d frames: face detect "
@@ -709,6 +767,15 @@ public:
                 doLog(log_, dashcam::log::LogLevel::ERROR,
                       "driver state frame size %zu != expected %zu (%ux%ux3) — "
                       "frames skipped", map.size, srcBytes_, srcW_, srcH_);
+            }
+            } catch (const std::exception& e) {
+                if (!procWarned) {
+                    procWarned = true;
+                    doLog(log_, dashcam::log::LogLevel::ERROR,
+                          "driver state frame processing threw (%s) — frame "
+                          "dropped; further such errors suppressed", e.what());
+                }
+                result.valid = false;   // do not publish a half-built result
             }
 
             gst_buffer_unmap(buf, &map);
@@ -808,8 +875,22 @@ public:
     }
 
     DriverStateResult poll() const {
-        std::lock_guard<std::mutex> lk(resultMutex_);
-        return latestResult_;
+        DriverStateResult r;
+        {
+            std::lock_guard<std::mutex> lk(resultMutex_);
+            r = latestResult_;
+        }
+        // Overlay the LIVE score: resetScore()/setLaneOffset() mutate the
+        // scorer from the caller's thread between inference ticks, so the
+        // snapshot embedded in latestResult_ can be up to a branch period
+        // stale.  The scorer is independently locked.
+        if (r.valid) {
+            const FatigueScorer::Snapshot fs = scorer_.snapshot();
+            r.fatigueScore = fs.score;
+            r.fatigueCap   = fs.cap;
+            r.fatigueLevel = fs.level;
+        }
+        return r;
     }
 };
 

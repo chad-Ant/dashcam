@@ -118,6 +118,7 @@ static DriverStateConfig makeDriverConfig(
     c.faceDetection      = (bool)d.driverFaceDetection;
     c.faceModelPath      = (std::string)d.driverFaceModelPath;
     c.faceScoreThreshold = (float)d.driverFaceScore;
+    c.faceDetectScale    = (float)d.driverFaceDetectScale;
     c.score              = makeScoreConfig(dashcam::config::DriverScoreConfig{});
     return c;
 }
@@ -226,7 +227,8 @@ static int runVideoMode(const std::string& engine, const std::string& video,
 
 // ─── live-camera mode (driver-facing UVC) ────────────────────────────────────
 
-static int runLiveMode(const std::string& engine, int seconds, bool faceDetect = true) {
+static int runLiveMode(const std::string& engine, int seconds,
+                       bool faceDetect = true, float detectScale = 0.0f) {
     std::vector<cameraInfo> cameras;
     if (getCameraList(cameras) != ERROR_CODE::NONE || cameras.empty()) {
         std::cerr << "ERROR: no cameras found\n";
@@ -265,10 +267,15 @@ static int runLiveMode(const std::string& engine, int seconds, bool faceDetect =
 
     dashcam::config::DetectionConfig det;   // <Detection> defaults: 2 Hz / 2 fps
     DriverStateConfig cfg = makeDriverConfig(det, engine);
-    // nofd: skip Viola-Jones and centre-crop the frame instead, so EVERY frame
-    // is classified even with eyes closed / head drooped (the frontal cascade
-    // drops those poses).  Isolates the model's response to eye state.
+    // nofd: skip face detection and centre-crop the frame instead, so EVERY
+    // frame is classified even with eyes closed / head drooped.  Isolates the
+    // model's response to eye state.
     cfg.faceDetection = cfg.faceDetection && faceDetect;
+    // Optional YuNet downscale override (0 = use config default 1.0), for
+    // comparing detection recall vs CPU at different scales.
+    if (detectScale > 0.0f) cfg.faceDetectScale = detectScale;
+    std::cout << "face detection: " << (cfg.faceDetection ? "ON" : "OFF")
+              << "  YuNet scale: " << cfg.faceDetectScale << "\n";
 
     DriverStateDetector detector(fmt.width, fmt.height, cfg);
     cam.addBranch("driverstate", detector.createBin(), /*leaky=*/true);
@@ -421,12 +428,32 @@ static int runScoreSelftest() {
         s.update(true, true, false, at(500.0 + 3601.0));  // 1 h after reset
         check(eq(s.cap(), 90.0f), "session clock restarted by reset", s.cap());
     }
-    { // 13: inconsistent config must be rejected
+    { // 13: a lane CROSS whose middle frames lose lane validity still pays —
+      // the invalidity holds (not disarms) the drift so the return is confirmed
+        FatigueScorer s(cfg, at(0));
+        for (double t = 0; t <= 2.0; t += 0.5) s.update(true, true, true, at(t));
+        s.laneOffset(0.9f, true,  at(2.0));           // departs (drowsy)
+        s.laneOffset(0.0f, false, at(3.0));           // crossing: boundaries lost
+        s.laneOffset(0.0f, false, at(4.0));           // still invalid
+        s.laneOffset(0.1f, true,  at(5.0));           // back in lane, valid
+        for (double t = 2.5; t <= 5.5; t += 0.5) s.update(true, true, true, at(t));
+        check(eq(s.score(), 90.0f), "cross with validity gap still deducts -10", s.score());
+    }
+    { // 14: inconsistent config is CLAMPED, not rejected (never disables us)
         FatigueScoreConfig bad = cfg;
-        bad.warningScore = bad.cautionScore + 1.0f;
+        bad.warningScore  = bad.cautionScore + 1.0f;   // mis-ordered
+        bad.drowsyChunkSec = -5.0f;                     // non-positive window
         bool threw = false;
-        try { FatigueScorer s(bad, at(0)); } catch (const std::exception&) { threw = true; }
-        check(threw, "unordered thresholds -> constructor throws", threw ? 1.f : 0.f);
+        try {
+            FatigueScorer s(bad, at(0));
+            // Sanitised: constructs fine (drowsyChunkSec -> 10, thresholds
+            // re-ordered) and still scores drowsiness normally: 25 s -> -20.
+            for (double t = 0; t <= 25.0; t += 0.5) s.update(true, true, true, at(t));
+            check(eq(s.score(), 80.0f),
+                  "clamped config still scores drowsiness (-20)", s.score());
+        } catch (const std::exception&) { threw = true; }
+        check(!threw, "unordered/invalid config -> sanitised, no throw",
+              threw ? 0.f : 1.f);
     }
 
     std::cout << "\nSCORE SELFTEST: " << (failures == 0 ? "PASS" : "FAIL")
@@ -463,6 +490,13 @@ int main(int argc, char* argv[]) {
         return runVideoMode(engine, image, 640, 480, s, /*still=*/true, !nofd);
     }
     const int  seconds = argc > 2 ? std::stoi(argv[2]) : 20;
-    const bool nofd    = argc > 3 && std::strcmp(argv[3], "nofd") == 0;
-    return runLiveMode(engine, seconds, !nofd);
+    // Trailing args (any order): "nofd" disables face detection; a bare number
+    // in (0,1] overrides the YuNet detect scale.  e.g. `<engine> 40 0.5`.
+    bool  nofd  = false;
+    float scale = 0.0f;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "nofd") == 0) { nofd = true; continue; }
+        try { scale = std::stof(argv[i]); } catch (...) {}
+    }
+    return runLiveMode(engine, seconds, !nofd, scale);
 }

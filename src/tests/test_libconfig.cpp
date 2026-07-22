@@ -113,6 +113,7 @@ static bool test_roundtrip() {
     src.detection.driverFaceDetection   = false;
     src.detection.driverFaceModelPath   = "models/custom_yunet.onnx";
     src.detection.driverFaceScore       = 0.75f;
+    src.detection.driverFaceDetectScale = 0.5f;
 
     src.driverScore.scoreInitial       = 90.0f;
     src.driverScore.scoreUpper         = 95.0f;
@@ -201,6 +202,8 @@ static bool test_roundtrip() {
                                               "detection.driverFaceModelPath round-trip");
     check(eq(dst.detection.driverFaceScore, 0.75f),
                                               "detection.driverFaceScore round-trip");
+    check(eq(dst.detection.driverFaceDetectScale, 0.5f),
+                                              "detection.driverFaceDetectScale round-trip");
 
     check(eq(dst.driverScore.scoreInitial, 90.0f),       "driverScore.scoreInitial round-trip");
     check(eq(dst.driverScore.scoreUpper, 95.0f),         "driverScore.scoreUpper round-trip");
