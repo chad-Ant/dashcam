@@ -12,6 +12,15 @@
 //   USB UVC (driver-facing)-> drowsiness classification ONLY (libdriverstate):
 //       raw YUYV branch rate-limited to 2 fps, face crop, DROWSY/NATURAL.
 //
+// Startup configuration setter (resolveCameraConfiguration, in the init phase):
+// inspects which cameras are present, assigns each discovered camera a role,
+// then logs the recognised profile.  The two anchor cases:
+//   * one USB camera and nothing else   -> RECORD-ONLY   (dashcam footage only).
+//   * one USB camera + one IMX296 CSI   -> RECORD + LANES (footage on the USB,
+//                                          lane detection on the IMX296).
+// Driver monitoring layers a third role on top when a cabin camera is available
+// (see below).  Any role that cannot be filled simply stays OFF.
+//
 // Driver-camera selection (librecord opens its camera exclusively, so the
 // recorder and the driver monitor can never share one UVC device):
 //   - Pinned: a <Camera name="cabin" type="USB"> config entry with a non-empty
@@ -262,6 +271,170 @@ static int pickDriverFormat(const cameraInfo& ci) {
     return best;
 }
 
+// ─── camera configuration setter ───────────────────────────────────────────────
+// The initialisation-phase step that inspects which cameras are present and
+// assigns each a functionality (role).  Two operator-facing scenarios anchor it
+// (file header): a lone USB camera records; a USB + IMX296 pair records on the
+// USB and runs lane detection on the IMX296.  The v0.3 driver-monitoring camera
+// (pinned <Camera name="cabin"> or an auto-picked spare USB) layers on top.
+// Every role degrades independently — an unfilled role just stays OFF.
+
+// Roles assigned to the discovered cameras.  Each pointer aliases an element of
+// the caller's `cams` vector (nullptr = role unfilled) with its chosen format
+// index into that camera's videoFormats.
+struct CameraConfiguration {
+    const cameraInfo* record    = nullptr;  ///< UVC MJPEG/H264 passthrough recording.
+    int               recordFmt = -1;       ///< Format index for `record`.
+    const cameraInfo* lane      = nullptr;  ///< IMX296 CSI lane detection (single native mode).
+    const cameraInfo* driver    = nullptr;  ///< UVC driver-monitoring (drowsiness).
+    int               driverFmt = -1;       ///< Format index for `driver`.
+    bool              driverPinned = false; ///< Driver camera came from a config pin (vs auto).
+
+    // Discovery census, for the recognised-configuration summary line.
+    int usbCount = 0, imx296Count = 0, otherCsiCount = 0;
+};
+
+// One-line human label for the recognised configuration (the "profile"), keyed
+// on which roles ended up filled.  The first two lines are the operator's named
+// scenarios; the rest cover the driver-monitoring and degraded permutations.
+static std::string describeConfiguration(const CameraConfiguration& c) {
+    const bool r = c.record, l = c.lane, d = c.driver;
+    if ( r && !l && !d) return "RECORD-ONLY (single USB dashcam recording)";
+    if ( r &&  l && !d) return "RECORD + LANES (USB recording + IMX296 lane detection)";
+    if ( r && !l &&  d) return "RECORD + DRIVER-MONITOR (USB recording + drowsiness; no IMX296)";
+    if ( r &&  l &&  d) return "RECORD + LANES + DRIVER-MONITOR (full v0.3)";
+    if (!r &&  l && !d) return "LANES-ONLY (IMX296 lane detection; no recordable USB)";
+    if (!r &&  l &&  d) return "LANES + DRIVER-MONITOR (no recordable USB)";
+    if (!r && !l &&  d) return "DRIVER-MONITOR-ONLY (no recordable USB, no IMX296)";
+    return "NONE (no camera role could be assigned)";
+}
+
+// The configuration setter proper: assign a role to each discovered camera and
+// announce the recognised profile.  Assignment order is load-bearing — a pinned
+// cabin (driver) camera is reserved BEFORE recording picks, so the recorder
+// never grabs the device the operator set aside for driver monitoring.
+static CameraConfiguration
+resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
+                           const std::string& cabinDev, bool cabinEnabled,
+                           const dashcam::log::LogCallback& log) {
+    using dashcam::log::LogLevel;
+    CameraConfiguration cc;
+    cc.driverPinned = !cabinDev.empty();
+
+    // Census + lane camera: first IMX296 CSI becomes the lane-detection source.
+    for (const auto& c : cams) {
+        if (c.type == CAMERA_TYPE::USB) { ++cc.usbCount; continue; }
+        if (c.type != CAMERA_TYPE::CSI) continue;
+        if (sensorNameContains(c, "imx296")) {
+            ++cc.imx296Count;
+            if (!cc.lane) cc.lane = &c;
+        } else {
+            ++cc.otherCsiCount;
+        }
+    }
+
+    // Driver camera first (see the ordering note above).
+    if (!cabinEnabled) {
+        log(LogLevel::INFO,
+            "cabin camera disabled in config — driver monitoring OFF");
+    } else if (!cabinDev.empty()) {
+        for (const auto& c : cams) {
+            if (c.type != CAMERA_TYPE::USB || c.address != cabinDev) continue;
+            const int idx = pickDriverFormat(c);
+            if (idx < 0)
+                log(LogLevel::ERROR,
+                    "pinned cabin camera " + cabinDev + " has no usable YUYV "
+                    "format — driver monitoring OFF");
+            else { cc.driver = &c; cc.driverFmt = idx; }
+            break;
+        }
+        // Reached here inside the pinned branch, so cabinEnabled is true and a
+        // null driver means the pin was unusable.  Distinguish "device absent"
+        // (logged here) from "device present but no YUYV format" (logged above).
+        if (!cc.driver &&
+            std::none_of(cams.begin(), cams.end(), [&](const cameraInfo& c) {
+                return c.type == CAMERA_TYPE::USB && c.address == cabinDev; }))
+            log(LogLevel::ERROR,
+                "pinned cabin camera " + cabinDev + " not found — "
+                "driver monitoring OFF");
+    }
+
+    // Recording camera: first precompressed-capable USB the driver monitor has
+    // not claimed.
+    for (const auto& c : cams) {
+        if (c.type != CAMERA_TYPE::USB) continue;
+        if (cc.driver && c.address == cc.driver->address) continue;
+        const int idx = pickUsbRecordFormat(c);
+        if (idx >= 0) { cc.record = &c; cc.recordFmt = idx; break; }
+    }
+
+    // Auto mode: driver camera = first remaining YUYV-capable USB.
+    if (!cc.driver && cabinEnabled && cabinDev.empty()) {
+        for (const auto& c : cams) {
+            if (c.type != CAMERA_TYPE::USB) continue;
+            if (cc.record && c.address == cc.record->address) continue;
+            const int idx = pickDriverFormat(c);
+            if (idx >= 0) { cc.driver = &c; cc.driverFmt = idx; break; }
+        }
+        // A lone recording camera (the RECORD-ONLY scenario) legitimately has no
+        // spare for driver monitoring — that is the expected single-camera
+        // profile, not an error.  Only flag it when a spare USB existed but was
+        // unusable (e.g. a webcam with no raw YUYV mode).
+        if (!cc.driver && cc.usbCount > 1)
+            log(LogLevel::ERROR,
+                "no free USB camera for driver monitoring (add a cabin camera "
+                "or pin one via <Camera name=\"cabin\" type=\"USB\">) — "
+                "driver monitoring OFF");
+    }
+
+    // Per-role absence notices.  Recording is the primary function, so its
+    // absence is an ERROR; lane detection is a degradable secondary subsystem
+    // and its absence in a USB-only rig is by design (the RECORD-ONLY profile),
+    // so it is reported at INFO — the recognised-profile line names it anyway.
+    if (!cc.record)
+        log(LogLevel::ERROR,
+            cc.driver ? "no USB camera left for recording (cabin pin claimed "
+                        + cc.driver->address + ") — continuing WITHOUT recording"
+                      : "no USB camera found — continuing WITHOUT recording");
+    if (!cc.lane)
+        log(LogLevel::INFO,
+            "no IMX296 CSI camera found — continuing WITHOUT lane detection");
+
+    // Announce the recognised configuration and the assigned roles.
+    log(LogLevel::INFO,
+        "camera configuration: " + describeConfiguration(cc)
+        + "  [discovered " + std::to_string(cams.size()) + ": "
+        + std::to_string(cc.usbCount) + " USB, "
+        + std::to_string(cc.imx296Count) + " IMX296"
+        + (cc.otherCsiCount ? ", " + std::to_string(cc.otherCsiCount) + " other CSI"
+                            : std::string())
+        + "]");
+    if (cc.record) {
+        const auto& f = cc.record->videoFormats[(size_t)cc.recordFmt];
+        log(LogLevel::INFO,
+            "  role recording  -> " + cc.record->address + " "
+            + std::to_string(f.width) + "x" + std::to_string(f.height) + "@"
+            + std::to_string((int)f.frameRate)
+            + (f.pixelFormat == V4L2_PIX_FMT_H264 ? " H264" : " MJPG")
+            + " passthrough");
+    }
+    if (cc.lane) {
+        const auto& f = cc.lane->videoFormats.at(0);   // IMX296: single mode
+        log(LogLevel::INFO,
+            "  role lanes      -> " + cc.lane->address + " (IMX296) "
+            + std::to_string(f.width) + "x" + std::to_string(f.height));
+    }
+    if (cc.driver) {
+        const auto& f = cc.driver->videoFormats[(size_t)cc.driverFmt];
+        log(LogLevel::INFO,
+            "  role driver     -> " + cc.driver->address + " "
+            + std::to_string(f.width) + "x" + std::to_string(f.height) + "@"
+            + std::to_string((int)f.frameRate) + " YUYV"
+            + (cc.driverPinned ? " (pinned)" : " (auto)"));
+    }
+    return cc;
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -312,75 +485,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const cameraInfo* laneInfo = nullptr;
-    for (const auto& c : cams)
-        if (c.type == CAMERA_TYPE::CSI && !laneInfo && sensorNameContains(c, "imx296"))
-            laneInfo = &c;
+    // ── configuration setter: assign a functionality to each camera ──────────
+    // Inspect which cameras are present and map each to a role (recording, lane
+    // detection, driver monitoring), then announce the recognised profile.
+    const CameraConfiguration camCfg =
+        resolveCameraConfiguration(cams, cabinDev, cabinEnabled, log);
+    const cameraInfo* laneInfo  = camCfg.lane;
+    const cameraInfo* usbInfo   = camCfg.record;
+    const int         usbFmtIdx = camCfg.recordFmt;
+    const cameraInfo* drvInfo   = camCfg.driver;
+    const int         drvFmtIdx = camCfg.driverFmt;
 
-    // Driver camera first: a pinned device is reserved before recording picks.
-    const cameraInfo* drvInfo = nullptr;
-    int drvFmtIdx = -1;
-    if (!cabinEnabled) {
-        log(dashcam::log::LogLevel::INFO,
-            "cabin camera disabled in config — driver monitoring OFF");
-    } else if (!cabinDev.empty()) {
-        for (const auto& c : cams) {
-            if (c.type != CAMERA_TYPE::USB || c.address != cabinDev) continue;
-            const int idx = pickDriverFormat(c);
-            if (idx < 0) {
-                log(dashcam::log::LogLevel::ERROR,
-                    "pinned cabin camera " + cabinDev + " has no usable YUYV "
-                    "format — driver monitoring OFF");
-            } else {
-                drvInfo = &c; drvFmtIdx = idx;
-            }
-            break;
-        }
-        // Reached here inside the pinned branch, so cabinEnabled is true and a
-        // null drvInfo means the pin was unusable.  Distinguish "device absent"
-        // (logged here) from "device present but no YUYV format" (logged above).
-        if (!drvInfo &&
-            std::none_of(cams.begin(), cams.end(), [&](const cameraInfo& c) {
-                return c.type == CAMERA_TYPE::USB && c.address == cabinDev; }))
-            log(dashcam::log::LogLevel::ERROR,
-                "pinned cabin camera " + cabinDev + " not found — "
-                "driver monitoring OFF");
-    }
-
-    // Recording camera: first precompressed-capable USB that the driver
-    // monitor has not claimed.
-    const cameraInfo* usbInfo = nullptr;
-    int usbFmtIdx = -1;
-    for (const auto& c : cams) {
-        if (c.type != CAMERA_TYPE::USB) continue;
-        if (drvInfo && c.address == drvInfo->address) continue;
-        const int idx = pickUsbRecordFormat(c);
-        if (idx >= 0) { usbInfo = &c; usbFmtIdx = idx; break; }
-    }
-
-    // Auto mode: driver camera = first remaining YUYV-capable USB.
-    if (!drvInfo && cabinEnabled && cabinDev.empty()) {
-        for (const auto& c : cams) {
-            if (c.type != CAMERA_TYPE::USB) continue;
-            if (usbInfo && c.address == usbInfo->address) continue;
-            const int idx = pickDriverFormat(c);
-            if (idx >= 0) { drvInfo = &c; drvFmtIdx = idx; break; }
-        }
-        if (!drvInfo)
-            log(dashcam::log::LogLevel::ERROR,
-                "no free USB camera for driver monitoring (add a cabin camera "
-                "or pin one via <Camera name=\"cabin\" type=\"USB\">) — "
-                "driver monitoring OFF");
-    }
-
-    if (!usbInfo)
-        log(dashcam::log::LogLevel::ERROR,
-            drvInfo ? "no USB camera left for recording (cabin pin claimed "
-                      + drvInfo->address + ") — continuing WITHOUT recording"
-                    : "no USB camera found — continuing WITHOUT recording");
-    if (!laneInfo)
-        log(dashcam::log::LogLevel::ERROR,
-            "no IMX296 CSI camera found — continuing WITHOUT lane detection");
     if (!usbInfo && !laneInfo && !drvInfo) {
         log(dashcam::log::LogLevel::ERROR, "no usable cameras at all; aborting");
         dashcam::log::shutdown();
@@ -394,24 +509,6 @@ int main(int argc, char* argv[]) {
         if (!dev.empty() && laneInfo && dev != laneInfo->address) continue;
         if ((float)cc.outFps > 0.0f) laneFps = (float)cc.outFps;
         break;
-    }
-
-    if (usbInfo) {
-        const auto& uFmt = usbInfo->videoFormats[(size_t)usbFmtIdx];
-        log(dashcam::log::LogLevel::INFO,
-            "record USB " + usbInfo->address + " "
-            + std::to_string(uFmt.width) + "x" + std::to_string(uFmt.height) + "@"
-            + std::to_string((int)uFmt.frameRate)
-            + (uFmt.pixelFormat == V4L2_PIX_FMT_H264 ? " H264" : " MJPG")
-            + " passthrough");
-    }
-    if (drvInfo) {
-        const auto& dFmt = drvInfo->videoFormats[(size_t)drvFmtIdx];
-        log(dashcam::log::LogLevel::INFO,
-            "driver USB " + drvInfo->address + " "
-            + std::to_string(dFmt.width) + "x" + std::to_string(dFmt.height)
-            + "@" + std::to_string((int)dFmt.frameRate) + " YUYV"
-            + (cabinDev.empty() ? " (auto)" : " (pinned)"));
     }
 
     // ── lane detector: load the TRT engine before pipeline setup ─────────────
