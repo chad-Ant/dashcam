@@ -16,17 +16,77 @@ Commands (type HELP once connected for the authoritative list):
   HELP                                 server help text
 
 Usage:
-  dashcam_ctl.py <host> <port> [token]
+  dashcam_ctl.py <host> <port> [--token-file PATH]
 
-  token  the shared secret matching <Network><ControlAuthToken> on the device.
-         Omit it only when the device runs with auth disabled (empty token).
+When authentication is enabled, the client prompts for the shared secret with
+terminal echo disabled.  For non-interactive use, --token-file reads it from a
+regular file that is owned by the current user (or root) and inaccessible to
+group/other users.
 """
 
+import argparse
+import getpass
 import hashlib
 import hmac
+import os
 import select
 import socket
+import stat
 import sys
+import warnings
+
+
+_MAX_TOKEN_BYTES = 65536
+
+
+def _read_token_file(path):
+    """Read a PSK without following symlinks or accepting permissive file modes."""
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("token file must be a regular file")
+        if info.st_uid not in (os.geteuid(), 0):
+            raise ValueError("token file must be owned by the current user or root")
+        if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ValueError("token file must not be accessible by group or other users")
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            token = stream.read(_MAX_TOKEN_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    if len(token.encode("utf-8")) > _MAX_TOKEN_BYTES:
+        raise ValueError("token file is too large")
+    token = token.rstrip("\r\n")
+    if not token:
+        raise ValueError("token file is empty")
+    if "\n" in token or "\r" in token:
+        raise ValueError("token file must contain exactly one line")
+    return token
+
+
+def _prompt_token():
+    """Prompt without permitting getpass's visible-input fallback."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            token = getpass.getpass("Control token: ")
+    except (EOFError, getpass.GetPassWarning):
+        print("cannot securely prompt for token; use --token-file",
+              file=sys.stderr)
+        return None
+    except KeyboardInterrupt:
+        print("\nauthentication cancelled", file=sys.stderr)
+        return None
+    if not token:
+        print("control token must not be empty", file=sys.stderr)
+        return None
+    return token
 
 
 def _read_line(sock, buf):
@@ -40,7 +100,7 @@ def _read_line(sock, buf):
     return line.decode("utf-8", "replace").rstrip("\r"), rest
 
 
-def _handshake(sock, token):
+def _handshake(sock, token=None):
     """Answer an AUTH-CHALLENGE if the server issues one. Returns (ok, remaining_buf)."""
     line, buf = _read_line(sock, b"")
     if line is None:
@@ -50,9 +110,9 @@ def _handshake(sock, token):
     if line.startswith("AUTH-CHALLENGE"):
         parts = line.split(None, 1)
         nonce = parts[1].strip() if len(parts) > 1 else ""
+        if token is None:
+            token = _prompt_token()
         if not token:
-            print("server requires authentication but no token was given",
-                  file=sys.stderr)
             return False, buf
         mac = hmac.new(token.encode("utf-8"), nonce.encode("utf-8"),
                        hashlib.sha256).hexdigest()
@@ -74,19 +134,29 @@ def _handshake(sock, token):
 
 
 def main(argv):
-    if len(argv) < 3:
-        print("usage: dashcam_ctl.py <host> <port> [token]", file=sys.stderr)
-        return 2
-    host = argv[1]
-    try:
-        port = int(argv[2])
-    except ValueError:
-        print("port must be an integer", file=sys.stderr)
-        return 2
-    token = argv[3] if len(argv) > 3 else ""
+    parser = argparse.ArgumentParser(
+        prog="dashcam_ctl.py",
+        description="Authenticated dashcam control and telemetry client")
+    parser.add_argument("host")
+    parser.add_argument("port", type=int)
+    parser.add_argument(
+        "--token-file", metavar="PATH",
+        help="read the control token from a private regular file")
+    args = parser.parse_args(argv[1:])
+
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be in the range 1..65535")
+
+    token = None
+    if args.token_file:
+        try:
+            token = _read_token_file(args.token_file)
+        except (OSError, UnicodeError, ValueError) as exc:
+            print("cannot read token file: %s" % exc, file=sys.stderr)
+            return 2
 
     try:
-        sock = socket.create_connection((host, port), timeout=10)
+        sock = socket.create_connection((args.host, args.port), timeout=10)
     except OSError as exc:
         print("connect failed: %s" % exc, file=sys.stderr)
         return 1

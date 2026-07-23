@@ -32,6 +32,23 @@ RUN apt-get update && apt-get install -y \
     libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# VPI is distributed through NVIDIA's Jetson repository rather than Ubuntu's
+# repositories.  Keep this on the r36.4 line to match the l4t-ml base image.
+# libstereocam and the production `dashcam` target need the VPI headers and
+# unversioned linker entry supplied by vpi3-dev.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gnupg \
+    && apt-key adv --fetch-key \
+        https://repo.download.nvidia.com/jetson/jetson-ota-public.asc \
+    && printf '%s\n' \
+        'deb https://repo.download.nvidia.com/jetson/common r36.4 main' \
+        > /etc/apt/sources.list.d/nvidia-jetson-common.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        libnvvpi3 \
+        vpi3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # nmcli (from network-manager) lets the dashcam ask the OS to connect to WiFi at
 # startup (libnetwork connectWifi).  It talks to the HOST's NetworkManager over
 # the D-Bus socket the launchcode_*.sh scripts mount (-v /run/dbus, -v
@@ -48,6 +65,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN install -d /usr/lib/aarch64-linux-gnu/gstreamer-1.0-disabled \
     && mv /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstrtpmanagerbad.so \
           /usr/lib/aarch64-linux-gnu/gstreamer-1.0-disabled/
+
+# NVIDIA's container startup checks loaded kernel modules with lsmod.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        kmod \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/app
 

@@ -1387,7 +1387,8 @@ int main(int argc, char* argv[]) {
                         : " (UNAUTHENTICATED — set <Network><ControlAuthToken>)") +
                 (cc.allowIps.empty() ? "" : " [IP allowlist active]") +
                 "  client: python3 src/tools/dashcam_ctl.py <device-ip> " +
-                std::to_string(ctrlSrv.port()) + (authed ? " <token>" : ""));
+                std::to_string(ctrlSrv.port()) +
+                (authed ? " [--token-file <path>]" : ""));
         } else {
             log(dashcam::log::LogLevel::ERROR,
                 "remote control: failed to start — continuing without it");
@@ -1536,8 +1537,12 @@ int main(int argc, char* argv[]) {
             // when it is both configured AND has a fresh valid sample; otherwise its
             // fields are reset to sentinels so a warming-up or torn-down detector can
             // never publish a fabricated "fatigue=100/face=true" or a stale reading.
-            const bool laneValid = (laneDet != nullptr) && lastLane.valid;
-            const bool drvValid  = (drvDet  != nullptr) && lastDrv.valid;
+            const bool laneValid =
+                laneDet != nullptr && lastLane.valid &&
+                laneDet->hasFreshResult(kLaneFreshnessMs);
+            const bool drvValid =
+                drvDet != nullptr && lastDrv.valid &&
+                drvDet->hasFreshResult(kDriverFreshnessMs);
             od.laneValid   = laneValid;
             od.driverValid = drvValid;
             od.adasValid   = laneValid || drvValid;

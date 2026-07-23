@@ -45,7 +45,7 @@ LD_ALSA  := -lasound
 
 # ─── VPI guard ────────────────────────────────────────────────────────────────
 # libstereocam and the production dashcam binary require VPI 3.x headers
-# (libnvvpi-dev on JetPack 6.x).  Skip them when headers are absent so that
+# (vpi3-dev on JetPack 6.x).  Skip them when headers are absent so that
 # tests and demos build in environments where VPI is not installed.
 
 VPI_HDRS := $(wildcard /usr/include/vpi/Image.h)
@@ -215,7 +215,7 @@ endif
 # dictionary); libconfig also recreates the defaults on demand at runtime.
 all: $(TARGETS) | $(BUILD_DIR)/logs $(BUILD_DIR)/config
 ifeq ($(VPI_HDRS),)
-	@echo "NOTE: VPI headers not found — dashcam target skipped (install libnvvpi-dev)"
+	@echo "NOTE: VPI headers not found — dashcam target skipped (install vpi3-dev)"
 endif
 	@echo "Built all targets in $(BUILD_DIR)/ (logs -> $(BUILD_DIR)/logs/, config -> $(BUILD_DIR)/config/)"
 
