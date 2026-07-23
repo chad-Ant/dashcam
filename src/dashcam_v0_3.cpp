@@ -182,11 +182,7 @@ static std::string syncSystemTime(const dashcam::config::NetworkConfig& net,
     std::snprintf(off, sizeof(off), "%+.3f", t.offsetSeconds);
     const std::string base = "time sync: " + server + " offset " + off + " s";
 
-    if (net.ntpStepClock)
-        log(LvL::WARN, base + " — NtpStepClock ignored: unauthenticated SNTP "
-            "is observation-only; configure the host time service instead");
-    else
-        log(LvL::INFO, base + " (clock unchanged)");
+    log(LvL::INFO, base + " (observation only; host time service owns clock discipline)");
     return base + " (observation only)";
 }
 
@@ -289,6 +285,8 @@ static bool sensorNameContains(const cameraInfo& info, const char* needle) {
     return name.find(needle) != std::string::npos;
 }
 
+using SensorNameMatcher = bool (*)(const cameraInfo&, const char*);
+
 // Recording format: PRECOMPRESSED only (MJPEG/H264 — librecord passthrough).
 // Largest area <=1080p at ~24-31 fps; H264 preferred over MJPEG when both
 // exist (smaller files at the same zero encode cost).
@@ -352,7 +350,7 @@ struct CameraConfiguration {
     const cameraInfo* record    = nullptr;  ///< UVC MJPEG/H264 passthrough recording.
     int               recordFmt = -1;       ///< Format index for `record`.
     const cameraInfo* lane      = nullptr;  ///< IMX296 CSI lane detection (single native mode).
-    int               laneFmt   = 0;        ///< Format index for `lane`.
+    int               laneFmt   = -1;       ///< Format index for `lane`.
     int               laneSensorId = -1;    ///< Configured Argus sensor id (-1 = discovery).
     const dashcam::config::CameraConfig* laneConfig = nullptr;
     const cameraInfo* driver    = nullptr;  ///< UVC driver-monitoring (drowsiness).
@@ -385,7 +383,8 @@ static std::string describeConfiguration(const CameraConfiguration& c) {
 static CameraConfiguration
 resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
                            const std::vector<dashcam::config::CameraConfig>& configs,
-                           const dashcam::log::LogCallback& log) {
+                           const dashcam::log::LogCallback& log,
+                           SensorNameMatcher sensorMatches = sensorNameContains) {
     using dashcam::log::LogLevel;
     CameraConfiguration cc;
     std::string cabinDev;
@@ -449,7 +448,7 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     for (const auto& c : cams) {
         if (c.type == CAMERA_TYPE::USB) { ++cc.usbCount; continue; }
         if (c.type != CAMERA_TYPE::CSI) continue;
-        if (sensorNameContains(c, "imx296")) {
+        if (sensorMatches(c, "imx296")) {
             ++cc.imx296Count;
         } else {
             ++cc.otherCsiCount;
@@ -469,18 +468,32 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
                 (std::string)cfg.device + " not found");
             continue;
         }
-        if (!sensorNameContains(*camera, "imx296")) continue;
+        if (!sensorMatches(*camera, "imx296")) continue;
+        if (camera->videoFormats.empty()) {
+            log(LogLevel::ERROR, camera->address +
+                ": IMX296 reports no video formats — lane detection OFF for "
+                "this device");
+            continue;
+        }
         cc.lane = camera;
+        cc.laneFmt = 0;
         cc.laneConfig = &cfg;
         break;
     }
     if (!cc.lane) {
         for (const auto& camera : cams) {
             if (camera.type != CAMERA_TYPE::CSI ||
-                !sensorNameContains(camera, "imx296") ||
+                !sensorMatches(camera, "imx296") ||
                 disabled(camera, "CSI"))
                 continue;
+            if (camera.videoFormats.empty()) {
+                log(LogLevel::ERROR, camera.address +
+                    ": IMX296 reports no video formats — lane detection OFF "
+                    "for this device");
+                continue;
+            }
             cc.lane = &camera;
+            cc.laneFmt = 0;
             cc.laneConfig = exactConfig(camera, "CSI");
             break;
         }
@@ -529,7 +542,9 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
             continue;
         const cameraInfo* camera =
             findCamera((std::string)cfg.device, CAMERA_TYPE::USB);
-        if (!camera || (cc.driver && camera->address == cc.driver->address))
+        if (!camera ||
+            (!cabinDev.empty() && camera->address == cabinDev) ||
+            (cc.driver && camera->address == cc.driver->address))
             continue;
         const int idx = configuredFormat(&cfg, *camera, true);
         if (idx >= 0) {
@@ -544,6 +559,10 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
         if (cc.record) break;
         if (c.type != CAMERA_TYPE::USB) continue;
         if (disabled(c, "USB")) continue;
+        // A cabin pin reserves the physical device even when it is absent or
+        // cannot supply YUYV.  Role assignment must follow operator intent:
+        // never silently turn a driver-facing camera into road footage.
+        if (!cabinDev.empty() && c.address == cabinDev) continue;
         if (cc.driver && c.address == cc.driver->address) continue;
         const int idx = configuredFormat(exactConfig(c, "USB"), c, true);
         if (idx >= 0) { cc.record = &c; cc.recordFmt = idx; break; }
@@ -551,10 +570,12 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
 
     // Auto mode: driver camera = first remaining YUYV-capable USB.
     if (!cc.driver && cabinEnabled && cabinDev.empty()) {
+        int eligibleSpareCount = 0;
         for (const auto& c : cams) {
             if (c.type != CAMERA_TYPE::USB) continue;
             if (disabled(c, "USB")) continue;
             if (cc.record && c.address == cc.record->address) continue;
+            ++eligibleSpareCount;
             const int idx = configuredFormat(exactConfig(c, "USB"), c, false);
             if (idx >= 0) { cc.driver = &c; cc.driverFmt = idx; break; }
         }
@@ -562,11 +583,10 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
         // spare for driver monitoring — that is the expected single-camera
         // profile, not an error.  Only flag it when a spare USB existed but was
         // unusable (e.g. a webcam with no raw YUYV mode).
-        if (!cc.driver && cc.usbCount > 1)
+        if (!cc.driver && eligibleSpareCount > 0)
             log(LogLevel::ERROR,
-                "no free USB camera for driver monitoring (add a cabin camera "
-                "or pin one via <Camera name=\"cabin\" type=\"USB\">) — "
-                "driver monitoring OFF");
+                "free USB camera(s) have no usable YUYV format — driver "
+                "monitoring OFF");
     }
 
     // Per-role absence notices.  Recording is the primary function, so its
@@ -575,9 +595,14 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     // so it is reported at INFO — the recognised-profile line names it anyway.
     if (!cc.record)
         log(LogLevel::ERROR,
-            cc.driver ? "no USB camera left for recording (cabin pin claimed "
+            !cabinDev.empty()
+                ? "no USB camera left for recording (cabin pin reserves "
+                    + cabinDev + ") — continuing WITHOUT recording"
+                : (cc.driver
+                    ? "no USB camera left for recording (driver monitor claimed "
                         + cc.driver->address + ") — continuing WITHOUT recording"
-                      : "no USB camera found — continuing WITHOUT recording");
+                    : "no recordable USB camera found — continuing WITHOUT "
+                      "recording"));
     if (!cc.lane)
         log(LogLevel::INFO,
             "no IMX296 CSI camera found — continuing WITHOUT lane detection");
@@ -601,7 +626,9 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
             + " passthrough");
     }
     if (cc.lane) {
-        const auto& f = cc.lane->videoFormats.at((size_t)cc.laneFmt);
+        // Selection above establishes this invariant; keep the access
+        // non-throwing so a malformed discovery result cannot escape main().
+        const auto& f = cc.lane->videoFormats[static_cast<size_t>(cc.laneFmt)];
         log(LogLevel::INFO,
             "  role lanes      -> " + cc.lane->address + " (IMX296) "
             + std::to_string(f.width) + "x" + std::to_string(f.height));
@@ -617,9 +644,125 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     return cc;
 }
 
+// Hardware-independent regression coverage for the role resolver's safety
+// invariants.  Run with:
+//   dashcam_v0_3 --self-test-camera-configuration
+// The normal launcher never supplies this flag.
+static int runCameraConfigurationSelfTest() {
+    using dashcam::log::LogLevel;
+    const dashcam::log::LogCallback noLog =
+        [](LogLevel, const std::string&) {};
+
+    auto format = [](uint32_t fourcc) {
+        cameraVideoFormat f{};
+        f.width = 1280;
+        f.height = 720;
+        f.frameRate = 30.0f;
+        f.pixelFormat = fourcc;
+        return f;
+    };
+    auto camera = [](CAMERA_TYPE type, const std::string& address,
+                     std::vector<cameraVideoFormat> formats) {
+        cameraInfo c{};
+        c.type = type;
+        c.address = address;
+        c.videoFormats = std::move(formats);
+        return c;
+    };
+    auto cabinConfig = [](const std::string& address, bool enabled) {
+        dashcam::config::CameraConfig c;
+        c.name = "cabin";
+        c.type = "USB";
+        c.device = address;
+        c.enabled = enabled;
+        return c;
+    };
+    auto disabledUsbConfig = [](const std::string& address) {
+        dashcam::config::CameraConfig c;
+        c.name = "disabled-spare";
+        c.type = "USB";
+        c.device = address;
+        c.enabled = false;
+        return c;
+    };
+
+    int failures = 0;
+    auto check = [&](bool ok, const char* message) {
+        std::fprintf(stderr, "camera-config self-test: %s — %s\n",
+                     ok ? "PASS" : "FAIL", message);
+        if (!ok) ++failures;
+    };
+
+    // A pinned MJPEG-only cabin must remain reserved; it cannot become the
+    // road-recording camera just because driver monitoring cannot consume it.
+    {
+        const std::vector<cameraInfo> cams{
+            camera(CAMERA_TYPE::USB, "/dev/cabin",
+                   {format(V4L2_PIX_FMT_MJPEG)}),
+            camera(CAMERA_TYPE::USB, "/dev/road",
+                   {format(V4L2_PIX_FMT_MJPEG)})
+        };
+        const std::vector<dashcam::config::CameraConfig> configs{
+            cabinConfig("/dev/cabin", true)
+        };
+        const auto cc = resolveCameraConfiguration(cams, configs, noLog);
+        check(cc.record && cc.record->address == "/dev/road" && !cc.driver,
+              "MJPEG-only cabin pin stays reserved from recording");
+    }
+
+    // Disabled cameras are not eligible spare driver cameras and therefore
+    // must not trigger the "free camera has no YUYV" error.
+    {
+        std::vector<std::string> errors;
+        const dashcam::log::LogCallback capture =
+            [&](LogLevel level, const std::string& message) {
+                if (level == LogLevel::ERROR) errors.push_back(message);
+            };
+        const std::vector<cameraInfo> cams{
+            camera(CAMERA_TYPE::USB, "/dev/road",
+                   {format(V4L2_PIX_FMT_MJPEG)}),
+            camera(CAMERA_TYPE::USB, "/dev/disabled",
+                   {format(V4L2_PIX_FMT_MJPEG)})
+        };
+        const std::vector<dashcam::config::CameraConfig> configs{
+            disabledUsbConfig("/dev/disabled")
+        };
+        const auto cc = resolveCameraConfiguration(cams, configs, capture);
+        const bool driverError = std::any_of(
+            errors.begin(), errors.end(), [](const std::string& message) {
+                return message.find("driver monitoring OFF") != std::string::npos;
+            });
+        check(cc.record && cc.record->address == "/dev/road" && !driverError,
+              "disabled USB does not cause a spurious driver-monitor error");
+    }
+
+    // Degenerate discovery data must degrade the lane role, never throw from a
+    // vector::at() and terminate recording.
+    {
+        const std::vector<cameraInfo> cams{
+            camera(CAMERA_TYPE::CSI, "/dev/imx296-empty", {}),
+            camera(CAMERA_TYPE::USB, "/dev/road",
+                   {format(V4L2_PIX_FMT_MJPEG)})
+        };
+        const auto fakeImx296 = [](const cameraInfo& c, const char*) {
+            return c.type == CAMERA_TYPE::CSI;
+        };
+        const auto cc =
+            resolveCameraConfiguration(cams, {}, noLog, fakeImx296);
+        check(!cc.lane && cc.record && cc.record->address == "/dev/road",
+              "empty CSI format list degrades lanes while recording remains active");
+    }
+
+    return failures == 0 ? 0 : 1;
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    if (argc == 2 &&
+        std::string(argv[1]) == "--self-test-camera-configuration")
+        return runCameraConfigurationSelfTest();
+
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
     std::signal(SIGUSR1, onResetScore);   // software fatigue-score reset
@@ -696,18 +839,40 @@ int main(int argc, char* argv[]) {
         resolveCameraConfiguration(cams, cfg.cameras, log);
     cameraInfo laneSelection;
     const cameraInfo* laneInfo = nullptr;
-    if (camCfg.lane) {
+    if (camCfg.lane && camCfg.laneFmt >= 0 &&
+        static_cast<size_t>(camCfg.laneFmt) < camCfg.lane->videoFormats.size()) {
         laneSelection = *camCfg.lane;
         if (camCfg.laneSensorId >= 0)
             laneSelection.deviceId =
                 static_cast<uint32_t>(camCfg.laneSensorId);
         laneInfo = &laneSelection;
+    } else if (camCfg.lane) {
+        // Defensive boundary check: resolver currently guarantees a valid
+        // format, but discovery/configuration data must never be able to throw
+        // std::out_of_range and terminate unrelated recording/driver roles.
+        log(dashcam::log::LogLevel::ERROR,
+            camCfg.lane->address + ": invalid lane format selection — "
+            "continuing WITHOUT lane detection");
     }
-    const cameraInfo* usbInfo   = camCfg.record;
     const int         usbFmtIdx = camCfg.recordFmt;
     const int         laneFmtIdx = camCfg.laneFmt;
-    const cameraInfo* drvInfo   = camCfg.driver;
     const int         drvFmtIdx = camCfg.driverFmt;
+    auto validatedRoleCamera =
+        [&](const cameraInfo* camera, int formatIndex,
+            const char* role) -> const cameraInfo* {
+            if (!camera) return nullptr;
+            if (formatIndex >= 0 &&
+                static_cast<size_t>(formatIndex) < camera->videoFormats.size())
+                return camera;
+            log(dashcam::log::LogLevel::ERROR,
+                camera->address + ": invalid " + role +
+                " format selection — role disabled");
+            return nullptr;
+        };
+    const cameraInfo* usbInfo =
+        validatedRoleCamera(camCfg.record, usbFmtIdx, "recording");
+    const cameraInfo* drvInfo =
+        validatedRoleCamera(camCfg.driver, drvFmtIdx, "driver");
 
     if (!usbInfo && !laneInfo && !drvInfo) {
         log(dashcam::log::LogLevel::ERROR, "no usable cameras at all; aborting");
@@ -715,9 +880,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const auto* laneConfig = camCfg.laneConfig;
+    const auto* laneConfig = laneInfo ? camCfg.laneConfig : nullptr;
     const cameraVideoFormat nativeLaneFmt = laneInfo
-        ? laneInfo->videoFormats.at((size_t)laneFmtIdx)
+        ? laneInfo->videoFormats[static_cast<size_t>(laneFmtIdx)]
         : cameraVideoFormat{};
     const uint32_t laneWidth =
         laneConfig && (int)laneConfig->outWidth > 0
@@ -1006,11 +1171,16 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         // Software fatigue-score reset (SIGUSR1; GPIO button later).
-        if (g_resetScore && drvDet) {
+        if (g_resetScore) {
             g_resetScore = 0;
-            drvDet->resetScore();
-            log(dashcam::log::LogLevel::INFO,
-                "fatigue score reset to a fresh session (SIGUSR1)");
+            if (drvDet) {
+                drvDet->resetScore();
+                log(dashcam::log::LogLevel::INFO,
+                    "fatigue score reset to a fresh session (SIGUSR1)");
+            } else {
+                log(dashcam::log::LogLevel::INFO,
+                    "fatigue score reset ignored: driver monitoring is OFF");
+            }
         }
 
         // No GPS/IMU source yet: motion fields stay at defaults, but the

@@ -488,7 +488,7 @@ WifiStatus connectWifi(const WifiConnectConfig& cfg, const dashcam::log::LogCall
  *
  * @c offsetSeconds is (server time − local system time): add it to the local
  * clock to correct it.  @c unixSeconds / @c unixNanos are the server's transmit
- * timestamp in the Unix epoch (the value stepSystemClock() would write).
+ * timestamp in the Unix epoch, exposed for observation and diagnostics.
  */
 struct TimeResult {
     bool        valid            = false;  ///< True only if a well-formed reply was parsed.
@@ -519,23 +519,6 @@ struct TimeResult {
 TimeResult queryTime(const std::string& server = "pool.ntp.org",
                      uint16_t port = 123, int timeoutMs = 3000,
                      const dashcam::log::LogCallback& log = {});
-
-/**
- * @brief Step the system real-time clock to @p t's transmit timestamp.
- *
- * @warning Do not pass a result from plain queryTime() here: SNTP has no
- * cryptographic server authentication.  This low-level helper is retained only
- * for callers whose TimeResult came from an independently authenticated source.
- *
- * Calls clock_settime(CLOCK_REALTIME); this requires CAP_SYS_TIME (root).  The
- * clock jumps rather than slews — intended for a dashcam booting with a wrong /
- * unset RTC, where correct footage and log timestamps matter more than
- * monotonic continuity.
- *
- * @return true on success; false if @p t is invalid or the call is not permitted
- *         (EPERM — run as root), with the reason logged when a callback is given.
- */
-bool stepSystemClock(const TimeResult& t, const dashcam::log::LogCallback& log = {});
 
 } // namespace dashcam::network
 

@@ -17,7 +17,7 @@
 // mode prints P(drowsy) every second — bench-check it once: face the camera
 // with eyes open, then keep them closed for a few seconds.  P(drowsy) must
 // rise while closed; if it falls instead, set positiveIsDrowsy = false.
-// Frames where Viola-Jones finds no face print NO-FACE and the classifier
+// Frames where YuNet finds no face print NO-FACE and the classifier
 // stays idle — the operator must actually be in frame for the bench-check.
 //
 // Video mode feeds a clip through the same detector bin; PASS requires valid

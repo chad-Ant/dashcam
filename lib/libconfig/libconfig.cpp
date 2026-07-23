@@ -284,8 +284,11 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
     readVar(node, n.ntpPort,             log);
     readVar(node, n.ntpTimeoutMs,        log);
     readVar(node, n.ntpRetries,          log);
-    readVar(node, n.ntpStepClock,        log);
-    readVar(node, n.ntpStepThresholdSec, log);
+    if (node.child("NtpStepClock") || node.child("NtpStepThresholdSec"))
+        doLog(log, dashcam::log::LogLevel::WARN,
+              "Network NtpStepClock/NtpStepThresholdSec are obsolete and "
+              "ignored: SNTP is observation-only; configure the host time "
+              "service for clock discipline");
     readVar(node, n.streamEnabled,       log);
     readVar(node, n.streamPort,          log);
     readVar(node, n.streamMaxClients,    log);
@@ -443,8 +446,6 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     writeVar(node, n.ntpPort);
     writeVar(node, n.ntpTimeoutMs);
     writeVar(node, n.ntpRetries);
-    writeVar(node, n.ntpStepClock);
-    writeVar(node, n.ntpStepThresholdSec);
     writeVar(node, n.streamEnabled);
     writeVar(node, n.streamPort);
     writeVar(node, n.streamMaxClients);

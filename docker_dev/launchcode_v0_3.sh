@@ -12,7 +12,7 @@
 #
 # v0.3 = v0.2 (UVC passthrough recording + UFLD v2 lanes on the IMX296) plus
 # DRIVER DROWSINESS MONITORING on a driver-facing UVC camera (libdriverstate:
-# Viola-Jones face crop + binary ResNet18 TRT classifier, 2 Hz).  Alerts are
+# YuNet DNN face crop + binary ResNet18 TRT classifier, 2 Hz).  Alerts are
 # logged at WARN after P(drowsy) holds >= threshold for 2 s.
 #
 # Camera roles: librecord opens its USB camera exclusively, so recording and

@@ -4,8 +4,7 @@
 //   [3] SNTP internet-time query (best-effort — WARN-only if offline)
 //
 // [1] and [2] need no network and must pass; [3] needs internet and only
-// reports.  The system clock is NEVER stepped here (that needs root and would
-// mutate the host); the test only reports what stepSystemClock() would apply.
+// reports.  The library is observation-only and never mutates the system clock.
 //
 // Ctrl-C exits cleanly.  Returns 0 if the loopback tests pass, 1 otherwise.
 
@@ -184,8 +183,8 @@ int main(int argc, char* argv[]) {
               << "                local offset: " << t.offsetSeconds << " s"
               << "  (round-trip " << (t.roundTripSeconds * 1000.0) << " ms)";
             log(LvL::INFO, o.str());
-            log(LvL::INFO, "  stepSystemClock() would set the clock to unix "
-                           + std::to_string(t.unixSeconds) + " (NOT applied — needs root)");
+            log(LvL::INFO, "  SNTP observation timestamp: unix "
+                           + std::to_string(t.unixSeconds) + " (not applied)");
         }
     }
 

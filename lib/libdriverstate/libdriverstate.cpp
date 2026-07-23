@@ -396,7 +396,7 @@ public:
               "driver state detector ready: %ux%u tee -> %s -> model %ux%u, "
               "branch cap %u fps, infer cap %u Hz, threshold %.2f",
               srcW_, srcH_,
-              config_.faceDetection ? "Viola-Jones face crop"
+              config_.faceDetection ? "YuNet DNN face crop"
                                     : "fixed centre crop",
               config_.modelInputW, config_.modelInputH,
               config_.branchMaxFps, config_.targetHz, config_.drowsyThreshold);

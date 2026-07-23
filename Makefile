@@ -118,7 +118,7 @@ V02_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
             $(call make_cu_objs, $(LIBLANE_CU_SRCS))
 
 # dashcam_v0_3: v0.3 app — v0.2 + driver drowsiness monitoring on a UVC camera
-# (libdriverstate: Viola-Jones face crop + TRT classifier; needs TRT + OpenCV)
+# (libdriverstate: YuNet DNN face crop + TRT classifier; needs TRT + OpenCV)
 V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
                 $(LIBLANE_SRCS) $(LIBDSTATE_SRCS) $(LIBNET_SRCS) src/dashcam_v0_3.cpp) \
             $(call make_cu_objs, $(LIBLANE_CU_SRCS) $(LIBDSTATE_CU_SRCS))

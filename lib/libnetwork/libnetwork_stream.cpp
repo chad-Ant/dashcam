@@ -10,6 +10,7 @@
 
 #include "libnetwork.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <string>
@@ -147,6 +148,19 @@ void MediaStreamServer::clientLoop(Client* c) {
 
 void MediaStreamServer::pushFrame(const void* data, size_t len) {
     if (!running_.load() || data == nullptr || len == 0) return;
+
+    // The recording callback runs for every compressed frame even when nobody
+    // is watching.  Avoid a bandwidth-sized heap allocation/copy in that
+    // steady-state case.  A viewer can connect/disconnect after this snapshot;
+    // missing one live frame is acceptable, and the delivery pass below
+    // re-checks each Client under clientsMtx_.
+    {
+        std::lock_guard<std::mutex> lk(clientsMtx_);
+        const bool hasViewer = std::any_of(
+            clients_.begin(), clients_.end(),
+            [](const std::unique_ptr<Client>& c) { return !c->done.load(); });
+        if (!hasViewer) return;
+    }
 
     // Build the framed payload once; every viewer shares it.
     std::shared_ptr<const std::string> payload =

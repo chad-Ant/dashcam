@@ -21,9 +21,8 @@
 #include "libnetwork.h"
 
 #include <arpa/inet.h>   // htonl, ntohl
-#include <ctime>         // clock_gettime, clock_settime, timespec
+#include <ctime>         // clock_gettime, timespec
 
-#include <cerrno>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -168,27 +167,6 @@ TimeResult queryTime(const std::string& server, uint16_t port, int timeoutMs,
     r.unixNanos   = static_cast<uint32_t>(static_cast<double>(txf) / TWO32 * 1e9);
     r.valid       = true;
     return r;
-}
-
-bool stepSystemClock(const TimeResult& t, const dashcam::log::LogCallback& log) {
-    if (!t.valid) {
-        say(log, LvL::WARN, "stepSystemClock: no valid time to apply");
-        return false;
-    }
-    struct timespec ts;
-    ts.tv_sec  = static_cast<time_t>(t.unixSeconds);
-    ts.tv_nsec = static_cast<long>(t.unixNanos);
-
-    if (::clock_settime(CLOCK_REALTIME, &ts) != 0) {
-        int e = errno;
-        say(log, LvL::ERROR, std::string("stepSystemClock: clock_settime failed: ") + std::strerror(e)
-                             + (e == EPERM ? " (needs CAP_SYS_TIME / root)" : ""));
-        return false;
-    }
-    say(log, LvL::INFO, "stepSystemClock: system clock set to " + std::to_string(t.unixSeconds)
-                        + "." + std::to_string(t.unixNanos) + " (offset "
-                        + std::to_string(t.offsetSeconds) + " s)");
-    return true;
 }
 
 } // namespace dashcam::network

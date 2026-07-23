@@ -369,7 +369,7 @@ struct DetectionConfig {
     ConfigVar<int>   driverTargetHz    {"DriverTargetHz",    2,     0,    30,   1,     "Driver-state inference rate cap (Hz)"};
     ConfigVar<int>   driverBranchMaxFps {"DriverBranchMaxFps", 2,   0,    120,  1,     "Driver-state branch inlet frame-rate cap (fps, videorate drop-only); UVC cameras cannot deliver 2 fps natively so the branch drops to it; 0 = uncapped"};
     ConfigVar<float> driverDrowsyThreshold {"DriverDrowsyThreshold", 0.50f, 0.0f, 1.0f, 0.01f, "P(drowsy) at or above which the driver state reports DROWSY"};
-    ConfigVar<bool>  driverFaceDetection {"DriverFaceDetection", true, "Viola-Jones face detect + crop before drowsiness classification (matches the model's face-crop training data); no-face frames skip classification"};
+    ConfigVar<bool>  driverFaceDetection {"DriverFaceDetection", true, "YuNet DNN face detect + crop before drowsiness classification (matches the model's face-crop training data); no-face frames skip classification"};
     ConfigVar<std::string> driverFaceModelPath {"DriverFaceModelPath", "models/face_detection_yunet_2023mar.onnx", "YuNet DNN face-detection model (ONNX) for driver face detection (vendored OpenCV Zoo face_detection_yunet_2023mar); robust to tilted/off-axis faces from a low dashboard mount"};
     ConfigVar<float> driverFaceScore {"DriverFaceScore", 0.60f, 0.0f, 1.0f, 0.01f, "YuNet detection confidence threshold; lower accepts more off-axis faces (fewer no-face dropouts) at the cost of occasional false boxes"};
     ConfigVar<float> driverFaceDetectScale {"DriverFaceDetectScale", 0.5f, 0.25f, 1.0f, 0.05f, "Run YuNet on the frame downscaled by this factor (detection cost ~quadratic, so 0.5 ~= a quarter of the CPU); the classifier still crops from full resolution. Default 0.5 validated to keep 100% recall at a low dashboard mount; 1.0 = no downscale"};
@@ -408,13 +408,10 @@ struct DriverScoreConfig {
  * @brief Internet connectivity (libnetwork) parameters.
  * XML section: @c \<Network\>
  *
- * Phase 1 exposes the SNTP time-sync tunables consumed by
- * dashcam::network::queryTime() / stepSystemClock() — a dashcam that boots with a
- * wrong or unset RTC can correct its clock so footage and log timestamps are
- * right.  Video-streaming fields are added to this section when that transport
- * lands.  libnetwork itself does not depend on libconfig (that would be circular
- * once libconfig grows a streaming dependency); the application copies these
- * values into the plain arguments queryTime()/stepSystemClock() take.
+ * The SNTP fields feed dashcam::network::queryTime() for startup clock-health
+ * telemetry only.  Plain SNTP is not authenticated, so the app never applies a
+ * reply to the privileged system clock; clock discipline belongs to the host
+ * time service.  libnetwork itself does not depend on libconfig.
  */
 struct NetworkConfig {
     // WiFi bring-up at startup: ask NetworkManager to connect to the SSID; if it
@@ -424,13 +421,11 @@ struct NetworkConfig {
     ConfigVar<int>         wifiTimeoutSec      {"WifiTimeoutSec",      20, 5, 120, 1, "Seconds to wait for the WiFi association before declaring offline"};
     ConfigVar<bool>        wifiRequireInternet {"WifiRequireInternet", false, "Require full internet connectivity (not just WiFi association) to count as online"};
 
-    ConfigVar<bool>        timeSyncEnabled {"TimeSyncEnabled", true, "Query an internet time server (SNTP) at startup to correct footage/log timestamps"};
+    ConfigVar<bool>        timeSyncEnabled {"TimeSyncEnabled", true, "Query an internet time server (SNTP) at startup and log the clock offset; does not change the system clock"};
     ConfigVar<std::string> ntpServer       {"NtpServer",       "pool.ntp.org", "SNTP/NTP time server hostname or IP"};
     ConfigVar<int>         ntpPort         {"NtpPort",         123,   1,   65535, 1,   "SNTP/NTP server UDP port (123 = standard NTP)"};
     ConfigVar<int>         ntpTimeoutMs    {"NtpTimeoutMs",    3000,  100, 30000, 100, "Per-attempt wait for the SNTP reply (ms)"};
     ConfigVar<int>         ntpRetries      {"NtpRetries",      2,     0,   10,    1,   "Extra SNTP attempts after the first when no reply arrives (total tries = 1 + this)"};
-    ConfigVar<bool>        ntpStepClock    {"NtpStepClock",    false, "Step the system clock to the server time (needs root/CAP_SYS_TIME); false = query and log the offset only"};
-    ConfigVar<float>       ntpStepThresholdSec {"NtpStepThresholdSec", 0.5f, 0.0f, 86400.0f, 0.1f, "Only step the clock when |offset| exceeds this many seconds (avoids churning the clock for sub-second drift)"};
 
     // Live video streaming of the recording camera's precompressed feed (the
     // direct libnetwork MediaStreamServer path).  The wire format is chosen

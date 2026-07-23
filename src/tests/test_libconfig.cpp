@@ -143,8 +143,6 @@ static bool test_roundtrip() {
     src.network.ntpPort             = 1230;
     src.network.ntpTimeoutMs        = 5000;
     src.network.ntpRetries          = 4;
-    src.network.ntpStepClock        = true;
-    src.network.ntpStepThresholdSec = 2.5f;
     src.network.streamEnabled       = true;
     src.network.streamPort          = 9000;
     src.network.streamMaxClients    = 8;
@@ -252,8 +250,6 @@ static bool test_roundtrip() {
     check(dst.network.ntpPort == 1230,                   "network.ntpPort round-trip");
     check(dst.network.ntpTimeoutMs == 5000,              "network.ntpTimeoutMs round-trip");
     check(dst.network.ntpRetries == 4,                   "network.ntpRetries round-trip");
-    check(dst.network.ntpStepClock == true,              "network.ntpStepClock round-trip");
-    check(eq(dst.network.ntpStepThresholdSec, 2.5f),     "network.ntpStepThresholdSec round-trip");
     check(dst.network.streamEnabled == true,             "network.streamEnabled round-trip");
     check(dst.network.streamPort == 9000,                "network.streamPort round-trip");
     check(dst.network.streamMaxClients == 8,             "network.streamMaxClients round-trip");
@@ -261,6 +257,14 @@ static bool test_roundtrip() {
     check(dst.network.rtpHost == "192.168.1.42",         "network.rtpHost round-trip");
     check(dst.network.rtpPort == 5602,                   "network.rtpPort round-trip");
     check(dst.network.rtpBitrateKbps == 6000,            "network.rtpBitrateKbps round-trip");
+    {
+        std::ifstream saved(tmpFile);
+        const std::string xml((std::istreambuf_iterator<char>(saved)),
+                              std::istreambuf_iterator<char>());
+        check(xml.find("NtpStepClock") == std::string::npos &&
+              xml.find("NtpStepThresholdSec") == std::string::npos,
+              "obsolete SNTP clock-step controls are not serialized");
+    }
 
     check(dst.cameras.size() == 2,            "cameras count == 2");
     if (dst.cameras.size() >= 2) {
