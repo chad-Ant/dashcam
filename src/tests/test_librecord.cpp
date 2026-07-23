@@ -11,12 +11,14 @@
 #include "libcamera.h"
 #include "libconfig.h"
 #include "liblog.h"
+#include "libnetwork.h"
 #include "librecord.h"
 
 #include <linux/videodev2.h>
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -25,12 +27,28 @@
 #include <vector>
 
 using namespace dashcam::camera;
-namespace fs = std::filesystem;
+namespace fs  = std::filesystem;
+namespace net = dashcam::network;
 
 static int  g_fails = 0;
 static void check(bool ok, const std::string& what) {
     std::cout << (ok ? "  ok    " : "  FAIL  ") << what << "\n";
     if (!ok) ++g_fails;
+}
+
+// Read from a connected socket until the peer goes idle or the window elapses.
+static std::string drainSock(net::TcpSocket& s, int totalMs) {
+    std::string acc;
+    char buf[8192];
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(totalMs);
+    while (std::chrono::steady_clock::now() < end) {
+        size_t got = 0;
+        net::IoStatus st = s.recv(buf, sizeof(buf), 150, got);
+        if (st == net::IoStatus::Ok)          acc.append(buf, got);
+        else if (st == net::IoStatus::Timeout) { if (!acc.empty()) break; }
+        else                                   break;
+    }
+    return acc;
 }
 
 static int64_t epochMs() {
@@ -99,7 +117,24 @@ int main(int argc, char* argv[]) {
     rf.v4l2PixFmt = f.pixelFormat;
     rf.width = f.width; rf.height = f.height; rf.fps = f.frameRate;
 
+    // Live-stream tap: fan the camera's own compressed frames to a viewer while
+    // recording, validating the librecord tee/appsink → MediaStreamServer path.
+    const bool mjpeg = f.pixelFormat == V4L2_PIX_FMT_MJPEG;
+    net::MediaStreamServer streamSrv;
+    net::StreamServerConfig sc;
+    sc.port = 0;
+    sc.wire = mjpeg ? net::StreamWire::MjpegHttp : net::StreamWire::RawTcp;
+    bool streamStarted = streamSrv.start(sc, log);
+    check(streamStarted, "stream server started");
+    if (streamStarted)
+        rec.setCompressedFrameCallback(
+            [&](const uint8_t* d, size_t n, bool) { streamSrv.pushFrame(d, n); });
+
     check(rec.startRecording(usb->address, rf, mkv), "startRecording OK");
+
+    // Connect a viewer once recording is under way.
+    net::TcpSocket viewer;
+    bool vconn = streamStarted && viewer.connect("127.0.0.1", streamSrv.port(), 1000, log);
 
     // Telemetry: live clock + a speed ramp so consecutive samples differ.
     for (int t = 0; t < seconds * 5 && rec.isRecording(); ++t) {
@@ -111,7 +146,19 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     check(rec.isRecording(), "session healthy for the whole run");
+
+    // The viewer should have received live frames from the camera through the tap.
+    std::string vs = drainSock(viewer, 1500);
+    bool gotFrames = mjpeg
+        ? (vs.find("Content-Type: image/jpeg") != std::string::npos &&
+           vs.find(std::string("\xFF\xD8", 2)) != std::string::npos)   // JPEG SOI
+        : (vconn && vs.size() > 1024);
+    check(vconn, "stream viewer connected");
+    check(gotFrames, "stream viewer received live compressed frames via the tap");
+    check(streamStarted && streamSrv.clientCount() >= 1, "server still has the viewer");
+
     rec.stopRecording();
+    streamSrv.stop();
 
     check(fs::exists(mkv) && fs::file_size(mkv) > 100 * 1024,
           "MKV exists and is non-trivial");

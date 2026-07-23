@@ -23,6 +23,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/liblanedetector \
             -Ilib/liblog \
             -Ilib/libmidi \
+            -Ilib/libnetwork \
             -Ilib/librecord \
             -Ilib/libspi \
             -Ilib/libstereocam \
@@ -62,6 +63,9 @@ LIBCAN_SRCS    := lib/libcan/libcan.cpp
 LIBGPIO_SRCS   := lib/libgpio/libgpio.cpp
 LIBI2C_SRCS    := lib/libi2c/libi2c.cpp
 LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
+LIBNET_SRCS    := lib/libnetwork/libnetwork.cpp lib/libnetwork/libnetwork_ntp.cpp \
+                  lib/libnetwork/libnetwork_stream.cpp lib/libnetwork/libnetwork_rtp.cpp \
+                  lib/libnetwork/libnetwork_wifi.cpp
 LIBSPI_SRCS    := lib/libspi/libspi.cpp
 LIBUART_SRCS   := lib/libuart/libuart.cpp
 LIBLOG_SRCS    := lib/liblog/liblog.cpp
@@ -101,7 +105,7 @@ USB_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) src/t
 
 # record_test: UVC compressed-passthrough recording + ASS telemetry sidecar
 REC_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
-                src/tests/test_librecord.cpp)
+                $(LIBNET_SRCS) src/tests/test_librecord.cpp)
 
 # RETIRED with the librecord redesign (Cairo overlay + x264 branch recording
 # removed): recording_and_safe_shutdown, test_dual_recording,
@@ -116,7 +120,7 @@ V02_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
 # dashcam_v0_3: v0.3 app — v0.2 + driver drowsiness monitoring on a UVC camera
 # (libdriverstate: Viola-Jones face crop + TRT classifier; needs TRT + OpenCV)
 V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
-                $(LIBLANE_SRCS) $(LIBDSTATE_SRCS) src/dashcam_v0_3.cpp) \
+                $(LIBLANE_SRCS) $(LIBDSTATE_SRCS) $(LIBNET_SRCS) src/dashcam_v0_3.cpp) \
             $(call make_cu_objs, $(LIBLANE_CU_SRCS) $(LIBDSTATE_CU_SRCS))
 
 # scan_cameras: enumerate all V4L2 devices
@@ -137,6 +141,9 @@ WRITECFG_OBJS := $(call make_objs, $(LIBCFG_SRCS) src/tools/write_default_config
 
 # can_test: SocketCAN send/receive loopback test
 CAN_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAN_SRCS) src/tests/can_test.cpp)
+
+# network_test: TCP/UDP socket loopback + SNTP internet-time smoke test
+NET_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBNET_SRCS) src/tests/test_libnetwork.cpp)
 
 # gpio_test: GPIO / UART / I2C / SPI hardware interface test
 GPIO_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBGPIO_SRCS) $(LIBUART_SRCS) \
@@ -159,7 +166,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
 # Always compile these; no VPI dependency.
 BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(SCAN_OBJS) \
                     $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
-                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS))
+                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS))
 
 ifneq ($(VPI_HDRS),)
 ALL_OBJS := $(sort $(BASE_OBJS) $(DASHCAM_OBJS))
@@ -180,6 +187,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
+           $(BUILD_DIR)/network_test \
            $(BUILD_DIR)/gpio_test \
            $(BUILD_DIR)/midi_test \
            $(BUILD_DIR)/liblog_test \
@@ -243,6 +251,9 @@ $(BUILD_DIR)/config_test: $(CFG_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/can_test: $(CAN_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/network_test: $(NET_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/gpio_test: $(GPIO_OBJS)

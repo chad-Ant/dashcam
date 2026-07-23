@@ -405,6 +405,52 @@ struct DriverScoreConfig {
 };
 
 /**
+ * @brief Internet connectivity (libnetwork) parameters.
+ * XML section: @c \<Network\>
+ *
+ * Phase 1 exposes the SNTP time-sync tunables consumed by
+ * dashcam::network::queryTime() / stepSystemClock() — a dashcam that boots with a
+ * wrong or unset RTC can correct its clock so footage and log timestamps are
+ * right.  Video-streaming fields are added to this section when that transport
+ * lands.  libnetwork itself does not depend on libconfig (that would be circular
+ * once libconfig grows a streaming dependency); the application copies these
+ * values into the plain arguments queryTime()/stepSystemClock() take.
+ */
+struct NetworkConfig {
+    // WiFi bring-up at startup: ask NetworkManager to connect to the SSID; if it
+    // cannot be fulfilled the app runs in offline mode (no time-sync, no streaming).
+    ConfigVar<bool>        wifiConnectEnabled  {"WifiConnectEnabled",  true, "Ask the OS (NetworkManager) to connect to the WiFi SSID at startup; on failure, run offline"};
+    ConfigVar<std::string> wifiSsid            {"WifiSsid",            "",   "Target WiFi SSID; empty = reconnect to the current/last-used SSID"};
+    ConfigVar<int>         wifiTimeoutSec      {"WifiTimeoutSec",      20, 5, 120, 1, "Seconds to wait for the WiFi association before declaring offline"};
+    ConfigVar<bool>        wifiRequireInternet {"WifiRequireInternet", false, "Require full internet connectivity (not just WiFi association) to count as online"};
+
+    ConfigVar<bool>        timeSyncEnabled {"TimeSyncEnabled", true, "Query an internet time server (SNTP) at startup to correct footage/log timestamps"};
+    ConfigVar<std::string> ntpServer       {"NtpServer",       "pool.ntp.org", "SNTP/NTP time server hostname or IP"};
+    ConfigVar<int>         ntpPort         {"NtpPort",         123,   1,   65535, 1,   "SNTP/NTP server UDP port (123 = standard NTP)"};
+    ConfigVar<int>         ntpTimeoutMs    {"NtpTimeoutMs",    3000,  100, 30000, 100, "Per-attempt wait for the SNTP reply (ms)"};
+    ConfigVar<int>         ntpRetries      {"NtpRetries",      2,     0,   10,    1,   "Extra SNTP attempts after the first when no reply arrives (total tries = 1 + this)"};
+    ConfigVar<bool>        ntpStepClock    {"NtpStepClock",    false, "Step the system clock to the server time (needs root/CAP_SYS_TIME); false = query and log the offset only"};
+    ConfigVar<float>       ntpStepThresholdSec {"NtpStepThresholdSec", 0.5f, 0.0f, 86400.0f, 0.1f, "Only step the clock when |offset| exceeds this many seconds (avoids churning the clock for sub-second drift)"};
+
+    // Live video streaming of the recording camera's precompressed feed (the
+    // direct libnetwork MediaStreamServer path).  The wire format is chosen
+    // automatically from the camera's pixel format: MJPEG → browser-viewable
+    // HTTP multipart at http://<ip>:<port>/ ; H.264 → raw TCP (ffplay tcp://).
+    ConfigVar<bool>        streamEnabled    {"StreamEnabled",    false, "Serve the recording camera's compressed feed over the network for live viewing (MJPEG: open http://<device-ip>:<StreamPort>/ in a browser)"};
+    ConfigVar<int>         streamPort       {"StreamPort",       8090,  1, 65535, 1, "TCP port for the live video stream"};
+    ConfigVar<int>         streamMaxClients {"StreamMaxClients", 4,     1, 32,    1, "Maximum simultaneous stream viewers"};
+
+    // H.264-over-RTP streaming of the INFERENCE camera feeds (raw → x264enc →
+    // rtph264pay → udpsink; software-encoded, extra CPU).  The lane/road camera
+    // streams to RtpPort and the driver camera to RtpPort+2 (see viewer hint in
+    // the log).  Receive with, e.g., gst-launch udpsrc / ffplay on an SDP.
+    ConfigVar<bool>        rtpEnabled     {"RtpEnabled",     false,        "Stream the inference camera feeds as H.264 over RTP/UDP (software-encoded — extra CPU)"};
+    ConfigVar<std::string> rtpHost        {"RtpHost",        "127.0.0.1",  "RTP/UDP destination: a viewer's unicast IP or a multicast group"};
+    ConfigVar<int>         rtpPort        {"RtpPort",        5600,  1, 65531, 1, "Base RTP/UDP destination port (lane cam = RtpPort, driver cam = RtpPort+2)"};
+    ConfigVar<int>         rtpBitrateKbps {"RtpBitrateKbps", 4000,  200, 50000, 100, "x264 target bitrate for RTP streaming (kbps)"};
+};
+
+/**
  * @brief Aggregated application configuration.
  * Root XML element: @c \<DashcamConfig\>
  */
@@ -418,6 +464,7 @@ struct AppConfig {
     DetectionConfig           detection;
     DriverScoreConfig         driverScore;
     LogConfig                 log;
+    NetworkConfig             network;
 };
 
 // ─── reader / writer ─────────────────────────────────────────────────────────

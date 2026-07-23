@@ -134,6 +134,25 @@ static bool test_roundtrip() {
     src.driverScore.acuteAlertSec      = 3.0f;
     src.driverScore.noFaceFreezes      = false;
 
+    src.network.wifiConnectEnabled  = false;
+    src.network.wifiSsid            = "MyDashcamNet";
+    src.network.wifiTimeoutSec      = 30;
+    src.network.wifiRequireInternet = true;
+    src.network.timeSyncEnabled     = false;
+    src.network.ntpServer           = "time.cloudflare.com";
+    src.network.ntpPort             = 1230;
+    src.network.ntpTimeoutMs        = 5000;
+    src.network.ntpRetries          = 4;
+    src.network.ntpStepClock        = true;
+    src.network.ntpStepThresholdSec = 2.5f;
+    src.network.streamEnabled       = true;
+    src.network.streamPort          = 9000;
+    src.network.streamMaxClients    = 8;
+    src.network.rtpEnabled          = true;
+    src.network.rtpHost             = "192.168.1.42";
+    src.network.rtpPort             = 5602;
+    src.network.rtpBitrateKbps      = 6000;
+
     CameraConfig csi;
     csi.name        = "front";
     csi.type        = "CSI";
@@ -223,6 +242,25 @@ static bool test_roundtrip() {
     check(eq(dst.driverScore.fatigueSustainSec, 120.0f), "driverScore.fatigueSustainSec round-trip");
     check(eq(dst.driverScore.acuteAlertSec, 3.0f),       "driverScore.acuteAlertSec round-trip");
     check(dst.driverScore.noFaceFreezes == false,        "driverScore.noFaceFreezes round-trip");
+
+    check(dst.network.wifiConnectEnabled == false,       "network.wifiConnectEnabled round-trip");
+    check(dst.network.wifiSsid == "MyDashcamNet",        "network.wifiSsid round-trip");
+    check(dst.network.wifiTimeoutSec == 30,              "network.wifiTimeoutSec round-trip");
+    check(dst.network.wifiRequireInternet == true,       "network.wifiRequireInternet round-trip");
+    check(dst.network.timeSyncEnabled == false,          "network.timeSyncEnabled round-trip");
+    check(dst.network.ntpServer == "time.cloudflare.com","network.ntpServer round-trip");
+    check(dst.network.ntpPort == 1230,                   "network.ntpPort round-trip");
+    check(dst.network.ntpTimeoutMs == 5000,              "network.ntpTimeoutMs round-trip");
+    check(dst.network.ntpRetries == 4,                   "network.ntpRetries round-trip");
+    check(dst.network.ntpStepClock == true,              "network.ntpStepClock round-trip");
+    check(eq(dst.network.ntpStepThresholdSec, 2.5f),     "network.ntpStepThresholdSec round-trip");
+    check(dst.network.streamEnabled == true,             "network.streamEnabled round-trip");
+    check(dst.network.streamPort == 9000,                "network.streamPort round-trip");
+    check(dst.network.streamMaxClients == 8,             "network.streamMaxClients round-trip");
+    check(dst.network.rtpEnabled == true,                "network.rtpEnabled round-trip");
+    check(dst.network.rtpHost == "192.168.1.42",         "network.rtpHost round-trip");
+    check(dst.network.rtpPort == 5602,                   "network.rtpPort round-trip");
+    check(dst.network.rtpBitrateKbps == 6000,            "network.rtpBitrateKbps round-trip");
 
     check(dst.cameras.size() == 2,            "cameras count == 2");
     if (dst.cameras.size() >= 2) {

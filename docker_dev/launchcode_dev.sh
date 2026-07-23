@@ -10,8 +10,11 @@ echo "Booting Machine Vision Environment: $IMAGE_NAME..."
 docker run -it --rm --network=host --privileged --ipc=host \
     --runtime nvidia \
     -w $INIT_DIR \
+    -e DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
     -v /dev:/dev \
     -v /tmp/argus_socket:/tmp/argus_socket \
+    -v /run/dbus:/run/dbus \
+    -v /run/NetworkManager:/run/NetworkManager \
     -v $SRC_DIR:/user/dashcam \
     -v $MEDIA_DIR/configs:/user/output/configs \
     -v $MEDIA_DIR/footage:/user/output/footage \

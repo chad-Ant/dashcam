@@ -38,8 +38,11 @@ docker run -it --rm --network=host --privileged --ipc=host \
     --runtime nvidia \
     -w $INIT_DIR \
     -e TZ="$HOST_TZ" \
+    -e DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
     -v /dev:/dev \
     -v /tmp/argus_socket:/tmp/argus_socket \
+    -v /run/dbus:/run/dbus \
+    -v /run/NetworkManager:/run/NetworkManager \
     -v $SRC_DIR:/user/dashcam \
     -v $MEDIA_DIR/configs:/user/output/configs \
     -v $MEDIA_DIR/footage:/user/output/footage \

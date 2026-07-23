@@ -273,6 +273,28 @@ static void parseDetection(pugi::xml_node node, DetectionConfig& d,
     readVar(node, d.driverFaceDetectScale, log);
 }
 
+static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
+                         const dashcam::log::LogCallback& log) {
+    readVar(node, n.wifiConnectEnabled,  log);
+    readVar(node, n.wifiSsid,            log);
+    readVar(node, n.wifiTimeoutSec,      log);
+    readVar(node, n.wifiRequireInternet, log);
+    readVar(node, n.timeSyncEnabled,     log);
+    readVar(node, n.ntpServer,           log);
+    readVar(node, n.ntpPort,             log);
+    readVar(node, n.ntpTimeoutMs,        log);
+    readVar(node, n.ntpRetries,          log);
+    readVar(node, n.ntpStepClock,        log);
+    readVar(node, n.ntpStepThresholdSec, log);
+    readVar(node, n.streamEnabled,       log);
+    readVar(node, n.streamPort,          log);
+    readVar(node, n.streamMaxClients,    log);
+    readVar(node, n.rtpEnabled,          log);
+    readVar(node, n.rtpHost,             log);
+    readVar(node, n.rtpPort,             log);
+    readVar(node, n.rtpBitrateKbps,      log);
+}
+
 static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
                              const dashcam::log::LogCallback& log) {
     readVar(node, s.scoreInitial,       log);
@@ -410,6 +432,28 @@ static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
     writeVar(n, d.driverFaceDetectScale);
 }
 
+static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
+    pugi::xml_node node = parent.append_child("Network");
+    writeVar(node, n.wifiConnectEnabled);
+    writeVar(node, n.wifiSsid);
+    writeVar(node, n.wifiTimeoutSec);
+    writeVar(node, n.wifiRequireInternet);
+    writeVar(node, n.timeSyncEnabled);
+    writeVar(node, n.ntpServer);
+    writeVar(node, n.ntpPort);
+    writeVar(node, n.ntpTimeoutMs);
+    writeVar(node, n.ntpRetries);
+    writeVar(node, n.ntpStepClock);
+    writeVar(node, n.ntpStepThresholdSec);
+    writeVar(node, n.streamEnabled);
+    writeVar(node, n.streamPort);
+    writeVar(node, n.streamMaxClients);
+    writeVar(node, n.rtpEnabled);
+    writeVar(node, n.rtpHost);
+    writeVar(node, n.rtpPort);
+    writeVar(node, n.rtpBitrateKbps);
+}
+
 static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) {
     pugi::xml_node n = parent.append_child("DriverScore");
     writeVar(n, s.scoreInitial);
@@ -462,6 +506,7 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
     if (auto ds  = root.child("DriverScore"))
         parseDriverScore(ds, config.driverScore, log);
     if (auto lg  = root.child("Log"))       parseLog      (lg,  config.log,       log);
+    if (auto net = root.child("Network"))   parseNetwork  (net, config.network,   log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
@@ -498,6 +543,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writeDetection(root, config.detection);
     writeDriverScore(root, config.driverScore);
     writeLog(root, config.log);
+    writeNetwork(root, config.network);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {
         doLog(log, dashcam::log::LogLevel::ERROR,

@@ -36,6 +36,15 @@ RUN apt-get update && apt-get install -y \
     libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# nmcli (from network-manager) lets the dashcam ask the OS to connect to WiFi at
+# startup (libnetwork connectWifi).  It talks to the HOST's NetworkManager over
+# the D-Bus socket the launchcode_*.sh scripts mount (-v /run/dbus, -v
+# /run/NetworkManager); the container does NOT run its own NM service.  Kept in a
+# separate layer so it does not invalidate the large build-tooling layer above.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    network-manager \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /home/app
 
 CMD ["/bin/bash"]

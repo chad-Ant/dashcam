@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 
 namespace dashcam::record {
@@ -71,6 +72,30 @@ void Recorder::setOverlayConfig(const dashcam::config::OverlayConfig& cfg) {
 
 void Recorder::setLogCallback(dashcam::log::LogCallback cb) {
     log_ = std::move(cb);
+}
+
+void Recorder::setCompressedFrameCallback(CompressedFrameCallback cb) {
+    frameCb_ = std::move(cb);
+}
+
+// ─── live-stream tap: appsink new-sample handler ──────────────────────────────
+
+GstFlowReturn Recorder::onNewSample(GstAppSink* sink, gpointer user) {
+    auto* self = static_cast<Recorder*>(user);
+    GstSample* sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_OK;
+
+    GstBuffer* buf = gst_sample_get_buffer(sample);
+    if (buf && self->frameCb_) {
+        GstMapInfo map;
+        if (gst_buffer_map(buf, &map, GST_MAP_READ)) {
+            const bool keyframe = !GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
+            self->frameCb_(map.data, map.size, keyframe);
+            gst_buffer_unmap(buf, &map);
+        }
+    }
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
 }
 
 // ─── ASS sidecar ──────────────────────────────────────────────────────────────
@@ -282,24 +307,49 @@ bool Recorder::startRecording(const std::string& devicePath,
     gint frNum = 30, frDen = 1;
     gst_util_double_to_fraction(static_cast<double>(fmt.fps), &frNum, &frDen);
 
-    std::string desc = "v4l2src name=camerasrc device=" + devicePath;
+    const bool streaming = static_cast<bool>(frameCb_);
+
+    // Common source + caps (+ MJPEG rate cap); everything downstream of this is
+    // where the record and (optional) stream branches diverge.
+    std::string trunk = "v4l2src name=camerasrc device=" + devicePath;
     if (mjpeg) {
-        desc += " ! image/jpeg, width=" + std::to_string(fmt.width) +
-                ", height=" + std::to_string(fmt.height) +
-                ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen);
+        trunk += " ! image/jpeg, width=" + std::to_string(fmt.width) +
+                 ", height=" + std::to_string(fmt.height) +
+                 ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen);
         // MJPEG frames are intra-only: dropping them to cap the rate is safe.
         if (maxFps > 0 && static_cast<float>(maxFps) < fmt.fps)
-            desc += " ! videorate drop-only=true max-rate=" + std::to_string(maxFps);
+            trunk += " ! videorate drop-only=true max-rate=" + std::to_string(maxFps);
     } else {
-        desc += " ! video/x-h264, width=" + std::to_string(fmt.width) +
-                ", height=" + std::to_string(fmt.height) +
-                ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
-                " ! h264parse";
+        trunk += " ! video/x-h264, width=" + std::to_string(fmt.width) +
+                 ", height=" + std::to_string(fmt.height) +
+                 ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen);
     }
-    desc += " ! queue max-size-buffers=8 leaky=0"
-            " ! matroskamux offset-to-zero=true"
-            " ! filesink name=fsink sync=false async=false location=\"" +
-            filename + "\"";
+
+    // Record branch: (H264 needs h264parse for matroskamux) → queue → mux → file.
+    // Kept byte-identical to the pre-streaming pipeline when no tap is attached.
+    const std::string recBranch =
+        std::string(h264 ? " ! h264parse" : "") +
+        " ! queue max-size-buffers=8 leaky=0"
+        " ! matroskamux offset-to-zero=true"
+        " ! filesink name=fsink sync=false async=false location=\"" + filename + "\"";
+
+    std::string desc;
+    if (!streaming) {
+        desc = trunk + recBranch;
+    } else {
+        // tee fans identical buffers to both branches.  The stream branch has its
+        // OWN queue (leaky=downstream → drop old frames, never backpressure the
+        // recording) and, for H.264, its own h264parse producing an Annex-B
+        // byte-stream with in-band SPS/PPS (config-interval=-1) so a viewer that
+        // joins mid-stream can decode.  drop=true on the appsink is a second guard.
+        desc  = trunk + " ! tee name=rectee";
+        desc += " rectee." + recBranch;
+        desc += " rectee. ! queue max-size-buffers=4 leaky=downstream";
+        if (h264)
+            desc += " ! h264parse config-interval=-1"
+                    " ! video/x-h264, stream-format=byte-stream, alignment=au";
+        desc += " ! appsink name=streamsink emit-signals=false sync=false max-buffers=4 drop=true";
+    }
 
     doLog(log_, dashcam::log::LogLevel::INFO, "recording pipeline: %s", desc.c_str());
 
@@ -316,6 +366,23 @@ bool Recorder::startRecording(const std::string& devicePath,
     videoW_       = fmt.width;
     videoH_       = fmt.height;
     eosTimeoutMs_ = eosTimeoutMs;
+
+    // Attach the live-stream tap: pull each compressed frame off the appsink and
+    // forward it to frameCb_.  set_callbacks() does not take ownership of the
+    // element, so release the ref gst_bin_get_by_name() added.
+    if (streaming) {
+        GstElement* appsink = gst_bin_get_by_name(GST_BIN(pipeline_), "streamsink");
+        if (appsink) {
+            GstAppSinkCallbacks cbs;
+            std::memset(&cbs, 0, sizeof(cbs));
+            cbs.new_sample = &Recorder::onNewSample;
+            gst_app_sink_set_callbacks(GST_APP_SINK(appsink), &cbs, this, nullptr);
+            gst_object_unref(appsink);
+        } else {
+            doLog(log_, dashcam::log::LogLevel::WARN,
+                  "stream tap: appsink 'streamsink' not found — recording without streaming");
+        }
+    }
 
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING)
             == GST_STATE_CHANGE_FAILURE) {

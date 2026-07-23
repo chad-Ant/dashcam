@@ -57,11 +57,13 @@
 #include "libdriverstate.h"
 #include "liblanedetector.h"
 #include "liblog.h"
+#include "libnetwork.h"
 #include "librecord.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -141,6 +143,78 @@ makeLogParams(const dashcam::config::LogConfig& l) {
     lp.level         = l.level;
     lp.flushOn       = l.flushOn;
     return lp;
+}
+
+// Query internet time (SNTP) and optionally step the system clock, per the
+// <Network> config.  Called BEFORE log::init() so the corrected clock is in
+// effect when the log file is named and before any footage timestamps are
+// stamped; its own progress is logged through the pre-init callback (stderr,
+// like the config-load messages).  Returns a one-line outcome the caller logs
+// to the file after init(), so the persistent log still records what happened.
+static std::string syncSystemTime(const dashcam::config::NetworkConfig& net,
+                                  const dashcam::log::LogCallback& log) {
+    using LvL = dashcam::log::LogLevel;
+    namespace nw = dashcam::network;
+
+    if (!net.timeSyncEnabled) {
+        log(LvL::INFO, "time sync: disabled (<Network><TimeSyncEnabled> = false)");
+        return "time sync: disabled";
+    }
+
+    const std::string server = net.ntpServer;
+    const int tries = 1 + std::max(0, (int)net.ntpRetries);
+    nw::TimeResult t;
+    for (int i = 0; i < tries && !t.valid; ++i) {
+        if (i > 0)
+            log(LvL::INFO, "time sync: retry " + std::to_string(i) + "/" +
+                           std::to_string(tries - 1) + " to " + server);
+        t = nw::queryTime(server, static_cast<uint16_t>((int)net.ntpPort),
+                          (int)net.ntpTimeoutMs, log);
+    }
+
+    if (!t.valid) {
+        log(LvL::WARN, "time sync: no NTP reply from " + server + " after " +
+                       std::to_string(tries) + " attempt(s); keeping current clock");
+        return "time sync: FAILED (" + server + ", " + std::to_string(tries) + " tries)";
+    }
+
+    char off[48];
+    std::snprintf(off, sizeof(off), "%+.3f", t.offsetSeconds);
+    const std::string base = "time sync: " + server + " offset " + off + " s";
+
+    if (!net.ntpStepClock) {
+        log(LvL::INFO, base + " (NtpStepClock=false; clock unchanged)");
+        return base + " (not stepped)";
+    }
+    if (std::fabs(t.offsetSeconds) <= (double)(float)net.ntpStepThresholdSec) {
+        char thr[32];
+        std::snprintf(thr, sizeof(thr), "%.3f", (double)(float)net.ntpStepThresholdSec);
+        log(LvL::INFO, base + " within threshold " + thr + " s; clock unchanged");
+        return base + " (within threshold)";
+    }
+    // stepSystemClock() logs its own success / EPERM(need-root) detail.
+    if (nw::stepSystemClock(t, log))
+        return base + " -> clock stepped";
+    return base + " -> STEP FAILED (need root/CAP_SYS_TIME?)";
+}
+
+// Build an H.264-over-RTP output branch bin from an RtpSession description, ready
+// for Camera_GST::addBranch().  gst_parse_bin_from_description ghosts the head
+// element's sink pad so the tee's queue/valve can link to it.  Returns nullptr on
+// a parse failure (the caller then simply runs without the RTP stream).
+static GstElement* makeRtpBranchBin(const dashcam::network::RtpSession& rtp, bool nvmm,
+                                    float fps, const dashcam::log::LogCallback& log) {
+    GError* err = nullptr;
+    const std::string desc = rtp.branchDescription(nvmm, fps);
+    GstElement* bin = gst_parse_bin_from_description(desc.c_str(), TRUE, &err);
+    if (!bin || err) {
+        log(dashcam::log::LogLevel::ERROR,
+            std::string("RTP branch parse failed (streaming off): ") + (err ? err->message : "?"));
+        if (err) g_error_free(err);
+        if (bin) gst_object_unref(bin);
+        return nullptr;
+    }
+    return bin;
 }
 
 static dashcam::lane::LaneDetectorConfig
@@ -451,11 +525,43 @@ int main(int argc, char* argv[]) {
     if (!dashcam::config::ConfigReader::loadOrCreate(configsDir + "/dashcam.xml", cfg, log))
         log(dashcam::log::LogLevel::WARN, "config load/create failed; using defaults");
 
+    // WiFi bring-up BEFORE anything network-dependent: ask the OS (NetworkManager)
+    // to connect to the SSID.  If it cannot be fulfilled we run in OFFLINE MODE —
+    // no internet time-sync, no network streaming.  Detail goes to stderr like the
+    // other pre-init startup steps; the summary is logged after init().
+    bool offline = false;
+    std::string wifiSummary;
+    {
+        dashcam::network::WifiConnectConfig wc;
+        wc.enabled         = cfg.network.wifiConnectEnabled;
+        wc.ssid            = (std::string)cfg.network.wifiSsid;
+        wc.timeoutSec      = (int)cfg.network.wifiTimeoutSec;
+        wc.requireInternet = cfg.network.wifiRequireInternet;
+        if (wc.enabled) {
+            dashcam::network::WifiStatus ws = dashcam::network::connectWifi(wc, log);
+            offline = (ws.state == dashcam::network::ConnectivityState::Offline);
+            wifiSummary = offline ? ("network: OFFLINE MODE — " + ws.detail)
+                                  : ("network: ONLINE (WiFi '" + ws.ssid + "')");
+        } else {
+            wifiSummary = "network: WiFi auto-connect disabled (assuming network present)";
+        }
+    }
+
+    // Internet time sync BEFORE log::init(), so a Jetson that booted with a
+    // wrong/unset RTC names its log file — and stamps all footage — with the
+    // corrected clock (detail goes to stderr; the summary is logged below).
+    // Skipped in offline mode (there is no internet to reach).
+    const std::string timeSyncSummary =
+        offline ? std::string("time sync: skipped (offline mode)")
+                : syncSystemTime(cfg.network, log);
+
     const std::string logDir = dashcam::config::resolveStorageDir(
         dashcam::config::kDefaultLogDir, dashcam::config::kFallbackLogName, log);
     dashcam::log::init(logDir, makeLogParams(cfg.log));
     log(dashcam::log::LogLevel::INFO,
         "dashcam v0.3 starting (UVC record + IMX296 lanes + driver monitoring)");
+    log(dashcam::log::LogLevel::INFO, wifiSummary);
+    log(dashcam::log::LogLevel::INFO, timeSyncSummary);
 
     dashcam::camera::AttributeDictionary dict;
     std::string attrPath = configsDir + "/camera_attributes.xml";
@@ -548,6 +654,19 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ── inference-camera RTP streaming sessions (control layer) ──────────────
+    // Lane/road camera streams to RtpPort, driver camera to RtpPort+2 (distinct
+    // ports so the two H.264 streams never collide on one UDP endpoint).
+    dashcam::network::RtpSession laneRtp, drvRtp;
+    {
+        dashcam::network::RtpStreamConfig rc;
+        rc.enabled     = cfg.network.rtpEnabled;
+        rc.host        = (std::string)cfg.network.rtpHost;
+        rc.bitrateKbps = (int)cfg.network.rtpBitrateKbps;
+        rc.port = static_cast<uint16_t>((int)cfg.network.rtpPort);       laneRtp.configure(rc);
+        rc.port = static_cast<uint16_t>((int)cfg.network.rtpPort + 2);   drvRtp.configure(rc);
+    }
+
     // ── lane camera ──────────────────────────────────────────────────────────
     Camera_CSI laneCam(laneInfo ? *laneInfo : cameraInfo{});
     if (laneDet) {
@@ -564,6 +683,17 @@ int main(int argc, char* argv[]) {
             log(dashcam::log::LogLevel::ERROR,
                 "lane bin creation failed — continuing WITHOUT lane detection");
             laneDet.reset();
+        }
+    }
+    if (laneDet && cfg.network.rtpEnabled && !offline) {
+        // CSI/Argus tee is NVMM → nvvidconv head.  Leaky so encoding never blocks
+        // the lane inference feed.
+        GstElement* rtpBin = makeRtpBranchBin(laneRtp, /*nvmm=*/true, laneFps, log);
+        if (rtpBin) {
+            laneCam.addBranch("lane-rtp", rtpBin, /*leaky=*/true);
+            log(dashcam::log::LogLevel::INFO,
+                "lane RTP stream -> " + (std::string)cfg.network.rtpHost + ":" +
+                std::to_string((int)cfg.network.rtpPort) + "   view: " + laneRtp.viewerHint());
         }
     }
     if (laneDet) {
@@ -599,6 +729,17 @@ int main(int argc, char* argv[]) {
             drvDet.reset();
         }
     }
+    if (drvDet && cfg.network.rtpEnabled && !offline) {
+        // USB driver cam tee is system-memory raw → videoconvert head.
+        const float drvFps = drvInfo->videoFormats[(size_t)drvFmtIdx].frameRate;
+        GstElement* rtpBin = makeRtpBranchBin(drvRtp, /*nvmm=*/false, drvFps, log);
+        if (rtpBin) {
+            drvCam.addBranch("driver-rtp", rtpBin, /*leaky=*/true);
+            log(dashcam::log::LogLevel::INFO,
+                "driver RTP stream -> " + (std::string)cfg.network.rtpHost + ":" +
+                std::to_string((int)cfg.network.rtpPort + 2) + "   view: " + drvRtp.viewerHint());
+        }
+    }
     if (drvDet) {
         drvCam.open();
         drvCam.setCameraVideoFormat(drvFmtIdx);
@@ -618,6 +759,10 @@ int main(int argc, char* argv[]) {
     }
 
     // ── recording: compressed UVC passthrough + ASS telemetry sidecar ────────
+    // Declared before rec so it outlives the recording pipeline: rec.stopRecording()
+    // (below, on shutdown) tears the pipeline down first, so no stream callback can
+    // fire into a destroyed server.
+    dashcam::network::MediaStreamServer streamSrv;
     dashcam::record::Recorder rec;
     std::string recFile;
     bool recActive = false;
@@ -638,6 +783,30 @@ int main(int argc, char* argv[]) {
         dashcam::record::OverlayData od0 = rec.getOverlayData();
         od0.timestampMs = epochMs();
         rec.setOverlayData(od0);
+
+        // Live-stream tap (direct precompressed path): fan the recording camera's
+        // own compressed frames out to network viewers, no re-encode.  The wire
+        // format follows the camera's pixel format.  Must be set BEFORE
+        // startRecording() so the tee/appsink branch is built into the pipeline.
+        if (cfg.network.streamEnabled && !offline) {
+            const bool recMjpeg = uFmt.pixelFormat == V4L2_PIX_FMT_MJPEG;
+            dashcam::network::StreamServerConfig sc;
+            sc.port       = static_cast<uint16_t>((int)cfg.network.streamPort);
+            sc.maxClients = (int)cfg.network.streamMaxClients;
+            sc.wire       = recMjpeg ? dashcam::network::StreamWire::MjpegHttp
+                                     : dashcam::network::StreamWire::RawTcp;
+            if (streamSrv.start(sc, log)) {
+                rec.setCompressedFrameCallback(
+                    [&streamSrv](const uint8_t* d, size_t n, bool) { streamSrv.pushFrame(d, n); });
+                log(dashcam::log::LogLevel::INFO,
+                    std::string("live stream: ") +
+                    (recMjpeg ? "open http://<device-ip>:" : "view: ffplay tcp://<device-ip>:") +
+                    std::to_string(streamSrv.port()) + (recMjpeg ? "/ in a browser" : ""));
+            } else {
+                log(dashcam::log::LogLevel::ERROR,
+                    "live stream: failed to start — recording without streaming");
+            }
+        }
 
         recActive = rec.startRecording(usbInfo->address, rfmt, recFile,
                                        (uint32_t)(int)cfg.recording.recordFps);
@@ -838,7 +1007,8 @@ int main(int argc, char* argv[]) {
 
     // ── graceful shutdown: EOS-finalise the MKV, close the sidecar ───────────
     log(dashcam::log::LogLevel::INFO, "shutting down (signal or subsystem loss)");
-    if (recActive) rec.stopRecording();
+    if (recActive) rec.stopRecording();   // stops the pipeline → no more stream callbacks
+    streamSrv.stop();                     // then disconnect viewers (safe: no callbacks in flight)
     if (laneDet) {
         laneCam.stop();
         laneDet->stop();

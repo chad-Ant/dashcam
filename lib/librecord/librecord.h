@@ -59,9 +59,11 @@
 #include "libconfig.h"
 #include "liblog.h"
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 #include <atomic>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -103,6 +105,28 @@ struct RecordingFormat {
     uint32_t height     = 0;   ///< Frame height in pixels.
     float    fps        = 0.0f;///< Camera frame rate for this format.
 };
+
+// ─── live-stream tap ───────────────────────────────────────────────────────────
+
+/**
+ * @brief Delivers each ALREADY-COMPRESSED frame as it is captured, for live
+ *        network streaming (see MediaStreamServer in libnetwork).
+ *
+ * @param data      Frame bytes: one JPEG (MJPEG) or one H.264 access unit
+ *                  (Annex-B byte-stream) — valid ONLY for the duration of the
+ *                  call, so copy anything you retain.
+ * @param len       Byte count.
+ * @param keyframe  true for an intra frame (always true for MJPEG; the IDR flag
+ *                  for H.264) — a new viewer should ideally start here.
+ *
+ * Invoked on a GStreamer streaming thread.  Keep it fast and non-blocking (hand
+ * the bytes to a stream server / queue); the tap branch is leaky, so a slow
+ * consumer drops its own frames and never backpressures the recording.  Set the
+ * callback BEFORE startRecording() — it selects whether the tee/appsink branch
+ * is built into the pipeline at all.
+ */
+using CompressedFrameCallback =
+    std::function<void(const uint8_t* data, size_t len, bool keyframe)>;
 
 // ─── Recorder ─────────────────────────────────────────────────────────────────
 
@@ -146,6 +170,16 @@ public:
     /** @brief Inject a log callback.  Defaults to silent. */
     void setLogCallback(dashcam::log::LogCallback cb);
 
+    /**
+     * @brief Tap the compressed stream for live network streaming.
+     *
+     * Call BEFORE startRecording().  When set, the recording pipeline gains a
+     * tee with a leaky appsink branch that hands every compressed frame to @p cb
+     * (see CompressedFrameCallback); the recording branch is unaffected.  Pass an
+     * empty callback (the default) to record with no streaming tap.
+     */
+    void setCompressedFrameCallback(CompressedFrameCallback cb);
+
     // ─── recording lifecycle ───────────────────────────────────────────────────
 
     /**
@@ -188,9 +222,13 @@ public:
 private:
     // ── configuration / telemetry state ──────────────────────────────────────
     dashcam::log::LogCallback      log_{};
+    CompressedFrameCallback        frameCb_{};   ///< Live-stream tap; empty = no tap.
     OverlayData                    overlayData_;
     dashcam::config::OverlayConfig overlayConfig_;
     mutable std::mutex             overlayMutex_;
+
+    /// appsink new-sample handler: maps the buffer and forwards it to frameCb_.
+    static GstFlowReturn onNewSample(GstAppSink* sink, gpointer user);
 
     // ── session state ────────────────────────────────────────────────────────
     GstElement*       pipeline_ = nullptr;
