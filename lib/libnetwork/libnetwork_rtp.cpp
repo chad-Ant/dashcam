@@ -14,6 +14,20 @@
 
 namespace dashcam::network {
 
+namespace {
+std::string gstQuoted(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (char ch : value) {
+        if (ch == '\\' || ch == '"') out.push_back('\\');
+        out.push_back(ch);
+    }
+    out.push_back('"');
+    return out;
+}
+} // namespace
+
 std::string RtpSession::branchDescription(bool nvmm, float fps) const {
     const int fpsI      = (fps > 0.0f) ? std::max(1, static_cast<int>(std::lround(fps))) : 30;
     const int keyFrames = std::max(1, cfg_.keyIntSec * fpsI);
@@ -31,7 +45,7 @@ std::string RtpSession::branchDescription(bool nvmm, float fps) const {
         " key-int-max=" + std::to_string(keyFrames) +
         " ! video/x-h264,profile=(string)baseline" +
         " ! rtph264pay config-interval=1 pt=96" +
-        " ! udpsink host=" + cfg_.host +
+        " ! udpsink host=" + gstQuoted(cfg_.host) +
         " port=" + std::to_string(cfg_.port) +
         " sync=false async=false";
 }

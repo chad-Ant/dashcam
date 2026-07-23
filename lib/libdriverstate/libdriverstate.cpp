@@ -310,6 +310,8 @@ public:
 
     mutable std::mutex resultMutex_;
     DriverStateResult  latestResult_;
+    std::atomic<uint64_t> processedFrames_{0};
+    std::atomic<int64_t>  lastResultSteadyMs_{0};
 
     static std::atomic<int> sCounter;
 
@@ -782,8 +784,14 @@ public:
             gst_sample_unref(sample);
 
             if (sizeOk && result.valid) {
+                result.sequence =
+                    processedFrames_.fetch_add(1, std::memory_order_relaxed) + 1;
+                const int64_t nowMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now().time_since_epoch()).count();
                 std::lock_guard<std::mutex> lk(resultMutex_);
                 latestResult_ = result;
+                lastResultSteadyMs_.store(nowMs, std::memory_order_release);
             }
         }
     }
@@ -892,6 +900,20 @@ public:
         }
         return r;
     }
+
+    uint64_t processedFrameCount() const {
+        return processedFrames_.load(std::memory_order_acquire);
+    }
+
+    bool hasFreshResult(uint32_t maxAgeMs) const {
+        const int64_t last =
+            lastResultSteadyMs_.load(std::memory_order_acquire);
+        if (last <= 0) return false;
+        const int64_t now =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        return now >= last && static_cast<uint64_t>(now - last) <= maxAgeMs;
+    }
 };
 
 std::atomic<int> DriverStateImpl::sCounter{0};
@@ -909,6 +931,12 @@ GstElement*       DriverStateDetector::createBin()  { return impl_->createBin();
 void              DriverStateDetector::start()      { impl_->start(); }
 void              DriverStateDetector::stop()       { impl_->stop(); }
 DriverStateResult DriverStateDetector::poll() const { return impl_->poll(); }
+uint64_t DriverStateDetector::processedFrameCount() const {
+    return impl_->processedFrameCount();
+}
+bool DriverStateDetector::hasFreshResult(uint32_t maxAgeMs) const {
+    return impl_->hasFreshResult(maxAgeMs);
+}
 
 void DriverStateDetector::setLaneOffset(float offset, bool offsetValid) {
     impl_->scorer_.laneOffset(offset, offsetValid,

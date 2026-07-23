@@ -89,6 +89,9 @@ enum class FatigueLevel : uint8_t {
 };
 
 struct DriverStateResult {
+    /// Monotonic sequence number of successfully processed frames.
+    uint64_t sequence = 0;
+
     /// Thresholded classification of the most recent frame.
     DriverState state = DriverState::NATURAL;
 
@@ -430,6 +433,12 @@ public:
 
     /** @brief Return the most recent driver state result (thread-safe). */
     DriverStateResult poll() const;
+
+    /** @brief Number of frames successfully processed (including valid no-face frames). */
+    uint64_t processedFrameCount() const;
+
+    /** @brief True when a successful result arrived within maxAgeMs. */
+    bool hasFreshResult(uint32_t maxAgeMs) const;
 
     /**
      * @brief Feed the latest lane lateral offset into the fatigue scorer

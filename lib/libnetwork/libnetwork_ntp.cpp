@@ -20,10 +20,11 @@
 
 #include "libnetwork.h"
 
-#include <arpa/inet.h>   // ntohl
+#include <arpa/inet.h>   // htonl, ntohl
 #include <ctime>         // clock_gettime, clock_settime, timespec
 
 #include <cerrno>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -70,6 +71,14 @@ double ntpToSeconds(uint32_t sec_be, uint32_t frac_be) {
          + static_cast<double>(ntohl(frac_be)) / TWO32;
 }
 
+void secondsToNtp(double value, uint32_t& sec_be, uint32_t& frac_be) {
+    const double whole = std::floor(value);
+    const double fraction = std::max(0.0, std::min(1.0 - 1.0 / TWO32,
+                                                   value - whole));
+    sec_be = htonl(static_cast<uint32_t>(whole));
+    frac_be = htonl(static_cast<uint32_t>(fraction * TWO32));
+}
+
 } // namespace
 
 TimeResult queryTime(const std::string& server, uint16_t port, int timeoutMs,
@@ -84,12 +93,20 @@ TimeResult queryTime(const std::string& server, uint16_t port, int timeoutMs,
     std::memset(&req, 0, sizeof(req));
     req.li_vn_mode = 0x1B;  // LI = 0, Version = 3, Mode = 3 (client)
 
-    double t1 = nowNtpSeconds();
-    if (!sock.sendTo(server, port, &req, sizeof(req))) return r;
+    // A server must echo this nonce-like transmit timestamp in its originate
+    // field.  This binds the response to this request and rejects unrelated or
+    // stale UDP datagrams (plain SNTP is still not cryptographically
+    // authenticated, so callers must not use it as authority to step a clock).
+    secondsToNtp(nowNtpSeconds(), req.txTs_s, req.txTs_f);
+    const double t1 = ntpToSeconds(req.txTs_s, req.txTs_f);
+    std::string destinationIp;
+    if (!sock.sendTo(server, port, &req, sizeof(req), &destinationIp)) return r;
 
     NtpPacket resp;
     std::memset(&resp, 0, sizeof(resp));
-    long n = sock.recvFrom(&resp, sizeof(resp), timeoutMs);
+    std::string sourceIp;
+    uint16_t sourcePort = 0;
+    long n = sock.recvFrom(&resp, sizeof(resp), timeoutMs, &sourceIp, &sourcePort);
     double t4 = nowNtpSeconds();
 
     if (n == 0) { say(log, LvL::WARN,  "NTP query to " + server + " timed out"); return r; }
@@ -98,20 +115,49 @@ TimeResult queryTime(const std::string& server, uint16_t port, int timeoutMs,
         say(log, LvL::WARN, "NTP reply from " + server + " too short (" + std::to_string(n) + " bytes)");
         return r;
     }
+    if (sourceIp != destinationIp || sourcePort != port) {
+        say(log, LvL::WARN, "NTP reply source mismatch (expected " +
+                            destinationIp + ":" + std::to_string(port) +
+                            ", got " + sourceIp + ":" +
+                            std::to_string(sourcePort) + ")");
+        return r;
+    }
 
-    int mode = resp.li_vn_mode & 0x07;
-    if (mode != 4 || resp.stratum == 0) {  // mode 4 = server; stratum 0 = KoD/unsynced
+    const int leap = (resp.li_vn_mode >> 6) & 0x03;
+    const int version = (resp.li_vn_mode >> 3) & 0x07;
+    const int mode = resp.li_vn_mode & 0x07;
+    if (mode != 4 || (version != 3 && version != 4) || leap == 3 ||
+        resp.stratum == 0 || resp.stratum > 15) {
         say(log, LvL::WARN, "NTP reply from " + server + " not a valid server response (mode="
-                            + std::to_string(mode) + " stratum=" + std::to_string(resp.stratum) + ")");
+                            + std::to_string(mode) + " version=" +
+                            std::to_string(version) + " leap=" +
+                            std::to_string(leap) + " stratum=" +
+                            std::to_string(resp.stratum) + ")");
+        return r;
+    }
+    if (resp.origTs_s != req.txTs_s || resp.origTs_f != req.txTs_f) {
+        say(log, LvL::WARN, "NTP reply from " + server +
+                           " did not echo this request's transmit timestamp");
         return r;
     }
 
     double t2 = ntpToSeconds(resp.rxTs_s, resp.rxTs_f);
     double t3 = ntpToSeconds(resp.txTs_s, resp.txTs_f);
-    if (t3 <= 0.0) { say(log, LvL::WARN, "NTP reply from " + server + " has no transmit timestamp"); return r; }
+    if (t2 <= 0.0 || t3 <= 0.0 || t3 < t2) {
+        say(log, LvL::WARN, "NTP reply from " + server +
+                           " has invalid receive/transmit timestamps");
+        return r;
+    }
 
     r.offsetSeconds    = ((t2 - t1) + (t3 - t4)) / 2.0;
     r.roundTripSeconds = (t4 - t1) - (t3 - t2);
+    const double maxRtt = std::max(1.0, timeoutMs / 1000.0 + 0.25);
+    if (!std::isfinite(r.offsetSeconds) || !std::isfinite(r.roundTripSeconds) ||
+        r.roundTripSeconds < -0.010 || r.roundTripSeconds > maxRtt) {
+        say(log, LvL::WARN, "NTP reply from " + server +
+                           " produced an implausible round-trip time");
+        return TimeResult{};
+    }
 
     // Derive Unix seconds/nanos directly from the integer transmit timestamp so
     // the stored value keeps full second precision (a double seconds value would

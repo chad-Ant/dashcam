@@ -3,9 +3,10 @@
 #
 # Workflow:
 #   1. If l4t-ml-gpio:latest already exists, tag it as l4t-ml-gpio:build_<timestamp>
-#      and remove the :latest tag, then use the archived image as the build base.
-#   2. If it does not exist, fall back to the Dockerfile ARG default
-#      (dustynv/l4t-ml:r36.4.0) so the first build still works.
+#      and remove the :latest tag.
+#   2. Always rebuild from the clean upstream Jetson base.  Building on the
+#      previous application image permanently preserves removed packages and
+#      was the cause of duplicate GStreamer plugin registrations.
 #   3. Build and tag the result as l4t-ml-gpio:latest.
 set -euo pipefail
 
@@ -19,12 +20,11 @@ if docker image inspect "${LATEST}" > /dev/null 2>&1; then
     echo "[build.sh] Archiving ${LATEST} → ${ARCHIVE}"
     docker tag "${LATEST}" "${ARCHIVE}"
     docker rmi "${LATEST}"
-    BASE_IMAGE="${ARCHIVE}"
 else
-    echo "[build.sh] No existing ${LATEST} found; using upstream base from Dockerfile ARG default"
-    BASE_IMAGE="dustynv/l4t-ml:r36.4.0"
+    echo "[build.sh] No existing ${LATEST} found"
 fi
 
+BASE_IMAGE="dustynv/l4t-ml:r36.4.0"
 echo "[build.sh] Building ${LATEST} from ${BASE_IMAGE} ..."
 docker build \
     --build-arg "BASE_IMAGE=${BASE_IMAGE}" \

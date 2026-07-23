@@ -44,6 +44,10 @@ static const char* directionStr(LaneDirection d) {
 }
 
 static void printResult(int t, const LaneResult& r) {
+    if (!r.valid) {
+        std::cout << "t+" << t << "s  warming up (no valid result)\n";
+        return;
+    }
     std::cout << "t+" << t << "s  lanes=" << static_cast<int>(r.numLanes);
     if (r.numLanes == 0) {
         std::cout << "  (none detected)";
@@ -219,12 +223,16 @@ static int runLiveMode(const std::string& engine) {
         cam.close();
         return 1;
     }
+    cam.setCaptureEnabled(false);
     detector.start();
 
     std::cout << "Running for 10 seconds...\n\n";
+    int validPolls = 0;
     for (int t = 1; t <= 10; ++t) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        printResult(t, detector.poll());
+        const LaneResult result = detector.poll();
+        if (result.valid) ++validPolls;
+        printResult(t, result);
     }
 
     cam.stop();       // flushes appsink → inference thread drains
@@ -232,9 +240,15 @@ static int runLiveMode(const std::string& engine) {
     cam.close();
 
     cam.getCameraStatus(st);
-    const bool pass = st.status == CAMERA_STATUS::CLOSED;
+    // A clean teardown alone is not evidence that Argus delivered a frame.
+    // Allow three seconds of warm-up, then require live inference results.
+    const bool pass = st.status == CAMERA_STATUS::CLOSED
+                   && detector.processedFrameCount() > 0
+                   && validPolls >= 7;
+    std::cout << "\nvalid-polls=" << validPolls << "/10"
+              << " processed=" << detector.processedFrameCount() << "\n";
     std::cout << "\nLIVE MODE: " << (pass ? "PASS" : "FAIL")
-              << " (pipeline ran, detector polled, teardown "
+              << " (live inference verified, teardown "
               << (pass ? "clean" : "dirty") << ")\n";
     return pass ? 0 : 1;
 }

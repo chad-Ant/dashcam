@@ -12,9 +12,9 @@
  *   - TcpServer : listen / accept with a self-pipe wake so a blocked accept()
  *                 unblocks promptly when another thread calls close()
  *                 (the same shutdown idiom libcan uses for its receive thread).
- *   - SNTP time : queryTime() fetches the time from an internet time server and
- *                 reports the local clock offset; stepSystemClock() applies it
- *                 (requires CAP_SYS_TIME / root, like libcan::configureInterface).
+ *   - SNTP time : queryTime() fetches an observation from an internet time
+ *                 server and reports the local clock offset.  Plain SNTP is
+ *                 not authenticated and must not be trusted to set a clock.
  *
  * Design notes:
  *   - IPv4 only for now (AF_INET).  getaddrinfo() is restricted to A records so
@@ -32,10 +32,10 @@
  *
  * Typical usage:
  * @code
- *   // Internet time:
+ *   // Internet time observation (host chrony/systemd-timesyncd owns discipline):
  *   auto t = dashcam::network::queryTime();           // pool.ntp.org
- *   if (t.valid && std::abs(t.offsetSeconds) > 0.5)
- *       dashcam::network::stepSystemClock(t, log);     // needs root
+ *   if (t.valid)
+ *       log(INFO, "clock offset " + std::to_string(t.offsetSeconds));
  *
  *   // UDP:
  *   dashcam::network::UdpSocket u;
@@ -117,7 +117,8 @@ public:
      * gives no delivery guarantee.
      * @return true if the datagram was handed to the kernel.
      */
-    bool sendTo(const std::string& host, uint16_t port, const void* data, size_t len);
+    bool sendTo(const std::string& host, uint16_t port, const void* data, size_t len,
+                std::string* resolvedHost = nullptr);
 
     /**
      * @brief Receive one datagram, waiting up to @p timeoutMs.
@@ -136,11 +137,11 @@ public:
     uint16_t localPort() const;
 
     void close();
-    bool isOpen() const { return fd_ >= 0; }
-    int  fd()     const { return fd_; }
+    bool isOpen() const { return fd_.load() >= 0; }
+    int  fd()     const { return fd_.load(); }
 
 private:
-    int                       fd_ = -1;
+    std::atomic<int>          fd_{-1};
     dashcam::log::LogCallback log_;
 };
 
@@ -208,14 +209,14 @@ public:
     void shutdown();
 
     void close();
-    bool isOpen() const { return fd_ >= 0; }
-    int  fd()     const { return fd_; }
+    bool isOpen() const { return fd_.load() >= 0; }
+    int  fd()     const { return fd_.load(); }
 
     /** @brief Remote endpoint as "ip:port" (empty if unknown). */
     const std::string& peer() const { return peer_; }
 
 private:
-    int                       fd_ = -1;
+    std::atomic<int>          fd_{-1};
     std::string               peer_;
     dashcam::log::LogCallback log_;
 };
@@ -260,13 +261,13 @@ public:
     /** @brief Close the listener and wake any concurrent accept(). */
     void close();
 
-    bool     isOpen() const { return fd_ >= 0; }
-    uint16_t port()   const { return port_; }
+    bool     isOpen() const { return fd_.load() >= 0; }
+    uint16_t port()   const { return port_.load(); }
 
 private:
-    int      fd_      = -1;
-    int      wake_[2] = {-1, -1};  ///< Self-pipe: write [1] to unblock accept()'s poll().
-    uint16_t port_    = 0;
+    std::atomic<int>      fd_{-1};
+    std::atomic<int>      wake_[2]{{-1}, {-1}}; ///< Self-pipe: write [1] wakes accept().
+    std::atomic<uint16_t> port_{0};
     dashcam::log::LogCallback log_;
 };
 
@@ -503,8 +504,10 @@ struct TimeResult {
  *
  * Sends a mode-3 (client) SNTP request over UDP and parses the mode-4 reply,
  * computing the clock offset and round-trip time from the four RFC 4330
- * timestamps (originate / receive / transmit / destination).  Does NOT change
- * the system clock — see stepSystemClock().
+ * timestamps (originate / receive / transmit / destination).  The echoed
+ * originate timestamp and UDP source address/port are verified to reject stale
+ * or unrelated packets.  This is correlation, not cryptographic authentication,
+ * and the function does not change the system clock.
  *
  * @param server     Hostname or IP of the time server.
  * @param port       UDP port (123 for standard NTP).
@@ -519,6 +522,10 @@ TimeResult queryTime(const std::string& server = "pool.ntp.org",
 
 /**
  * @brief Step the system real-time clock to @p t's transmit timestamp.
+ *
+ * @warning Do not pass a result from plain queryTime() here: SNTP has no
+ * cryptographic server authentication.  This low-level helper is retained only
+ * for callers whose TimeResult came from an independently authenticated source.
  *
  * Calls clock_settime(CLOCK_REALTIME); this requires CAP_SYS_TIME (root).  The
  * clock jumps rather than slews — intended for a dashcam booting with a wrong /

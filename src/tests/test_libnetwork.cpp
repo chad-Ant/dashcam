@@ -323,7 +323,7 @@ int main(int argc, char* argv[]) {
             has(usb, "x264enc") && has(usb, "bitrate=6000") &&
             has(usb, "key-int-max=60") &&                       // keyIntSec(2) * 30 fps
             has(usb, "rtph264pay config-interval=1 pt=96") &&
-            has(usb, "udpsink host=127.0.0.1 port=5600") &&
+            has(usb, "udpsink host=\"127.0.0.1\" port=5600") &&
             has(sdp, "m=video 5600 RTP/AVP 96") &&
             has(sdp, "a=rtpmap:96 H264/90000");
         log(ok ? LvL::INFO : LvL::ERROR,

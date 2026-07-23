@@ -98,16 +98,13 @@ std::string addrToString(const sockaddr_in& a) {
 UdpSocket::~UdpSocket() { close(); }
 
 UdpSocket::UdpSocket(UdpSocket&& o) noexcept
-    : fd_(o.fd_), log_(std::move(o.log_)) {
-    o.fd_ = -1;
-}
+    : fd_(o.fd_.exchange(-1)), log_(std::move(o.log_)) {}
 
 UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
     if (this != &o) {
         close();
-        fd_    = o.fd_;
+        fd_    = o.fd_.exchange(-1);
         log_   = std::move(o.log_);
-        o.fd_  = -1;
     }
     return *this;
 }
@@ -138,13 +135,21 @@ bool UdpSocket::open(uint16_t bindPort, const dashcam::log::LogCallback& log) {
     return true;
 }
 
-bool UdpSocket::sendTo(const std::string& host, uint16_t port, const void* data, size_t len) {
+bool UdpSocket::sendTo(const std::string& host, uint16_t port, const void* data,
+                       size_t len, std::string* resolvedHost) {
     if (fd_ < 0) {
         say(log_, LvL::ERROR, "UDP sendTo on a closed socket");
         return false;
     }
     sockaddr_in dst;
     if (!resolveV4(host, port, dst, log_)) return false;
+    if (resolvedHost) {
+        char ip[INET_ADDRSTRLEN] = {0};
+        if (::inet_ntop(AF_INET, &dst.sin_addr, ip, sizeof(ip)))
+            *resolvedHost = ip;
+        else
+            resolvedHost->clear();
+    }
 
     ssize_t n = ::sendto(fd_, data, len, MSG_NOSIGNAL,
                          reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
@@ -193,7 +198,8 @@ uint16_t UdpSocket::localPort() const {
 }
 
 void UdpSocket::close() {
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    const int fd = fd_.exchange(-1);
+    if (fd >= 0) ::close(fd);
 }
 
 // ─── TcpSocket ─────────────────────────────────────────────────────────────────
@@ -204,17 +210,15 @@ TcpSocket::TcpSocket(int fd, std::string peer)
 TcpSocket::~TcpSocket() { close(); }
 
 TcpSocket::TcpSocket(TcpSocket&& o) noexcept
-    : fd_(o.fd_), peer_(std::move(o.peer_)), log_(std::move(o.log_)) {
-    o.fd_ = -1;
-}
+    : fd_(o.fd_.exchange(-1)), peer_(std::move(o.peer_)),
+      log_(std::move(o.log_)) {}
 
 TcpSocket& TcpSocket::operator=(TcpSocket&& o) noexcept {
     if (this != &o) {
         close();
-        fd_    = o.fd_;
+        fd_    = o.fd_.exchange(-1);
         peer_  = std::move(o.peer_);
         log_   = std::move(o.log_);
-        o.fd_  = -1;
     }
     return *this;
 }
@@ -303,11 +307,13 @@ IoStatus TcpSocket::recv(void* buf, size_t bufLen, int timeoutMs, size_t& outByt
 }
 
 void TcpSocket::shutdown() {
-    if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);  // unblock a concurrent send/recv; fd stays open
+    const int fd = fd_.load();
+    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);  // unblock a concurrent send/recv; fd stays open
 }
 
 void TcpSocket::close() {
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    const int fd = fd_.exchange(-1);
+    if (fd >= 0) ::close(fd);
 }
 
 // ─── TcpServer ─────────────────────────────────────────────────────────────────
@@ -352,22 +358,30 @@ bool TcpServer::listen(uint16_t port, int backlog, const dashcam::log::LogCallba
         port_ = port;
 
     // Self-pipe wake so close() can unblock a concurrent accept().
-    if (::pipe(wake_) < 0) {
+    int wakeFds[2] = {-1, -1};
+    if (::pipe(wakeFds) < 0) {
         say(log_, LvL::ERROR, "TCP server wake pipe() failed: " + errnoStr());
         close();
         return false;
     }
+    wake_[0].store(wakeFds[0]);
+    wake_[1].store(wakeFds[1]);
     return true;
 }
 
 TcpSocket TcpServer::accept(int timeoutMs, IoStatus* status) {
     auto setStatus = [&](IoStatus s) { if (status) *status = s; };
 
-    if (fd_ < 0) { setStatus(IoStatus::Error); return TcpSocket{}; }
+    const int listenFd = fd_.load();
+    const int wakeRead = wake_[0].load();
+    if (listenFd < 0 || wakeRead < 0) {
+        setStatus(IoStatus::Error);
+        return TcpSocket{};
+    }
 
     struct pollfd p[2];
-    p[0].fd = fd_;       p[0].events = POLLIN; p[0].revents = 0;
-    p[1].fd = wake_[0];  p[1].events = POLLIN; p[1].revents = 0;
+    p[0].fd = listenFd; p[0].events = POLLIN; p[0].revents = 0;
+    p[1].fd = wakeRead; p[1].events = POLLIN; p[1].revents = 0;
 
     int r;
     for (;;) {
@@ -397,7 +411,7 @@ TcpSocket TcpServer::accept(int timeoutMs, IoStatus* status) {
     sockaddr_in peer;
     socklen_t   plen = sizeof(peer);
     std::memset(&peer, 0, sizeof(peer));
-    int cfd = ::accept(fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
+    int cfd = ::accept(listenFd, reinterpret_cast<sockaddr*>(&peer), &plen);
     if (cfd < 0) {
         say(log_, LvL::ERROR, "TCP accept() failed: " + errnoStr());
         setStatus(IoStatus::Error);
@@ -409,15 +423,19 @@ TcpSocket TcpServer::accept(int timeoutMs, IoStatus* status) {
 
 void TcpServer::close() {
     // Wake a concurrent accept() before tearing the descriptors down.
-    if (wake_[1] >= 0) {
+    const int wakeWrite = wake_[1].load();
+    if (wakeWrite >= 0) {
         const char b = 1;
-        ssize_t wr = ::write(wake_[1], &b, 1);
+        ssize_t wr = ::write(wakeWrite, &b, 1);
         (void)wr;  // best-effort wake; nothing actionable if the pipe is full/closed
     }
-    if (fd_ >= 0)      { ::close(fd_);      fd_      = -1; }
-    if (wake_[0] >= 0) { ::close(wake_[0]); wake_[0] = -1; }
-    if (wake_[1] >= 0) { ::close(wake_[1]); wake_[1] = -1; }
-    port_ = 0;
+    const int fd = fd_.exchange(-1);
+    const int wake0 = wake_[0].exchange(-1);
+    const int wake1 = wake_[1].exchange(-1);
+    if (fd >= 0) ::close(fd);
+    if (wake0 >= 0) ::close(wake0);
+    if (wake1 >= 0) ::close(wake1);
+    port_.store(0);
 }
 
 } // namespace dashcam::network

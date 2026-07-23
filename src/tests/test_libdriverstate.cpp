@@ -291,6 +291,7 @@ static int runLiveMode(const std::string& engine, int seconds,
         cam.close();
         return 1;
     }
+    cam.setCaptureEnabled(false);
     detector.start();
 
     std::cout << "Running for " << seconds << " seconds...\n"

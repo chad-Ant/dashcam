@@ -377,9 +377,17 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
                   return videoIndex(a) < videoIndex(b);
               });
 
-    // CSI cameras are addressed by Argus sensor-id (0-based among CSI cameras),
-    // which is independent of the /dev/videoN numbering.
-    uint32_t csiSensorCount = 0;
+    // Argus sensor-id is a dense 0-based index over ACTIVE camera modules.
+    // Device-tree module indices are not dense when a module is disabled or
+    // physically absent (for example, only module1 populated still appears to
+    // Argus as sensor-id 0).  Remember each discovered module index and compact
+    // them after discovery in module order.
+    struct CsiModule {
+        size_t cameraIndex;
+        int    moduleIndex;  // -1 when the device-tree chain was unavailable
+        size_t discoveryOrder;
+    };
+    std::vector<CsiModule> csiModules;
 
     for (const auto& devicePath : videoPaths) {
         ScopedFd fd(::open(devicePath.c_str(), O_RDONLY | O_NONBLOCK));
@@ -404,15 +412,15 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
         if (driverName == "tegra-video" || driverName == "vi") {
             info.type = CAMERA_TYPE::CSI;
             const std::string cardName(reinterpret_cast<const char*>(cap.card));
-            const int argusId = argusIdFromCard(cardName);
-            info.deviceId = (argusId >= 0) ? static_cast<uint32_t>(argusId)
-                                           : csiSensorCount;
-            if (argusId < 0 && log)
+            const int moduleIndex = argusIdFromCard(cardName);
+            // Temporary value; overwritten with the compact active ordinal below.
+            info.deviceId = 0;
+            if (moduleIndex < 0 && log)
                 log(dashcam::log::LogLevel::WARN,
-                    devicePath.string() + ": Argus sensor-id not resolvable from"
-                    " device tree; assuming sequential id "
-                    + std::to_string(csiSensorCount));
-            csiSensorCount++;
+                    devicePath.string() + ": camera module not resolvable from "
+                    "device tree; placing it after resolved CSI modules");
+            csiModules.push_back(
+                {cameraList.size(), moduleIndex, csiModules.size()});
         } else if (driverName == "uvcvideo") {
             info.type     = CAMERA_TYPE::USB;
             info.deviceId = parsedDevId;
@@ -425,6 +433,20 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
         populateCameraVideoFormats(fd, info, log);
         cameraList.push_back(info);
     }
+
+    // Match Argus' dense enumeration of active modules.  Known module positions
+    // sort first in device-tree order; unresolved modules retain discovery order.
+    std::stable_sort(csiModules.begin(), csiModules.end(),
+        [](const CsiModule& a, const CsiModule& b) {
+            if ((a.moduleIndex >= 0) != (b.moduleIndex >= 0))
+                return a.moduleIndex >= 0;
+            if (a.moduleIndex >= 0 && a.moduleIndex != b.moduleIndex)
+                return a.moduleIndex < b.moduleIndex;
+            return a.discoveryOrder < b.discoveryOrder;
+        });
+    for (size_t argusId = 0; argusId < csiModules.size(); ++argusId)
+        cameraList[csiModules[argusId].cameraIndex].deviceId =
+            static_cast<uint32_t>(argusId);
 
     if (cameraList.empty()) {
         return ERROR_CODE::NO_CAMERAS_FOUND;

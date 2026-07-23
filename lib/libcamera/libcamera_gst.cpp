@@ -853,7 +853,11 @@ void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& by
 void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin,
                            bool leaky, bool initialEnabled) {  // defaults in header
     std::lock_guard<std::mutex> lock(stateMutex_);
-    if (status_.status == CAMERA_STATUS::RUNNING) {
+    if (!sinkBin || name.empty() || status_.status == CAMERA_STATUS::RUNNING) {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "cannot add camera branch '%s': %s", name.c_str(),
+              !sinkBin ? "null bin" : name.empty() ? "empty name"
+                                                : "camera already running");
         status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
         return;
     }

@@ -52,10 +52,10 @@
 #ifndef LIBLANEDETECTOR_H
 #define LIBLANEDETECTOR_H
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <vector>
 #include <gst/gst.h>
 #include "liblog.h"
 
@@ -77,6 +77,13 @@ enum class LaneDirection : uint8_t {
 };
 
 struct LaneResult {
+    /// True only after a frame completed CUDA + TensorRT + decode successfully.
+    /// A valid result may still contain zero lanes (e.g. a blank/indoor scene).
+    bool valid = false;
+
+    /// Monotonic sequence number of successfully processed frames.
+    uint64_t sequence = 0;
+
     /// Total lanes visible between detected boundaries (n boundaries → n-1 lanes).
     /// 0 if fewer than 2 boundaries were found.
     int8_t numLanes = 0;
@@ -98,8 +105,13 @@ struct LaneResult {
     /// (currentLaneIndex >= 0).
     bool lateralValid = false;
 
-    /// One entry per lane.  Size == numLanes.
-    std::vector<LaneDirection> laneAllowedDirections;
+    /// Fixed-capacity directions for the at-most-three lanes produced by the
+    /// four-boundary UFLD v2 head.  Only entries [0, numLanes) are meaningful;
+    /// fixed storage avoids a heap allocation on every inference result.
+    std::array<LaneDirection, 3> laneAllowedDirections{
+        LaneDirection::Straight,
+        LaneDirection::Straight,
+        LaneDirection::Straight};
 };
 
 // ─── configuration ────────────────────────────────────────────────────────────
@@ -247,6 +259,17 @@ public:
 
     /** @brief Return the most recent lane result (thread-safe). */
     LaneResult poll() const;
+
+    /** @brief Number of frames successfully processed by CUDA/TRT. */
+    uint64_t processedFrameCount() const;
+
+    /**
+     * @brief True when at least one successful result arrived within maxAgeMs.
+     *
+     * Intended for startup readiness and runtime watchdogs; unlike "zero lanes",
+     * a stale result means the inference path is not receiving/processing frames.
+     */
+    bool hasFreshResult(uint32_t maxAgeMs) const;
 
     /** @brief Replace the log sink (same pattern as the other libraries). */
     void setLogCallback(dashcam::log::LogCallback cb);

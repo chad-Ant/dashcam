@@ -61,7 +61,6 @@
 #include "librecord.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -81,13 +80,13 @@ namespace fs = std::filesystem;
 
 // ─── shutdown / reset flags ───────────────────────────────────────────────────
 
-static std::atomic<bool> g_run{true};
-static void onSignal(int) { g_run.store(false); }
+static volatile std::sig_atomic_t g_run = 1;
+static void onSignal(int) { g_run = 0; }
 
 // SIGUSR1 = software fatigue-score reset ("I took a break").  A GPIO button
 // will trigger the same path in a later version.
-static std::atomic<bool> g_resetScore{false};
-static void onResetScore(int) { g_resetScore.store(true); }
+static volatile std::sig_atomic_t g_resetScore = 0;
+static void onResetScore(int) { g_resetScore = 1; }
 
 // ─── driver-alert tuning ──────────────────────────────────────────────────────
 
@@ -102,6 +101,9 @@ static constexpr float kNoFaceSec      = 5.0f;
 // alarm every this-many seconds — a one-shot alert a fatigued driver misses is
 // no alert.  (A GPIO/audio alarm would repeat on the same cadence.)
 static constexpr float kFatigueRealertSec = 30.0f;
+static constexpr auto  kInferenceStartupTimeout = std::chrono::seconds(8);
+static constexpr uint32_t kLaneFreshnessMs = 3000;
+static constexpr uint32_t kDriverFreshnessMs = 5000;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -145,12 +147,10 @@ makeLogParams(const dashcam::config::LogConfig& l) {
     return lp;
 }
 
-// Query internet time (SNTP) and optionally step the system clock, per the
-// <Network> config.  Called BEFORE log::init() so the corrected clock is in
-// effect when the log file is named and before any footage timestamps are
-// stamped; its own progress is logged through the pre-init callback (stderr,
-// like the config-load messages).  Returns a one-line outcome the caller logs
-// to the file after init(), so the persistent log still records what happened.
+// Query internet time (SNTP) for clock-health telemetry.  Plain SNTP has no
+// cryptographic server authentication, so it must never be used to set the
+// privileged system clock; clock discipline belongs to the host time service.
+// Called before log::init(), with a summary repeated into the persistent log.
 static std::string syncSystemTime(const dashcam::config::NetworkConfig& net,
                                   const dashcam::log::LogCallback& log) {
     using LvL = dashcam::log::LogLevel;
@@ -182,20 +182,12 @@ static std::string syncSystemTime(const dashcam::config::NetworkConfig& net,
     std::snprintf(off, sizeof(off), "%+.3f", t.offsetSeconds);
     const std::string base = "time sync: " + server + " offset " + off + " s";
 
-    if (!net.ntpStepClock) {
-        log(LvL::INFO, base + " (NtpStepClock=false; clock unchanged)");
-        return base + " (not stepped)";
-    }
-    if (std::fabs(t.offsetSeconds) <= (double)(float)net.ntpStepThresholdSec) {
-        char thr[32];
-        std::snprintf(thr, sizeof(thr), "%.3f", (double)(float)net.ntpStepThresholdSec);
-        log(LvL::INFO, base + " within threshold " + thr + " s; clock unchanged");
-        return base + " (within threshold)";
-    }
-    // stepSystemClock() logs its own success / EPERM(need-root) detail.
-    if (nw::stepSystemClock(t, log))
-        return base + " -> clock stepped";
-    return base + " -> STEP FAILED (need root/CAP_SYS_TIME?)";
+    if (net.ntpStepClock)
+        log(LvL::WARN, base + " — NtpStepClock ignored: unauthenticated SNTP "
+            "is observation-only; configure the host time service instead");
+    else
+        log(LvL::INFO, base + " (clock unchanged)");
+    return base + " (observation only)";
 }
 
 // Build an H.264-over-RTP output branch bin from an RtpSession description, ready
@@ -360,6 +352,9 @@ struct CameraConfiguration {
     const cameraInfo* record    = nullptr;  ///< UVC MJPEG/H264 passthrough recording.
     int               recordFmt = -1;       ///< Format index for `record`.
     const cameraInfo* lane      = nullptr;  ///< IMX296 CSI lane detection (single native mode).
+    int               laneFmt   = 0;        ///< Format index for `lane`.
+    int               laneSensorId = -1;    ///< Configured Argus sensor id (-1 = discovery).
+    const dashcam::config::CameraConfig* laneConfig = nullptr;
     const cameraInfo* driver    = nullptr;  ///< UVC driver-monitoring (drowsiness).
     int               driverFmt = -1;       ///< Format index for `driver`.
     bool              driverPinned = false; ///< Driver camera came from a config pin (vs auto).
@@ -389,22 +384,116 @@ static std::string describeConfiguration(const CameraConfiguration& c) {
 // never grabs the device the operator set aside for driver monitoring.
 static CameraConfiguration
 resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
-                           const std::string& cabinDev, bool cabinEnabled,
+                           const std::vector<dashcam::config::CameraConfig>& configs,
                            const dashcam::log::LogCallback& log) {
     using dashcam::log::LogLevel;
     CameraConfiguration cc;
+    std::string cabinDev;
+    bool cabinEnabled = true;
+    for (const auto& cfg : configs) {
+        if (cfg.type == "USB" && cfg.name == "cabin") {
+            cabinDev = (std::string)cfg.device;
+            cabinEnabled = (bool)cfg.enabled;
+            break;
+        }
+    }
     cc.driverPinned = !cabinDev.empty();
 
-    // Census + lane camera: first IMX296 CSI becomes the lane-detection source.
+    auto exactConfig = [&](const cameraInfo& camera, const char* type)
+        -> const dashcam::config::CameraConfig* {
+        for (const auto& cfg : configs)
+            if (cfg.type == type && !std::string(cfg.device).empty() &&
+                (std::string)cfg.device == camera.address)
+                return &cfg;
+        return nullptr;
+    };
+    auto disabled = [&](const cameraInfo& camera, const char* type) {
+        const auto* cfg = exactConfig(camera, type);
+        return cfg && !(bool)cfg->enabled;
+    };
+    auto findCamera = [&](const std::string& device, CAMERA_TYPE type)
+        -> const cameraInfo* {
+        for (const auto& camera : cams)
+            if (camera.type == type && camera.address == device)
+                return &camera;
+        return nullptr;
+    };
+    auto configuredFormat = [&](const dashcam::config::CameraConfig* cfg,
+                                const cameraInfo& camera,
+                                bool recording) -> int {
+        if (!cfg) return recording ? pickUsbRecordFormat(camera)
+                                   : pickDriverFormat(camera);
+        const int index = (int)cfg->formatIndex;
+        if (index >= 0 && static_cast<size_t>(index) < camera.videoFormats.size()) {
+            const auto& f = camera.videoFormats[static_cast<size_t>(index)];
+            const bool compatible = recording
+                ? (f.pixelFormat == V4L2_PIX_FMT_H264 ||
+                   f.pixelFormat == V4L2_PIX_FMT_MJPEG)
+                : (f.pixelFormat == V4L2_PIX_FMT_YUYV &&
+                   f.height >= 240 && f.frameRate >= 2.0f);
+            if (compatible) return index;
+            log(LogLevel::WARN, camera.address + ": configured FormatIndex " +
+                std::to_string(index) + " is incompatible with the " +
+                (recording ? "compressed recorder" : "driver monitor") +
+                "; selecting a safe format automatically");
+        } else {
+            log(LogLevel::WARN, camera.address + ": configured FormatIndex " +
+                std::to_string(index) + " is out of range; selecting a safe "
+                "format automatically");
+        }
+        return recording ? pickUsbRecordFormat(camera) : pickDriverFormat(camera);
+    };
+
+    // Census first.  A disabled exact device entry removes that device from
+    // automatic role assignment; unlisted hot-plug cameras remain eligible.
     for (const auto& c : cams) {
         if (c.type == CAMERA_TYPE::USB) { ++cc.usbCount; continue; }
         if (c.type != CAMERA_TYPE::CSI) continue;
         if (sensorNameContains(c, "imx296")) {
             ++cc.imx296Count;
-            if (!cc.lane) cc.lane = &c;
         } else {
             ++cc.otherCsiCount;
         }
+    }
+
+    // Prefer an enabled, explicitly configured IMX296.  SensorId and
+    // FormatIndex are consumed below instead of being silently ignored.
+    for (const auto& cfg : configs) {
+        if (cfg.type != "CSI" || !(bool)cfg.enabled ||
+            std::string(cfg.device).empty())
+            continue;
+        const cameraInfo* camera =
+            findCamera((std::string)cfg.device, CAMERA_TYPE::CSI);
+        if (!camera) {
+            log(LogLevel::WARN, "configured CSI camera " +
+                (std::string)cfg.device + " not found");
+            continue;
+        }
+        if (!sensorNameContains(*camera, "imx296")) continue;
+        cc.lane = camera;
+        cc.laneConfig = &cfg;
+        break;
+    }
+    if (!cc.lane) {
+        for (const auto& camera : cams) {
+            if (camera.type != CAMERA_TYPE::CSI ||
+                !sensorNameContains(camera, "imx296") ||
+                disabled(camera, "CSI"))
+                continue;
+            cc.lane = &camera;
+            cc.laneConfig = exactConfig(camera, "CSI");
+            break;
+        }
+    }
+    if (cc.laneConfig) {
+        cc.laneSensorId = (int)cc.laneConfig->sensorId;
+        const int index = (int)cc.laneConfig->formatIndex;
+        if (index >= 0 &&
+            static_cast<size_t>(index) < cc.lane->videoFormats.size())
+            cc.laneFmt = index;
+        else
+            log(LogLevel::WARN, cc.lane->address + ": configured CSI "
+                "FormatIndex is out of range; using 0");
     }
 
     // Driver camera first (see the ordering note above).
@@ -414,7 +503,7 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     } else if (!cabinDev.empty()) {
         for (const auto& c : cams) {
             if (c.type != CAMERA_TYPE::USB || c.address != cabinDev) continue;
-            const int idx = pickDriverFormat(c);
+            const int idx = configuredFormat(exactConfig(c, "USB"), c, false);
             if (idx < 0)
                 log(LogLevel::ERROR,
                     "pinned cabin camera " + cabinDev + " has no usable YUYV "
@@ -433,12 +522,30 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
                 "driver monitoring OFF");
     }
 
-    // Recording camera: first precompressed-capable USB the driver monitor has
-    // not claimed.
+    // Recording camera: explicit non-cabin USB entries get priority.
+    for (const auto& cfg : configs) {
+        if (cfg.type != "USB" || cfg.name == "cabin" || !(bool)cfg.enabled ||
+            std::string(cfg.device).empty())
+            continue;
+        const cameraInfo* camera =
+            findCamera((std::string)cfg.device, CAMERA_TYPE::USB);
+        if (!camera || (cc.driver && camera->address == cc.driver->address))
+            continue;
+        const int idx = configuredFormat(&cfg, *camera, true);
+        if (idx >= 0) {
+            cc.record = camera;
+            cc.recordFmt = idx;
+            break;
+        }
+    }
+    // Otherwise auto-select a non-disabled compressed USB camera the driver
+    // monitor has not claimed.
     for (const auto& c : cams) {
+        if (cc.record) break;
         if (c.type != CAMERA_TYPE::USB) continue;
+        if (disabled(c, "USB")) continue;
         if (cc.driver && c.address == cc.driver->address) continue;
-        const int idx = pickUsbRecordFormat(c);
+        const int idx = configuredFormat(exactConfig(c, "USB"), c, true);
         if (idx >= 0) { cc.record = &c; cc.recordFmt = idx; break; }
     }
 
@@ -446,8 +553,9 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     if (!cc.driver && cabinEnabled && cabinDev.empty()) {
         for (const auto& c : cams) {
             if (c.type != CAMERA_TYPE::USB) continue;
+            if (disabled(c, "USB")) continue;
             if (cc.record && c.address == cc.record->address) continue;
-            const int idx = pickDriverFormat(c);
+            const int idx = configuredFormat(exactConfig(c, "USB"), c, false);
             if (idx >= 0) { cc.driver = &c; cc.driverFmt = idx; break; }
         }
         // A lone recording camera (the RECORD-ONLY scenario) legitimately has no
@@ -493,7 +601,7 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
             + " passthrough");
     }
     if (cc.lane) {
-        const auto& f = cc.lane->videoFormats.at(0);   // IMX296: single mode
+        const auto& f = cc.lane->videoFormats.at((size_t)cc.laneFmt);
         log(LogLevel::INFO,
             "  role lanes      -> " + cc.lane->address + " (IMX296) "
             + std::to_string(f.width) + "x" + std::to_string(f.height));
@@ -573,16 +681,6 @@ int main(int argc, char* argv[]) {
     const std::string footageDir = dashcam::config::resolveStorageDir(
         cfg.system.footagePath, dashcam::config::kFallbackFootageName, log);
 
-    // ── cabin-camera pin from config (see header) ────────────────────────────
-    std::string cabinDev;
-    bool cabinEnabled = true;
-    for (const auto& cc : cfg.cameras) {
-        if (cc.type != "USB" || cc.name != "cabin") continue;
-        cabinEnabled = (bool)cc.enabled;
-        cabinDev     = (std::string)cc.device;
-        break;
-    }
-
     // ── camera discovery: USB record + USB driver + IMX296 lanes ─────────────
     std::vector<cameraInfo> cams;
     if (getCameraList(cams, log) != ERROR_CODE::NONE || cams.empty()) {
@@ -595,10 +693,19 @@ int main(int argc, char* argv[]) {
     // Inspect which cameras are present and map each to a role (recording, lane
     // detection, driver monitoring), then announce the recognised profile.
     const CameraConfiguration camCfg =
-        resolveCameraConfiguration(cams, cabinDev, cabinEnabled, log);
-    const cameraInfo* laneInfo  = camCfg.lane;
+        resolveCameraConfiguration(cams, cfg.cameras, log);
+    cameraInfo laneSelection;
+    const cameraInfo* laneInfo = nullptr;
+    if (camCfg.lane) {
+        laneSelection = *camCfg.lane;
+        if (camCfg.laneSensorId >= 0)
+            laneSelection.deviceId =
+                static_cast<uint32_t>(camCfg.laneSensorId);
+        laneInfo = &laneSelection;
+    }
     const cameraInfo* usbInfo   = camCfg.record;
     const int         usbFmtIdx = camCfg.recordFmt;
+    const int         laneFmtIdx = camCfg.laneFmt;
     const cameraInfo* drvInfo   = camCfg.driver;
     const int         drvFmtIdx = camCfg.driverFmt;
 
@@ -608,23 +715,30 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    float laneFps = 20.0f;
-    for (const auto& cc : cfg.cameras) {
-        if (cc.type != "CSI") continue;
-        const std::string dev = cc.device;
-        if (!dev.empty() && laneInfo && dev != laneInfo->address) continue;
-        if ((float)cc.outFps > 0.0f) laneFps = (float)cc.outFps;
-        break;
-    }
+    const auto* laneConfig = camCfg.laneConfig;
+    const cameraVideoFormat nativeLaneFmt = laneInfo
+        ? laneInfo->videoFormats.at((size_t)laneFmtIdx)
+        : cameraVideoFormat{};
+    const uint32_t laneWidth =
+        laneConfig && (int)laneConfig->outWidth > 0
+            ? static_cast<uint32_t>((int)laneConfig->outWidth)
+            : nativeLaneFmt.width;
+    const uint32_t laneHeight =
+        laneConfig && (int)laneConfig->outHeight > 0
+            ? static_cast<uint32_t>((int)laneConfig->outHeight)
+            : nativeLaneFmt.height;
+    const float laneFps =
+        laneConfig && (float)laneConfig->outFps > 0.0f
+            ? (float)laneConfig->outFps
+            : nativeLaneFmt.frameRate;
 
     // ── lane detector: load the TRT engine before pipeline setup ─────────────
     std::unique_ptr<dashcam::lane::LaneDetector> laneDet;
     if (laneInfo) {
-        const auto& lFmt = laneInfo->videoFormats.at(0);  // IMX296: single mode
         const auto t0 = std::chrono::steady_clock::now();
         try {
             laneDet = std::make_unique<dashcam::lane::LaneDetector>(
-                lFmt.width, lFmt.height, makeLaneConfig(cfg.detection, log));
+                laneWidth, laneHeight, makeLaneConfig(cfg.detection, log));
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             log(dashcam::log::LogLevel::INFO,
@@ -670,11 +784,13 @@ int main(int argc, char* argv[]) {
     // ── lane camera ──────────────────────────────────────────────────────────
     Camera_CSI laneCam(laneInfo ? *laneInfo : cameraInfo{});
     if (laneDet) {
-        const auto& lFmt = laneInfo->videoFormats.at(0);
         laneCam.setLogCallback(log);
         laneCam.setAttributeDictionary(dict);
         laneCam.setPipelineParams(makePipelineParams(cfg.pipeline));
-        laneCam.setOutputResolution(lFmt.width, lFmt.height, laneFps);
+        laneCam.setOutputResolution(laneWidth, laneHeight, laneFps);
+        if (laneConfig)
+            for (const auto& [name, value] : laneConfig->capabilities)
+                laneCam.setCameraAttribute(name, value);
 
         GstElement* laneBin = laneDet->createBin();
         if (laneBin) {
@@ -698,7 +814,7 @@ int main(int argc, char* argv[]) {
     }
     if (laneDet) {
         laneCam.open();
-        laneCam.setCameraVideoFormat(0);
+        laneCam.setCameraVideoFormat(static_cast<uint16_t>(laneFmtIdx));
         laneCam.start();
 
         cameraStatus ls;
@@ -711,6 +827,24 @@ int main(int argc, char* argv[]) {
         } else {
             laneCam.setCaptureEnabled(false);   // branch-only consumer
             laneDet->start();
+            const auto deadline =
+                std::chrono::steady_clock::now() + kInferenceStartupTimeout;
+            while (g_run && laneDet->processedFrameCount() == 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                laneCam.getCameraStatus(ls);
+                if (ls.status != CAMERA_STATUS::RUNNING) break;
+            }
+            if (laneDet->processedFrameCount() == 0) {
+                log(dashcam::log::LogLevel::ERROR,
+                    "lane path produced no inference result before timeout — "
+                    "continuing WITHOUT lane detection");
+                laneCam.stop(); laneDet->stop(); laneDet.reset();
+                laneCam.close();
+            } else {
+                log(dashcam::log::LogLevel::INFO,
+                    "lane inference ready (first result received)");
+            }
         }
     }
 
@@ -755,6 +889,24 @@ int main(int argc, char* argv[]) {
         } else {
             drvCam.setCaptureEnabled(false);    // branch-only consumer
             drvDet->start();
+            const auto deadline =
+                std::chrono::steady_clock::now() + kInferenceStartupTimeout;
+            while (g_run && drvDet->processedFrameCount() == 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                drvCam.getCameraStatus(ds);
+                if (ds.status != CAMERA_STATUS::RUNNING) break;
+            }
+            if (drvDet->processedFrameCount() == 0) {
+                log(dashcam::log::LogLevel::ERROR,
+                    "driver path produced no inference result before timeout — "
+                    "continuing WITHOUT driver monitoring");
+                drvCam.stop(); drvDet->stop(); drvDet.reset();
+                drvCam.close();
+            } else {
+                log(dashcam::log::LogLevel::INFO,
+                    "driver inference ready (first result received)");
+            }
         }
     }
 
@@ -810,9 +962,11 @@ int main(int argc, char* argv[]) {
 
         recActive = rec.startRecording(usbInfo->address, rfmt, recFile,
                                        (uint32_t)(int)cfg.recording.recordFps);
-        if (!recActive)
+        if (!recActive) {
             log(dashcam::log::LogLevel::ERROR,
                 "recording failed to start — continuing WITHOUT recording");
+            streamSrv.stop();
+        }
     }
     if (!recActive && !laneDet && !drvDet) {
         log(dashcam::log::LogLevel::ERROR, "no active subsystems; aborting");
@@ -848,11 +1002,12 @@ int main(int argc, char* argv[]) {
     auto lastLevel = dashcam::driver::FatigueLevel::OK;
     auto lastFatigueAlarm = clock::now();
 
-    while (g_run.load()) {
+    while (g_run) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         // Software fatigue-score reset (SIGUSR1; GPIO button later).
-        if (g_resetScore.exchange(false) && drvDet) {
+        if (g_resetScore && drvDet) {
+            g_resetScore = 0;
             drvDet->resetScore();
             log(dashcam::log::LogLevel::INFO,
                 "fatigue score reset to a fresh session (SIGUSR1)");
@@ -868,17 +1023,20 @@ int main(int argc, char* argv[]) {
 
         if (laneDet) {
             const dashcam::lane::LaneResult lr = laneDet->poll();
-            if (lr.numLanes != lastLane.numLanes ||
-                lr.currentLaneIndex != lastLane.currentLaneIndex) {
+            if (lr.valid && lr.sequence != lastLane.sequence &&
+                (lr.numLanes != lastLane.numLanes ||
+                 lr.currentLaneIndex != lastLane.currentLaneIndex)) {
                 log(dashcam::log::LogLevel::INFO,
                     "lane update: lanes=" + std::to_string((int)lr.numLanes)
                     + " ego=" + std::to_string((int)lr.currentLaneIndex));
-                lastLane = lr;
             }
+            if (lr.valid && lr.sequence != lastLane.sequence)
+                lastLane = lr;
             // Bridge lane position into the fatigue scorer (the libraries are
             // deliberately decoupled — the app is the only place both exist).
             if (drvDet)
-                drvDet->setLaneOffset(lr.lateralOffset, lr.lateralValid);
+                drvDet->setLaneOffset(lr.lateralOffset,
+                                      lr.valid && lr.lateralValid);
         }
 
         if (drvDet) {
@@ -958,15 +1116,22 @@ int main(int argc, char* argv[]) {
             lastStatus = now;
             if (recActive && !rec.isRecording()) {
                 log(dashcam::log::LogLevel::ERROR,
-                    "recording no longer healthy; stopping");
-                break;
+                    "recording no longer healthy — disabling recorder and "
+                    "continuing remaining subsystems");
+                rec.stopRecording();
+                streamSrv.stop();
+                recActive = false;
             }
             if (laneDet) {
                 cameraStatus ls;
                 laneCam.getCameraStatus(ls);
-                if (ls.status != CAMERA_STATUS::RUNNING) {
+                if (ls.status != CAMERA_STATUS::RUNNING ||
+                    !laneDet->hasFreshResult(kLaneFreshnessMs)) {
                     log(dashcam::log::LogLevel::ERROR,
-                        "IMX296 no longer RUNNING — lane detection lost");
+                        ls.status != CAMERA_STATUS::RUNNING
+                            ? "IMX296 no longer RUNNING — lane detection lost"
+                            : "lane inference results became stale — lane "
+                              "detection lost");
                     laneCam.stop(); laneDet->stop(); laneDet.reset();
                     laneCam.close();
                 } else {
@@ -978,9 +1143,14 @@ int main(int argc, char* argv[]) {
             if (drvDet) {
                 cameraStatus ds;
                 drvCam.getCameraStatus(ds);
-                if (ds.status != CAMERA_STATUS::RUNNING) {
+                if (ds.status != CAMERA_STATUS::RUNNING ||
+                    !drvDet->hasFreshResult(kDriverFreshnessMs)) {
                     log(dashcam::log::LogLevel::ERROR,
-                        "driver camera no longer RUNNING — driver monitoring lost");
+                        ds.status != CAMERA_STATUS::RUNNING
+                            ? "driver camera no longer RUNNING — driver "
+                              "monitoring lost"
+                            : "driver inference results became stale — driver "
+                              "monitoring lost");
                     drvCam.stop(); drvDet->stop(); drvDet.reset();
                     drvCam.close();
                 } else {

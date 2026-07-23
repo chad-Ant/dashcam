@@ -4,7 +4,8 @@
 #
 # Same container/mount setup as launchcode_dev.sh, but instead of dropping into
 # an interactive shell it starts the newest built dashcam_v0_3 binary right
-# away (building it first if none exists).  The binary runs as the container's
+# away (always rebuilding first so source edits can never launch a stale
+# binary).  The binary runs as the container's
 # foreground process, so Ctrl+C (SIGINT) or `docker stop` (SIGTERM) reaches it
 # directly and triggers the graceful shutdown path: recording valves closed,
 # EOS flushed, MKV finalised, lane + driver inference threads joined.
@@ -51,12 +52,9 @@ docker run -it --rm --network=host --privileged --ipc=host \
     -v /etc/timezone:/etc/timezone:ro \
     $IMAGE_NAME bash -c '
         cd /user/dashcam || exit 1
+        echo "building dashcam_v0_3 from the mounted source..."
+        make -j6 dashcam_v0_3 || exit 1
         BIN=$(ls -td bin/build_*/dashcam_v0_3 2>/dev/null | head -1)
-        if [ -z "$BIN" ]; then
-            echo "dashcam_v0_3 not built yet — building..."
-            make -j6 || exit 1
-            BIN=$(ls -td bin/build_*/dashcam_v0_3 2>/dev/null | head -1)
-        fi
         [ -n "$BIN" ] || { echo "build produced no dashcam_v0_3 binary"; exit 1; }
         echo "starting $BIN"
         exec "$BIN"

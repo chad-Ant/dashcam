@@ -162,13 +162,12 @@ struct cameraInfo {
  * reports @c V4L2_CAP_VIDEO_CAPTURE, the function probes supported pixel
  * formats, discrete resolutions, discrete frame rates, and V4L2 controls.
  *
- * CSI cameras (driver: @c tegra-video or @c vi) receive their Argus sensor-id
- * in @c cameraInfo::deviceId, resolved via the device tree's
- * tegra-camera-platform module list (video-node order follows i2c probe order,
- * which can differ from Argus order with mixed sensors).  If the device tree
- * chain cannot be resolved, a sequential id in /dev/videoN order is assumed
- * and a WARN is logged.  USB cameras (driver: @c uvcvideo) receive the raw
- * numeric device index.
+ * CSI cameras (driver: @c tegra-video or @c vi) receive their dense Argus
+ * sensor-id in @c cameraInfo::deviceId.  Discovered device-tree module
+ * positions are sorted then compacted, because Argus numbers only active
+ * modules (a lone module1 is therefore sensor-id 0, not 1).  If the device-tree
+ * chain cannot be resolved, discovery order is used after resolved modules and
+ * a WARN is logged.  USB cameras receive the raw numeric device index.
  *
  * @param[out] cameraList  Cleared and populated with one entry per discovered
  *                         capture device.  The vector may be empty on return

@@ -16,7 +16,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
-#include <vector>
 
 namespace dashcam::lane {
 
@@ -102,14 +101,12 @@ public:
 
     mutable std::mutex resultMutex_;
     LaneResult         latestResult_;
+    std::atomic<uint64_t> processedFrames_{0};
+    std::atomic<int64_t>  lastResultSteadyMs_{0};
 
     static std::atomic<int> sCounter;
 
     // ── internal types ────────────────────────────────────────────────────────
-
-    // y is normalised (fraction of the model's implied full frame) — decode
-    // geometry is scale-invariant, so pixels are never needed vertically.
-    struct Pt { float x, y; };
 
     // Least-squares line x = slope·y + intercept over all decoded points.
     struct Boundary {
@@ -464,9 +461,15 @@ public:
             gst_buffer_unmap(buf, &map);
             gst_sample_unref(sample);
 
-            if (sizeOk) {
+            if (sizeOk && result.valid) {
+                const uint64_t sequence =
+                    processedFrames_.fetch_add(1, std::memory_order_relaxed) + 1;
+                result.sequence = sequence;
+                const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now().time_since_epoch()).count();
                 std::lock_guard<std::mutex> lk(resultMutex_);
                 latestResult_ = std::move(result);
+                lastResultSteadyMs_.store(nowMs, std::memory_order_release);
             }
         }
     }
@@ -566,8 +569,23 @@ public:
         return acc / se + 0.5f;
     }
 
-    // Decode one lane slot from the row head: x in pixels, y normalised.
-    std::vector<Pt> lanePointsRow(int lane) const {
+    static Boundary boundaryFromMoments(int n, float sumX, float sumY,
+                                        float sumYX, float sumYY) {
+        if (n < 2) return {};
+        const float invN = 1.0f / static_cast<float>(n);
+        const float covYX = sumYX - sumY * sumX * invN;
+        const float varY  = sumYY - sumY * sumY * invN;
+        if (varY < 1e-6f) return {};
+        Boundary b;
+        b.slope = covYX / varY;
+        b.intercept = (sumX - b.slope * sumY) * invN;
+        b.detected = true;
+        return b;
+    }
+
+    // Decode and fit one lane slot directly from the row head.  Accumulating
+    // least-squares moments avoids allocating point vectors on every frame.
+    Boundary boundaryRow(int lane) const {
         const int G = config_.numCellRow;
         const int K = config_.numRowAnchors;
         const int L = config_.numLanes;
@@ -579,10 +597,10 @@ public:
             if (exist[1 * K * L + k * L + lane] > exist[0 * K * L + k * L + lane])
                 ++existCount;
 
-        std::vector<Pt> pts;
-        if (existCount * 2 <= K) return pts;    // demo: sum > K/2
-        pts.reserve(static_cast<size_t>(existCount));
+        if (existCount * 2 <= K) return {};    // demo: sum > K/2
 
+        float sumX = 0.0f, sumY = 0.0f, sumYX = 0.0f, sumYY = 0.0f;
+        int n = 0;
         for (int k = 0; k < K; ++k) {
             if (exist[1 * K * L + k * L + lane] <= exist[0 * K * L + k * L + lane])
                 continue;
@@ -594,13 +612,15 @@ public:
                 if (v > best) { best = v; gStar = g; }
             }
             const float cell = softLocalArgmax(loc, G, K * L, off, gStar);
-            pts.push_back({ cell / (G - 1) * srcW_, rowAnchorY(k) });
+            const float x = cell / (G - 1) * srcW_;
+            const float y = rowAnchorY(k);
+            sumX += x; sumY += y; sumYX += y * x; sumYY += y * y; ++n;
         }
-        return pts;
+        return boundaryFromMoments(n, sumX, sumY, sumYX, sumYY);
     }
 
-    // Decode one lane slot from the column head.
-    std::vector<Pt> lanePointsCol(int lane) const {
+    // Decode and fit one lane slot directly from the column head.
+    Boundary boundaryCol(int lane) const {
         const int G = config_.numCellCol;
         const int K = config_.numColAnchors;
         const int L = config_.numLanes;
@@ -612,10 +632,10 @@ public:
             if (exist[1 * K * L + k * L + lane] > exist[0 * K * L + k * L + lane])
                 ++existCount;
 
-        std::vector<Pt> pts;
-        if (existCount * 4 <= K) return pts;    // demo: sum > K/4
-        pts.reserve(static_cast<size_t>(existCount));
+        if (existCount * 4 <= K) return {};    // demo: sum > K/4
 
+        float sumX = 0.0f, sumY = 0.0f, sumYX = 0.0f, sumYY = 0.0f;
+        int n = 0;
         for (int k = 0; k < K; ++k) {
             if (exist[1 * K * L + k * L + lane] <= exist[0 * K * L + k * L + lane])
                 continue;
@@ -629,55 +649,35 @@ public:
             const float cell = softLocalArgmax(loc, G, K * L, off, gStar);
             const float x = static_cast<float>(k)
                           / static_cast<float>(K - 1) * srcW_;
-            pts.push_back({ x, cell / (G - 1) });
+            const float y = cell / (G - 1);
+            sumX += x; sumY += y; sumYX += y * x; sumYY += y * y; ++n;
         }
-        return pts;
-    }
-
-    // Least-squares fit x = slope·y + intercept over ALL decoded points —
-    // steadier than an endpoint fit when markings curve or one anchor jumps.
-    Boundary boundaryFromPts(const std::vector<Pt>& pts) const {
-        const size_t n = pts.size();
-        if (n < 2) return {};
-        float meanX = 0, meanY = 0;
-        for (const Pt& p : pts) { meanX += p.x; meanY += p.y; }
-        meanX /= n; meanY /= n;
-        float covYX = 0, varY = 0;
-        for (const Pt& p : pts) {
-            covYX += (p.y - meanY) * (p.x - meanX);
-            varY  += (p.y - meanY) * (p.y - meanY);
-        }
-        if (varY < 1e-6f) return {};   // no vertical spread — not a boundary
-        Boundary b;
-        b.slope     = covYX / varY;
-        b.intercept = meanX - b.slope * meanY;
-        b.detected  = true;
-        return b;
+        return boundaryFromMoments(n, sumX, sumY, sumYX, sumYY);
     }
 
     LaneResult decode() const {
-        std::vector<Boundary> bounds;
-        bounds.reserve(static_cast<size_t>(config_.numLanes));
+        std::array<Boundary, 4> bounds{};
         for (int i = 0; i < config_.numLanes; ++i) {
             const bool rowSlot = (i == 1 || i == 2);
-            bounds.push_back(boundaryFromPts(
-                rowSlot ? lanePointsRow(i) : lanePointsCol(i)));
+            bounds[static_cast<size_t>(i)] =
+                rowSlot ? boundaryRow(i) : boundaryCol(i);
         }
 
         const float refY = config_.laneReferenceY;   // normalised
-        std::vector<float> xs;
+        std::array<float, 4> xs{};
+        size_t xsCount = 0;
         for (const auto& b : bounds)
-            if (b.detected) xs.push_back(b.xAtY(refY));
-        std::sort(xs.begin(), xs.end());
-
-        if (xs.size() < 2) return {};
+            if (b.detected) xs[xsCount++] = b.xAtY(refY);
+        std::sort(xs.begin(), xs.begin() + static_cast<std::ptrdiff_t>(xsCount));
 
         LaneResult result;
-        result.numLanes = static_cast<int8_t>(xs.size() - 1);
+        result.valid = true;
+        if (xsCount < 2) return result;
+        result.numLanes = static_cast<int8_t>(xsCount - 1);
 
         const float vehicleX = srcW_ * 0.5f;
         result.currentLaneIndex = -1;
-        for (uint8_t i = 0; i + 1 < static_cast<uint8_t>(xs.size()); ++i) {
+        for (size_t i = 0; i + 1 < xsCount; ++i) {
             if (vehicleX >= xs[i] && vehicleX <= xs[i + 1]) {
                 result.currentLaneIndex = static_cast<int8_t>(i);
                 // Lateral projection inside the ego lane: -1 on the left
@@ -692,8 +692,6 @@ public:
             }
         }
 
-        result.laneAllowedDirections.assign(
-            static_cast<size_t>(result.numLanes), LaneDirection::Straight);
         return result;
     }
 
@@ -714,6 +712,18 @@ public:
         std::lock_guard<std::mutex> lk(resultMutex_);
         return latestResult_;
     }
+
+    uint64_t processedFrameCount() const {
+        return processedFrames_.load(std::memory_order_acquire);
+    }
+
+    bool hasFreshResult(uint32_t maxAgeMs) const {
+        const int64_t last = lastResultSteadyMs_.load(std::memory_order_acquire);
+        if (last <= 0) return false;
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return now >= last && static_cast<uint64_t>(now - last) <= maxAgeMs;
+    }
 };
 
 std::atomic<int> LaneDetectorImpl::sCounter{0};
@@ -732,6 +742,12 @@ GstElement* LaneDetector::createBin()       { return impl_->createBin(); }
 void        LaneDetector::start()           { impl_->start(); }
 void        LaneDetector::stop()            { impl_->stop(); }
 LaneResult  LaneDetector::poll() const      { return impl_->poll(); }
+uint64_t    LaneDetector::processedFrameCount() const {
+    return impl_->processedFrameCount();
+}
+bool LaneDetector::hasFreshResult(uint32_t maxAgeMs) const {
+    return impl_->hasFreshResult(maxAgeMs);
+}
 
 void LaneDetector::setLogCallback(dashcam::log::LogCallback cb) {
     impl_->log_ = std::move(cb);

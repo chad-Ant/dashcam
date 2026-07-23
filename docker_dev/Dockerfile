@@ -1,7 +1,5 @@
-# BASE_IMAGE is injected by build.sh:
-#   - First build:      falls back to dustynv/l4t-ml:r36.4.0
-#   - Subsequent builds: the previous l4t-ml-gpio:latest (archived as build_<timestamp>)
-# Direct `docker build` invocations still work; they use the ARG default.
+# build.sh always injects this clean upstream base.  Never use a prior app image
+# as the next base: removed packages would survive in lower layers.
 ARG BASE_IMAGE=dustynv/l4t-ml:r36.4.0
 FROM ${BASE_IMAGE}
 
@@ -10,10 +8,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # plugins-good / plugins-bad / gstreamer-tools ship with the NVIDIA l4t-ml base
 # image via nvidia-l4t-gstreamer.  Re-installing the standard Ubuntu packages
 # causes duplicate GStreamer type registrations (GstRtpSrc, GstRtpSink, …).
-# plugins-ugly and plugins-base are genuinely absent or incomplete:
-#   - plugins-ugly: x264enc is excluded from the NVIDIA image (patent licensing).
-#   - plugins-base: the NVIDIA image omits the pango plugin (libgstpango.so),
-#     so textoverlay is unavailable without explicitly installing this package.
+# plugins-ugly is genuinely absent: x264enc is excluded from the NVIDIA image
+# (patent licensing).  v0.3 writes an ASS telemetry sidecar and does not use the
+# pango/textoverlay runtime plugin, so do not install another plugins-base copy.
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -23,7 +20,6 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-dev \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
-    gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-ugly \
     libcairo2-dev \
     ffmpeg \
@@ -44,6 +40,14 @@ RUN apt-get update && apt-get install -y \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     network-manager \
     && rm -rf /var/lib/apt/lists/*
+
+# NVIDIA's plugins-bad build contains an experimental rtpmanagerbad plugin
+# that registers GstRtpSrc/GstRtpSink types also owned by the stable
+# plugins-good rtpmanager.  Keep the package (other Jetson plugins depend on
+# it), but move only that conflicting module outside GStreamer's scan path.
+RUN install -d /usr/lib/aarch64-linux-gnu/gstreamer-1.0-disabled \
+    && mv /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstrtpmanagerbad.so \
+          /usr/lib/aarch64-linux-gnu/gstreamer-1.0-disabled/
 
 WORKDIR /home/app
 

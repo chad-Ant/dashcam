@@ -25,6 +25,21 @@ static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lv
     cb(lvl, buf);
 }
 
+// Quote a GStreamer string property.  Device paths and filenames are external
+// configuration, so they must not be able to terminate the property and append
+// arbitrary pipeline elements.
+static std::string gstQuoted(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (char ch : value) {
+        if (ch == '\\' || ch == '"') out.push_back('\\');
+        out.push_back(ch);
+    }
+    out.push_back('"');
+    return out;
+}
+
 // ─── telemetry formatting (same content the Cairo overlay drew) ───────────────
 
 static const char* headingToCardinal(float deg) {
@@ -205,7 +220,6 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
     assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",BR,,0,0,0,,"
              << dateBuf << "\\N" << timeBuf << "\n";
 
-    assFile_.flush();
 }
 
 // ─── subtitle / bus thread ────────────────────────────────────────────────────
@@ -227,6 +241,7 @@ void Recorder::subtitleLoop() {
 
     GstBus* bus = gst_element_get_bus(pipeline_);
     int64_t lastPos = -1;
+    auto nextAssFlush = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
     while (!stopFlag_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(interval);
@@ -267,6 +282,11 @@ void Recorder::subtitleLoop() {
         const bool stale = staleMs > 0 && (nowMs - od.timestampMs) > staleMs;
 
         writeAssSample(pos, durNs, od, nowMs, stale);
+        if (std::chrono::steady_clock::now() >= nextAssFlush) {
+            assFile_.flush();
+            nextAssFlush = std::chrono::steady_clock::now()
+                         + std::chrono::seconds(5);
+        }
     }
 
     if (bus) gst_object_unref(bus);
@@ -311,7 +331,7 @@ bool Recorder::startRecording(const std::string& devicePath,
 
     // Common source + caps (+ MJPEG rate cap); everything downstream of this is
     // where the record and (optional) stream branches diverge.
-    std::string trunk = "v4l2src name=camerasrc device=" + devicePath;
+    std::string trunk = "v4l2src name=camerasrc device=" + gstQuoted(devicePath);
     if (mjpeg) {
         trunk += " ! image/jpeg, width=" + std::to_string(fmt.width) +
                  ", height=" + std::to_string(fmt.height) +
@@ -331,7 +351,7 @@ bool Recorder::startRecording(const std::string& devicePath,
         std::string(h264 ? " ! h264parse" : "") +
         " ! queue max-size-buffers=8 leaky=0"
         " ! matroskamux offset-to-zero=true"
-        " ! filesink name=fsink sync=false async=false location=\"" + filename + "\"";
+        " ! filesink name=fsink sync=false async=false location=" + gstQuoted(filename);
 
     std::string desc;
     if (!streaming) {

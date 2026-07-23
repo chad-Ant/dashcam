@@ -199,7 +199,7 @@ ifneq ($(VPI_HDRS),)
 TARGETS += $(BUILD_DIR)/dashcam
 endif
 
-.PHONY: all clean run
+.PHONY: all clean run dashcam_v0_3
 
 # Each build gets its own logs/ and config/ directories.  Binaries resolve
 # <exe_dir>/logs and <exe_dir>/config at runtime (dashcam::log::init() /
@@ -211,6 +211,12 @@ ifeq ($(VPI_HDRS),)
 	@echo "NOTE: VPI headers not found — dashcam target skipped (install libnvvpi-dev)"
 endif
 	@echo "Built all targets in $(BUILD_DIR)/ (logs -> $(BUILD_DIR)/logs/, config -> $(BUILD_DIR)/config/)"
+
+# Production launcher target: compile only v0.3 and its libraries, while still
+# creating/seeding the per-build runtime directories.  The broad `all` target
+# remains available to development/test workflows.
+dashcam_v0_3: $(BUILD_DIR)/dashcam_v0_3 | $(BUILD_DIR)/logs $(BUILD_DIR)/config
+	@echo "Built dashcam_v0_3 in $(BUILD_DIR)/"
 
 $(BUILD_DIR)/logs:
 	@mkdir -p $@
