@@ -6,7 +6,8 @@
 //   [5] Raw-TCP stream passthrough
 //   [6] RtpSession branch description / SDP / viewer hint / named sink
 //   [7] WiFi connectivity (non-destructive: targets the current SSID)
-//   [8] ControlServer command dispatch + telemetry push (loopback)
+//   [8] ControlServer: HMAC known-answer, no-auth + authenticated handshake,
+//       unauthenticated telemetry denial, wrong-key rejection, IP allowlist
 //
 // All sections but [3] need no network and must pass; [3] needs internet and
 // only reports.  The library is observation-only and never mutates the clock.
@@ -372,11 +373,23 @@ int main(int argc, char* argv[]) {
         if (!coherent) ++failures;
     }
 
-    // ── [8] ControlServer: command dispatch + telemetry push (loopback) ───────
+    // ── [8] ControlServer: HMAC + auth handshake + dispatch + telemetry ───────
     log(LvL::INFO, "--------------------------------------------");
-    log(LvL::INFO, "[8] ControlServer (remote control + telemetry)");
+    log(LvL::INFO, "[8] ControlServer (auth + remote control + telemetry)");
     log(LvL::INFO, "--------------------------------------------");
     {
+        auto has = [](const std::string& s, const char* sub) {
+            return s.find(sub) != std::string::npos;
+        };
+        // Pull the nonce out of an "AUTH-CHALLENGE <nonce>" line.
+        auto nonceOf = [](const std::string& s) -> std::string {
+            const std::string tag = "AUTH-CHALLENGE ";
+            const size_t p = s.find(tag);
+            if (p == std::string::npos) return "";
+            const size_t b = p + tag.size();
+            const size_t e = s.find_first_of("\r\n", b);
+            return s.substr(b, e == std::string::npos ? std::string::npos : e - b);
+        };
         // Handler echoes the parsed command back so the client can verify the
         // server tokenised verb/args/clientIp correctly — no shared state, no race.
         net::ControlHandler handler = [](const net::ControlCommand& cmd) -> std::string {
@@ -387,54 +400,160 @@ int main(int argc, char* argv[]) {
             return os.str();
         };
 
-        net::ControlServer cs;
-        net::ControlServerConfig cc;
-        cc.port = 0;            // OS-assigned; read back via port()
-        cc.maxClients = 2;
-        const bool started = cs.start(cc, handler, log);
-        const uint16_t port = cs.port();
-        log(started ? LvL::INFO : LvL::ERROR,
-            std::string("  start() on port ") + std::to_string(port) +
-            "  " + (started ? "OK" : "FAIL"));
-        if (!started) ++failures;
-
-        if (started) {
-            net::TcpSocket cli;
-            const bool conn = cli.connect("127.0.0.1", port, 1000, log);
-
-            const std::string greet = drain(cli, 400);   // server greeting
-
-            const std::string c1 = "SET foo bar\n";
-            cli.sendAll(c1.data(), c1.size());
-            const std::string r1 = drain(cli, 600);       // dispatched reply
-
-            cs.pushTelemetry("{\"hello\":1}");
-            const std::string r2 = drain(cli, 600);        // broadcast telemetry
-
-            const bool count1 = (cs.clientCount() == 1);
-
-            auto has = [](const std::string& s, const char* sub) {
-                return s.find(sub) != std::string::npos;
-            };
+        // (a) HMAC-SHA256 known-answer vectors (RFC 4231 test cases 1 & 2).  A
+        //     wrong SHA-256/HMAC here would silently break every auth handshake.
+        {
+            const std::string k1(20, '\x0b');
+            const std::string m1 = net::detail::hmacSha256Hex(k1, "Hi There");
+            const std::string m2 = net::detail::hmacSha256Hex(
+                "Jefe", "what do ya want for nothing?");
             const bool ok =
-                conn &&
-                has(greet, "control ready") &&
-                has(r1, "verb=SET") && has(r1, "nargs=2") &&
-                has(r1, "ip=127.0.0.1") && has(r1, "a0=foo") &&
-                has(r2, "hello") &&
-                count1;
+                m1 == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7" &&
+                m2 == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
             log(ok ? LvL::INFO : LvL::ERROR,
-                std::string("  connect / dispatch / telemetry / count  ") +
+                std::string("  HMAC-SHA256 RFC-4231 known-answer            ") +
                 (ok ? "OK" : "FAIL"));
-            if (!ok) {
-                ++failures;
-                log(LvL::ERROR, "    greet=\"" + greet + "\" r1=\"" + r1 +
-                                "\" r2=\"" + r2 + "\" clients=" +
-                                std::to_string(cs.clientCount()));
-            }
-            cli.close();
+            if (!ok) { ++failures; log(LvL::ERROR, "    m1=" + m1 + " m2=" + m2); }
         }
-        cs.stop();
+
+        // (b) No-auth channel (empty token): immediate greeting, dispatch, telemetry.
+        {
+            net::ControlServer cs;
+            net::ControlServerConfig cc;
+            cc.port = 0;                 // OS-assigned
+            cc.maxClients = 2;
+            const bool started = cs.start(cc, handler, log);
+            const uint16_t port = cs.port();
+            bool ok = started;
+            if (started) {
+                net::TcpSocket cli;
+                const bool conn = cli.connect("127.0.0.1", port, 1000, log);
+                const std::string greet = drain(cli, 400);
+                const std::string c1 = "SET foo bar\n";
+                cli.sendAll(c1.data(), c1.size());
+                const std::string r1 = drain(cli, 600);
+                cs.pushTelemetry("{\"hello\":1}");
+                const std::string r2 = drain(cli, 600);
+                ok = conn && has(greet, "control ready") &&
+                     has(r1, "verb=SET") && has(r1, "nargs=2") &&
+                     has(r1, "ip=127.0.0.1") && has(r1, "a0=foo") &&
+                     has(r2, "hello") && cs.clientCount() == 1;
+                cli.close();
+            }
+            log(ok ? LvL::INFO : LvL::ERROR,
+                std::string("  no-auth connect / dispatch / telemetry       ") +
+                (ok ? "OK" : "FAIL"));
+            if (!ok) ++failures;
+            cs.stop();
+        }
+
+        // (c) Authenticated channel: correct HMAC unlocks dispatch + telemetry; a
+        //     wrong key is rejected; a never-authenticated client is denied both
+        //     command dispatch and telemetry.
+        {
+            const std::string token = "unit-test-psk";
+            net::ControlServer cs;
+            net::ControlServerConfig cc;
+            cc.port        = 0;
+            cc.maxClients  = 4;
+            cc.bindAddress = "127.0.0.1";      // host-local bind
+            cc.authToken   = token;
+            cc.allowIps    = { "127.0.0.1" };  // loopback is permitted
+            const bool started = cs.start(cc, handler, log);
+            const uint16_t port = cs.port();
+            if (!started) { ++failures; log(LvL::ERROR, "  auth start() FAILED"); }
+
+            if (started) {
+                // Good client: full handshake, then a command + telemetry.
+                net::TcpSocket good;
+                const bool conn = good.connect("127.0.0.1", port, 1000, log);
+                const std::string chal = drain(good, 500);
+                const std::string mac  = net::detail::hmacSha256Hex(token, nonceOf(chal));
+                const std::string am   = "AUTH " + mac + "\n";
+                good.sendAll(am.data(), am.size());
+                const std::string authReply = drain(good, 600);
+                const std::string c1 = "STATUS now\n";
+                good.sendAll(c1.data(), c1.size());
+                const std::string r1 = drain(good, 600);
+                cs.pushTelemetry("{\"hello\":1}");
+                const std::string r2 = drain(good, 600);
+                const bool okGood =
+                    conn && has(chal, "AUTH-CHALLENGE") && !nonceOf(chal).empty() &&
+                    has(authReply, "AUTH-OK") && has(authReply, "control ready") &&
+                    has(r1, "verb=STATUS") && has(r2, "hello");
+                log(okGood ? LvL::INFO : LvL::ERROR,
+                    std::string("  auth: correct HMAC -> dispatch + telemetry   ") +
+                    (okGood ? "OK" : "FAIL"));
+                if (!okGood) {
+                    ++failures;
+                    log(LvL::ERROR, "    chal=\"" + chal + "\" auth=\"" + authReply +
+                                    "\" r1=\"" + r1 + "\" r2=\"" + r2 + "\"");
+                }
+
+                // Wrong-key client: AUTH-FAIL and no telemetry ever delivered.
+                net::TcpSocket bad;
+                bad.connect("127.0.0.1", port, 1000, log);
+                const std::string chalB = drain(bad, 500);
+                const std::string macB  = net::detail::hmacSha256Hex("wrong-key", nonceOf(chalB));
+                const std::string amB   = "AUTH " + macB + "\n";
+                bad.sendAll(amB.data(), amB.size());
+                const std::string replyB = drain(bad, 600);
+                cs.pushTelemetry("{\"secret\":1}");
+                const std::string afterB = drain(bad, 400);
+                const bool okBad = has(replyB, "AUTH-FAIL") &&
+                                   afterB.find("secret") == std::string::npos;
+                log(okBad ? LvL::INFO : LvL::ERROR,
+                    std::string("  auth: wrong HMAC -> AUTH-FAIL, no telemetry  ") +
+                    (okBad ? "OK" : "FAIL"));
+                if (!okBad) ++failures;
+
+                // Unauthenticated client: a command is refused and no telemetry
+                // leaks while it stays unauthenticated.
+                net::TcpSocket un;
+                un.connect("127.0.0.1", port, 1000, log);
+                const std::string chalU = drain(un, 500);
+                const std::string cu = "STATUS\n";
+                un.sendAll(cu.data(), cu.size());
+                const std::string rU = drain(un, 500);
+                cs.pushTelemetry("{\"secret\":2}");
+                const std::string afterU = drain(un, 400);
+                const bool okUn = has(chalU, "AUTH-CHALLENGE") &&
+                                  has(rU, "authenticate first") &&
+                                  afterU.find("secret") == std::string::npos;
+                log(okUn ? LvL::INFO : LvL::ERROR,
+                    std::string("  unauth: command refused, telemetry denied    ") +
+                    (okUn ? "OK" : "FAIL"));
+                if (!okUn) ++failures;
+
+                good.close(); bad.close(); un.close();
+            }
+            cs.stop();
+        }
+
+        // (d) IP allowlist: a source not on the list is refused before it becomes
+        //     a client (loopback connects, but the allowlist names a different IP).
+        {
+            net::ControlServer cs;
+            net::ControlServerConfig cc;
+            cc.port        = 0;
+            cc.bindAddress = "127.0.0.1";
+            cc.allowIps    = { "10.11.12.13" };   // deliberately NOT loopback
+            const bool started = cs.start(cc, handler, log);
+            bool ok = started;
+            if (started) {
+                net::TcpSocket cli;
+                cli.connect("127.0.0.1", cs.port(), 1000, log);
+                const std::string got = drain(cli, 500);   // server closes us immediately
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                ok = got.empty() && cs.clientCount() == 0;
+                cli.close();
+            }
+            log(ok ? LvL::INFO : LvL::ERROR,
+                std::string("  allowlist refuses a non-listed source IP      ") +
+                (ok ? "OK" : "FAIL"));
+            if (!ok) ++failures;
+            cs.stop();
+        }
     }
 
     // ── Summary ───────────────────────────────────────────────────────────────

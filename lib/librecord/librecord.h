@@ -92,13 +92,21 @@ struct OverlayData {
     // When adasValid is false the ADAS overlay banner and telemetry are omitted.
     // These are deliberately plain scalars so librecord stays decoupled from
     // liblanedetector / libdriverstate — the application copies the results in.
-    bool  adasValid       = false;   ///< false → ADAS overlay banner suppressed.
+    //
+    // adasValid gates the banner as a whole; laneValid / driverValid gate the two
+    // halves INDEPENDENTLY.  The lane and driver detectors warm up and fail
+    // separately, so their validity must not be conflated: an invalid source
+    // renders as a dash rather than a stale or fabricated reading.  The
+    // application rebuilds these fields fresh each tick (never inherited).
+    bool  adasValid       = false;   ///< false → ADAS overlay banner suppressed entirely.
+    bool  laneValid       = false;   ///< A fresh lane result backs the lane fields this sample.
+    bool  driverValid     = false;   ///< A fresh driver result backs the fatigue/face fields this sample.
     int   laneCount       = 0;       ///< Lanes detected (LaneResult::numLanes).
     int   egoLaneIndex    = -1;      ///< 0-based ego lane; -1 = off-road / unknown.
     float laneOffset      = 0.0f;    ///< Lateral offset within the lane, -1 (left line) .. +1 (right line).
     bool  laneOffsetValid = false;   ///< laneOffset is meaningful this sample.
     float fatigueScore    = 100.0f;  ///< Fatigue score: 100 fresh → ≤0 fatigued.
-    int   fatigueLevel    = 0;       ///< 0 OK, 1 NOTICE, 2 WARNING, 3 FATIGUE.
+    int   fatigueLevel    = 0;       ///< 0 OK, 1 CAUTION, 2 WARNING, 3 FATIGUE.
     bool  driverDrowsy    = false;   ///< Most recent classification is drowsy.
     bool  faceDetected    = true;    ///< Driver's face currently visible to the cabin cam.
 };

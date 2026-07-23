@@ -230,26 +230,35 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
 
     // ADAS banner (top-centre): lane position + fatigue state.  Drawn only when
     // the application has fed a valid ADAS snapshot (adasValid); otherwise the
-    // recording carries just the GPS corners.  No commas in the text — the ASS
-    // Dialogue Text field is positional.
+    // recording carries just the GPS corners.  The lane and driver halves are
+    // rendered INDEPENDENTLY from laneValid / driverValid: an invalid source
+    // becomes a dash rather than a stale or fabricated reading (the two detectors
+    // warm up and fail on their own).  No commas in the text — the ASS Dialogue
+    // Text field is positional.
     if (od.adasValid) {
         char lane[64];
-        if (od.laneOffsetValid && od.egoLaneIndex >= 0)
+        if (od.laneValid && od.laneOffsetValid && od.egoLaneIndex >= 0)
             std::snprintf(lane, sizeof(lane), "LANE %d/%d %+.2f",
                           od.egoLaneIndex + 1, od.laneCount,
                           static_cast<double>(od.laneOffset));
         else
             std::snprintf(lane, sizeof(lane), "LANE --");
 
-        static const char* lvlName[4] = { "OK", "CAUTION", "WARN", "FATIGUE" };
-        const char* lvl = (od.fatigueLevel >= 0 && od.fatigueLevel < 4)
-                              ? lvlName[od.fatigueLevel] : "?";
+        char fat[64];
+        if (od.driverValid) {
+            static const char* lvlName[4] = { "OK", "CAUTION", "WARN", "FATIGUE" };
+            const char* lvl = (od.fatigueLevel >= 0 && od.fatigueLevel < 4)
+                                  ? lvlName[od.fatigueLevel] : "?";
+            std::snprintf(fat, sizeof(fat), "FAT %.0f %s%s%s",
+                          static_cast<double>(od.fatigueScore), lvl,
+                          od.driverDrowsy ? "  DROWSY" : "",
+                          od.faceDetected ? ""         : "  NOFACE");
+        } else {
+            std::snprintf(fat, sizeof(fat), "FAT --");
+        }
 
         char adas[256];
-        std::snprintf(adas, sizeof(adas), "%s   FAT %.0f %s%s%s",
-                      lane, static_cast<double>(od.fatigueScore), lvl,
-                      od.driverDrowsy   ? "  DROWSY" : "",
-                      od.faceDetected   ? ""         : "  NOFACE");
+        std::snprintf(adas, sizeof(adas), "%s   %s", lane, fat);
         assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",ADAS,,0,0,0,," << adas << "\n";
     }
 }

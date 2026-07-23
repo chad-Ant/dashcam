@@ -65,7 +65,8 @@ LIBI2C_SRCS    := lib/libi2c/libi2c.cpp
 LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
 LIBNET_SRCS    := lib/libnetwork/libnetwork.cpp lib/libnetwork/libnetwork_ntp.cpp \
                   lib/libnetwork/libnetwork_stream.cpp lib/libnetwork/libnetwork_rtp.cpp \
-                  lib/libnetwork/libnetwork_control.cpp lib/libnetwork/libnetwork_wifi.cpp
+                  lib/libnetwork/libnetwork_control.cpp lib/libnetwork/libnetwork_hmac.cpp \
+                  lib/libnetwork/libnetwork_wifi.cpp
 LIBSPI_SRCS    := lib/libspi/libspi.cpp
 LIBUART_SRCS   := lib/libuart/libuart.cpp
 LIBLOG_SRCS    := lib/liblog/liblog.cpp

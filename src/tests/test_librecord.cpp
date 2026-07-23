@@ -143,7 +143,10 @@ int main(int argc, char* argv[]) {
         od.speedKmh    = 40.0f + 10.0f * std::sin(t * 0.2f);
         od.headingDeg  = static_cast<float>((t * 3) % 360);
         // ADAS telemetry banner (top-centre): lane position + fatigue state.
+        // Both sources valid, so the banner shows real readings on both halves.
         od.adasValid       = true;
+        od.laneValid       = true;
+        od.driverValid     = true;
         od.laneCount       = 3;
         od.egoLaneIndex    = 1;
         od.laneOffset      = 0.25f;
@@ -178,18 +181,27 @@ int main(int argc, char* argv[]) {
     std::ifstream in(ass);
     std::string line;
     int styles = 0, events = 0, adasStyle = 0, adasEvents = 0;
+    int adasReal = 0, adasFatDash = 0;
     bool playRes = false;
     while (std::getline(in, line)) {
         if (line.rfind("Style: ", 0) == 0)         ++styles;
         if (line.rfind("Style: ADAS,", 0) == 0)    ++adasStyle;
         if (line.rfind("Dialogue: ", 0) == 0)      ++events;
-        if (line.find(",ADAS,,0,0,0,,") != std::string::npos) ++adasEvents;
+        if (line.find(",ADAS,,0,0,0,,") != std::string::npos) {
+            ++adasEvents;
+            // Both sources valid → real lane + fatigue readings, no dashes.
+            if (line.find(",ADAS,,0,0,0,,LANE 2/3 +0.25   FAT 82 WARN") != std::string::npos)
+                ++adasReal;
+            if (line.find("FAT --") != std::string::npos) ++adasFatDash;
+        }
         if (line == "PlayResX: " + std::to_string(f.width)) playRes = true;
     }
     check(styles == 5, "five styles (TL/TR/BL/BR + ADAS banner)");
     check(adasStyle == 1, "ADAS banner style present in header");
     check(adasEvents > 0, "ADAS telemetry banner rendered (" +
           std::to_string(adasEvents) + " events)");
+    check(adasReal > 0, "ADAS banner shows real lane + fatigue readings when both valid");
+    check(adasFatDash == 0, "no dashed FAT half while the driver source is valid");
     check(playRes, "PlayRes matches the video resolution");
     // 5 Hz nominal, 5 events per sample (4 corners + ADAS); generous startup slack.
     const int expectMin = seconds * 5 * 4 / 2;
@@ -225,15 +237,17 @@ int main(int argc, char* argv[]) {
     rec.stopRecording();
 
     std::ifstream in3(ass3);
-    int dashTL = 0, freshSpd = 0, clockEvents = 0;
+    int dashTL = 0, freshSpd = 0, clockEvents = 0, adasBanner3 = 0;
     while (std::getline(in3, line)) {
         if (line.find(",TL,,0,0,0,,SPD -- km/h") != std::string::npos) ++dashTL;
         if (line.find(",TL,,0,0,0,,SPD 42")      != std::string::npos) ++freshSpd;
         if (line.find(",BR,,0,0,0,,20")          != std::string::npos) ++clockEvents;
+        if (line.find(",ADAS,,0,0,0,,")          != std::string::npos) ++adasBanner3;
     }
     check(dashTL > 0,       "stale samples render 'SPD -- km/h'");
     check(freshSpd == 0,    "no fresh speed value leaks through when stale");
     check(clockEvents > 0,  "bottom-right clock still populated while stale");
+    check(adasBanner3 == 0, "no ADAS banner emitted when adasValid is false");
 
     std::cout << "\n" << (g_fails == 0 ? "RESULT: PASS" : "RESULT: FAIL")
               << " (" << g_fails << " failures)\n";

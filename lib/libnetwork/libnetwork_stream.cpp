@@ -77,7 +77,7 @@ bool MediaStreamServer::start(const StreamServerConfig& cfg,
     cfg_ = cfg;
     log_ = log;
 
-    if (!server_.listen(cfg_.port, /*backlog=*/cfg_.maxClients + 1, log_)) {
+    if (!server_.listen(cfg_.port, /*backlog=*/cfg_.maxClients + 1, log_, cfg_.bindAddress)) {
         say(log_, LvL::ERROR, "stream: listen on port " + std::to_string(cfg_.port) + " failed");
         return false;
     }

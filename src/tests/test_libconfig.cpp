@@ -146,6 +146,7 @@ static bool test_roundtrip() {
     src.network.streamEnabled       = true;
     src.network.streamPort          = 9000;
     src.network.streamMaxClients    = 8;
+    src.network.streamBindAddress   = "10.0.0.5";
     src.network.rtpEnabled          = true;
     src.network.rtpHost             = "192.168.1.42";
     src.network.rtpPort             = 5602;
@@ -153,6 +154,9 @@ static bool test_roundtrip() {
     src.network.controlEnabled      = true;
     src.network.controlPort         = 8123;
     src.network.controlMaxClients   = 5;
+    src.network.controlBindAddress  = "127.0.0.1";
+    src.network.controlAllowlist    = "127.0.0.1,192.168.1.10";
+    src.network.controlAuthToken    = "s3cr3t-psk";
 
     CameraConfig csi;
     csi.name        = "front";
@@ -256,6 +260,7 @@ static bool test_roundtrip() {
     check(dst.network.streamEnabled == true,             "network.streamEnabled round-trip");
     check(dst.network.streamPort == 9000,                "network.streamPort round-trip");
     check(dst.network.streamMaxClients == 8,             "network.streamMaxClients round-trip");
+    check(dst.network.streamBindAddress == "10.0.0.5",   "network.streamBindAddress round-trip");
     check(dst.network.rtpEnabled == true,                "network.rtpEnabled round-trip");
     check(dst.network.rtpHost == "192.168.1.42",         "network.rtpHost round-trip");
     check(dst.network.rtpPort == 5602,                   "network.rtpPort round-trip");
@@ -263,6 +268,10 @@ static bool test_roundtrip() {
     check(dst.network.controlEnabled == true,            "network.controlEnabled round-trip");
     check(dst.network.controlPort == 8123,               "network.controlPort round-trip");
     check(dst.network.controlMaxClients == 5,            "network.controlMaxClients round-trip");
+    check(dst.network.controlBindAddress == "127.0.0.1", "network.controlBindAddress round-trip");
+    check(dst.network.controlAllowlist == "127.0.0.1,192.168.1.10",
+                                                         "network.controlAllowlist round-trip");
+    check(dst.network.controlAuthToken == "s3cr3t-psk",  "network.controlAuthToken round-trip");
     {
         std::ifstream saved(tmpFile);
         const std::string xml((std::istreambuf_iterator<char>(saved)),

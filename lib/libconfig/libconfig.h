@@ -431,9 +431,10 @@ struct NetworkConfig {
     // direct libnetwork MediaStreamServer path).  The wire format is chosen
     // automatically from the camera's pixel format: MJPEG → browser-viewable
     // HTTP multipart at http://<ip>:<port>/ ; H.264 → raw TCP (ffplay tcp://).
-    ConfigVar<bool>        streamEnabled    {"StreamEnabled",    false, "Serve the recording camera's compressed feed over the network for live viewing (MJPEG: open http://<device-ip>:<StreamPort>/ in a browser)"};
-    ConfigVar<int>         streamPort       {"StreamPort",       8090,  1, 65535, 1, "TCP port for the live video stream"};
-    ConfigVar<int>         streamMaxClients {"StreamMaxClients", 4,     1, 32,    1, "Maximum simultaneous stream viewers"};
+    ConfigVar<bool>        streamEnabled     {"StreamEnabled",     false, "Serve the recording camera's compressed feed over the network for live viewing (MJPEG: open http://<device-ip>:<StreamPort>/ in a browser)"};
+    ConfigVar<int>         streamPort        {"StreamPort",        8090,  1, 65535, 1, "TCP port for the live video stream"};
+    ConfigVar<int>         streamMaxClients  {"StreamMaxClients",  4,     1, 32,    1, "Maximum simultaneous stream viewers"};
+    ConfigVar<std::string> streamBindAddress {"StreamBindAddress", "",    "Bind the live video stream to this local IPv4 (e.g. 127.0.0.1 = localhost only); empty = all interfaces"};
 
     // H.264-over-RTP streaming of the INFERENCE camera feeds (raw → x264enc →
     // rtph264pay → udpsink; software-encoded, extra CPU).  The lane/road camera
@@ -448,10 +449,16 @@ struct NetworkConfig {
     // connection lets a remote operator re-point the RTP streams at runtime
     // (e.g. "RTP lane here 5600" sends the lane cam to the operator's own IP) and
     // continuously receives ADAS telemetry (lane offset, fatigue score) as JSON
-    // lines.  Connect with `nc <device-ip> <ControlPort>`; type HELP.
-    ConfigVar<bool> controlEnabled    {"ControlEnabled",    false, "Open a TCP control+telemetry channel: remote operators can re-point the RTP streams and stream live ADAS telemetry"};
-    ConfigVar<int>  controlPort       {"ControlPort",       8091,  1, 65535, 1, "TCP port for the remote control + telemetry channel"};
-    ConfigVar<int>  controlMaxClients {"ControlMaxClients", 2,     1, 16,    1, "Maximum simultaneous control/telemetry clients"};
+    // lines.  This channel can redirect the video feeds, so it is access-controlled:
+    // bind it narrowly (ControlBindAddress), scope it to known IPs (ControlAllowlist),
+    // and require a pre-shared key (ControlAuthToken).  Connect with the bundled
+    // src/tools/dashcam_ctl.py client (it computes the HMAC challenge response).
+    ConfigVar<bool>        controlEnabled     {"ControlEnabled",     false, "Open a TCP control+telemetry channel: remote operators can re-point the RTP streams and stream live ADAS telemetry"};
+    ConfigVar<int>         controlPort        {"ControlPort",        8091,  1, 65535, 1, "TCP port for the remote control + telemetry channel"};
+    ConfigVar<int>         controlMaxClients  {"ControlMaxClients",  2,     1, 16,    1, "Maximum simultaneous control/telemetry clients"};
+    ConfigVar<std::string> controlBindAddress {"ControlBindAddress", "",    "Bind the control channel to this local IPv4 (e.g. 127.0.0.1 = localhost only, or a LAN IP); empty = all interfaces"};
+    ConfigVar<std::string> controlAllowlist   {"ControlAllowlist",   "",    "Comma-separated IPv4 allowlist for control clients; empty = accept any source IP"};
+    ConfigVar<std::string> controlAuthToken   {"ControlAuthToken",   "",    "Pre-shared key for nonce+HMAC-SHA256 control-channel auth; empty = authentication DISABLED (unauthenticated!)"};
 };
 
 /**

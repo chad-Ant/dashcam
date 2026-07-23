@@ -320,7 +320,8 @@ void TcpSocket::close() {
 
 TcpServer::~TcpServer() { close(); }
 
-bool TcpServer::listen(uint16_t port, int backlog, const dashcam::log::LogCallback& log) {
+bool TcpServer::listen(uint16_t port, int backlog, const dashcam::log::LogCallback& log,
+                       const std::string& bindAddress) {
     close();
     log_ = log;
 
@@ -335,9 +336,18 @@ bool TcpServer::listen(uint16_t port, int backlog, const dashcam::log::LogCallba
 
     sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port        = htons(port);
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    // Empty bindAddress = all interfaces; otherwise scope the listener to one
+    // local IPv4 (e.g. 127.0.0.1 to keep a channel host-local).
+    if (bindAddress.empty()) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (::inet_pton(AF_INET, bindAddress.c_str(), &addr.sin_addr) != 1) {
+        say(log_, LvL::ERROR, "TCP server bind address '" + bindAddress +
+                              "' is not a valid IPv4 literal");
+        close();
+        return false;
+    }
     if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         say(log_, LvL::ERROR, "TCP server bind(" + std::to_string(port) + ") failed: " + errnoStr());
         close();

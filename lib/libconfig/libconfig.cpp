@@ -292,6 +292,7 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
     readVar(node, n.streamEnabled,       log);
     readVar(node, n.streamPort,          log);
     readVar(node, n.streamMaxClients,    log);
+    readVar(node, n.streamBindAddress,   log);
     readVar(node, n.rtpEnabled,          log);
     readVar(node, n.rtpHost,             log);
     readVar(node, n.rtpPort,             log);
@@ -299,6 +300,9 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
     readVar(node, n.controlEnabled,      log);
     readVar(node, n.controlPort,         log);
     readVar(node, n.controlMaxClients,   log);
+    readVar(node, n.controlBindAddress,  log);
+    readVar(node, n.controlAllowlist,    log);
+    readVar(node, n.controlAuthToken,    log);
 }
 
 static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
@@ -452,6 +456,7 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     writeVar(node, n.streamEnabled);
     writeVar(node, n.streamPort);
     writeVar(node, n.streamMaxClients);
+    writeVar(node, n.streamBindAddress);
     writeVar(node, n.rtpEnabled);
     writeVar(node, n.rtpHost);
     writeVar(node, n.rtpPort);
@@ -459,6 +464,9 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     writeVar(node, n.controlEnabled);
     writeVar(node, n.controlPort);
     writeVar(node, n.controlMaxClients);
+    writeVar(node, n.controlBindAddress);
+    writeVar(node, n.controlAllowlist);
+    writeVar(node, n.controlAuthToken);
 }
 
 static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) {

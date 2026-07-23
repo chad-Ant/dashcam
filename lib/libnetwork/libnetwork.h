@@ -243,11 +243,15 @@ public:
 
     /**
      * @brief Bind and listen on @p port.
-     * @param port     Local TCP port; 0 = OS-assigned (read back via port()).
-     * @param backlog  Pending-connection queue depth.
+     * @param port         Local TCP port; 0 = OS-assigned (read back via port()).
+     * @param backlog      Pending-connection queue depth.
+     * @param bindAddress  Local IPv4 to bind to (e.g. "127.0.0.1" = localhost
+     *                     only); empty (the default) binds INADDR_ANY (all
+     *                     interfaces).  An unparseable address fails the listen.
      * @return true on success.
      */
-    bool listen(uint16_t port, int backlog = 4, const dashcam::log::LogCallback& log = {});
+    bool listen(uint16_t port, int backlog = 4, const dashcam::log::LogCallback& log = {},
+                const std::string& bindAddress = {});
 
     /**
      * @brief Wait up to @p timeoutMs for an inbound connection.
@@ -289,11 +293,12 @@ enum class StreamWire {
 
 /** @brief MediaStreamServer tuning. */
 struct StreamServerConfig {
-    uint16_t    port       = 8090;                 ///< TCP listen port (0 = OS-assigned, read back via port()).
-    StreamWire  wire       = StreamWire::MjpegHttp;///< Viewer wire format.
-    int         maxClients = 4;                    ///< Connections beyond this are refused.
-    int         queueDepth = 4;                    ///< Per-client backlog (frames); the oldest are dropped when a viewer can't keep up (live view favours latest).
-    std::string boundary   = "dashcamframe";       ///< MJPEG multipart boundary token (MjpegHttp only).
+    uint16_t    port        = 8090;                 ///< TCP listen port (0 = OS-assigned, read back via port()).
+    StreamWire  wire        = StreamWire::MjpegHttp;///< Viewer wire format.
+    int         maxClients  = 4;                    ///< Connections beyond this are refused.
+    int         queueDepth  = 4;                    ///< Per-client backlog (frames); the oldest are dropped when a viewer can't keep up (live view favours latest).
+    std::string boundary    = "dashcamframe";       ///< MJPEG multipart boundary token (MjpegHttp only).
+    std::string bindAddress;                        ///< Local IPv4 to bind (empty = all interfaces).
 };
 
 /**
@@ -436,13 +441,43 @@ private:
     RtpStreamConfig cfg_;
 };
 
+// ─── Crypto helpers (dependency-free; libnetwork_hmac.cpp) ──────────────────────
+
+namespace detail {
+
+/**
+ * @brief HMAC-SHA256(@p key, @p msg) as a 64-char lowercase hex string.
+ *
+ * Self-contained (no OpenSSL): FIPS 180-4 SHA-256 + RFC 2104 HMAC.  Used by the
+ * ControlServer nonce/PSK auth handshake.  Authentication only — not a substitute
+ * for transport encryption.
+ */
+std::string hmacSha256Hex(const std::string& key, const std::string& msg);
+
+/**
+ * @brief @p nBytes cryptographically-random bytes as a 2·nBytes hex string.
+ *
+ * Sourced from getrandom()/`/dev/urandom`.  Used to mint per-client auth nonces.
+ */
+std::string randomHex(size_t nBytes);
+
+} // namespace detail
+
 // ─── Remote control + telemetry channel ────────────────────────────────────────
 
 /** @brief ControlServer tuning. */
 struct ControlServerConfig {
     uint16_t port       = 8091;  ///< TCP listen port (0 = OS-assigned, read back via port()).
     int      maxClients = 2;     ///< Connections beyond this are refused.
-    int      queueDepth = 8;     ///< Per-client outbound backlog (lines); oldest telemetry is dropped when a client can't keep up.
+    int      queueDepth = 8;     ///< Per-client telemetry backlog (lines); oldest telemetry is dropped when a client can't keep up.
+
+    // ── access control ────────────────────────────────────────────────────────
+    // The control channel can re-point the RTP video feeds and pause streams, so
+    // it must not be open to the whole LAN by default.  Bind it narrowly, scope it
+    // to known source IPs, and require a pre-shared key.
+    std::string              bindAddress;  ///< Local IPv4 to bind (empty = all interfaces).
+    std::string              authToken;    ///< PSK for nonce+HMAC auth; empty = auth DISABLED (unauthenticated!).
+    std::vector<std::string> allowIps;     ///< Accepted client IPs (dotted-quad); empty = accept any source IP.
 };
 
 /**
@@ -541,6 +576,7 @@ private:
 
     void acceptLoop();
     void clientLoop(Client* c);
+    bool flushOutbound(Client* c);       ///< Send queued replies (priority) then telemetry; false on send failure.
     void dispatchLine(Client* c, const std::string& line);
     void reapDoneLocked();               ///< clientsMtx_ must be held.
 

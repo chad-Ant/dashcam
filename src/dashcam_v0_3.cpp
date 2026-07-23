@@ -77,6 +77,9 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>   // inet_pton — RTP-host validation for remote-control commands
+#include <netinet/in.h>
+
 using namespace dashcam::camera;
 namespace fs = std::filesystem;
 
@@ -208,10 +211,70 @@ static GstElement* makeRtpBranchBin(const dashcam::network::RtpSession& rtp, boo
     return bin;
 }
 
+// Escape a string for embedding inside a JSON double-quoted value.  The RTP host
+// can be operator-supplied ("RTP lane <host>"); even though isValidRtpHost()
+// already blocks quotes, escaping here is defence-in-depth so a malformed host can
+// never corrupt or inject telemetry fields.
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (unsigned char ch : s) {
+        switch (ch) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (ch < 0x20) {
+                    char b[8];
+                    std::snprintf(b, sizeof(b), "\\u%04x", ch);
+                    out += b;
+                } else {
+                    out.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    return out;
+}
+
+// Validate an RTP destination host before it reaches udpsink / telemetry: accept
+// an IPv4 literal or an RFC-1123 hostname (letters, digits, '-', dot-separated
+// labels that neither start nor end with '-'), reject everything else.  Blocks a
+// remote operator from wedging a malformed host into GStreamer or the JSON.
+static bool isValidRtpHost(const std::string& h) {
+    if (h.empty() || h.size() > 253) return false;
+    struct in_addr a;
+    if (::inet_pton(AF_INET, h.c_str(), &a) == 1) return true;   // IPv4 literal
+
+    size_t labelLen = 0;
+    for (size_t i = 0; i < h.size(); ++i) {
+        const char ch = h[i];
+        if (ch == '.') {
+            if (labelLen == 0) return false;           // empty label ("a..b" / leading dot)
+            if (h[i - 1] == '-') return false;         // label ended with '-'
+            labelLen = 0;
+            continue;
+        }
+        const bool alnumDash =
+            (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-';
+        if (!alnumDash) return false;
+        if (labelLen == 0 && ch == '-') return false;  // label started with '-'
+        if (++labelLen > 63) return false;
+    }
+    return labelLen != 0 && h.back() != '-';           // no trailing dot; last label ok
+}
+
 // Compact single-line JSON telemetry record pushed to remote clients over the
 // ControlServer channel (see the main loop).  Carries the ADAS state the device
 // computes onboard plus the current RTP destinations; a remote viewer parses
 // this alongside the H.264/RTP video to render a full remote-monitoring view.
+//
+// Each source reports BOTH "on" (detector configured) and "valid" (a fresh sample
+// backs the numbers this tick), so a consumer distinguishes OFF (on=false) from
+// WARMING (on=true, valid=false) from a real reading (valid=true) — the numbers of
+// an invalid source are sentinels, not stale/fabricated state.
 static std::string makeTelemetryJson(const dashcam::record::OverlayData& od,
                                      bool laneOn, bool drvOn, bool acuteAlert,
                                      const std::string& laneHost, int lanePort,
@@ -220,21 +283,23 @@ static std::string makeTelemetryJson(const dashcam::record::OverlayData& od,
     std::ostringstream os;
     os.setf(std::ios::fixed);
     os << "{\"t\":" << od.timestampMs
-       << ",\"lane\":{\"on\":" << jb(laneOn)
-       << ",\"n\":"     << od.laneCount
-       << ",\"ego\":"   << od.egoLaneIndex;
+       << ",\"lane\":{\"on\":"  << jb(laneOn)
+       << ",\"valid\":"         << jb(od.laneValid)
+       << ",\"n\":"             << od.laneCount
+       << ",\"ego\":"           << od.egoLaneIndex;
     os.precision(3);
-    os << ",\"off\":"   << od.laneOffset
-       << ",\"valid\":" << jb(od.laneOffsetValid) << "}"
-       << ",\"driver\":{\"on\":" << jb(drvOn);
+    os << ",\"off\":"      << od.laneOffset
+       << ",\"offValid\":" << jb(od.laneOffsetValid) << "}"
+       << ",\"driver\":{\"on\":" << jb(drvOn)
+       << ",\"valid\":"          << jb(od.driverValid);
     os.precision(1);
     os << ",\"fatigue\":" << od.fatigueScore
        << ",\"level\":"   << od.fatigueLevel
        << ",\"drowsy\":"  << jb(od.driverDrowsy)
        << ",\"face\":"    << jb(od.faceDetected)
        << ",\"alert\":"   << jb(acuteAlert) << "}"
-       << ",\"rtp\":{\"lane\":\""   << laneHost << ":" << lanePort << "\""
-       <<           ",\"driver\":\"" << drvHost  << ":" << drvPort  << "\"}}";
+       << ",\"rtp\":{\"lane\":\""    << jsonEscape(laneHost) << ":" << lanePort << "\""
+       <<           ",\"driver\":\"" << jsonEscape(drvHost)  << ":" << drvPort  << "\"}}";
     return os.str();
 }
 
@@ -1163,10 +1228,11 @@ int main(int argc, char* argv[]) {
         if (cfg.network.streamEnabled && !offline) {
             const bool recMjpeg = uFmt.pixelFormat == V4L2_PIX_FMT_MJPEG;
             dashcam::network::StreamServerConfig sc;
-            sc.port       = static_cast<uint16_t>((int)cfg.network.streamPort);
-            sc.maxClients = (int)cfg.network.streamMaxClients;
-            sc.wire       = recMjpeg ? dashcam::network::StreamWire::MjpegHttp
-                                     : dashcam::network::StreamWire::RawTcp;
+            sc.port        = static_cast<uint16_t>((int)cfg.network.streamPort);
+            sc.maxClients  = (int)cfg.network.streamMaxClients;
+            sc.bindAddress = (std::string)cfg.network.streamBindAddress;
+            sc.wire        = recMjpeg ? dashcam::network::StreamWire::MjpegHttp
+                                      : dashcam::network::StreamWire::RawTcp;
             if (streamSrv.start(sc, log)) {
                 rec.setCompressedFrameCallback(
                     [&streamSrv](const uint8_t* d, size_t n, bool) { streamSrv.pushFrame(d, n); });
@@ -1252,12 +1318,13 @@ int main(int argc, char* argv[]) {
             }
 
             // Otherwise re-point: action is a destination host, or "here" (the
-            // operator's own IP).  udpsink host/port are runtime-mutable, and
-            // g_object_set on the kept ref is safe even after a teardown.
-            GstElement* sink = isLane ? laneSink : drvSink;
-            if (!sink) return "ERR that stream has no sink (RTP disabled?)";
+            // operator's own IP).  Validate the host and parse the port up front,
+            // then apply the whole change as ONE synchronized transaction so the
+            // actual udpsink destination and the reported bookkeeping can never
+            // diverge across concurrent clients.
             const std::string host = (action == "here") ? cmd.clientIp : action;
-            if (host.empty()) return "ERR could not resolve host";
+            if (host.empty())           return "ERR could not resolve host";
+            if (!isValidRtpHost(host))  return "ERR invalid host";
 
             int port;
             { std::lock_guard<std::mutex> lk(ctrlMtx); port = isLane ? laneDestPort : drvDestPort; }
@@ -1267,10 +1334,24 @@ int main(int argc, char* argv[]) {
                 if (port < 1 || port > 65535) return "ERR port out of range";
             }
 
-            g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", port, NULL);
-            { std::lock_guard<std::mutex> lk(ctrlMtx);
-              if (isLane) { laneDestHost = host; laneDestPort = port; }
-              else        { drvDestHost  = host; drvDestPort  = port; } }
+            {
+                // Single transaction: liveness check + sink mutation + bookkeeping
+                // all under ctrlMtx.  Teardown (health block) sets *RtpAlive=false
+                // under this same lock before stopping the camera, so we either see
+                // the stream alive and complete the re-point before teardown runs,
+                // or see it dead and reject — never race into a freed valve, and
+                // never report a destination the sink didn't actually take.
+                std::lock_guard<std::mutex> lk(ctrlMtx);
+                const bool alive = isLane ? laneRtpAlive : drvRtpAlive;
+                if (!alive)
+                    return isLane ? "ERR lane stream not active"
+                                  : "ERR driver stream not active";
+                GstElement* sink = isLane ? laneSink : drvSink;
+                if (!sink) return "ERR that stream has no sink (RTP disabled?)";
+                g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", port, NULL);
+                if (isLane) { laneDestHost = host; laneDestPort = port; }
+                else        { drvDestHost  = host; drvDestPort  = port; }
+            }
             log(dashcam::log::LogLevel::INFO,
                 std::string("control: ") + (isLane ? "lane" : "driver") +
                 " RTP re-pointed -> " + host + ":" + std::to_string(port) +
@@ -1283,15 +1364,34 @@ int main(int argc, char* argv[]) {
 
     if (cfg.network.controlEnabled && !offline) {
         dashcam::network::ControlServerConfig cc;
-        cc.port       = static_cast<uint16_t>((int)cfg.network.controlPort);
-        cc.maxClients = (int)cfg.network.controlMaxClients;
-        if (ctrlSrv.start(cc, controlHandler, log))
+        cc.port        = static_cast<uint16_t>((int)cfg.network.controlPort);
+        cc.maxClients  = (int)cfg.network.controlMaxClients;
+        cc.bindAddress = (std::string)cfg.network.controlBindAddress;
+        cc.authToken   = (std::string)cfg.network.controlAuthToken;
+        // Parse the comma-separated IPv4 allowlist (whitespace-trimmed; blanks dropped).
+        {
+            const std::string csv = (std::string)cfg.network.controlAllowlist;
+            std::istringstream is(csv);
+            std::string tok;
+            while (std::getline(is, tok, ',')) {
+                const size_t a = tok.find_first_not_of(" \t");
+                const size_t b = tok.find_last_not_of(" \t");
+                if (a != std::string::npos) cc.allowIps.push_back(tok.substr(a, b - a + 1));
+            }
+        }
+        if (ctrlSrv.start(cc, controlHandler, log)) {
+            const bool authed = !cc.authToken.empty();
             log(dashcam::log::LogLevel::INFO,
-                "remote control: nc <device-ip> " + std::to_string(ctrlSrv.port()) +
-                "  (type HELP; telemetry streams as JSON lines)");
-        else
+                std::string("remote control: port ") + std::to_string(ctrlSrv.port()) +
+                (authed ? " (auth: nonce+HMAC PSK)"
+                        : " (UNAUTHENTICATED — set <Network><ControlAuthToken>)") +
+                (cc.allowIps.empty() ? "" : " [IP allowlist active]") +
+                "  client: python3 src/tools/dashcam_ctl.py <device-ip> " +
+                std::to_string(ctrlSrv.port()) + (authed ? " <token>" : ""));
+        } else {
             log(dashcam::log::LogLevel::ERROR,
                 "remote control: failed to start — continuing without it");
+        }
     }
 
     // ── main loop: telemetry clock, health, lane results, driver alerts ──────
@@ -1430,19 +1530,39 @@ int main(int argc, char* argv[]) {
             dashcam::record::OverlayData od =
                 recActive ? rec.getOverlayData() : dashcam::record::OverlayData{};
             od.timestampMs = epochMs();
-            od.adasValid   = (laneDet && lastLane.valid) || (drvDet && lastDrv.valid);
-            if (laneDet) {
+
+            // Build the ADAS block FRESH from this tick's results — never inherit
+            // ADAS fields from the previous OverlayData.  A source contributes only
+            // when it is both configured AND has a fresh valid sample; otherwise its
+            // fields are reset to sentinels so a warming-up or torn-down detector can
+            // never publish a fabricated "fatigue=100/face=true" or a stale reading.
+            const bool laneValid = (laneDet != nullptr) && lastLane.valid;
+            const bool drvValid  = (drvDet  != nullptr) && lastDrv.valid;
+            od.laneValid   = laneValid;
+            od.driverValid = drvValid;
+            od.adasValid   = laneValid || drvValid;
+            if (laneValid) {
                 od.laneCount       = lastLane.numLanes;
                 od.egoLaneIndex    = lastLane.currentLaneIndex;
                 od.laneOffset      = lastLane.lateralOffset;
-                od.laneOffsetValid = lastLane.valid && lastLane.lateralValid;
+                od.laneOffsetValid = lastLane.lateralValid;
+            } else {
+                od.laneCount       = 0;
+                od.egoLaneIndex    = -1;
+                od.laneOffset      = 0.0f;
+                od.laneOffsetValid = false;
             }
-            if (drvDet) {
+            if (drvValid) {
                 od.fatigueScore = lastDrv.fatigueScore;
                 od.fatigueLevel = static_cast<int>(lastDrv.fatigueLevel);
-                od.driverDrowsy = lastDrv.valid && lastDrv.faceDetected &&
+                od.driverDrowsy = lastDrv.faceDetected &&
                                   lastDrv.state == dashcam::driver::DriverState::DROWSY;
-                od.faceDetected = lastDrv.valid ? lastDrv.faceDetected : true;
+                od.faceDetected = lastDrv.faceDetected;
+            } else {
+                od.fatigueScore = 100.0f;
+                od.fatigueLevel = 0;
+                od.driverDrowsy = false;
+                od.faceDetected = false;
             }
             if (recActive) rec.setOverlayData(od);
 
