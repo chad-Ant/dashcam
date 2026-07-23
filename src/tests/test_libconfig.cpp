@@ -150,6 +150,9 @@ static bool test_roundtrip() {
     src.network.rtpHost             = "192.168.1.42";
     src.network.rtpPort             = 5602;
     src.network.rtpBitrateKbps      = 6000;
+    src.network.controlEnabled      = true;
+    src.network.controlPort         = 8123;
+    src.network.controlMaxClients   = 5;
 
     CameraConfig csi;
     csi.name        = "front";
@@ -257,6 +260,9 @@ static bool test_roundtrip() {
     check(dst.network.rtpHost == "192.168.1.42",         "network.rtpHost round-trip");
     check(dst.network.rtpPort == 5602,                   "network.rtpPort round-trip");
     check(dst.network.rtpBitrateKbps == 6000,            "network.rtpBitrateKbps round-trip");
+    check(dst.network.controlEnabled == true,            "network.controlEnabled round-trip");
+    check(dst.network.controlPort == 8123,               "network.controlPort round-trip");
+    check(dst.network.controlMaxClients == 5,            "network.controlMaxClients round-trip");
     {
         std::ifstream saved(tmpFile);
         const std::string xml((std::istreambuf_iterator<char>(saved)),

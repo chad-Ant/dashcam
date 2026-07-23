@@ -71,6 +71,8 @@
 #include <gst/gst.h>
 #include <linux/videodev2.h>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -191,9 +193,10 @@ static std::string syncSystemTime(const dashcam::config::NetworkConfig& net,
 // element's sink pad so the tee's queue/valve can link to it.  Returns nullptr on
 // a parse failure (the caller then simply runs without the RTP stream).
 static GstElement* makeRtpBranchBin(const dashcam::network::RtpSession& rtp, bool nvmm,
-                                    float fps, const dashcam::log::LogCallback& log) {
+                                    float fps, const std::string& sinkName,
+                                    const dashcam::log::LogCallback& log) {
     GError* err = nullptr;
-    const std::string desc = rtp.branchDescription(nvmm, fps);
+    const std::string desc = rtp.branchDescription(nvmm, fps, sinkName);
     GstElement* bin = gst_parse_bin_from_description(desc.c_str(), TRUE, &err);
     if (!bin || err) {
         log(dashcam::log::LogLevel::ERROR,
@@ -203,6 +206,36 @@ static GstElement* makeRtpBranchBin(const dashcam::network::RtpSession& rtp, boo
         return nullptr;
     }
     return bin;
+}
+
+// Compact single-line JSON telemetry record pushed to remote clients over the
+// ControlServer channel (see the main loop).  Carries the ADAS state the device
+// computes onboard plus the current RTP destinations; a remote viewer parses
+// this alongside the H.264/RTP video to render a full remote-monitoring view.
+static std::string makeTelemetryJson(const dashcam::record::OverlayData& od,
+                                     bool laneOn, bool drvOn, bool acuteAlert,
+                                     const std::string& laneHost, int lanePort,
+                                     const std::string& drvHost, int drvPort) {
+    auto jb = [](bool b) { return b ? "true" : "false"; };
+    std::ostringstream os;
+    os.setf(std::ios::fixed);
+    os << "{\"t\":" << od.timestampMs
+       << ",\"lane\":{\"on\":" << jb(laneOn)
+       << ",\"n\":"     << od.laneCount
+       << ",\"ego\":"   << od.egoLaneIndex;
+    os.precision(3);
+    os << ",\"off\":"   << od.laneOffset
+       << ",\"valid\":" << jb(od.laneOffsetValid) << "}"
+       << ",\"driver\":{\"on\":" << jb(drvOn);
+    os.precision(1);
+    os << ",\"fatigue\":" << od.fatigueScore
+       << ",\"level\":"   << od.fatigueLevel
+       << ",\"drowsy\":"  << jb(od.driverDrowsy)
+       << ",\"face\":"    << jb(od.faceDetected)
+       << ",\"alert\":"   << jb(acuteAlert) << "}"
+       << ",\"rtp\":{\"lane\":\""   << laneHost << ":" << lanePort << "\""
+       <<           ",\"driver\":\"" << drvHost  << ":" << drvPort  << "\"}}";
+    return os.str();
 }
 
 static dashcam::lane::LaneDetectorConfig
@@ -946,6 +979,21 @@ int main(int argc, char* argv[]) {
         rc.port = static_cast<uint16_t>((int)cfg.network.rtpPort + 2);   drvRtp.configure(rc);
     }
 
+    // Shared control state for the remote-control channel (ControlServer, below).
+    // The kept udpsink refs let the command handler re-point host/port live; the
+    // *Alive flags gate setBranchEnabled so a mid-run camera teardown (in the
+    // health block) can't race a handler into a freed valve.  All of it is
+    // guarded by ctrlMtx: the handler runs on a ControlServer client thread.
+    GstElement* laneSink = nullptr;   // named udpsink of the lane RTP branch (kept ref).
+    GstElement* drvSink  = nullptr;   // named udpsink of the driver RTP branch (kept ref).
+    std::mutex  ctrlMtx;
+    bool        laneRtpAlive = false, drvRtpAlive = false;   // branch attached & camera live.
+    bool        laneRtpOn    = true,  drvRtpOn    = true;     // valve pass state.
+    std::string laneDestHost = (std::string)cfg.network.rtpHost;
+    std::string drvDestHost  = (std::string)cfg.network.rtpHost;
+    int         laneDestPort = (int)cfg.network.rtpPort;
+    int         drvDestPort  = (int)cfg.network.rtpPort + 2;
+
     // ── lane camera ──────────────────────────────────────────────────────────
     Camera_CSI laneCam(laneInfo ? *laneInfo : cameraInfo{});
     if (laneDet) {
@@ -969,8 +1017,12 @@ int main(int argc, char* argv[]) {
     if (laneDet && cfg.network.rtpEnabled && !offline) {
         // CSI/Argus tee is NVMM → nvvidconv head.  Leaky so encoding never blocks
         // the lane inference feed.
-        GstElement* rtpBin = makeRtpBranchBin(laneRtp, /*nvmm=*/true, laneFps, log);
+        GstElement* rtpBin = makeRtpBranchBin(laneRtp, /*nvmm=*/true, laneFps,
+                                              "lane-rtpsink", log);
         if (rtpBin) {
+            // Keep a ref to the named udpsink BEFORE addBranch hands the bin to the
+            // pipeline, so the control channel can re-point host/port at runtime.
+            laneSink = gst_bin_get_by_name(GST_BIN(rtpBin), "lane-rtpsink");
             laneCam.addBranch("lane-rtp", rtpBin, /*leaky=*/true);
             log(dashcam::log::LogLevel::INFO,
                 "lane RTP stream -> " + (std::string)cfg.network.rtpHost + ":" +
@@ -1031,8 +1083,10 @@ int main(int argc, char* argv[]) {
     if (drvDet && cfg.network.rtpEnabled && !offline) {
         // USB driver cam tee is system-memory raw → videoconvert head.
         const float drvFps = drvInfo->videoFormats[(size_t)drvFmtIdx].frameRate;
-        GstElement* rtpBin = makeRtpBranchBin(drvRtp, /*nvmm=*/false, drvFps, log);
+        GstElement* rtpBin = makeRtpBranchBin(drvRtp, /*nvmm=*/false, drvFps,
+                                              "driver-rtpsink", log);
         if (rtpBin) {
+            drvSink = gst_bin_get_by_name(GST_BIN(rtpBin), "driver-rtpsink");
             drvCam.addBranch("driver-rtp", rtpBin, /*leaky=*/true);
             log(dashcam::log::LogLevel::INFO,
                 "driver RTP stream -> " + (std::string)cfg.network.rtpHost + ":" +
@@ -1080,6 +1134,7 @@ int main(int argc, char* argv[]) {
     // (below, on shutdown) tears the pipeline down first, so no stream callback can
     // fire into a destroyed server.
     dashcam::network::MediaStreamServer streamSrv;
+    dashcam::network::ControlServer     ctrlSrv;
     dashcam::record::Recorder rec;
     std::string recFile;
     bool recActive = false;
@@ -1145,6 +1200,100 @@ int main(int argc, char* argv[]) {
         + (drvDet  ? "  | driver monitoring ACTIVE" : "  | driver monitoring OFF")
         + "  (SIGINT to stop)");
 
+    // ── remote control + telemetry channel ────────────────────────────────────
+    // One TCP connection lets a remote operator re-point the RTP streams at
+    // runtime and continuously receive ADAS telemetry (pushed from the loop).
+    laneRtpAlive = (laneDet != nullptr && laneSink != nullptr);
+    drvRtpAlive  = (drvDet  != nullptr && drvSink  != nullptr);
+
+    dashcam::network::ControlHandler controlHandler =
+        [&](const dashcam::network::ControlCommand& cmd) -> std::string {
+        if (cmd.verb == "HELP")
+            return "commands:\n"
+                   "  RTP lane|driver <host|here> [port]   re-point a stream\n"
+                   "  RTP lane|driver on|off               pause/resume a stream\n"
+                   "  STATUS                               show destinations\n"
+                   "  HELP                                 this text\n"
+                   "telemetry streams continuously as JSON lines.";
+
+        if (cmd.verb == "STATUS") {
+            std::lock_guard<std::mutex> lk(ctrlMtx);
+            std::ostringstream os;
+            os << "lane rtp=" << laneDestHost << ":" << laneDestPort << " "
+               << (laneRtpAlive ? (laneRtpOn ? "on" : "off") : "n/a")
+               << " | driver rtp=" << drvDestHost << ":" << drvDestPort << " "
+               << (drvRtpAlive ? (drvRtpOn ? "on" : "off") : "n/a");
+            return os.str();
+        }
+
+        if (cmd.verb == "RTP") {
+            if (cmd.args.size() < 2)
+                return "ERR usage: RTP lane|driver <host|here|on|off> [port]";
+            const bool isLane = (cmd.args[0] == "lane"   || cmd.args[0] == "LANE");
+            const bool isDrv  = (cmd.args[0] == "driver" || cmd.args[0] == "DRIVER");
+            if (!isLane && !isDrv) return "ERR first arg must be 'lane' or 'driver'";
+            const std::string action = cmd.args[1];
+
+            // Pause / resume via the branch valve — gated by the alive flag so a
+            // mid-run camera teardown can't race us into a freed valve.
+            if (action == "on" || action == "off") {
+                const bool enable = (action == "on");
+                std::lock_guard<std::mutex> lk(ctrlMtx);
+                if (isLane) {
+                    if (!laneRtpAlive) return "ERR lane stream not active";
+                    laneCam.setBranchEnabled("lane-rtp", enable);
+                    laneRtpOn = enable;
+                } else {
+                    if (!drvRtpAlive) return "ERR driver stream not active";
+                    drvCam.setBranchEnabled("driver-rtp", enable);
+                    drvRtpOn = enable;
+                }
+                return std::string("OK ") + (isLane ? "lane" : "driver") + " " + action;
+            }
+
+            // Otherwise re-point: action is a destination host, or "here" (the
+            // operator's own IP).  udpsink host/port are runtime-mutable, and
+            // g_object_set on the kept ref is safe even after a teardown.
+            GstElement* sink = isLane ? laneSink : drvSink;
+            if (!sink) return "ERR that stream has no sink (RTP disabled?)";
+            const std::string host = (action == "here") ? cmd.clientIp : action;
+            if (host.empty()) return "ERR could not resolve host";
+
+            int port;
+            { std::lock_guard<std::mutex> lk(ctrlMtx); port = isLane ? laneDestPort : drvDestPort; }
+            if (cmd.args.size() >= 3) {
+                try { port = std::stoi(cmd.args[2]); }
+                catch (...) { return "ERR bad port"; }
+                if (port < 1 || port > 65535) return "ERR port out of range";
+            }
+
+            g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", port, NULL);
+            { std::lock_guard<std::mutex> lk(ctrlMtx);
+              if (isLane) { laneDestHost = host; laneDestPort = port; }
+              else        { drvDestHost  = host; drvDestPort  = port; } }
+            log(dashcam::log::LogLevel::INFO,
+                std::string("control: ") + (isLane ? "lane" : "driver") +
+                " RTP re-pointed -> " + host + ":" + std::to_string(port) +
+                " (by " + cmd.clientIp + ")");
+            return std::string("OK ") + (isLane ? "lane" : "driver") +
+                   " -> " + host + ":" + std::to_string(port);
+        }
+        return "ERR unknown command (try HELP)";
+    };
+
+    if (cfg.network.controlEnabled && !offline) {
+        dashcam::network::ControlServerConfig cc;
+        cc.port       = static_cast<uint16_t>((int)cfg.network.controlPort);
+        cc.maxClients = (int)cfg.network.controlMaxClients;
+        if (ctrlSrv.start(cc, controlHandler, log))
+            log(dashcam::log::LogLevel::INFO,
+                "remote control: nc <device-ip> " + std::to_string(ctrlSrv.port()) +
+                "  (type HELP; telemetry streams as JSON lines)");
+        else
+            log(dashcam::log::LogLevel::ERROR,
+                "remote control: failed to start — continuing without it");
+    }
+
     // ── main loop: telemetry clock, health, lane results, driver alerts ──────
     using clock = std::chrono::steady_clock;
     auto secondsSince = [](clock::time_point t) {
@@ -1181,14 +1330,6 @@ int main(int argc, char* argv[]) {
                 log(dashcam::log::LogLevel::INFO,
                     "fatigue score reset ignored: driver monitoring is OFF");
             }
-        }
-
-        // No GPS/IMU source yet: motion fields stay at defaults, but the
-        // sidecar clock tracks wall time.
-        if (recActive) {
-            dashcam::record::OverlayData od = rec.getOverlayData();
-            od.timestampMs = epochMs();
-            rec.setOverlayData(od);
         }
 
         if (laneDet) {
@@ -1281,6 +1422,41 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // ── telemetry: ADAS overlays into the recording + push to remote ──────
+        // Built from the freshest lane + driver results this iteration.  No GPS/
+        // IMU source yet, so the motion/position fields keep their defaults; the
+        // ADAS block carries what the device actually computes.
+        {
+            dashcam::record::OverlayData od =
+                recActive ? rec.getOverlayData() : dashcam::record::OverlayData{};
+            od.timestampMs = epochMs();
+            od.adasValid   = (laneDet && lastLane.valid) || (drvDet && lastDrv.valid);
+            if (laneDet) {
+                od.laneCount       = lastLane.numLanes;
+                od.egoLaneIndex    = lastLane.currentLaneIndex;
+                od.laneOffset      = lastLane.lateralOffset;
+                od.laneOffsetValid = lastLane.valid && lastLane.lateralValid;
+            }
+            if (drvDet) {
+                od.fatigueScore = lastDrv.fatigueScore;
+                od.fatigueLevel = static_cast<int>(lastDrv.fatigueLevel);
+                od.driverDrowsy = lastDrv.valid && lastDrv.faceDetected &&
+                                  lastDrv.state == dashcam::driver::DriverState::DROWSY;
+                od.faceDetected = lastDrv.valid ? lastDrv.faceDetected : true;
+            }
+            if (recActive) rec.setOverlayData(od);
+
+            if (ctrlSrv.isRunning() && ctrlSrv.clientCount() > 0) {
+                std::string lh, dh; int lp, dp;
+                { std::lock_guard<std::mutex> lk(ctrlMtx);
+                  lh = laneDestHost; lp = laneDestPort;
+                  dh = drvDestHost;  dp = drvDestPort; }
+                ctrlSrv.pushTelemetry(makeTelemetryJson(
+                    od, laneDet != nullptr, drvDet != nullptr, alertActive,
+                    lh, lp, dh, dp));
+            }
+        }
+
         auto now = clock::now();
         if (now - lastStatus >= std::chrono::seconds(5)) {
             lastStatus = now;
@@ -1302,6 +1478,9 @@ int main(int argc, char* argv[]) {
                             ? "IMX296 no longer RUNNING — lane detection lost"
                             : "lane inference results became stale — lane "
                               "detection lost");
+                    // Mark the stream dead BEFORE teardown so a concurrent
+                    // control command can't call setBranchEnabled on a freed valve.
+                    { std::lock_guard<std::mutex> lk(ctrlMtx); laneRtpAlive = false; }
                     laneCam.stop(); laneDet->stop(); laneDet.reset();
                     laneCam.close();
                 } else {
@@ -1321,6 +1500,7 @@ int main(int argc, char* argv[]) {
                               "monitoring lost"
                             : "driver inference results became stale — driver "
                               "monitoring lost");
+                    { std::lock_guard<std::mutex> lk(ctrlMtx); drvRtpAlive = false; }
                     drvCam.stop(); drvDet->stop(); drvDet.reset();
                     drvCam.close();
                 } else {
@@ -1347,6 +1527,8 @@ int main(int argc, char* argv[]) {
 
     // ── graceful shutdown: EOS-finalise the MKV, close the sidecar ───────────
     log(dashcam::log::LogLevel::INFO, "shutting down (signal or subsystem loss)");
+    ctrlSrv.stop();                       // FIRST: join client threads so no command
+                                          // handler can touch the cameras mid-teardown.
     if (recActive) rec.stopRecording();   // stops the pipeline → no more stream callbacks
     streamSrv.stop();                     // then disconnect viewers (safe: no callbacks in flight)
     if (laneDet) {
@@ -1359,6 +1541,9 @@ int main(int argc, char* argv[]) {
         drvDet->stop();     // joins inference thread
         drvCam.close();
     }
+    // Release the kept udpsink refs now the pipelines that owned them are gone.
+    if (laneSink) { gst_object_unref(laneSink); laneSink = nullptr; }
+    if (drvSink)  { gst_object_unref(drvSink);  drvSink  = nullptr; }
 
     if (recActive) {
         auto sizeKb = [](const std::string& f) -> long {

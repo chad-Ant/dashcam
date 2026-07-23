@@ -87,6 +87,20 @@ struct OverlayData {
     float   accelerationMs2 = 0.0f;       ///< Longitudinal acceleration in m/s² (+ve = forward).
     float   headingDeg      = 90.0f;      ///< True heading in degrees (0 = North, clockwise).
     int64_t timestampMs     = 1777633580000LL; ///< UNIX epoch timestamp in milliseconds.
+
+    // ── ADAS telemetry (computed onboard; no GPS/IMU needed) ──────────────────
+    // When adasValid is false the ADAS overlay banner and telemetry are omitted.
+    // These are deliberately plain scalars so librecord stays decoupled from
+    // liblanedetector / libdriverstate — the application copies the results in.
+    bool  adasValid       = false;   ///< false → ADAS overlay banner suppressed.
+    int   laneCount       = 0;       ///< Lanes detected (LaneResult::numLanes).
+    int   egoLaneIndex    = -1;      ///< 0-based ego lane; -1 = off-road / unknown.
+    float laneOffset      = 0.0f;    ///< Lateral offset within the lane, -1 (left line) .. +1 (right line).
+    bool  laneOffsetValid = false;   ///< laneOffset is meaningful this sample.
+    float fatigueScore    = 100.0f;  ///< Fatigue score: 100 fresh → ≤0 fatigued.
+    int   fatigueLevel    = 0;       ///< 0 OK, 1 NOTICE, 2 WARNING, 3 FATIGUE.
+    bool  driverDrowsy    = false;   ///< Most recent classification is drowsy.
+    bool  faceDetected    = true;    ///< Driver's face currently visible to the cabin cam.
 };
 
 // ─── recording format ─────────────────────────────────────────────────────────

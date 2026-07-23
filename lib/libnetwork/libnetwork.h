@@ -59,6 +59,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -417,8 +418,13 @@ public:
      * @param nvmm  true for an NVMM (CSI/Argus) tee source → head with nvvidconv;
      *              false for a system-memory raw (USB) source → head with videoconvert.
      * @param fps   Source frame rate; sets key-int-max = keyIntSec*fps (<=0 → 30 fps).
+     * @param sinkName  When non-empty, the udpsink is named (`udpsink name=<sinkName>`)
+     *              so the application can fetch it with gst_bin_get_by_name() and
+     *              re-point host/port at runtime (see ControlServer / dynamic RTP
+     *              destination).  Empty leaves the sink unnamed.
      */
-    std::string branchDescription(bool nvmm, float fps = 0.0f) const;
+    std::string branchDescription(bool nvmm, float fps = 0.0f,
+                                  const std::string& sinkName = {}) const;
 
     /** @brief An SDP a receiver can save and open (ffplay/VLC). */
     std::string sdp() const;
@@ -428,6 +434,125 @@ public:
 
 private:
     RtpStreamConfig cfg_;
+};
+
+// ─── Remote control + telemetry channel ────────────────────────────────────────
+
+/** @brief ControlServer tuning. */
+struct ControlServerConfig {
+    uint16_t port       = 8091;  ///< TCP listen port (0 = OS-assigned, read back via port()).
+    int      maxClients = 2;     ///< Connections beyond this are refused.
+    int      queueDepth = 8;     ///< Per-client outbound backlog (lines); oldest telemetry is dropped when a client can't keep up.
+};
+
+/**
+ * @brief One command line received from a remote operator.
+ *
+ * The server tokenises the line on whitespace: @c verb is the upper-cased first
+ * token, @c args the rest (original case).  @c clientIp is the connecting peer's
+ * IP (no port) — used by "send the stream to me" style commands.  @c raw is the
+ * whole line as received (trimmed of the trailing CR/LF).
+ */
+struct ControlCommand {
+    std::string              verb;      ///< Upper-cased first token, e.g. "RTP".
+    std::vector<std::string> args;      ///< Remaining tokens, original case.
+    std::string              clientIp;  ///< Connecting client's IP (dotted-quad, no port).
+    std::string              raw;       ///< The full command line (CR/LF stripped).
+};
+
+/**
+ * @brief Application command handler.
+ *
+ * Invoked on a ControlServer client thread for every command line a remote
+ * operator sends.  Return a reply string to send back to that client (a trailing
+ * newline is added if missing); return "" for no reply.  Must be thread-safe: it
+ * runs concurrently with the application and with other clients' handlers.
+ */
+using ControlHandler = std::function<std::string(const ControlCommand&)>;
+
+/**
+ * @brief A TCP server carrying a bidirectional control + telemetry channel.
+ *
+ * One connection does both jobs: the remote operator SENDS newline-delimited
+ * commands (dispatched to a ControlHandler — e.g. re-point an RTP stream), and
+ * the device PUSHES telemetry lines to every connected client via
+ * pushTelemetry().  A pure viewer connects and only reads telemetry.
+ *
+ * Built on TcpServer / TcpSocket, mirroring MediaStreamServer: each client runs
+ * on its own thread that interleaves a short-timeout recv (inbound commands)
+ * with a bounded outbound queue flush (telemetry + replies), so a stalled
+ * operator drops its own telemetry instead of blocking the producer or others.
+ *
+ * Threading:
+ *   - start()/stop() from the control thread; not re-entrant.
+ *   - pushTelemetry() is safe from any single producer thread (the app's main
+ *     loop); one line is fanned out to all clients.
+ *   - The ControlHandler runs on a client thread — keep app state it touches
+ *     thread-safe.
+ *
+ * Typical usage:
+ * @code
+ *   dashcam::network::ControlServer ctrl;
+ *   dashcam::network::ControlServerConfig cc; cc.port = 8091;
+ *   ctrl.start(cc, [&](const dashcam::network::ControlCommand& cmd) -> std::string {
+ *       if (cmd.verb == "RTP" && cmd.args.size() >= 2) { ...re-point udpsink...; return "OK\n"; }
+ *       return "ERR unknown\n";
+ *   }, log);
+ *   // in the main loop (5 Hz):
+ *   ctrl.pushTelemetry(R"({"t":..., "fatigue":82})");
+ *   ...
+ *   ctrl.stop();
+ * @endcode
+ */
+class ControlServer {
+public:
+    // Out-of-line so the incomplete Client type only needs completing inside
+    // libnetwork_control.cpp (same reason as MediaStreamServer).
+    ControlServer();
+    ~ControlServer();
+
+    ControlServer(const ControlServer&)            = delete;
+    ControlServer& operator=(const ControlServer&) = delete;
+
+    /** @brief Bind, listen and start accepting operators. @return true on success. */
+    bool start(const ControlServerConfig& cfg, ControlHandler handler,
+               const dashcam::log::LogCallback& log = {});
+
+    /** @brief Stop accepting, disconnect all clients, join all threads. Idempotent. */
+    void stop();
+
+    /**
+     * @brief Broadcast one telemetry line to every connected client.
+     *
+     * A trailing newline is appended if missing.  No-op if not running or with no
+     * clients.  Never blocks on a slow client — its oldest queued lines are
+     * dropped instead.
+     */
+    void pushTelemetry(const std::string& line);
+
+    /** @brief Number of currently connected clients. */
+    int      clientCount() const;
+    /** @brief Actual bound port (useful after start() with port 0). */
+    uint16_t port() const { return server_.port(); }
+    bool     isRunning() const { return running_.load(); }
+
+private:
+    struct Client;                       ///< Defined in libnetwork_control.cpp.
+
+    void acceptLoop();
+    void clientLoop(Client* c);
+    void dispatchLine(Client* c, const std::string& line);
+    void reapDoneLocked();               ///< clientsMtx_ must be held.
+
+    ControlServerConfig       cfg_;
+    dashcam::log::LogCallback log_;
+    ControlHandler            handler_;
+    TcpServer                 server_;
+    std::thread               acceptThread_;
+    std::atomic<bool>         running_{false};
+
+    mutable std::mutex                    clientsMtx_;
+    std::vector<std::unique_ptr<Client>>  clients_;
 };
 
 // ─── WiFi / connectivity control ───────────────────────────────────────────────

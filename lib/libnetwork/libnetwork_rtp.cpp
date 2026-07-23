@@ -28,7 +28,8 @@ std::string gstQuoted(const std::string& value) {
 }
 } // namespace
 
-std::string RtpSession::branchDescription(bool nvmm, float fps) const {
+std::string RtpSession::branchDescription(bool nvmm, float fps,
+                                          const std::string& sinkName) const {
     const int fpsI      = (fps > 0.0f) ? std::max(1, static_cast<int>(std::lround(fps))) : 30;
     const int keyFrames = std::max(1, cfg_.keyIntSec * fpsI);
 
@@ -39,13 +40,20 @@ std::string RtpSession::branchDescription(bool nvmm, float fps) const {
         ? "nvvidconv ! video/x-raw,format=(string)I420"
         : "videoconvert ! video/x-raw,format=(string)I420";
 
+    // A named udpsink lets the app fetch it (gst_bin_get_by_name) and re-point
+    // host/port at runtime — the dynamic RTP destination feature.
+    const std::string sink = sinkName.empty()
+        ? std::string("udpsink")
+        : "udpsink name=" + sinkName;
+
     return head +
         " ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=" +
             std::to_string(cfg_.bitrateKbps) +
         " key-int-max=" + std::to_string(keyFrames) +
         " ! video/x-h264,profile=(string)baseline" +
         " ! rtph264pay config-interval=1 pt=96" +
-        " ! udpsink host=" + gstQuoted(cfg_.host) +
+        " ! " + sink +
+        " host=" + gstQuoted(cfg_.host) +
         " port=" + std::to_string(cfg_.port) +
         " sync=false async=false";
 }

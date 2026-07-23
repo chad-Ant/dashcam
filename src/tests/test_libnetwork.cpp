@@ -2,9 +2,14 @@
 //   [1] UDP datagram loopback  (sendTo / recvFrom on 127.0.0.1)
 //   [2] TCP echo loopback      (TcpServer::accept in a thread + TcpSocket client)
 //   [3] SNTP internet-time query (best-effort — WARN-only if offline)
+//   [4] MJPEG/HTTP stream server (multi-viewer fan-out + reap)
+//   [5] Raw-TCP stream passthrough
+//   [6] RtpSession branch description / SDP / viewer hint / named sink
+//   [7] WiFi connectivity (non-destructive: targets the current SSID)
+//   [8] ControlServer command dispatch + telemetry push (loopback)
 //
-// [1] and [2] need no network and must pass; [3] needs internet and only
-// reports.  The library is observation-only and never mutates the system clock.
+// All sections but [3] need no network and must pass; [3] needs internet and
+// only reports.  The library is observation-only and never mutates the clock.
 //
 // Ctrl-C exits cleanly.  Returns 0 if the loopback tests pass, 1 otherwise.
 
@@ -329,6 +334,13 @@ int main(int argc, char* argv[]) {
             std::string("  branch description / SDP well-formed  ") + (ok ? "OK" : "FAIL"));
         if (!ok) ++failures;
 
+        // Named-sink variant (for runtime RTP re-pointing via ControlServer).
+        const std::string named = rtp.branchDescription(/*nvmm=*/false, 30.0f, "lane-rtpsink");
+        const bool okName = has(named, "udpsink name=lane-rtpsink host=\"127.0.0.1\" port=5600");
+        log(okName ? LvL::INFO : LvL::ERROR,
+            std::string("  named udpsink for live re-point         ") + (okName ? "OK" : "FAIL"));
+        if (!okName) ++failures;
+
         // Emit the USB (videoconvert) description on a marker line so an external
         // harness can feed it through real GStreamer and confirm RTP actually flows.
         log(LvL::INFO, "  RTP_USB_DESC: " + usb);
@@ -358,6 +370,71 @@ int main(int argc, char* argv[]) {
             std::string("  connectWifi() -> ") + (online ? "ONLINE" : "OFFLINE") +
             " (" + ws.detail + ")  " + (coherent ? "OK" : "FAIL"));
         if (!coherent) ++failures;
+    }
+
+    // ── [8] ControlServer: command dispatch + telemetry push (loopback) ───────
+    log(LvL::INFO, "--------------------------------------------");
+    log(LvL::INFO, "[8] ControlServer (remote control + telemetry)");
+    log(LvL::INFO, "--------------------------------------------");
+    {
+        // Handler echoes the parsed command back so the client can verify the
+        // server tokenised verb/args/clientIp correctly — no shared state, no race.
+        net::ControlHandler handler = [](const net::ControlCommand& cmd) -> std::string {
+            std::ostringstream os;
+            os << "GOT verb=" << cmd.verb << " nargs=" << cmd.args.size()
+               << " ip=" << cmd.clientIp;
+            if (!cmd.args.empty()) os << " a0=" << cmd.args[0];
+            return os.str();
+        };
+
+        net::ControlServer cs;
+        net::ControlServerConfig cc;
+        cc.port = 0;            // OS-assigned; read back via port()
+        cc.maxClients = 2;
+        const bool started = cs.start(cc, handler, log);
+        const uint16_t port = cs.port();
+        log(started ? LvL::INFO : LvL::ERROR,
+            std::string("  start() on port ") + std::to_string(port) +
+            "  " + (started ? "OK" : "FAIL"));
+        if (!started) ++failures;
+
+        if (started) {
+            net::TcpSocket cli;
+            const bool conn = cli.connect("127.0.0.1", port, 1000, log);
+
+            const std::string greet = drain(cli, 400);   // server greeting
+
+            const std::string c1 = "SET foo bar\n";
+            cli.sendAll(c1.data(), c1.size());
+            const std::string r1 = drain(cli, 600);       // dispatched reply
+
+            cs.pushTelemetry("{\"hello\":1}");
+            const std::string r2 = drain(cli, 600);        // broadcast telemetry
+
+            const bool count1 = (cs.clientCount() == 1);
+
+            auto has = [](const std::string& s, const char* sub) {
+                return s.find(sub) != std::string::npos;
+            };
+            const bool ok =
+                conn &&
+                has(greet, "control ready") &&
+                has(r1, "verb=SET") && has(r1, "nargs=2") &&
+                has(r1, "ip=127.0.0.1") && has(r1, "a0=foo") &&
+                has(r2, "hello") &&
+                count1;
+            log(ok ? LvL::INFO : LvL::ERROR,
+                std::string("  connect / dispatch / telemetry / count  ") +
+                (ok ? "OK" : "FAIL"));
+            if (!ok) {
+                ++failures;
+                log(LvL::ERROR, "    greet=\"" + greet + "\" r1=\"" + r1 +
+                                "\" r2=\"" + r2 + "\" clients=" +
+                                std::to_string(cs.clientCount()));
+            }
+            cli.close();
+        }
+        cs.stop();
     }
 
     // ── Summary ───────────────────────────────────────────────────────────────

@@ -443,6 +443,15 @@ struct NetworkConfig {
     ConfigVar<std::string> rtpHost        {"RtpHost",        "127.0.0.1",  "RTP/UDP destination: a viewer's unicast IP or a multicast group"};
     ConfigVar<int>         rtpPort        {"RtpPort",        5600,  1, 65531, 1, "Base RTP/UDP destination port (lane cam = RtpPort, driver cam = RtpPort+2)"};
     ConfigVar<int>         rtpBitrateKbps {"RtpBitrateKbps", 4000,  200, 50000, 100, "x264 target bitrate for RTP streaming (kbps)"};
+
+    // Remote control + telemetry channel (libnetwork ControlServer): one TCP
+    // connection lets a remote operator re-point the RTP streams at runtime
+    // (e.g. "RTP lane here 5600" sends the lane cam to the operator's own IP) and
+    // continuously receives ADAS telemetry (lane offset, fatigue score) as JSON
+    // lines.  Connect with `nc <device-ip> <ControlPort>`; type HELP.
+    ConfigVar<bool> controlEnabled    {"ControlEnabled",    false, "Open a TCP control+telemetry channel: remote operators can re-point the RTP streams and stream live ADAS telemetry"};
+    ConfigVar<int>  controlPort       {"ControlPort",       8091,  1, 65535, 1, "TCP port for the remote control + telemetry channel"};
+    ConfigVar<int>  controlMaxClients {"ControlMaxClients", 2,     1, 16,    1, "Maximum simultaneous control/telemetry clients"};
 };
 
 /**

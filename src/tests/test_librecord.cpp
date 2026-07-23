@@ -142,6 +142,15 @@ int main(int argc, char* argv[]) {
         od.timestampMs = epochMs();
         od.speedKmh    = 40.0f + 10.0f * std::sin(t * 0.2f);
         od.headingDeg  = static_cast<float>((t * 3) % 360);
+        // ADAS telemetry banner (top-centre): lane position + fatigue state.
+        od.adasValid       = true;
+        od.laneCount       = 3;
+        od.egoLaneIndex    = 1;
+        od.laneOffset      = 0.25f;
+        od.laneOffsetValid = true;
+        od.fatigueScore    = 82.0f;
+        od.fatigueLevel    = 2;      // WARN
+        od.faceDetected    = true;
         rec.setOverlayData(od);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -168,16 +177,21 @@ int main(int argc, char* argv[]) {
     std::cout << "\n--- Test 3: sidecar structure ---\n";
     std::ifstream in(ass);
     std::string line;
-    int styles = 0, events = 0;
+    int styles = 0, events = 0, adasStyle = 0, adasEvents = 0;
     bool playRes = false;
     while (std::getline(in, line)) {
-        if (line.rfind("Style: ", 0) == 0)    ++styles;
-        if (line.rfind("Dialogue: ", 0) == 0) ++events;
+        if (line.rfind("Style: ", 0) == 0)         ++styles;
+        if (line.rfind("Style: ADAS,", 0) == 0)    ++adasStyle;
+        if (line.rfind("Dialogue: ", 0) == 0)      ++events;
+        if (line.find(",ADAS,,0,0,0,,") != std::string::npos) ++adasEvents;
         if (line == "PlayResX: " + std::to_string(f.width)) playRes = true;
     }
-    check(styles == 4, "four corner styles (TL/TR/BL/BR)");
+    check(styles == 5, "five styles (TL/TR/BL/BR + ADAS banner)");
+    check(adasStyle == 1, "ADAS banner style present in header");
+    check(adasEvents > 0, "ADAS telemetry banner rendered (" +
+          std::to_string(adasEvents) + " events)");
     check(playRes, "PlayRes matches the video resolution");
-    // 5 Hz nominal, 4 events per sample; allow generous startup slack.
+    // 5 Hz nominal, 5 events per sample (4 corners + ADAS); generous startup slack.
     const int expectMin = seconds * 5 * 4 / 2;
     check(events >= expectMin, "event count " + std::to_string(events)
           + " >= " + std::to_string(expectMin));

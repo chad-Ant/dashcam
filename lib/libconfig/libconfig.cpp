@@ -296,6 +296,9 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
     readVar(node, n.rtpHost,             log);
     readVar(node, n.rtpPort,             log);
     readVar(node, n.rtpBitrateKbps,      log);
+    readVar(node, n.controlEnabled,      log);
+    readVar(node, n.controlPort,         log);
+    readVar(node, n.controlMaxClients,   log);
 }
 
 static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
@@ -453,6 +456,9 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     writeVar(node, n.rtpHost);
     writeVar(node, n.rtpPort);
     writeVar(node, n.rtpBitrateKbps);
+    writeVar(node, n.controlEnabled);
+    writeVar(node, n.controlPort);
+    writeVar(node, n.controlMaxClients);
 }
 
 static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) {
