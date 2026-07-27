@@ -1,0 +1,57 @@
+# Doxyfile — PowerManager library documentation
+# Run: doxygen Doxyfile  (from this directory)
+# Output written to docs/html/index.html
+
+#---------------------------------------------------------------------------
+# Project
+#---------------------------------------------------------------------------
+PROJECT_NAME           = "PowerManager"
+PROJECT_NUMBER         = "1.0.0"
+PROJECT_BRIEF          = "Lightweight Battery Management System for ESP32-C3 (Arduino)"
+OUTPUT_DIRECTORY       = docs
+
+#---------------------------------------------------------------------------
+# Input
+#---------------------------------------------------------------------------
+INPUT                  = powerManager.h powerManager.cpp
+RECURSIVE              = NO
+FILE_PATTERNS          = *.h *.cpp
+
+#---------------------------------------------------------------------------
+# Output formats
+#---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+
+#---------------------------------------------------------------------------
+# Extraction
+#---------------------------------------------------------------------------
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+JAVADOC_AUTOBRIEF      = YES
+
+#---------------------------------------------------------------------------
+# Appearance
+#---------------------------------------------------------------------------
+SORT_MEMBER_DOCS       = NO
+SHOW_INCLUDE_FILES     = YES
+INLINE_INFO            = YES
+TYPEDEF_HIDES_STRUCT   = NO
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+
+#---------------------------------------------------------------------------
+# Source browsing
+#---------------------------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+
+#---------------------------------------------------------------------------
+# Graphs  (requires Graphviz dot; set HAVE_DOT = NO if not installed)
+#---------------------------------------------------------------------------
+HAVE_DOT               = NO
+CLASS_DIAGRAMS         = YES
+COLLABORATION_GRAPH    = YES
