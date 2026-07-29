@@ -142,6 +142,19 @@ int main(int argc, char* argv[]) {
         od.timestampMs = epochMs();
         od.speedKmh    = 40.0f + 10.0f * std::sin(t * 0.2f);
         od.headingDeg  = static_cast<float>((t * 3) % 360);
+        // Every per-source validity flag AND its own timestamp must be set, or
+        // the renderer correctly draws dashes and this "fresh" case silently
+        // tests nothing.  The flags default to false — fail-closed — so an
+        // aggregate initialiser that omits them produces a blank overlay rather
+        // than the live one the assertions below expect.
+        od.speedValid          = true;
+        od.accelValid          = true;
+        od.positionValid       = true;
+        od.headingValid        = true;
+        od.speedTimestampMs    = od.timestampMs;
+        od.accelTimestampMs    = od.timestampMs;
+        od.positionTimestampMs = od.timestampMs;
+        od.headingTimestampMs  = od.timestampMs;
         // ADAS telemetry banner (top-centre): lane position + fatigue state.
         // Both sources valid, so the banner shows real readings on both halves.
         od.adasValid       = true;
@@ -225,12 +238,28 @@ int main(int argc, char* argv[]) {
     const std::string ass3 = "/tmp/record_test3.ass";
     fs::remove(mkv3); fs::remove(ass3);
     check(rec.startRecording(usb->address, rf, mkv3), "start (stale case) OK");
-    // Feed telemetry whose capture time is well beyond the default 2 s window,
-    // so every sample is stale regardless of the wall clock on test day.
+    // Every validity flag TRUE, every per-source timestamp OLD.  Ageing only the
+    // legacy timestampMs (as this test used to) proves nothing now that the
+    // renderer judges each source by its own stamp: with the new flags left at
+    // their fail-closed default of false, the overlay dashed for the wrong
+    // reason and the test passed even when every per-source timeout was broken.
     for (int t = 0; t < 3 * 5 && rec.isRecording(); ++t) {
         dashcam::record::OverlayData od;
-        od.timestampMs = epochMs() - 10000;   // 10 s old
-        od.speedKmh    = 42.0f;               // would show if treated as fresh
+        od.timestampMs         = epochMs();          // legacy field deliberately FRESH
+        od.speedKmh            = 42.0f;              // would show if treated as fresh
+        od.accelerationMs2     = 3.5f;
+        od.headingDeg          = 123.0f;
+        od.latitude            = 1.5;
+        od.longitude           = 2.5;
+        od.speedValid          = true;
+        od.accelValid          = true;
+        od.positionValid       = true;
+        od.headingValid        = true;
+        const int64_t old      = epochMs() - 10000;  // 10 s old
+        od.speedTimestampMs    = old;
+        od.accelTimestampMs    = old;
+        od.positionTimestampMs = old;
+        od.headingTimestampMs  = old;
         rec.setOverlayData(od);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -238,16 +267,73 @@ int main(int argc, char* argv[]) {
 
     std::ifstream in3(ass3);
     int dashTL = 0, freshSpd = 0, clockEvents = 0, adasBanner3 = 0;
+    int dashHdg = 0, freshHdg = 0, dashPos = 0;
     while (std::getline(in3, line)) {
         if (line.find(",TL,,0,0,0,,SPD -- km/h") != std::string::npos) ++dashTL;
         if (line.find(",TL,,0,0,0,,SPD 42")      != std::string::npos) ++freshSpd;
+        if (line.find(",TR,,0,0,0,,HDG --")      != std::string::npos) ++dashHdg;
+        if (line.find(",TR,,0,0,0,,HDG 123")     != std::string::npos) ++freshHdg;
+        if (line.find(",BL,,0,0,0,,LAT --")      != std::string::npos) ++dashPos;
         if (line.find(",BR,,0,0,0,,20")          != std::string::npos) ++clockEvents;
         if (line.find(",ADAS,,0,0,0,,")          != std::string::npos) ++adasBanner3;
     }
-    check(dashTL > 0,       "stale samples render 'SPD -- km/h'");
-    check(freshSpd == 0,    "no fresh speed value leaks through when stale");
+    check(dashTL > 0,       "per-source stale timestamp renders 'SPD -- km/h'");
+    check(freshSpd == 0,    "no fresh speed leaks through on a stale speed stamp");
+    check(dashHdg > 0,      "per-source stale timestamp renders 'HDG --'");
+    check(freshHdg == 0,    "no fresh heading leaks through on a stale heading stamp");
+    check(dashPos > 0,      "per-source stale timestamp renders 'LAT --'");
     check(clockEvents > 0,  "bottom-right clock still populated while stale");
     check(adasBanner3 == 0, "no ADAS banner emitted when adasValid is false");
+
+    // ── Test 6: sources age INDEPENDENTLY ────────────────────────────────────
+    // The defect this guards: a live GNSS fix refreshes speed while a dead ECU
+    // leaves acceleration inherited, and a stationary vehicle has a good fix
+    // with no trustworthy course.  One shared flag necessarily certifies the
+    // stale half, which is fabricated evidence in a recording.
+    std::cout << "\n--- Test 6: independent per-source validity ---\n";
+    const std::string mkv4 = "/tmp/record_test4.mkv";
+    const std::string ass4 = "/tmp/record_test4.ass";
+    fs::remove(mkv4); fs::remove(ass4);
+    check(rec.startRecording(usb->address, rf, mkv4), "start (mixed case) OK");
+    for (int t = 0; t < 3 * 5 && rec.isRecording(); ++t) {
+        dashcam::record::OverlayData od;
+        const int64_t nowT     = epochMs();
+        od.timestampMs         = nowT;
+        // Speed live, acceleration dead (GNSS speed with a silent ECU).
+        od.speedKmh            = 55.0f;
+        od.speedValid          = true;
+        od.speedTimestampMs    = nowT;
+        od.accelerationMs2     = 9.9f;      // must NOT appear
+        od.accelValid          = false;
+        // Position live, heading untrustworthy (stationary, or warming up).
+        od.latitude            = 10.5;
+        od.longitude           = 106.5;
+        od.altitudeM           = 12.0;
+        od.positionValid       = true;
+        od.positionTimestampMs = nowT;
+        od.headingDeg          = 90.0f;     // the struct's placeholder; must NOT appear
+        od.headingValid        = false;
+        rec.setOverlayData(od);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    rec.stopRecording();
+
+    std::ifstream in4(ass4);
+    int spdLive = 0, accDash = 0, accLive = 0, hdgDash = 0, hdgLive = 0, posLive = 0;
+    while (std::getline(in4, line)) {
+        if (line.find(",TL,,0,0,0,,SPD 55") != std::string::npos) ++spdLive;
+        if (line.find("ACC -- m/s2")        != std::string::npos) ++accDash;
+        if (line.find("ACC +9.9")           != std::string::npos) ++accLive;
+        if (line.find(",TR,,0,0,0,,HDG --") != std::string::npos) ++hdgDash;
+        if (line.find(",TR,,0,0,0,,HDG 090")!= std::string::npos) ++hdgLive;
+        if (line.find(",BL,,0,0,0,,LAT 10.5")!= std::string::npos) ++posLive;
+    }
+    check(spdLive > 0, "live speed still renders when acceleration is invalid");
+    check(accDash > 0, "invalid acceleration renders 'ACC --' beside a live speed");
+    check(accLive == 0, "stale acceleration never leaks under a live speed");
+    check(posLive > 0, "live position still renders when heading is invalid");
+    check(hdgDash > 0, "invalid heading renders 'HDG --' beside a live position");
+    check(hdgLive == 0, "placeholder heading never leaks under a live position");
 
     std::cout << "\n" << (g_fails == 0 ? "RESULT: PASS" : "RESULT: FAIL")
               << " (" << g_fails << " failures)\n";

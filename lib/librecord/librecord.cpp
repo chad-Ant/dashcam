@@ -354,17 +354,27 @@ void Recorder::subtitleLoop() {
         // immediately rather than after the timeout: the flag says "this is not
         // backed by a live source", which is a stronger statement than "this has
         // not been refreshed lately" and should not wait for a clock.
+        // A non-finite value is treated as stale REGARDLESS of its validity
+        // flag.  The flag is set by the application, which is outside this
+        // library's control, and a NaN or Inf reaching the formatters below
+        // becomes "nan" burned into the recording — or, for heading, is fed
+        // straight to std::lround(), whose result is undefined for values that
+        // do not fit an integer.  Trusting a caller-supplied bool over the
+        // number it describes would put an undefined conversion in the render
+        // path of a device whose output is evidence.
         const bool speedStale =
-            !od.speedValid ||
+            !od.speedValid || !std::isfinite(od.speedKmh) ||
             (staleMs > 0 && (nowMs - od.speedTimestampMs) > staleMs);
         const bool accelStale =
-            !od.accelValid ||
+            !od.accelValid || !std::isfinite(od.accelerationMs2) ||
             (staleMs > 0 && (nowMs - od.accelTimestampMs) > staleMs);
         const bool positionStale =
             !od.positionValid ||
+            !std::isfinite(od.latitude) || !std::isfinite(od.longitude) ||
+            !std::isfinite(od.altitudeM) ||
             (staleMs > 0 && (nowMs - od.positionTimestampMs) > staleMs);
         const bool headingStale =
-            !od.headingValid ||
+            !od.headingValid || !std::isfinite(od.headingDeg) ||
             (staleMs > 0 && (nowMs - od.headingTimestampMs) > staleMs);
 
         writeAssSample(pos, durNs, od, nowMs, speedStale, accelStale,

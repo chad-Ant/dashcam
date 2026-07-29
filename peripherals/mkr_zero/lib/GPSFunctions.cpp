@@ -110,13 +110,23 @@ const char *gpsInitStageName(GPSInitStage stage){
 }
 
 void gpsInitBegin(GPSInitState &state){
+    // Quarantined is TERMINAL, and it has to be terminal here rather than only
+    // at the one call site that currently respects it.  gpsInitTick() refusing
+    // to leave the state is not enough on its own: this function assigns the
+    // stage directly, so a caller that armed the machine again would walk it
+    // straight back into the hang the quarantine exists to prevent.
+    if (state.stage == GPSInitStage::Quarantined) return;
+
     state.stage      = GPSInitStage::Begin;
     state.lastStatus = GPSReturnStatus::OK;
-    state.attempts   = 0u;
     state.nextStepMs = millis();
 }
 
 void gpsInitFail(GPSInitState &state, GPSReturnStatus why){
+    // Same reason as gpsInitBegin(): Failed schedules a retry, so downgrading a
+    // quarantine to a failure would silently re-arm the machine.
+    if (state.stage == GPSInitStage::Quarantined) return;
+
     // Remember WHICH step refused before overwriting the stage, or the log can
     // only report "failed", which says nothing: -1 at Begin means nothing
     // answered at 0x42, while -6 at SetNavRate means the receiver is right there
@@ -197,10 +207,24 @@ GPSInitStage gpsInitTick(SFE_UBLOX_GNSS &myGNSS, GPSInitState &state){
         return state.stage;
     }
 
-    state.attempts++;
-
     switch (state.stage){
         case GPSInitStage::Begin:
+            // Buffer readiness enforced HERE, in the library, not left to each
+            // caller.  Production checks preallocateGPS_I2C() and quarantines on
+            // failure, but the helper sketches call the blocking wrapper and one
+            // of them discarded the result entirely — and the consequence is not
+            // a clean failure.  setPacketCfgPayloadSize() leaves payloadCfg NULL
+            // on OOM, begin() retries it without checking, and the configuration
+            // path then writes payloadCfg[0] unconditionally.  A null dereference
+            // is not something a caller can be trusted to avoid by convention.
+            //
+            // packetUBXNAVPVT is the one allocation this code can observe (the
+            // payload members are private), and it is allocated by the same
+            // preallocation step, so it stands in for both.
+            if (myGNSS.packetUBXNAVPVT == nullptr){
+                gpsInitFail(state, GPSReturnStatus::NOK_INIT_FAILED);
+                break;
+            }
             if (!myGNSS.begin(Wire, GPS_DEFAULT_I2C_ADDRESS, GPS_CMD_TIMEOUT_MS)){
                 gpsInitFail(state, GPSReturnStatus::NOK_INIT_FAILED);
                 break;
@@ -274,6 +298,14 @@ GPSReturnStatus initializeGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
     // loop() to drive it — the validation and fault-injection sketches.  The
     // production sketch must NOT use this: see gpsInitTick() for why a
     // straight-line bring-up is a hazard there.
+    // Preallocation is performed HERE rather than assumed.  Every caller of this
+    // wrapper is a helper sketch, and they did not all check it: one discarded
+    // the result and two never called it at all, so they could enter SparkFun's
+    // unchecked null-payload path.  Doing it inside the wrapper means the
+    // guarantee belongs to the function rather than to whoever remembers.
+    const GPSReturnStatus alloc = preallocateGPS_I2C(myGNSS);
+    if (alloc != GPSReturnStatus::OK) return alloc;
+
     GPSInitState state;
     gpsInitBegin(state);
 

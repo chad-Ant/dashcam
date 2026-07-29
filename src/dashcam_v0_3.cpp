@@ -1580,6 +1580,11 @@ int main(int argc, char* argv[]) {
             // current.  A frozen speed or a minutes-old position burned into a
             // recording and presented as live is false evidence, which is the one
             // output a dashcam must never produce.
+            // One clock read per tick.  Every per-source stamp below refers to the
+            // same sample, so reading the clock separately for each of them was
+            // both wasteful and slightly wrong — the stamps could differ by the
+            // time the block took to run.
+            const int64_t tickMs = epochMs();
             const bool bridgeFresh = !bridge.isStale(kBridgeFreshnessMs);
             const auto t = bridge.telemetry();
 
@@ -1598,11 +1603,11 @@ int main(int argc, char* argv[]) {
             if (fixLive && !std::isnan(t.gpsSpeedKmh)) {
                 od.speedKmh         = t.gpsSpeedKmh;
                 od.speedValid       = true;
-                od.speedTimestampMs = epochMs();
+                od.speedTimestampMs = tickMs;
             } else if (obdLive && !std::isnan(t.speed)) {
                 od.speedKmh         = t.speed;
                 od.speedValid       = true;
-                od.speedTimestampMs = epochMs();
+                od.speedTimestampMs = tickMs;
             } else {
                 // Cleared, not inherited.  Leaving the previous number in place
                 // relies on every downstream consumer checking the flag, and one
@@ -1620,7 +1625,7 @@ int main(int argc, char* argv[]) {
             if (obdLive && !std::isnan(t.accel)) {
                 od.accelerationMs2  = t.accel;
                 od.accelValid       = true;
-                od.accelTimestampMs = epochMs();
+                od.accelTimestampMs = tickMs;
             } else {
                 od.accelValid      = false;
                 od.accelerationMs2 = 0.0f;
@@ -1632,7 +1637,7 @@ int main(int argc, char* argv[]) {
                 if (!std::isnan(t.altitude)) od.altitudeM = t.altitude;
 
                 od.positionValid       = true;
-                od.positionTimestampMs = epochMs();
+                od.positionTimestampMs = tickMs;
             } else {
                 od.positionValid = false;
                 od.latitude      = 0.0;
@@ -1652,7 +1657,7 @@ int main(int argc, char* argv[]) {
             if (fixLive && !std::isnan(t.heading)) {
                 od.headingDeg         = t.heading;
                 od.headingValid       = true;
-                od.headingTimestampMs = epochMs();
+                od.headingTimestampMs = tickMs;
             } else {
                 od.headingValid = false;
                 od.headingDeg   = 0.0f;
@@ -1668,7 +1673,7 @@ int main(int argc, char* argv[]) {
             // It is deliberately NOT used to age the motion or position fields;
             // that is what speedValid/accelValid/positionValid and their own
             // stamps are for.
-            od.timestampMs = epochMs();
+            od.timestampMs = tickMs;
 
             // Build the ADAS block FRESH from this tick's results — never inherit
             // ADAS fields from the previous OverlayData.  A source contributes only

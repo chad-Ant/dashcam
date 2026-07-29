@@ -9,7 +9,8 @@
  * Keep this file byte-identical on both sides. It depends only on Arduino /
  * string / stdint, so it drags in no board-specific or project libraries.
  *
- * Frame: SOF(0x7E) | VER(0x01) | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
+ * Frame: SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
+ * VER is COMM_VERSION, currently 0x04; the payload is 131 bytes.
  * CRC-16/CCITT-FALSE over VER..last payload byte, transmitted low byte first.
  * Both MCUs are little-endian IEEE-754, so a packed struct copies verbatim.
  */

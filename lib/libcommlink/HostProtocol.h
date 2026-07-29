@@ -34,7 +34,8 @@
  * rather than corrupting telemetry in the field.
  *
  * ── Frame layout ─────────────────────────────────────────────────────────────
- *   SOF(0x7E) | VER(0x01) | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
+ *   SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
+ *   VER is hostproto::VERSION, currently 0x04; Telemetry is 131 bytes.
  *
  * CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over VER..last payload byte,
  * transmitted low byte first.  Both ends are little-endian IEEE-754, so a
@@ -369,7 +370,7 @@ constexpr size_t MAX_LOG_TEXT = MAX_PAYLOAD - sizeof(LogHeader);
 static_assert(sizeof(Telemetry)    == 131, "hostproto::Telemetry must be tightly packed to 131 bytes");
 /**
  * Must fit the frame's one-byte LEN field and @c Hello::telemetryBytes, which is
- * also one byte.  Stated explicitly now the struct has grown 79 -> 83 -> 123:
+ * also one byte.  Stated explicitly now the struct has grown 79 -> 83 -> 123 -> 131:
  * past 255 the length silently truncates rather than failing visibly.
  */
 static_assert(sizeof(Telemetry)    <= MAX_PAYLOAD,

@@ -268,13 +268,31 @@ static void updateIMUSampleMode()
  * disabled gpsData holds NAN, the filter skips the sample, and the result is
  * NAN — the same answer, reached without a second code path to rot.
  */
-static void updateHeading()
+static void updateHeading(bool freshSample)
 {
     if (!gpsData.fixValid || isnan(gpsData.velocityKmh) ||
         gpsData.velocityKmh < HEADING_MIN_SPEED_KMH) {
+        // RESET the window, not merely blank the output.  Clearing only the
+        // output left the filter holding the courses recorded before the stop,
+        // so when the vehicle pulled away in a NEW direction those stale samples
+        // were still in the window — and being mutually consistent, they held
+        // resultantLength() above the threshold and certified the OLD course as
+        // current for the first second or two of the new one.  A heading that is
+        // confidently wrong is worse than no heading, which is the whole reason
+        // this function publishes NAN so readily.
+        headingFilter.reset();
         derived.headingDeg = NAN;
         return;
     }
+
+    // Fed ONLY on a fresh PVT packet.  This used to run on the 10 Hz derived
+    // signal tick against a 4 Hz receiver, so each course was inserted two or
+    // three times.  Duplicates are not merely wasted window slots: identical
+    // samples are perfectly coherent, so they INFLATE resultantLength() — the
+    // one statistic whose job is to reject an incoherent window — and make a
+    // noisy heading look trustworthy.  With SIZE_8 and 2.5x oversampling the
+    // window also spanned barely three real fixes.
+    if (!freshSample) return;
 
     float mean = NAN;
     if (!headingFilter.calculate(gpsData.headingDegrees, mean)) {
@@ -376,14 +394,16 @@ void setup()
     watchdogFeed();
 
 #ifdef USE_GPS
-    // Allocation only — this no longer touches the bus, so it cannot hang and
-    // cannot leave a queued reply for the real bring-up to trip over.
+    // Skipped entirely on a quarantined boot: GNSS will not be brought up at
+    // all, so claiming its buffers would only consume RAM nothing will read.
     //
-    // Checked, not discarded.  These are the only two GNSS allocations this
-    // code can force to happen during setup(), so a failure here means the
-    // driver will allocate from loop() instead — the exact thing the call
-    // exists to prevent — and it must not pass silently.
-    const bool gpsMemoryOk = (preallocateGPS_I2C(myGNSS) == GPSReturnStatus::OK);
+    // Otherwise allocation only — it touches no bus, so it cannot hang and
+    // cannot leave a queued reply for the real bring-up to trip over.  Checked,
+    // not discarded: these are the only two GNSS allocations this code can force
+    // into setup(), so a failure means the driver would allocate from loop()
+    // instead, which is the exact thing the call exists to prevent.
+    const bool gpsMemoryOk =
+        hangQuarantine || (preallocateGPS_I2C(myGNSS) == GPSReturnStatus::OK);
     if (!gpsMemoryOk) {
         // TERMINAL for this boot, not merely logged.  A failed allocation is not
         // a degraded-but-usable state: setPacketCfgPayloadSize() leaves
@@ -427,8 +447,14 @@ void setup()
 
 void loop()
 {
-    // One feed per pass.  Every branch below is non-blocking by construction, so
-    // reaching here at all is the health condition the watchdog is testing.
+    // One feed per pass.  Reaching here at all is the health condition the
+    // watchdog is testing.
+    //
+    // "Non-blocking" would overstate it: the GNSS bring-up stage below can hold
+    // this pass for up to 750 ms (see gpsInitTick), which is bounded and far
+    // under WATCHDOG_PERIOD_MS but long enough to age the IMU FIFO past its
+    // freshness window and be reported as a data gap.  Every OTHER branch is
+    // non-blocking by construction.
     watchdogFeed();
     // ── 1) OBD-II poll, with bounded recovery ────────────────────────────────
     if (obdReady) {
@@ -475,6 +501,10 @@ void loop()
                 // cleanly but never streams retry fast forever, because the
                 // counter was wiped before it could ever escalate.
                 gpsInitConfirmStreaming(gpsInit);
+                // The ONE place the heading filter is fed: one packet, one
+                // sample.  OK means a fix; NO_FIX still counts as the receiver
+                // talking, and updateHeading() resets the window for it.
+                updateHeading(st == GPSReturnStatus::OK);
                 // A fresh packet is authoritative either way: OK sets fixValid
                 // inside getGPSData(), NO_FIX clears it there too.
             }
@@ -515,6 +545,12 @@ void loop()
             // observes GPS_RETRY_MS instead of hammering a dead receiver.
             gpsInitFail(gpsInit, GPSReturnStatus::NOK_INIT_FAILED);
             prevGPSStage = GPSInitStage::Failed;   // already logged above
+            // Discard the course window too.  It holds pre-outage samples, and
+            // a receiver that returns after a gap may well be pointing a
+            // different way — re-using them would certify a course from before
+            // the outage as current.
+            headingFilter.reset();
+            derived.headingDeg = NAN;
             // Everything, not just the fix: with the receiver gone, the UTC
             // stamp, satellite count and fix type are as stale as the position,
             // and a satellite count frozen at 7 is a particularly convincing
@@ -606,7 +642,9 @@ void loop()
         lastAccelSample = millis();
         (void)accelEst.update(obdData.speed, lastAccelSample); // NAN handled inside
         derived.accelMs2 = accelEst.value();
-        updateHeading();
+        // false: this tick may only INVALIDATE. Feeding here is what
+        // oversampled a 4 Hz receiver at 10 Hz; see updateHeading().
+        updateHeading(false);
     }
 
     // ── 3) Serve the ESP32-C3 link ───────────────────────────────────────────

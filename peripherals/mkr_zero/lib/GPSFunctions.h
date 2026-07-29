@@ -145,7 +145,14 @@ enum class GPSInitStage : uint8_t{
     SetNavFreq,    ///< Navigation solution rate.
     SetNavRate,    ///< Measurements per navigation solution.
     SetAutoPVT,    ///< Ask the receiver to push PVT automatically.
-    Done,          ///< Receiver configured and streaming.
+    /**
+     * Receiver ACKed every configuration exchange.
+     *
+     * NOT the same as streaming.  Reaching here says the receiver accepted its
+     * settings; whether it then emits PVT packets is a separate question, and
+     * one that only @c gpsInitConfirmStreaming() answers.
+     */
+    Done,
     Failed,        ///< A step refused; holds the retry backoff — NOT terminal.
     /**
      * Abandoned for this boot because the previous run hung.  TERMINAL.
@@ -174,7 +181,6 @@ struct GPSInitState{
     GPSInitStage    failedAt   = GPSInitStage::Idle; ///< Stage that refused, for logs.
     GPSReturnStatus lastStatus = GPSReturnStatus::OK; ///< Why the last attempt failed.
     uint32_t        nextStepMs = 0;   ///< Earliest @c millis() for the next attempt.
-    uint16_t        attempts   = 0;   ///< Steps executed since the last restart.
     uint16_t        failures   = 0;   ///< Consecutive failed bring-ups, for backoff.
 };
 

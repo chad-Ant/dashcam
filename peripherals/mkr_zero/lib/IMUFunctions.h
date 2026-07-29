@@ -100,6 +100,11 @@ enum class IMUSampleMode : uint8_t{
     LowPower = 1,
 };
 
+/// @c IMUDevice::lifecycle sentinels.  Arbitrary values, chosen only to be
+/// improbable as stack garbage.
+#define IMU_LIFECYCLE_ACTIVE      0x9A1C0DE1u
+#define IMU_LIFECYCLE_QUARANTINED 0x9A1CDEADu
+
 /** Return codes used by IMU functions. */
 enum class IMUReturnStatus{
     OK = 0,                     ///< Requested operation succeeded.
@@ -310,14 +315,29 @@ struct IMUDevice{
     /// Abandoned for this boot after a watchdog reset — no recovery attempted.
     /// See @c imuQuarantine().
     bool quarantined;
+
+    /**
+     * Lifecycle latch, so quarantine survives a later @c initializeIMU().
+     *
+     * A plain bool cannot express this.  @c initializeIMU() begins by resetting
+     * every field — it has to, it is the initialiser — so it would clear
+     * @c quarantined and then transact, undoing the quarantine on any caller
+     * that simply calls it again.  The sketch happens not to, but the LIBRARY
+     * must not depend on one caller's discipline for a safety property.
+     *
+     * A magic word rather than a flag, because the check has to be meaningful on
+     * an UNINITIALISED object: an automatic @c IMUDevice holds stack garbage
+     * before its first call, and reading a bool from that is as likely to say
+     * "quarantined" as not.  A 32-bit sentinel is wrong by chance once in 4.3
+     * billion, which is a risk worth taking to make the check safe at all.
+     */
+    uint32_t lifecycle;
     /// Deadline form, not elapsed-time form: the gap notice is HELD until
     /// @c gapFlagUntilMs and then latched off.  Deriving it from "counter
     /// nonzero and lastOverrunMs looks recent" republished a long-finished gap
     /// for 250 ms every time @c millis() rolled over at 49.7 days.
     bool     gapFlagActive;
     uint32_t gapFlagUntilMs;
-    /// @c millis() of the most recent gap, for diagnostics.
-    uint32_t lastOverrunMs;
 
     /// Current sampling scheme.  Change it through @c setIMUSampleMode(), never
     /// by assignment — the field only describes what the DEVICE was configured

@@ -675,10 +675,10 @@ void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
     dev.magIOErrors   = 0u;
     dev.fifoOverruns  = 0u;
     dev.fifoGapFlushes = 0u;
-    dev.lastOverrunMs  = millis();
     dev.gapFlagActive  = false;
     dev.gapFlagUntilMs = millis();
     dev.quarantined   = false;
+    dev.lifecycle     = IMU_LIFECYCLE_ACTIVE;
     // Full capture until something establishes the vehicle is parked.  The safe
     // default is the expensive one: starting in LowPower would mean a boot that
     // happens to coincide with a collision records it at reduced fidelity.
@@ -691,6 +691,10 @@ void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
 
 void imuQuarantine(IMUDevice &dev){
     imuMarkAbsent(dev, IMU_ACCEL_I2C_ADDRESS, IMU_MAG_I2C_ADDRESS);
+    // Set AFTER imuMarkAbsent(), which writes IMU_LIFECYCLE_ACTIVE.  Ordering
+    // matters: the latch is what makes the quarantine survive a later call to
+    // initializeIMU(), so it must be the last word on the subject.
+    dev.lifecycle   = IMU_LIFECYCLE_QUARANTINED;
     // Terminal for the boot.  isIMUDegraded() is what schedules recoverIMU(),
     // and recovery transacts — so without this flag the caller's retry timer
     // would walk straight back into the hang that caused the reset, which is the
@@ -699,6 +703,14 @@ void imuQuarantine(IMUDevice &dev){
 }
 
 IMUReturnStatus initializeIMU(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
+    // Checked BEFORE the struct is reset, because resetting it is what would
+    // erase the answer.  Without this a caller could quarantine the device and
+    // then re-initialise it — clearing the flag and transacting on a bus that
+    // just hung the board.  The sketch does not do that, but a library whose
+    // safety property depends on callers not doing the obvious thing does not
+    // have the property.
+    if (dev.lifecycle == IMU_LIFECYCLE_QUARANTINED) return IMUReturnStatus::NOK_LINK_LOST;
+
     imuMarkAbsent(dev, accelAddress, magAddress);
 
     if (!isUsableI2CAddress(accelAddress) || !isUsableI2CAddress(magAddress) ||
@@ -1035,7 +1047,6 @@ static bool drainAccelFifo(IMUDevice &dev, IMUData &data, uint32_t now, bool &fr
         // tell a technician which happened.
         if (overrun) { if (dev.fifoOverruns  < 0xFFFFu) dev.fifoOverruns++; }
         else         { if (dev.fifoGapFlushes < 0xFFFFu) dev.fifoGapFlushes++; }
-        dev.lastOverrunMs  = now;
         dev.gapFlagActive  = true;
         dev.gapFlagUntilMs = now + IMU_PEAK_WINDOW_MS;
 
