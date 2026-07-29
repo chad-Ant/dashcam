@@ -1,55 +1,369 @@
 /**
- * ESP_Sentinel — telemetry receiver demo.
+ * ESP_Sentinel — telemetry bridge.
  *
- * Requests a 10 Hz telemetry stream from the MKR Zero master over UART and
- * prints each decoded OBD2+GPS snapshot to the USB-CDC console. Re-requests the
- * stream if the link goes quiet (e.g. the master reset).
+ * Sits between the MKR Zero (which owns OBD2 + GPS) and the Jetson Orin Nano
+ * (which runs the dashcam application), speaking the same framed protocol on
+ * both sides:
  *
- * Wiring (cross-over + common ground):
+ *   MKR Zero ──UART1 115200, CommProtocol.h──> [ESP32-C3] ──USB-C, HostProtocol.h──> Jetson
+ *                 (C3 is initiator)                            (C3 is responder)
+ *
+ * Downward (commLink) it asks the MKR for a 10 Hz stream and re-asks if the
+ * link goes quiet.  Upward (hostLink) it answers the Jetson's commands and
+ * forwards each master snapshot as it lands — event-driven, so the Jetson never
+ * receives the same sample twice and never receives a stale one.  A 1 Hz
+ * MSG_STATUS heartbeat carries bridge health regardless of whether telemetry is
+ * flowing, which is what lets the Jetson tell "USB gone" from "MKR gone".
+ *
+ * Wiring:
  *   MKR Zero Serial1 TX (pin 14) -> C3 RX (GPIO20)
  *   MKR Zero Serial1 RX (pin 13) <- C3 TX (GPIO21)
  *   GND <-> GND
- * Board setting: USB CDC On Boot = Enabled (native USB, so Serial is the console
- * and UART0's GPIO20/21 are free for Serial1).
+ *   C3 USB-C -> any USB port on the Jetson Orin Nano  (enumerates as /dev/ttyACM*)
+ *
+ * Board settings: USB CDC On Boot = **Enabled** (Serial is the native USB link
+ * to the Jetson; UART0's GPIO20/21 are then free for Serial1/commLink).
+ *
+ * NOTE: Serial carries binary frames — never print to it.  Use bridgeLog().
  */
 
 #include <Arduino.h>
-#include "commLink.h"
+#include <esp_log.h>      // esp_log_level_set()
+#include <esp_system.h>   // esp_reset_reason()
+#include <math.h>
+#include <stddef.h>
+#include <string.h>
 
-static CommLink   gLink;  // not 'link' — collides with POSIX link() from <unistd.h>
-static uint32_t   lastHealthMs = 0;
+#include "commLink.h"
+#include "hostLink.h"
+
+// ─── build identity ───────────────────────────────────────────────────────────
+
+static constexpr uint8_t  BRIDGE_FW_MAJOR = 1;
+static constexpr uint8_t  BRIDGE_FW_MINOR = 0;
+
+static constexpr uint32_t STATUS_INTERVAL_MS  = 1000; ///< MSG_STATUS heartbeat period.
+static constexpr uint32_t MASTER_STALE_MS     = 1000; ///< No master telemetry for this long = link down.
+static constexpr uint32_t MASTER_RETRY_MS     = 1000; ///< How often to re-request the master stream while down.
+/**
+ * Downstream heartbeat period (ms).
+ *
+ * Sent even while the link is healthy, which is the whole point.  This bridge
+ * is silent by design once telemetry is flowing — it only speaks to re-request a
+ * stopped stream — so from the MKR's side a working link and an unplugged cable
+ * look identical: writing to a severed UART succeeds exactly like writing to a
+ * live one.  A periodic PING is the only thing that lets the master distinguish
+ * them, and it answers with PONG for free.
+ *
+ * Comfortably shorter than the master's COMM_LINK_SILENT_MS (8 s) so normal
+ * jitter never reads as a disconnect.
+ */
+static constexpr uint32_t MASTER_HEARTBEAT_MS = 2000;
+static constexpr uint32_t ONCE_TIMEOUT_MS     = 500;  ///< A latched CMD_GET_ONCE is abandoned after this.
+
+// The two hops carry the same snapshot under different type names (one header is
+// Arduino-only, the other portable).  Assert the layouts agree so a change to one
+// that is not mirrored in the other fails the build instead of silently shifting
+// every field on the wire.
+//
+// The size is deliberately NOT written as a literal here: it lives in exactly one
+// place per header (their own static_asserts), and repeating it in a comment is
+// how the previous "79-byte snapshot" note came to be wrong two versions running.
+static_assert(sizeof(TelemetryPayload) == sizeof(hostproto::Telemetry),
+              "TelemetryPayload and hostproto::Telemetry must stay the same size");
+static_assert(offsetof(TelemetryPayload, masterMillis) == offsetof(hostproto::Telemetry, masterMillis),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (masterMillis)");
+static_assert(offsetof(TelemetryPayload, accel) == offsetof(hostproto::Telemetry, accel),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (accel)");
+static_assert(offsetof(TelemetryPayload, latitude) == offsetof(hostproto::Telemetry, latitude),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (latitude)");
+// Both ends of the IMU block, so a field inserted or reordered inside it is
+// caught rather than only a change to its overall length.
+static_assert(offsetof(TelemetryPayload, imuAccelX) == offsetof(hostproto::Telemetry, imuAccelX),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuAccelX)");
+static_assert(offsetof(TelemetryPayload, imuTempC) == offsetof(hostproto::Telemetry, imuTempC),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuTempC)");
+static_assert(offsetof(TelemetryPayload, flags) == offsetof(hostproto::Telemetry, flags),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (flags)");
+
+// ─── state ────────────────────────────────────────────────────────────────────
+
+static CommLink gLink;  // not 'link' — collides with POSIX link() from <unistd.h>
+static HostLink gHost;
+
+// Boot counter, part of the forensic trail the Jetson receives in MSG_HELLO: a
+// climbing count with a short bridgeMillis is a C3 stuck in a reset loop.
+//
+// RTC_NOINIT_ATTR — not RTC_DATA_ATTR — is what survives a watchdog or software
+// reset: RTC_DATA_ATTR is re-initialised by the bootloader on every reset other
+// than a deep-sleep wake, which would zero the counter in exactly the crash case
+// it exists to diagnose.  NOINIT holds garbage on the first power-on, hence the
+// magic-word guard.
+static constexpr uint32_t BOOT_MAGIC = 0xB0071CEDu;
+RTC_NOINIT_ATTR static uint32_t gBootMagic;
+RTC_NOINIT_ATTR static uint16_t gBootCount;
+
+static uint32_t gLastStatusMs   = 0;
+static uint32_t gLastMasterMs   = 0;
+static uint32_t gLastRetryMs    = 0;
+static bool     gMasterSeen     = false; ///< False until the first master frame ever.
+static bool     gMasterUp       = false; ///< Edge-detect for logging the master link state.
+static bool     gForwardOnce    = false; ///< A CMD_GET_ONCE is waiting for the next master frame.
+static uint32_t gForwardOnceMs  = 0;     ///< millis() when that request was latched (expiry clock).
+static bool     gOncePendingTx  = false; ///< CMD_GET_ONCE not yet handed to the MKR (its TX was busy).
+static uint8_t  gDecimCount     = 0;
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+/** @brief Sends one log line up to the Jetson. Silently dropped when no host is attached. */
+static void bridgeLog(uint8_t level, const char *text)
+{
+    (void)gHost.sendLog(level, text); // best-effort diagnostics; never gate control flow on it
+}
+
+/** @brief Milliseconds since the last master telemetry, or UINT32_MAX if none ever arrived. */
+static uint32_t masterAgeMs(uint32_t nowMs)
+{
+    return gMasterSeen ? (nowMs - gLastMasterMs) : UINT32_MAX;
+}
+
+/** @brief Copies the master snapshot into the portable host-hop struct. */
+static void toHostTelemetry(const TelemetryPayload &src, hostproto::Telemetry &dst)
+{
+    // Layout equality is asserted at compile time above, so a flat copy is
+    // correct and keeps the two contracts from having to know each other.
+    memcpy(&dst, &src, sizeof(dst));
+}
+
+/** @brief Fills the 1 Hz health frame. */
+static void buildStatus(uint32_t nowMs, hostproto::BridgeStatus &s)
+{
+    memset(&s, 0, sizeof(s));
+
+    s.bridgeMillis    = nowMs;
+    s.telemetryAgeMs  = masterAgeMs(nowMs);
+    s.masterFrames    = gLink.framesRx();
+    s.masterCrcErrors = gLink.crcErrors();
+    s.hostFrames      = gHost.framesRx();
+    s.hostTxDropped   = gHost.txDropped();
+
+    // No PowerManager is instantiated by default: this sketch must not drive a
+    // charge-enable GPIO on hardware whose wiring it cannot verify.  The fields
+    // are reported as "unavailable" and BRIDGE_FLAG_PM_PRESENT stays clear.
+    // To enable a fitted BMS, construct a PowerManager (see powerManager.h),
+    // call update() in loop(), fill the four fields below from its getters, and
+    // set BRIDGE_FLAG_PM_PRESENT plus the battery flags.
+    s.batteryVolts   = NAN;
+    s.batteryPercent = NAN;
+    s.batteryStatus  = 0xFF;
+    s.chargeState    = 0xFF;
+
+    s.tempC = temperatureRead(); // C3 die temperature, not ambient
+
+    const uint32_t freeKb = ESP.getFreeHeap() / 1024u;
+    s.freeHeapKb = (freeKb > static_cast<uint32_t>(UINT16_MAX)) ? UINT16_MAX
+                                                                : static_cast<uint16_t>(freeKb);
+
+    uint8_t flags = 0;
+    if (gMasterSeen && masterAgeMs(nowMs) < MASTER_STALE_MS) flags |= hostproto::BRIDGE_FLAG_MASTER_LINK;
+    if (gHost.streaming())                                    flags |= hostproto::BRIDGE_FLAG_STREAMING;
+    s.flags = flags;
+
+    s.decimation = gHost.decimation();
+}
+
+/** @brief Answers a fresh host connection with its identity frame and an immediate status. */
+static void greetHost(uint32_t nowMs)
+{
+    hostproto::Hello h;
+    h.protoVersion   = hostproto::VERSION;
+    h.fwMajor        = BRIDGE_FW_MAJOR;
+    h.fwMinor        = BRIDGE_FW_MINOR;
+    h.resetReason    = static_cast<uint8_t>(esp_reset_reason());
+    h.telemetryBytes = static_cast<uint8_t>(sizeof(hostproto::Telemetry));
+    h.statusBytes    = static_cast<uint8_t>(sizeof(hostproto::BridgeStatus));
+    h.bootCount      = gBootCount;
+    h.bridgeMillis   = nowMs;
+    (void)gHost.sendHello(h);
+
+    hostproto::BridgeStatus s;
+    buildStatus(nowMs, s);
+    (void)gHost.sendStatus(s);
+    gLastStatusMs = nowMs;
+
+    bridgeLog(hostproto::LOG_INFO, "bridge ready");
+}
+
+/**
+ * @brief Abandons a latched one-shot that could not be answered in time.
+ *
+ * Called every loop() rather than from forwardTelemetry(), because the case
+ * that needs the timeout most is the one where no master frame ever arrives —
+ * exactly when forwardTelemetry() is never reached.  Past the deadline the
+ * requester has moved on, and an unexpected late frame is worse than none.
+ */
+static void expireOneShot(uint32_t nowMs)
+{
+    if (!gForwardOnce && !gOncePendingTx) return;
+
+    // Still inside the window: keep retrying the downstream hand-off.  The MKR's
+    // TX buffer is only briefly full, so a request that lost one race is worth
+    // re-offering rather than discarding — dropping it leaves the host waiting
+    // on a reply that was never even asked for.
+    if ((nowMs - gForwardOnceMs) < ONCE_TIMEOUT_MS) {
+        if (gOncePendingTx && gLink.requestOnce()) gOncePendingTx = false;
+        return;
+    }
+
+    if (gOncePendingTx)
+        bridgeLog(hostproto::LOG_WARN, "CMD_GET_ONCE expired: master TX stayed busy");
+    else if (gForwardOnce)
+        bridgeLog(hostproto::LOG_WARN, "CMD_GET_ONCE expired: no master frame in time");
+
+    gForwardOnce   = false;
+    gOncePendingTx = false;
+}
+
+/** @brief Forwards one master snapshot upward, honouring streaming state and decimation. */
+static void forwardTelemetry()
+{
+    const bool oneShot = gForwardOnce;
+
+    if (!oneShot) {
+        if (!gHost.streaming()) return;
+        // Decimation gate: forward every Nth master frame.  decimation() is
+        // guaranteed >= 1 by hostLink (CMD_SET_DECIM rejects 0).
+        if (++gDecimCount < gHost.decimation()) return;
+    }
+    gDecimCount = 0;
+
+    hostproto::Telemetry t;
+    toHostTelemetry(gLink.latest(), t);
+    const bool sent = gHost.sendTelemetry(t); // a drop is counted in BridgeStatus::hostTxDropped
+
+    // Only retire the one-shot once it has actually gone out.  Clearing it on
+    // the attempt would answer a full TX ring with silence, leaving the host
+    // waiting for a reply that was never transmitted.
+    if (oneShot && sent) { gForwardOnce = false; gOncePendingTx = false; }
+}
+
+/** @brief Keeps the master stream alive; logs the link's up/down edges upward. */
+static void serviceMasterLink(uint32_t nowMs)
+{
+    const bool up = gMasterSeen && (masterAgeMs(nowMs) < MASTER_STALE_MS);
+
+    if (up != gMasterUp) {
+        gMasterUp = up;
+        bridgeLog(up ? hostproto::LOG_INFO : hostproto::LOG_WARN,
+                  up ? "master link up" : "master link lost");
+    }
+
+    // While the master is quiet, re-request the stream once per second: the MKR
+    // may have reset and forgotten it was streaming.  Bounded retry with a
+    // defined period — never a spin.
+    if (!up && (nowMs - gLastRetryMs) >= MASTER_RETRY_MS) {
+        gLastRetryMs = nowMs;
+        (void)gLink.startStream(); // best-effort; this periodic path is itself the retry
+        return;                    // a start-stream already proves we are alive
+    }
+
+    // Heartbeat while the link IS up, so the master can tell "bridge attached
+    // and quiet" from "bridge unplugged".  Without it the master has no signal
+    // at all during healthy streaming and cannot report a disconnect.
+    static uint32_t lastBeatMs = 0;
+    if (up && (nowMs - lastBeatMs) >= MASTER_HEARTBEAT_MS) {
+        lastBeatMs = nowMs;
+        (void)gLink.ping();   // best-effort; the MKR replies PONG
+    }
+}
+
+// ─── Arduino entry points ─────────────────────────────────────────────────────
 
 void setup()
 {
-    Serial.begin(115200);
-    delay(100); // let native USB-CDC enumerate before the first prints
+    // MUST come first.  On a C3 the ESP-IDF console is routed to the same USB
+    // Serial/JTAG peripheral this bridge uses for binary frames, so any
+    // ESP_LOGx from an IDF component injects ASCII mid-frame.  CRC catches it
+    // and the decoder resyncs, but the frame is lost — and a chatty component
+    // would cost telemetry continuously.  Silencing the log at runtime covers
+    // the IDF libraries that ship precompiled at INFO level, which the IDE's
+    // "Core Debug Level" setting cannot reach.
+    //
+    // Bootloader and ROM output still precedes this (it runs before any user
+    // code); the host decoder discards it as pre-SOF garbage.
+    esp_log_level_set("*", ESP_LOG_NONE);
 
-    Serial.println("ESP_Sentinel telemetry receiver");
-    gLink.begin(115200, COMMLINK_RX_PIN, COMMLINK_TX_PIN);
-    if (gLink.startStream()) Serial.println("Requested 10 Hz telemetry stream from master.");
-    else                     Serial.println("startStream() TX busy; will retry on the stale-link check.");
+    // First power-on leaves RTC_NOINIT memory undefined; seed it before use.
+    if (gBootMagic != BOOT_MAGIC) {
+        gBootMagic = BOOT_MAGIC;
+        gBootCount = 0;
+    }
+    ++gBootCount;
+
+    gHost.begin();                 // native USB CDC -> Jetson
+    gLink.begin(115200, COMMLINK_RX_PIN, COMMLINK_TX_PIN); // UART1 -> MKR Zero
+
+    // Ask the master to stream straight away so telemetry is already flowing by
+    // the time the Jetson attaches.  A failure here is not fatal: the stale-link
+    // path in serviceMasterLink() retries every second.
+    (void)gLink.startStream();
+
+    const uint32_t now = millis();
+    gLastStatusMs = now;
+    gLastRetryMs  = now;
 }
 
 void loop()
 {
-    if (gLink.poll()) {
-        const TelemetryPayload &t = gLink.latest();
-        Serial.printf(
-            "t=%lu ms  spd=%.1f km/h  rpm=%.0f  temp=%.0fC  fuel=%.0f%%  "
-            "lat=%.6f lon=%.6f alt=%.1f m  sats=%u fix=%u  "
-            "%04u-%02u-%02u %02u:%02u:%02uZ  flags=0x%02X\n",
-            (unsigned long)t.masterMillis, t.speed, t.rpm, t.coolantTemp, t.fuelLevel,
-            (double)t.latitude, (double)t.longitude, (double)t.altitude,
-            t.satellites, t.fixType,
-            t.year, t.month, t.day, t.hour, t.minute, t.second, t.flags);
+    const uint32_t now = millis();
+
+    // 1) Jetson commands.  Must run every pass: it is also what keeps the
+    //    host-liveness timer fed.
+    (void)gHost.poll(now);
+    if (gHost.connectSeen()) {
+        gDecimCount = 0;
+        greetHost(now);
     }
 
-    // Link health: if the stream has been silent for >1 s, re-request it.
-    if (millis() - lastHealthMs >= 1000UL) {
-        lastHealthMs = millis();
-        if (gLink.isStale(1000)) {
-            Serial.println("[stale] no telemetry in 1 s; re-requesting stream");
-            (void)gLink.startStream();   // best-effort; this stale-check path is itself the retry
+    // 2) A one-shot request is forwarded down to the MKR; the answer is relayed
+    //    when it lands, below.
+    if (gHost.onceRequested()) {
+        // Arm the relay first, then try to hand the request down.  A busy master
+        // TX only defers the hand-off (expireOneShot() retries it within the
+        // window); it must not discard the request, because the reply the host
+        // is waiting for would then never be asked for at all.
+        gForwardOnce   = true;
+        gForwardOnceMs = now;
+        gOncePendingTx = !gLink.requestOnce();
+    }
+
+    expireOneShot(now);
+
+    // 3) Master telemetry.  Always polled, host attached or not, so the UART
+    //    ring never overflows and the staleness view stays honest.
+    if (gLink.poll()) {
+        gMasterSeen   = true;
+        gLastMasterMs = now;
+        forwardTelemetry();
+    }
+
+    // 4) Health heartbeat + on-demand status.
+    if (gHost.statusRequested() || (now - gLastStatusMs) >= STATUS_INTERVAL_MS) {
+        gLastStatusMs = now;
+        if (gHost.isConnected()) {
+            hostproto::BridgeStatus s;
+            buildStatus(now, s);
+            (void)gHost.sendStatus(s);
         }
     }
+
+    // 5) Master link supervision.
+    serviceMasterLink(now);
+
+    // Yield.  Every step above is non-blocking, so without this loop() spins as
+    // fast as the core allows — on the C3's single RISC-V core that starves the
+    // idle task and trips the task watchdog, and it burns power for nothing.
+    // delay() calls vTaskDelay, which yields and feeds the watchdog.  1 ms is
+    // invisible against a 100 ms telemetry period.
+    delay(1);
 }

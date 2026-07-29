@@ -15,6 +15,13 @@ enum class GPSReturnStatus{
     NOK_SET_RATE_FAILED = -2, ///< Navigation rate could not be changed.
     NOK_TIME_INVALID = -3,    ///< PVT received but time or date validity flags not set.
     NOK_CONFIG_FAILED = -6,   ///< Module responded but rejected its I2C/PVT configuration.
+    /// The shared I2C bus is wedged, so nothing was attempted.
+    ///
+    /// Distinct from @c NOK_INIT_FAILED, and the distinction is the whole point:
+    /// a stuck bus means the receiver was never asked, so it is not evidence
+    /// about the receiver at all.  Reported rather than swallowed because the
+    /// repair is different — a line held low, versus a module that is absent.
+    NOK_BUS_STUCK = -7,
 };
 
 
@@ -54,6 +61,17 @@ struct GPSData {
     uint8_t satellites;       ///< Satellites used in the navigation solution.
     uint8_t fixType;          ///< u-blox fix type (0=no fix, 2=2D, 3=3D, 4=GNSS+DR).
     bool fixValid;            ///< True when the receiver marks the GNSS fix valid.
+
+    /**
+     * The receiver is configured and still answering.
+     *
+     * Maintained by the caller, not by @c getGPSData() — which sees only
+     * packets, not bring-up state.  Kept here so a consumer can tell "no
+     * receiver fitted or dead" from "receiver healthy, no fix yet": both show
+     * NAN coordinates and @c fixValid false, and without this they are the same
+     * picture.  Same reasoning as @c IMUData::devicePresent.
+     */
+    bool devicePresent;
 };
 
 /**
@@ -82,8 +100,47 @@ GPSReturnStatus initializeGPS(SFE_UBLOX_GNSS &myGNSS);
  */
 GPSReturnStatus initializeGPS_I2C(SFE_UBLOX_GNSS &myGNSS);
 
+/**
+ * @brief Claims the SparkFun driver's heap buffers up front. Call once, in setup().
+ *
+ * The driver allocates lazily and idempotently — @c packetCfg's payload inside
+ * @c begin(), the @c UBX_NAV_PVT_t inside @c setAutoPVTrate() — each behind an
+ * "if still null" guard, so nothing is ever allocated twice and nothing is freed
+ * before the destructor runs.  The problem is not churn, it is TIMING: when no
+ * receiver answers at boot, @c begin() fails before reaching either allocation,
+ * and the buffers are then claimed by the first successful retry from @c loop().
+ * That is an allocation after initialisation, on a path taken precisely when the
+ * hardware is already misbehaving.
+ *
+ * Both calls made here allocate BEFORE they transmit, so the RAM is claimed even
+ * with nothing on the bus, which is the case that matters.
+ *
+ * One buffer cannot be forced this way: @c packetUBXCFGPRT is allocated inside
+ * the private @c getPortSettingsInternal(), which @c isConnected() only reaches
+ * once the receiver has ACKed.  It stays lazy, and that is accepted — a single
+ * allocation, at most once per boot, never freed, so it cannot fragment.
+ *
+ * @return @c OK, or @c NOK_BUS_STUCK if the bus could not be brought up.
+ */
+GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS);
+
 /** Resets a GPS snapshot to a known invalid state. */
 void initGPSData(GPSData &data);
+
+/**
+ * @brief Clears every fix-dependent field, leaving the receiver-status fields.
+ *
+ * Enforces the invariant @c GPSData documents: position, velocity, heading and
+ * altitude are @c NAN unless @c fixValid.  Clearing @c fixValid on its own does
+ * not do that — it leaves the last coordinates sitting there as plausible
+ * numbers, and any consumer that reads them without first checking the flag gets
+ * a stale position presented exactly like a live one.
+ *
+ * UTC, satellite count and fix type are deliberately kept: they came from a real
+ * packet and remain true of the receiver even after the fix ages out.  Use
+ * @c initGPSData() instead when the receiver itself has gone silent.
+ */
+void invalidateGPSFix(GPSData &data);
 
 /**
  * @brief Reads all requested navigation data from one automatic PVT packet.
@@ -92,8 +149,19 @@ void initGPSData(GPSData &data);
  * UTC and satellite fields update for every fresh packet. Position, speed,
  * heading, and altitude update only when the receiver reports a valid fix.
  *
- * @return @c OK for a valid fix, @c NO_FIX for a fresh packet without a valid
- *         fix, or @c DATA_STALE when no new packet is available.
+ * A fix has to clear four independent hurdles before it is published, because
+ * any one of them alone lets through a position that is not a measurement:
+ *  - @c fixType is 2-D, 3-D or GNSS+dead-reckoning (a receiver with no fix still
+ *    reports its last known position, and @c gnssFixOK does not always cover it);
+ *  - the @c gnssFixOK flag is set;
+ *  - the @c invalidLlh flag is CLEAR — u-blox sets it precisely to mark
+ *    longitude/latitude/height as unusable while the rest of the packet is fine;
+ *  - the coordinates land inside their physical ranges, which catches a corrupted
+ *    packet that satisfied all three flags.
+ *
+ * @return @c OK for a valid fix, @c NO_FIX for a fresh packet without a usable
+ *         fix, @c DATA_STALE when no new packet is available, or
+ *         @c NOK_BUS_STUCK when the I2C bus was not safe to transact on.
  */
 GPSReturnStatus getGPSData(SFE_UBLOX_GNSS &myGNSS, GPSData &data);
 

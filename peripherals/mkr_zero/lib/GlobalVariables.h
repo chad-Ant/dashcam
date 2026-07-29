@@ -1,8 +1,9 @@
 #ifndef GLOBAL_VARIABLES
 #define GLOBAL_VARIABLES 1
 
-/// @c true after @c Wire.begin() has been called at least once.
-extern bool i2cInitialized;
+// i2cInitialized was removed: I2CBus.h owns the bus lifecycle now, and a bare
+// bool could not represent the state that matters (Stuck), nor enforce that
+// recovery happens before the first transaction.  Use i2cBusBegin().
 
 /// @c true after @c SPI.begin() has been called at least once.
 extern bool spiInitialized;

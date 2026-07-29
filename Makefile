@@ -17,6 +17,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/libdriverstate \
             -Ilib/libsigndetector \
             -Ilib/libcamera \
+            -Ilib/libcommlink \
             -Ilib/libconfig \
             -Ilib/libgpio \
             -Ilib/libi2c \
@@ -60,6 +61,7 @@ LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
                lib/libcamera/libcamera_usb.cpp
 
 LIBCAN_SRCS    := lib/libcan/libcan.cpp
+LIBCOMM_SRCS   := lib/libcommlink/libcommlink.cpp
 LIBGPIO_SRCS   := lib/libgpio/libgpio.cpp
 LIBI2C_SRCS    := lib/libi2c/libi2c.cpp
 LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
@@ -81,7 +83,9 @@ LIBREC_SRCS      := lib/librecord/librecord.cpp
 LIBSTEREO_SRCS := lib/libstereocam/libstereocam.cpp
 
 # Convenience group: all peripheral interface libs (no GStreamer / OpenCV dependency)
-LIBPERIPH_SRCS := $(LIBCAN_SRCS) $(LIBGPIO_SRCS) $(LIBI2C_SRCS) $(LIBMIDI_SRCS) $(LIBSPI_SRCS) $(LIBUART_SRCS)
+# libcommlink sits on top of libuart, so it must follow it in the link order.
+LIBPERIPH_SRCS := $(LIBCAN_SRCS) $(LIBGPIO_SRCS) $(LIBI2C_SRCS) $(LIBMIDI_SRCS) $(LIBSPI_SRCS) \
+                  $(LIBUART_SRCS) $(LIBCOMM_SRCS)
 
 # ─── build directory (timestamped so parallel invocations don't collide) ──────
 
@@ -121,7 +125,8 @@ V02_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
 # dashcam_v0_3: v0.3 app — v0.2 + driver drowsiness monitoring on a UVC camera
 # (libdriverstate: YuNet DNN face crop + TRT classifier; needs TRT + OpenCV)
 V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
-                $(LIBLANE_SRCS) $(LIBDSTATE_SRCS) $(LIBNET_SRCS) src/dashcam_v0_3.cpp) \
+                $(LIBLANE_SRCS) $(LIBDSTATE_SRCS) $(LIBNET_SRCS) \
+                $(LIBUART_SRCS) $(LIBCOMM_SRCS) src/dashcam_v0_3.cpp) \
             $(call make_cu_objs, $(LIBLANE_CU_SRCS) $(LIBDSTATE_CU_SRCS))
 
 # scan_cameras: enumerate all V4L2 devices
@@ -142,6 +147,10 @@ WRITECFG_OBJS := $(call make_objs, $(LIBCFG_SRCS) src/tools/write_default_config
 
 # can_test: SocketCAN send/receive loopback test
 CAN_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAN_SRCS) src/tests/can_test.cpp)
+
+# commlink_test: ESP32-C3 USB bridge link test (discovery, streaming, hot-replug)
+COMMLINK_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) \
+                     src/tests/test_commlink.cpp)
 
 # network_test: TCP/UDP socket loopback + SNTP internet-time smoke test
 NET_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBNET_SRCS) src/tests/test_libnetwork.cpp)
@@ -172,7 +181,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
 BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(SCAN_OBJS) \
                     $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                     $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
-                    $(CSI_RTP_OBJS))
+                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
 
 ifneq ($(VPI_HDRS),)
 ALL_OBJS := $(sort $(BASE_OBJS) $(DASHCAM_OBJS))
@@ -193,6 +202,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
+           $(BUILD_DIR)/commlink_test \
            $(BUILD_DIR)/network_test \
            $(BUILD_DIR)/csi_rtp_test \
            $(BUILD_DIR)/gpio_test \
@@ -206,7 +216,11 @@ ifneq ($(VPI_HDRS),)
 TARGETS += $(BUILD_DIR)/dashcam
 endif
 
-.PHONY: all clean run dashcam_v0_3
+.PHONY: all clean run dashcam_v0_3 commlink_test
+
+# Convenience alias so `make commlink_test` works without the build-dir prefix.
+commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
+	@echo "Built commlink_test in $(BUILD_DIR)/"
 
 # Each build gets its own logs/ and config/ directories.  Binaries resolve
 # <exe_dir>/logs and <exe_dir>/config at runtime (dashcam::log::init() /
@@ -264,6 +278,9 @@ $(BUILD_DIR)/config_test: $(CFG_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/can_test: $(CAN_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/commlink_test: $(COMMLINK_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/network_test: $(NET_TEST_OBJS)

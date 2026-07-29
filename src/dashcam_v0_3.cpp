@@ -53,6 +53,7 @@
 
 #include "libcamera_csi.h"
 #include "libcamera_usb.h"
+#include "libcommlink.h"
 #include "libconfig.h"
 #include "libdriverstate.h"
 #include "liblanedetector.h"
@@ -109,6 +110,9 @@ static constexpr float kFatigueRealertSec = 30.0f;
 static constexpr auto  kInferenceStartupTimeout = std::chrono::seconds(8);
 static constexpr uint32_t kLaneFreshnessMs = 3000;
 static constexpr uint32_t kDriverFreshnessMs = 5000;
+/// Vehicle telemetry arrives at ~10 Hz; past this the overlay reverts to
+/// defaults rather than showing a position the car has since driven away from.
+static constexpr int      kBridgeFreshnessMs = 1000;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -1200,6 +1204,25 @@ int main(int argc, char* argv[]) {
     // fire into a destroyed server.
     dashcam::network::MediaStreamServer streamSrv;
     dashcam::network::ControlServer     ctrlSrv;
+
+    // ── vehicle telemetry bridge (ESP32-C3 over USB) ─────────────────────────
+    // Supplies the position/motion fields the ADAS overlay block leaves at
+    // defaults.  Entirely optional: if the C3 is absent the link keeps retrying
+    // in its own thread and the overlay simply keeps its defaults, so a missing
+    // or unplugged bridge can never stop the dashcam from recording.
+    //
+    // Declared before rec only for teardown order; it has no dependency on it.
+    dashcam::commlink::CommLink bridge;
+    {
+        dashcam::commlink::CommLinkConfig bcfg;   // by-id discovery, auto-stream
+        if (!bridge.open(bcfg, log))
+            log(dashcam::log::LogLevel::WARN,
+                "telemetry bridge: not present yet — will keep retrying in the background");
+        if (!bridge.start())
+            log(dashcam::log::LogLevel::ERROR,
+                "telemetry bridge: RX thread failed to start — overlay keeps default values");
+    }
+
     dashcam::record::Recorder rec;
     std::string recFile;
     bool recActive = false;
@@ -1216,9 +1239,13 @@ int main(int argc, char* argv[]) {
         rfmt.height     = uFmt.height;
         rfmt.fps        = uFmt.frameRate;
 
-        // Seed the telemetry clock before the first sample.
+        // Seed the telemetry clock as ALREADY STALE, so the motion/position
+        // corners start as dashes and only show numbers once the bridge has
+        // actually delivered a sample.  Seeding it to "now" would present
+        // OverlayData's built-in placeholder coordinates as a live fix for the
+        // first staleTimeoutMs of every recording.
         dashcam::record::OverlayData od0 = rec.getOverlayData();
-        od0.timestampMs = epochMs();
+        od0.timestampMs = 0;
         rec.setOverlayData(od0);
 
         // Live-stream tap (direct precompressed path): fan the recording camera's
@@ -1256,6 +1283,7 @@ int main(int argc, char* argv[]) {
     }
     if (!recActive && !laneDet && !drvDet) {
         log(dashcam::log::LogLevel::ERROR, "no active subsystems; aborting");
+        bridge.stop();   // join before shutdown(): the RX thread holds the log callback
         dashcam::log::shutdown();
         return 1;
     }
@@ -1524,13 +1552,62 @@ int main(int argc, char* argv[]) {
         }
 
         // ── telemetry: ADAS overlays into the recording + push to remote ──────
-        // Built from the freshest lane + driver results this iteration.  No GPS/
-        // IMU source yet, so the motion/position fields keep their defaults; the
-        // ADAS block carries what the device actually computes.
+        // Built from the freshest lane + driver results this iteration.  Motion
+        // and position come from the ESP32-C3 bridge (OBD2 + GPS via the MKR
+        // Zero); when it goes quiet the recorder draws dashes instead (below).
         {
             dashcam::record::OverlayData od =
                 recActive ? rec.getOverlayData() : dashcam::record::OverlayData{};
-            od.timestampMs = epochMs();
+
+            // Vehicle telemetry.  Every field is written only when it is both
+            // fresh and a real number: the wire carries NaN for "the ECU never
+            // answered this PID", and copying that through would render "nan"
+            // in the burned-in overlay and poison the recorded sidecar.
+            const bool vehicleFresh = !bridge.isStale(kBridgeFreshnessMs);
+            if (vehicleFresh) {
+                const auto t = bridge.telemetry();
+
+                // Prefer GPS ground speed when the fix is valid; fall back to the
+                // OBD2 wheel speed, which exists whenever the ECU is answering.
+                if (t.fixValid && !std::isnan(t.gpsSpeedKmh))  od.speedKmh = t.gpsSpeedKmh;
+                else if (!std::isnan(t.speed))                 od.speedKmh = t.speed;
+
+                // Acceleration is estimated on the MKR Zero (smoothed speed,
+                // differentiated, jerk-limited) rather than derived here: this
+                // stream repeats each 1 km/h reading several times, so a
+                // derivative taken on this side would be spikes, not motion.
+                // NaN means the estimator has not warmed up yet.
+                if (!std::isnan(t.accel)) od.accelerationMs2 = t.accel;
+
+                if (t.fixValid) {
+                    if (!std::isnan(t.latitude))  od.latitude   = t.latitude;
+                    if (!std::isnan(t.longitude)) od.longitude  = t.longitude;
+                    if (!std::isnan(t.altitude))  od.altitudeM  = t.altitude;
+
+                    // Heading is NaN whenever the master judged the course
+                    // untrustworthy — below ~5 km/h a GNSS receiver reports a
+                    // direction that wanders the whole circle.  Holding the last
+                    // travelled heading through a stop is deliberate and matches
+                    // how a vehicle compass behaves; it is not a stale reading
+                    // presented as new, because the whole motion block ages out
+                    // together via timestampMs below.
+                    if (!std::isnan(t.heading))   od.headingDeg = t.heading;
+                }
+            }
+
+            // timestampMs is not a "when was this frame drawn" clock — it is the
+            // age of the motion/position block, and librecord renders SPD/HDG/
+            // LAT/LON/ALT as dashes once it exceeds overlay.staleTimeoutMs.
+            //
+            // So it may ONLY be advanced when those fields were actually
+            // refreshed above.  Stamping it every tick (as this did while the
+            // fields were fixed placeholders) defeats that protection the moment
+            // real telemetry feeds them: od is carried over from the previous
+            // sample, so a bridge that dies would leave the last real speed and
+            // GPS fix burned into every later frame, stamped fresh — false
+            // recorded evidence, which is the one thing a dashcam must not
+            // produce.  Leaving the timestamp behind ages the block out instead.
+            if (vehicleFresh) od.timestampMs = epochMs();
 
             // Build the ADAS block FRESH from this tick's results — never inherit
             // ADAS fields from the previous OverlayData.  A source contributes only
@@ -1654,6 +1731,10 @@ int main(int argc, char* argv[]) {
     log(dashcam::log::LogLevel::INFO, "shutting down (signal or subsystem loss)");
     ctrlSrv.stop();                       // FIRST: join client threads so no command
                                           // handler can touch the cameras mid-teardown.
+    bridge.stop();                        // join the RX thread while the logger is still
+                                          // up — liblog requires every thread that can
+                                          // call the log callback to be joined before
+                                          // shutdown(), and the bridge logs reconnects.
     if (recActive) rec.stopRecording();   // stops the pipeline → no more stream callbacks
     streamSrv.stop();                     // then disconnect viewers (safe: no callbacks in flight)
     if (laneDet) {

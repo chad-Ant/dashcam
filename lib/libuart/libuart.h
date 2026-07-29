@@ -38,11 +38,30 @@ namespace dashcam::uart {
 
 struct UartConfig {
     uint32_t baudRate    = 115200; ///< Baud rate (e.g. 9600, 115200, 921600).
+                                   ///< Ignored by USB CDC-ACM devices, which have no line rate.
     uint8_t  dataBits    = 8;      ///< Character width: 5, 6, 7, or 8.
     uint8_t  stopBits    = 1;      ///< Stop bits: 1 or 2.
     bool     parityEven  = false;  ///< Even parity (parityOdd takes precedence if both set).
     bool     parityOdd   = false;  ///< Odd parity.
     bool     flowControl = false;  ///< RTS/CTS hardware flow control.
+
+    /**
+     * Take the port exclusively (TIOCEXCL): further open() calls by other
+     * processes fail with EBUSY.  Worth setting on a USB device node, where
+     * a stray `screen`/`minicom` would otherwise silently steal bytes from
+     * a running application.
+     */
+    bool     exclusive   = false;
+
+    /**
+     * Leave HUPCL set, so closing the port lowers DTR/RTS (the POSIX default).
+     *
+     * Set **false** for USB-CDC devices whose MCU is reset by modem-control
+     * lines — notably the ESP32-C3's native USB Serial/JTAG, where the DTR/RTS
+     * pair is what esptool uses to force a reboot into download mode.  With
+     * HUPCL left set, every close() of the port can bounce the microcontroller.
+     */
+    bool     hangupOnClose = true;
 };
 
 // ─── Uart ─────────────────────────────────────────────────────────────────────
@@ -87,6 +106,22 @@ public:
 
     bool write(const uint8_t* buf, size_t len);
     bool write(const std::string& str);
+
+    /**
+     * @brief Write with a bounded overall deadline.
+     *
+     * Unlike write(), this never blocks indefinitely: it waits for writability
+     * with poll(POLLOUT) against an absolute deadline and gives up when the
+     * deadline passes.  Required for USB CDC-ACM peers, where a device that
+     * stops draining its endpoint would otherwise block write() forever — and,
+     * if the caller holds a lock across it, wedge everything behind that lock.
+     *
+     * @param buf        Source buffer.
+     * @param len        Bytes to write.
+     * @param timeoutMs  Overall deadline for the whole transfer, in ms.
+     * @return true only if all @p len bytes were written before the deadline.
+     */
+    bool writeTimeout(const uint8_t* buf, size_t len, int timeoutMs);
 
     void flush()    override; ///< Discard both RX and TX buffers.
     void close()    override;

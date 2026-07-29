@@ -65,6 +65,12 @@ public:
     /** @brief Returns and clears the "PONG received" flag. */
     bool pongSeen() { bool p = pong_; pong_ = false; return p; }
 
+    /** @brief Frames discarded on CRC mismatch since begin() — cable/EMI health. */
+    uint32_t crcErrors() const { return crcErrors_; }
+
+    /** @brief Telemetry frames accepted since begin(). */
+    uint32_t framesRx() const { return framesRx_; }
+
 private:
     bool sendCmd(uint8_t type);
 
@@ -74,4 +80,6 @@ private:
     bool             hasData_ = false;
     bool             pong_ = false;
     uint32_t         lastRxMs_ = 0;
+    uint32_t         crcErrors_ = 0;
+    uint32_t         framesRx_ = 0;
 };

@@ -19,7 +19,17 @@
 #include <string.h>
 
 #define COMM_SOF             0x7Eu  ///< Start-of-frame delimiter.
-#define COMM_VERSION         0x01u  ///< Protocol version byte.
+/**
+ * Protocol version byte.
+ *
+ * 0x02 added TelemetryPayload::accel (79 -> 83 bytes).  Bumped rather than
+ * relying on the length check alone: a mismatched pair now fails at the version
+ * byte and resyncs immediately, instead of decoding a frame that looks almost
+ * right and silently discarding it on size.
+ *
+ * 0x03 added the nine-axis IMU block plus die temperature (83 -> 123 bytes).
+ */
+#define COMM_VERSION         0x03u
 #define COMM_MAX_PAYLOAD     255u   ///< Largest payload (LEN is one byte).
 #define COMM_FRAME_OVERHEAD  6u     ///< SOF+VER+TYPE+LEN + CRC16(2).
 #define COMM_MAX_FRAME       (COMM_FRAME_OVERHEAD + COMM_MAX_PAYLOAD)
@@ -29,6 +39,42 @@
 #define COMM_FLAG_OBD2_VALID 0x01u  ///< OBD2 data is live (a reading arrived within the master's freshness window).
 #define COMM_FLAG_GPS_FIX    0x02u  ///< GPS reported a valid fix.
 #define COMM_FLAG_TIME_VALID 0x04u  ///< UTC date and time are valid.
+/**
+ * The IMU initialised and has not been declared lost.
+ *
+ * Distinct from the per-axis NAN sentinels, and the distinction is the point:
+ * NAN with this flag CLEAR means no IMU is fitted, NAN with it SET means the
+ * IMU is fitted but that channel is stale.  Same reasoning as
+ * @c COMM_FLAG_GPS_FIX — a receiver that cannot tell absent hardware from a
+ * silent sensor will misdiagnose both.
+ */
+#define COMM_FLAG_IMU_PRESENT 0x08u
+/**
+ * The GNSS receiver is configured and still emitting PVT packets.
+ *
+ * The counterpart of @c COMM_FLAG_IMU_PRESENT, and added for the same reason:
+ * @c COMM_FLAG_GPS_FIX alone cannot distinguish a receiver that is absent or
+ * failed its bring-up from a healthy one that simply has no fix yet.  Both show
+ * NAN coordinates with GPS_FIX clear, and they call for opposite responses —
+ * one is a fault to report, the other is a normal cold start.
+ */
+#define COMM_FLAG_GPS_PRESENT 0x10u
+/**
+ * The IMU is answering on only ONE of its two devices — a suspected power or
+ * wiring fault, not merely reduced data.
+ *
+ * The LSM6DSOX and LIS3MDL share one PCB, one VIN and one ground, so there is no
+ * benign way for exactly one of them to stop responding.  What produces this in
+ * practice is a broken supply: an unpowered I2C slave still draws parasitic
+ * power through the bus pull-ups and keeps acknowledging, so the lighter-draw
+ * part looks alive while the other dies.  Observed on the bench by pulling VIN —
+ * the magnetometer kept answering and the accelerometer did not.
+ *
+ * Treat as a connection warning for the whole module, not as a per-sensor
+ * degradation: the readings that DO arrive came from a part running on parasitic
+ * power and should not be trusted either.
+ */
+#define COMM_FLAG_IMU_DEGRADED 0x20u
 
 /** Message / command identifiers. High bit set = master (MKR) -> slave (C3). */
 enum CommMsgType : uint8_t {
@@ -61,7 +107,19 @@ enum class CommReturnStatus : int8_t {
 struct __attribute__((packed)) TelemetryPayload {
     uint32_t masterMillis; ///< Master uptime (ms) for staleness detection.
     // ---- OBD2 ----
-    float speed;           ///< Vehicle speed (km/h).
+    float speed;           ///< Vehicle speed (km/h), as reported (whole km/h).
+    /**
+     * Longitudinal acceleration (m/s², +ve = accelerating).
+     *
+     * DERIVED, not a PID: @c AccelerationEstimator smooths the quantised speed
+     * and differentiates it (see SignalProcessingFunctions.h).  Differentiating
+     * @c speed on the receiving side instead does not work — the 10 Hz stream
+     * repeats each 1 km/h reading many times, so the apparent derivative is a
+     * train of spikes rather than a signal.
+     *
+     * NAN while the filter is warming up or the ECU has not supplied speed.
+     */
+    float accel;
     float rpm;             ///< Engine speed (rpm).
     float coolantTemp;     ///< Coolant temperature (°C).
     float fuelLevel;       ///< Fuel tank level (%).
@@ -88,12 +146,45 @@ struct __attribute__((packed)) TelemetryPayload {
     uint8_t hour;          ///< 0–23.
     uint8_t minute;        ///< 0–59.
     uint8_t second;        ///< 0–60.
+    /**
+     * ---- IMU (LSM6DSOX + LIS3MDL, sensor frame) ----
+     *
+     * NOT to be confused with @c accel above.  That is a scalar LONGITUDINAL
+     * acceleration derived from the ECU speed signal; these are the raw
+     * three-axis measurements from the inertial sensor, in the sensor's own
+     * frame as silkscreened on the breakout.  Mapping them to the vehicle frame
+     * depends on how the board is bolted in and is deliberately left to the
+     * consumer — the master does not guess a mounting orientation.
+     *
+     * Each is NAN when its channel is stale or absent; see
+     * @c COMM_FLAG_IMU_PRESENT for telling "no IMU fitted" from "IMU fitted,
+     * channel quiet".
+     */
+    float imuAccelX;       ///< Sensor-frame X acceleration (m/s², gravity included).
+    float imuAccelY;       ///< Sensor-frame Y acceleration (m/s²).
+    float imuAccelZ;       ///< Sensor-frame Z acceleration (m/s²).
+    float imuGyroX;        ///< Angular rate about sensor X (deg/s).
+    float imuGyroY;        ///< Angular rate about sensor Y (deg/s).
+    float imuGyroZ;        ///< Angular rate about sensor Z (deg/s).
+    float imuMagX;         ///< Magnetic flux density along sensor X (µT), uncalibrated.
+    float imuMagY;         ///< Magnetic flux density along sensor Y (µT), uncalibrated.
+    float imuMagZ;         ///< Magnetic flux density along sensor Z (µT), uncalibrated.
+    float imuTempC;        ///< LSM6DSOX die temperature (°C) — board, not cabin.
     // ---- status ----
     uint8_t flags;         ///< COMM_FLAG_* bitfield.
 };
 
 /// The wire contract depends on this exact size on both MCUs.
-static_assert(sizeof(TelemetryPayload) == 79, "TelemetryPayload must be tightly packed to 79 bytes");
+static_assert(sizeof(TelemetryPayload) == 123, "TelemetryPayload must be tightly packed to 123 bytes");
+/**
+ * The payload has to fit the frame's one-byte LEN field, and the bridge's
+ * one-byte @c telemetryBytes self-check.  Worth stating now that the struct has
+ * grown 79 -> 83 -> 123: the next addition of this size lands at 163, and the
+ * failure mode past 255 is a silently truncated length rather than anything that
+ * looks like an error.
+ */
+static_assert(sizeof(TelemetryPayload) <= COMM_MAX_PAYLOAD,
+              "TelemetryPayload no longer fits the frame's one-byte LEN field");
 
 /** @brief One CRC-16/CCITT-FALSE step (poly 0x1021, init 0xFFFF). */
 inline uint16_t crc16_update(uint16_t crc, uint8_t b) {

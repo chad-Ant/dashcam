@@ -2,13 +2,16 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 // ─── file-local helpers ───────────────────────────────────────────────────────
 
@@ -133,6 +136,11 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
     if (cfg.flowControl) tty.c_cflag |= CRTSCTS;
     else                  tty.c_cflag &= ~CRTSCTS;
 
+    // HUPCL lowers DTR/RTS on close.  On a USB-CDC MCU those lines can be a
+    // reset request (ESP32-C3 USB Serial/JTAG), so callers can suppress it.
+    if (cfg.hangupOnClose) tty.c_cflag |=  HUPCL;
+    else                    tty.c_cflag &= ~HUPCL;
+
     tty.c_cflag |= CREAD | CLOCAL;
 
     // Blocking read: return as soon as any byte arrives.
@@ -146,15 +154,24 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
         return false;
     }
 
+    // Exclusive access is advisory-but-enforced for open(): other processes get
+    // EBUSY.  Non-fatal if the driver rejects it — log and carry on.
+    if (cfg.exclusive && ::ioctl(m_fd, TIOCEXCL) < 0) {
+        doLog(m_log, dashcam::log::LogLevel::WARN,
+              "Uart::open: TIOCEXCL failed on '%s': %s",
+              device.c_str(), ::strerror(errno));
+    }
+
     ::tcflush(m_fd, TCIOFLUSH);
 
     doLog(m_log, dashcam::log::LogLevel::INFO,
-          "Uart::open: %s  %u %d%s%d%s",
+          "Uart::open: %s  %u %d%s%d%s%s",
           device.c_str(), cfg.baudRate,
           cfg.dataBits,
           cfg.parityOdd ? "O" : (cfg.parityEven ? "E" : "N"),
           cfg.stopBits,
-          cfg.flowControl ? " [RTS/CTS]" : "");
+          cfg.flowControl ? " [RTS/CTS]" : "",
+          cfg.exclusive ? " [excl]" : "");
     return true;
 }
 
@@ -207,8 +224,14 @@ bool Uart::readLine(std::string& line, int timeoutMs) {
 
 bool Uart::write(const uint8_t* buf, size_t len) {
     if (m_fd < 0) return false;
+    if (len == 0)  return true;
+
     // Loop until every byte is written: a blocking write() can still return a
     // short count on signal or under RTS/CTS backpressure.
+    //
+    // NOTE: this blocks for as long as the peer takes.  That is the right
+    // default for a hardware UART, which always drains, but NOT for a USB CDC
+    // peer that can stop reading — use writeTimeout() there.
     size_t total = 0;
     while (total < len) {
         ssize_t n = ::write(m_fd, buf + total, len - total);
@@ -219,6 +242,15 @@ bool Uart::write(const uint8_t* buf, size_t len) {
                   total, len, ::strerror(errno));
             return false;
         }
+        if (n == 0) {
+            // Zero bytes written with bytes still outstanding means no progress
+            // is being made.  Retrying cannot change that, so looping here would
+            // spin this thread at 100 % CPU forever — fail instead.
+            doLog(m_log, dashcam::log::LogLevel::ERROR,
+                  "Uart::write: wrote 0 of %zu remaining bytes; aborting",
+                  len - total);
+            return false;
+        }
         total += static_cast<size_t>(n);
     }
     return true;
@@ -226,6 +258,79 @@ bool Uart::write(const uint8_t* buf, size_t len) {
 
 bool Uart::write(const std::string& str) {
     return write(reinterpret_cast<const uint8_t*>(str.data()), str.size());
+}
+
+bool Uart::writeTimeout(const uint8_t* buf, size_t len, int timeoutMs) {
+    if (m_fd < 0) return false;
+    if (len == 0)  return true;
+
+    // Absolute deadline, so a transfer that makes slow partial progress still
+    // terminates — a per-iteration timeout could be restarted indefinitely by a
+    // peer that accepts one byte at a time.
+    struct timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t startMs    = static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+    const int64_t deadlineMs = startMs + (timeoutMs < 0 ? 0 : timeoutMs);
+
+    // O_NONBLOCK for the duration: with it clear, a single ::write() to a
+    // stalled endpoint blocks in the kernel where no deadline can reach it.
+    const int flags = ::fcntl(m_fd, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
+
+    size_t total = 0;
+    bool   ok    = true;
+
+    while (total < len) {
+        ssize_t n = ::write(m_fd, buf + total, len - total);
+        if (n > 0) { total += static_cast<size_t>(n); continue; }
+
+        if (n == 0) {                       // no progress and no error
+            ok = false;
+            break;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            doLog(m_log, dashcam::log::LogLevel::ERROR,
+                  "Uart::writeTimeout: failed after %zu/%zu bytes: %s",
+                  total, len, ::strerror(errno));
+            ok = false;
+            break;
+        }
+
+        ::clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int64_t nowMs     = static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+        const int64_t remaining = deadlineMs - nowMs;
+        if (remaining <= 0) {
+            doLog(m_log, dashcam::log::LogLevel::WARN,
+                  "Uart::writeTimeout: timed out after %zu/%zu bytes in %d ms",
+                  total, len, timeoutMs);
+            ok = false;
+            break;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = m_fd; pfd.events = POLLOUT; pfd.revents = 0;
+        const int r = ::poll(&pfd, 1, static_cast<int>(remaining));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (r == 0) {                       // deadline reached with no writability
+            doLog(m_log, dashcam::log::LogLevel::WARN,
+                  "Uart::writeTimeout: timed out after %zu/%zu bytes in %d ms",
+                  total, len, timeoutMs);
+            ok = false;
+            break;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags);
+    return ok && (total == len);
 }
 
 void Uart::flush() {

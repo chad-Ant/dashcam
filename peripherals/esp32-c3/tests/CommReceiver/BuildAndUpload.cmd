@@ -8,7 +8,9 @@ if errorlevel 1 (
 )
 
 for %%I in ("%~dp0.") do set "SKETCH_DIR=%%~fI"
-for %%I in ("%SKETCH_DIR%\..\lib\commLink") do set "LIB_DIR=%%~fI"
+rem SKETCH_DIR is peripherals/esp32-c3/tests/CommReceiver, so the shared library
+rem lives two levels up (..\..\lib\commLink), not one.
+for %%I in ("%SKETCH_DIR%\..\..\lib\commLink") do set "LIB_DIR=%%~fI"
 
 rem Optimized ESP32-C3 config:
 rem  - CDCOnBoot=cdc      : Serial over native USB, frees UART0 GPIO20/21 for Serial1

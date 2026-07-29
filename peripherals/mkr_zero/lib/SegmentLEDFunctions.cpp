@@ -1,6 +1,8 @@
 #include "SegmentLEDFunctions.h"
 #include "MathFunctions.h"
 #include "TimerFunctions.h"
+#include "DataDictionary.h"
+#include "I2CBus.h"
 
 DigitMapping mapDigitMirror(int digit, bool decimalPoint){
     switch (digit){
@@ -173,6 +175,13 @@ DigitMapping mapStringMirror(char c){
 }
 
 bool initializeSegmentLED(Adafruit_AlphaNum4 &alpha4){
+    // Enter through the shared bus manager first.  Adafruit_AlphaNum4::begin()
+    // calls Wire.begin() itself, so if this display were ever brought up before
+    // the IMU or GNSS it would transact on a bus nobody had recovered — exactly
+    // the ordering hole the manager exists to close.  Dormant today; the point
+    // is that enabling it must not silently reintroduce the bug.
+    if (i2cBusBegin() != I2CBusState::Ready) return false;
+
     if (!alpha4.begin(SEGLED_ADDRESS)) return false;
     alpha4.setBrightness(15);
     alpha4.clear();

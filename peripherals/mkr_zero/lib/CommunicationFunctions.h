@@ -2,8 +2,10 @@
 #define COMMUNICATION_FUNCTIONS 1
 
 #include <Arduino.h>
+#include <math.h>
 #include "CommProtocol.h"
 #include "DataDictionary.h"
+#include "IMUFunctions.h"   // IMUData, carried in the telemetry payload
 
 /// GPS uses I2C on the MKR Zero, leaving @c Serial1 free for the ESP32-C3 link.
 
@@ -12,6 +14,21 @@
 // (which drag in ExternalLibConfig.h) are pulled only into the .cpp.
 struct OBD2Data;
 struct GPSData;
+
+/**
+ * @brief Signals computed on the master rather than read from a sensor.
+ *
+ * Grouped into a struct rather than passed as loose floats so adding the next
+ * derived quantity does not change the signature of three functions again.
+ *
+ * Every field is @c NAN when its estimator has not warmed up or its input is
+ * untrustworthy — never a plausible-looking substitute, so a consumer can tell
+ * "not available" from a real measurement.
+ */
+struct DerivedSignals {
+    float accelMs2   = NAN; ///< Longitudinal acceleration (m/s²) from @c AccelerationEstimator.
+    float headingDeg = NAN; ///< Filtered course over ground (deg) from @c CircularMovingAverage.
+};
 
 /**
  * @brief Copies a sub-sequence of bytes from a C-string into an output buffer.
@@ -57,18 +74,21 @@ CommReturnStatus sendFrame(uint8_t type, const uint8_t *payload, uint8_t len);
  * Copies fields verbatim (NAN passes through) and sets @c flags from data
  * validity: @c COMM_FLAG_OBD2_VALID, @c COMM_FLAG_GPS_FIX, @c COMM_FLAG_TIME_VALID.
  *
- * @param[in]  obd  Latest OBD2 readings (from @c tickOBD2()).
- * @param[in]  gps  Latest GPS snapshot (from @c getGPSData()).
- * @param[out] out  Telemetry struct to fill.
+ * @param[in]  obd       Latest OBD2 readings (from @c tickOBD2()).
+ * @param[in]  gps       Latest GPS snapshot (from @c getGPSData()).
+ * @param[in]  derived   Master-computed signals (acceleration, filtered heading).
+ *                       Passed in rather than read from @c OBD2Data / @c GPSData
+ *                       because these are derived, not sensor readings.
+ * @param[out] out       Telemetry struct to fill.
  */
-void buildTelemetry(const OBD2Data &obd, const GPSData &gps, TelemetryPayload &out);
+void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, TelemetryPayload &out);
 
 /**
  * @brief Builds and transmits one @c MSG_TELEMETRY frame on @c Serial1.
  *
  * @return @c CommReturnStatus::OK, or @c NOK_OVERFLOW if framing failed.
  */
-CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps);
+CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived);
 
 /**
  * @brief Runtime state for the master link: streaming toggle + RX decoder.
@@ -76,10 +96,33 @@ CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps);
  * Initialise with @c initCommMaster() before the first @c tickCommMaster().
  */
 struct CommMaster {
-    bool          streaming;   ///< True while pushing telemetry at 10 Hz.
-    unsigned long lastPushMs;  ///< @c millis() of the last streamed frame.
-    CommRxState   rx;          ///< Incremental inbound-command decoder.
+    bool          streaming;     ///< True while pushing telemetry at 10 Hz.
+    unsigned long lastPushMs;    ///< @c millis() of the last streamed frame.
+    bool          oncePending;   ///< A @c CMD_GET_ONCE whose reply has not gone out yet.
+    unsigned long onceRequestMs; ///< @c millis() when that request arrived (expiry clock).
+    CommRxState   rx;            ///< Incremental inbound-command decoder.
+    /**
+     * @c millis() when the last valid command frame arrived from the C3.
+     *
+     * The MKR is the responder on this hop, so inbound frames are the ONLY
+     * evidence the bridge is still there.  Without this the master happily
+     * streams 10 Hz telemetry into an unplugged cable forever, reporting
+     * nothing: TX into a disconnected UART completes normally, so a silent link
+     * is indistinguishable from a healthy one unless arrival is tracked.
+     * 0 = nothing has ever been received.
+     */
+    unsigned long lastCommandMs;
 };
+
+/**
+ * @brief True when no command has arrived from the C3 for @p timeoutMs.
+ *
+ * Reports only; the master keeps streaming regardless, because a bridge that
+ * reboots and re-issues CMD_START_STREAM must find the link exactly as it left
+ * it.  This exists so the silence is visible in the log rather than silently
+ * normal.
+ */
+bool isCommLinkSilent(const CommMaster &m, unsigned long timeoutMs);
 
 /** @brief Resets a @c CommMaster to idle with a clean decoder. */
 void initCommMaster(CommMaster &m);
@@ -92,10 +135,11 @@ void initCommMaster(CommMaster &m);
  * @c MSG_NACK) and, while streaming, pushes a telemetry frame every
  * @c COMM_STREAM_INTERVAL_MS (10 Hz).
  *
- * @param[in,out] m    Master state.
- * @param[in]     obd  Latest OBD2 readings to publish.
- * @param[in]     gps  Latest GPS snapshot to publish.
+ * @param[in,out] m         Master state.
+ * @param[in]     obd       Latest OBD2 readings to publish.
+ * @param[in]     gps       Latest GPS snapshot to publish.
+ * @param[in]     derived   Latest master-computed signals.
  */
-void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps);
+void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived);
 
 #endif

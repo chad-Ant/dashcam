@@ -5,9 +5,11 @@ void CommLink::begin(unsigned long baud, int8_t rxPin, int8_t txPin, HardwareSer
     uart_ = &uart;
     uart_->begin(baud, SERIAL_8N1, rxPin, txPin);
     commRxInit(rx_);
-    hasData_  = false;
-    pong_     = false;
-    lastRxMs_ = 0;
+    hasData_   = false;
+    pong_      = false;
+    lastRxMs_  = 0;
+    crcErrors_ = 0;
+    framesRx_  = 0;
 }
 
 bool CommLink::sendCmd(uint8_t type)
@@ -39,7 +41,11 @@ bool CommLink::poll()
     for (uint8_t serviced = 0; serviced < COMMLINK_MAX_FRAMES_PER_POLL; ++serviced) {
         CommReturnStatus r = pollFrame(rx_, *uart_, type, payload, sizeof(payload), len);
         if (r == CommReturnStatus::NO_DATA) break;
-        if (r != CommReturnStatus::FRAME_READY) continue; // bad CRC / overflow: keep draining
+        // Count CRC failures: on a vehicle harness they are the first symptom of
+        // a marginal ground or an EMI problem, and the bridge reports them to
+        // the Jetson in BridgeStatus::masterCrcErrors.
+        if (r == CommReturnStatus::NOK_CRC) { ++crcErrors_; continue; }
+        if (r != CommReturnStatus::FRAME_READY) continue; // overflow: keep draining
 
         switch (type) {
         case MSG_TELEMETRY:
@@ -48,6 +54,7 @@ bool CommLink::poll()
                 hasData_  = true;
                 lastRxMs_ = millis();
                 fresh     = true;
+                ++framesRx_;
             }
             break;
         case MSG_PONG:
