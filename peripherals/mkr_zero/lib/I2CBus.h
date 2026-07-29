@@ -72,6 +72,40 @@ void watchdogFeed(void);
 /** @brief True when the last reset was caused by the watchdog (forensics). */
 bool watchdogCausedReset(void);
 
+/**
+ * @brief True for the WHOLE of a boot that follows a watchdog reset.
+ *
+ * The watchdog turns a hang into a reboot, which is containment — but on its own
+ * it produces an INFINITE reboot loop, because the next boot runs the same code
+ * in the same order and hangs in the same place.  Measured on the bench with a
+ * deliberate hang: a reset every ~9 s, indefinitely.
+ *
+ * The escape is for a boot that follows a hang to come up WITHOUT the I2C
+ * peripherals that are the likely cause — degraded, loudly, but alive,
+ * streaming telemetry, and diagnosable.
+ *
+ * QUARANTINE MUST BE TERMINAL FOR THE BOOT.  Skipping one attempt is not enough:
+ * anything that retries afterwards re-enters the same hang and the loop simply
+ * resumes at the retry interval.  So callers must not merely defer the risky
+ * work, they must abandon it until the next non-watchdog reset.  A transient
+ * hang therefore costs one boot's sensors; a persistent one costs sensors until
+ * the vehicle is power-cycled, which is the price of guaranteeing the board
+ * always reaches @c loop() and keeps reporting.
+ *
+ * Blunter than it looks like it should be, deliberately.  Naming the exact step
+ * that hung needs state that survives a reset, and this chip has none to offer:
+ * the SAMD21 has no backup registers, and @c .noinit does not survive here (see
+ * the implementation for the measured evidence).  @c RCAUSE is the one thing
+ * that does persist, and it answers "did the last run hang?" — not "where".
+ *
+ * The definitive fix is bounding the SAMD core's undeadlined SERCOM waits, which
+ * would remove the hang rather than contain it; that needs the core's SERCOM
+ * vendored, not just Wire.
+ *
+ * Idempotent and NOT consumed: every caller sees the same answer all boot.
+ */
+bool bootAfterHang(void);
+
 /** Lifecycle of the shared bus. */
 enum class I2CBusState{
     Uninitialized = 0, ///< @c Wire has not been opened this session.

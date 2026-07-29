@@ -274,7 +274,20 @@ int main(int argc, char* argv[]) {
     // are drawn before the main loop's first 200 ms tick and would otherwise
     // carry librecord's placeholder timestamp.
     dashcam::record::OverlayData od0 = usbRec.getOverlayData();
+    // These builds carry no telemetry source: OverlayData's built-in
+    // placeholder coordinates are the demo content.  The validity flags
+    // default to false (fail-closed, so a real source that dies renders as
+    // dashes), which would blank this demo's overlay entirely — so say
+    // explicitly that the placeholders are intended to be drawn.
     od0.timestampMs = epochMs();
+    od0.speedValid    = true;
+    od0.accelValid    = true;
+    od0.positionValid = true;
+    od0.headingValid  = true;
+    od0.speedTimestampMs    = od0.timestampMs;
+    od0.accelTimestampMs    = od0.timestampMs;
+    od0.positionTimestampMs = od0.timestampMs;
+    od0.headingTimestampMs  = od0.timestampMs;
     usbRec.setOverlayData(od0);
 
     usbCam.setBranchEnabled("recording", true);
@@ -291,6 +304,14 @@ int main(int argc, char* argv[]) {
         // overlay clock tracks wall time.
         dashcam::record::OverlayData od = usbRec.getOverlayData();
         od.timestampMs = epochMs();
+        od.speedValid    = true;
+        od.accelValid    = true;
+        od.positionValid = true;
+        od.headingValid  = true;
+        od.speedTimestampMs    = od.timestampMs;
+        od.accelTimestampMs    = od.timestampMs;
+        od.positionTimestampMs = od.timestampMs;
+        od.headingTimestampMs  = od.timestampMs;
         usbRec.setOverlayData(od);
 
         // getCameraStatus() also drains the pipeline bus, so a dead pipeline

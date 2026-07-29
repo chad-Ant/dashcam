@@ -155,17 +155,134 @@
 /// otherwise run recovery 112 times.
 #define I2C_BUS_RECOVER_RETRY_MS                     250UL
 
-/// Shared-bus clock.  100 kHz is the SAMD21 core default and the speed the
-/// u-blox DDC interface is happiest at; all three parts on this bus also
-/// tolerate 400 kHz, so raise it here if the GNSS read time ever matters.
-#define IMU_I2C_CLOCK_HZ                             100000UL
-
-/// IMU sampling cadence (50 ms = 20 Hz).
+/// Shared-bus clock — Fast-mode, raised from the 100 kHz SAMD21 default.
 ///
-/// Deliberately well below the 104 Hz sensor output rate: polling slower than
-/// the ODR always finds a complete sample waiting, whereas polling near it
-/// produces long runs of "no new data" as the two clocks drift past each other.
+/// All three parts are rated for it: LSM6DSOX and LIS3MDL to 400 kHz, and the
+/// u-blox DDC port likewise.  The reason to use it is the FIFO drain, which
+/// moves 220.5 words/s of 7 bytes and made the bus the binding constraint at
+/// 100 kHz rather than anything about the sensors.
+///
+/// Measured on the bench 2026-07-29, same firmware, only this constant changed:
+///
+///   clock    IMU worst poll   GNSS worst poll   IMU I/O errors
+///   100 kHz     16233 us          14020 us        0 / 2199 polls
+///   400 kHz      6057 us           6238 us        0 / 2359 polls
+///
+/// 2.7x on the IMU and 2.2x on GNSS — NOT the 4x the clock ratio suggests, and
+/// worth knowing why: a sizeable part of each transaction is fixed cost that no
+/// clock speed touches (per-transfer setup in the SAMD driver, the sensor's own
+/// response latency, and for the FIFO path one addressing phase per 7-byte
+/// word).  Only the bits on the wire got four times faster.
+///
+/// Zero I/O errors at either speed, GNSS packet rate 3.99/s against a target of
+/// 4, and every address probe ACKed, so Fast-mode is comfortable on this
+/// wiring — which is jumper leads to the IMU and an ESLOV cable to the receiver,
+/// i.e. not a favourable case.
+///
+/// This is the ONE place the clock is set, via Wire.setClock() in
+/// i2cBusRecover() after every Wire.begin().  Any library that calls
+/// Wire.begin() behind our back silently reverts the bus to 100 kHz — the
+/// Adafruit segment-LED backpack is one such (see SegmentLEDFunctions.cpp), and
+/// it is not fitted on this build.
+///
+/// If a longer harness or weaker pull-ups ever make Fast-mode marginal, the
+/// symptom is IMU ioerr climbing or GNSS going stale, and the fix is to put this
+/// back to 100000UL — nothing else needs to change.
+#define IMU_I2C_CLOCK_HZ                             400000UL
+
+/// IMU FIFO drain cadence (50 ms = 20 Hz).
+///
+/// This is the rate the HOST empties the LSM6DSOX FIFO, not the rate the sensor
+/// samples at.  Those were the same thing before the FIFO existed, and that was
+/// the defect: reading the output registers at 20 Hz against a 104 Hz ODR threw
+/// away four samples in five, so a pothole or kerb strike — a 10-50 ms impulse,
+/// the exact event the +/-8 g range was chosen to capture — was usually gone
+/// before the next poll looked.  Now every converted sample is buffered in the
+/// part and collected here, and the peak across the whole window survives even
+/// though telemetry still publishes at 10 Hz.
 #define IMU_POLL_MS                                  50UL
+
+/// Largest number of FIFO words read in one poll.
+///
+/// The drain has to be bounded — an unbounded "read until empty" is a loop whose
+/// length is decided by a peripheral, which is exactly what mission-critical
+/// rules forbid.  Steady state produces 104 + 104 + 12.5 = 220.5 words/s, so a
+/// 20 Hz drain needs 11.03 words per poll; 16 leaves 45% headroom to catch up
+/// after a slow pass without any single pass being able to run long.
+///
+/// The bound is also the latency budget: 16 words is 16 * 7 bytes plus per-word
+/// addressing, about 15 ms at IMU_I2C_CLOCK_HZ, which has to stay comfortably
+/// inside COMM_STREAM_INTERVAL_MS or the 10 Hz telemetry push starts to jitter.
+#define IMU_FIFO_MAX_WORDS_PER_POLL                  16U
+
+/// LSM6DSOX FIFO capacity in words, from the datasheet.  Used as a sanity bound
+/// on the reported fill level: a count above this did not come from a healthy
+/// part, and 0x3FF is what a failed read of both status bytes looks like.
+#define IMU_FIFO_DEPTH_WORDS                         512U
+
+// ─── vehicle power state (drives the IMU sample mode) ─────────────────────────────
+//
+// Low power is entered when the VEHICLE IS POWERED OFF, not when it merely
+// happens to be stationary.  That distinction is the whole design, and it was
+// reached the hard way: an earlier revision inferred "parked" from GNSS speed
+// and inertial peaks, which meant deciding, per sample, whether a reading was
+// noise or movement.  That is not solvable by amplitude.  Measured on a
+// motionless bench, every threshold raised was exceeded again — gyro peaks of
+// 5.88 then 15.08 dps, GNSS ground speed excursions of 6.7 then 9.3 then
+// 10.9 km/h — because a noise floor has a tail and a long enough run finds it.
+//
+// Ignition state has no tail.  The ECU either answers or it does not.
+
+/// CAN silence this long means the ignition is off, not merely a gap in traffic.
+///
+/// Comfortably longer than OBD2_RETRY_MS, so the seconds of silence around
+/// cranking — where the ECU drops off the bus and the retry path is already
+/// re-initialising — cannot be mistaken for a shutdown.  Erring long costs a
+/// little sensor current after a genuine power-off; erring short would drop the
+/// IMU into its coarse mode while the engine is being started, which is exactly
+/// the moment before the vehicle moves.
+#define VEHICLE_POWEROFF_CONFIRM_MS                  30000UL
+/// Trailing window over which the peak acceleration and rate are held (ms).
+///
+/// Must exceed COMM_STREAM_INTERVAL_MS, or a transient could occur and decay
+/// entirely between two telemetry frames and never be transmitted — which would
+/// defeat the FIFO.  At 250 ms every peak appears in at least two consecutive
+/// frames.
+///
+/// CORRECTION.  An earlier note here claimed the hold "only ever reports a
+/// transient for longer than it lasted — never shorter, which is the direction
+/// that would lose an impact."  That was wrong, and wrong in the dangerous
+/// direction.  The old implementation kept ONE maximum and one timestamp, and on
+/// expiry replaced it with whatever sample was current — so a hard hit at t=0
+/// masked a medium hit at t=200 ms (the medium one never became the maximum),
+/// and at t=250 ms the reading collapsed to idle even though the medium hit was
+/// still inside the window.  It could and did under-report.
+///
+/// The bucket ring below is what actually delivers the guarantee the comment
+/// claimed.  Expiry now removes only buckets that are genuinely too old.
+#define IMU_PEAK_WINDOW_MS                           250UL
+
+/// Buckets in the peak ring.  Each covers IMU_PEAK_WINDOW_MS / IMU_PEAK_BUCKETS.
+///
+/// Six at a 250 ms window is ~42 ms per bucket, comfortably finer than the 50 ms
+/// poll, so a single drain lands in one or two buckets and expiry granularity is
+/// well below the window it is protecting.  The cost is 6 floats per channel.
+#define IMU_PEAK_BUCKETS                             6U
+
+/// FIFO fill above which the OLDEST buffered words are older than the freshness
+/// contract, so draining them would publish stale samples stamped as current.
+///
+/// Derived, not chosen: the batched rates are 104 + 104 + 12.5 = 220.5 words/s,
+/// so IMU_MAX_DATA_AGE_MS of production is 220.5 * 0.25 = ~55 words.  A backlog
+/// beyond that means the head of the queue already violates the age guarantee
+/// the data carries, whatever the drain does with it.
+///
+/// This matters because the drain reads the OLDEST words and stamps them with
+/// the current time — the FIFO carries no per-word timestamp in this
+/// configuration.  So a long stall must be reported as a data gap rather than
+/// quietly flattened into "fresh" samples.  Anything that blocks the loop for
+/// more than a quarter second can produce it.
+#define IMU_FIFO_BACKLOG_WORDS                       55U
 
 /// Readings older than this are published as NAN rather than as measurements.
 /// Five missed 20 Hz polls — long enough to ride out a busy loop, short enough

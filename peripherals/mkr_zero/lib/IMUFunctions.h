@@ -68,6 +68,38 @@
  * hang into a reboot.
  */
 
+/**
+ * How the LSM6DSOX is sampled.  Selected at runtime, per driving state.
+ *
+ * The two modes exist because the right answer genuinely changes with the
+ * vehicle.  Moving, the sensor must not miss a 10-50 ms impulse, which costs
+ * 104 Hz batching and roughly 21% of the shared 100 kHz bus.  Parked, that same
+ * configuration burns bus time and sensor current to record a stationary car —
+ * and this system is designed to stay powered while the vehicle is off.
+ */
+enum class IMUSampleMode : uint8_t{
+    /**
+     * 104 Hz into the FIFO, drained in full every poll.
+     *
+     * Every converted sample is examined, so @c IMUData::accelPeakMs2 is a true
+     * peak over the window.  Use whenever the vehicle may be moving.
+     */
+    Fifo = 0,
+    /**
+     * Reduced ODR, FIFO bypassed, output registers polled directly.
+     *
+     * The pre-FIFO scheme, kept deliberately.  Draws roughly a tenth of the
+     * sensor current and a fifth of the bus time, at the cost of seeing only the
+     * samples a 20 Hz poll happens to land on — enough to show a parked vehicle
+     * is still, NOT enough to characterise an impact.
+     *
+     * Selected from VEHICLE POWER STATE, never from apparent stillness.  A
+     * vehicle waiting at a light is powered on and stays in @c Fifo.  See
+     * @c setIMUSampleMode().
+     */
+    LowPower = 1,
+};
+
 /** Return codes used by IMU functions. */
 enum class IMUReturnStatus{
     OK = 0,                     ///< Requested operation succeeded.
@@ -109,6 +141,56 @@ struct IMUData{
     float magZ;           ///< Magnetic flux density along sensor Z (uT).
 
     float temperatureC;   ///< LSM6DSOX die temperature (degC) — board, not cabin.
+
+    /**
+     * Largest |a| and |w| seen over the trailing @c IMU_PEAK_WINDOW_MS.
+     *
+     * The reason the FIFO exists.  @c accelX/Y/Z above are the most recent
+     * sample, and at a 10 Hz publication rate that sample is one of the ten the
+     * sensor produced since the last frame — a pothole hit by the other nine is
+     * simply not in the data.  These are computed from EVERY sample drained from
+     * the FIFO, so a transient is reported even though the vector that caused it
+     * is not.
+     *
+     * Magnitudes, so they do not depend on how the breakout is bolted in — the
+     * master does not guess a mounting orientation anywhere else either.
+     * Gravity is included, so a stationary vehicle reads about 9.81 rather than
+     * zero; subtract it if what is wanted is the excursion.
+     *
+     * NAN whenever the matching channel is invalid, exactly like the axes.
+     */
+    float accelPeakMs2;   ///< Peak |a| over the window (m/s2, gravity included).
+    float gyroPeakDps;    ///< Peak |w| over the window (deg/s).
+
+    /**
+     * There is a HOLE in the inertial record for this window.
+     *
+     * Raised for either cause, because the consequence is identical: a peak
+     * computed across a gap is not a peak over the window it claims, and an
+     * incident detector has to know that.
+     *   - the part overwrote unread words (a true FIFO overrun), or
+     *   - the host discarded a backlog that was already older than
+     *     IMU_MAX_DATA_AGE_MS, so draining it would have stamped stale samples
+     *     as current.
+     *
+     * Named for the CONSEQUENCE rather than one of the causes: an earlier name
+     * of "fifoOverrun" described only the first, while the flag was in fact
+     * raised by both, so a reader chasing an overrun found a counter that had
+     * never incremented.  @c IMUDevice keeps the two causes apart.
+     */
+    bool dataGap;
+
+    /**
+     * The samples in this snapshot were taken in low-power mode.
+     *
+     * Device state rather than sample state, and here for the same reason
+     * @c devicePresent is: a consumer holding only an @c IMUData must be able to
+     * tell a coarse reading from a fine one.  Without it, a peak recorded at
+     * 26 Hz with no buffering is indistinguishable from one folded across every
+     * sample at 104 Hz — and those two numbers support very different
+     * conclusions about an impact.
+     */
+    bool lowPower;
 
     uint32_t accelSampleMs; ///< @c millis() of the newest accepted accelerometer sample.
     uint32_t gyroSampleMs;  ///< @c millis() of the newest accepted gyroscope sample.
@@ -192,6 +274,56 @@ struct IMUDevice{
     float accelScaleMs2;      ///< m/s2 per LSB for the configured accelerometer range.
     float gyroScaleDps;       ///< deg/s per LSB for the configured gyroscope range.
     float magScaleUt;         ///< uT per LSB for the configured magnetometer range.
+
+    /// Windowed peak tracking, held as SQUARED magnitudes in a bucket ring.
+    ///
+    /// Squares keep the hot path free of square roots: the drain compares every
+    /// sample, and one sqrtf per channel per poll at the end replaces ten inside
+    /// the loop.  On a Cortex-M0+ with no FPU that is not a micro-optimisation —
+    /// every sqrtf is a software routine.
+    ///
+    /// The RING is what makes the window honest.  A single max plus a timestamp
+    /// cannot represent one: when the stored maximum aged out it was replaced by
+    /// whatever sample happened to be current, so a large hit at t=0 followed by
+    /// a medium hit at t=200 ms reported the medium one only until t=250 ms, and
+    /// then dropped straight to the idle level — discarding an impact that was
+    /// still well inside the window.  Bucketing by arrival time means expiry
+    /// removes only what is genuinely too old, and the published peak is the max
+    /// of what remains.
+    float    accelPeakSq[IMU_PEAK_BUCKETS];  ///< Max |a|^2 seen in each bucket.
+    float    gyroPeakSq[IMU_PEAK_BUCKETS];   ///< Max |w|^2 seen in each bucket.
+    uint32_t peakBucketMs[IMU_PEAK_BUCKETS]; ///< Start @c millis() of each bucket.
+    uint8_t  peakBucketHead;                 ///< Bucket currently being filled.
+
+    /// Cumulative HARDWARE overruns since @c initializeIMU(), saturating.
+    /// The part overwrote unread words: samples are gone and nothing could have
+    /// prevented it once the drain fell that far behind.
+    uint16_t fifoOverruns;
+    /// Cumulative FRESHNESS discards: the host flushed a backlog that had not
+    /// overflowed but was already older than IMU_MAX_DATA_AGE_MS.
+    ///
+    /// Counted separately from a true overrun because the two have different
+    /// causes and different fixes.  An overrun means the FIFO is too small or
+    /// the drain too slow; a freshness discard means something blocked the loop.
+    /// One number covering both cannot tell a technician which.
+    uint16_t fifoGapFlushes;
+    /// Abandoned for this boot after a watchdog reset — no recovery attempted.
+    /// See @c imuQuarantine().
+    bool quarantined;
+    /// Deadline form, not elapsed-time form: the gap notice is HELD until
+    /// @c gapFlagUntilMs and then latched off.  Deriving it from "counter
+    /// nonzero and lastOverrunMs looks recent" republished a long-finished gap
+    /// for 250 ms every time @c millis() rolled over at 49.7 days.
+    bool     gapFlagActive;
+    uint32_t gapFlagUntilMs;
+    /// @c millis() of the most recent gap, for diagnostics.
+    uint32_t lastOverrunMs;
+
+    /// Current sampling scheme.  Change it through @c setIMUSampleMode(), never
+    /// by assignment — the field only describes what the DEVICE was configured
+    /// to do, and writing it without touching the registers makes the driver
+    /// decode the FIFO on a part that is no longer filling one.
+    IMUSampleMode mode;
 };
 
 /** What answered on the bus, and whether it is what we expected. */
@@ -305,6 +437,71 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data);
  * retried.
  */
 bool isIMULinkLost(const IMUDevice &dev);
+
+/**
+ * @brief Puts the bundle into a valid "nothing fitted" state WITHOUT touching the bus.
+ *
+ * Every field is set exactly as @c initializeIMU() sets it before probing, so
+ * the struct is safe to read and to publish; only the hardware access is
+ * skipped.  Use when the bus must not be touched at all.
+ */
+void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress);
+
+/**
+ * @brief Abandons the IMU for this boot, without any bus access. TERMINAL.
+ *
+ * For use after a watchdog reset.  @c initializeIMU() transacts, and so does the
+ * @c recoverIMU() path that @c isIMUDegraded() schedules — so on a boot that
+ * follows a hang BOTH have to be suppressed, not just the first.  Suppressing
+ * only initialisation leaves the retry timer to re-enter the hang a few seconds
+ * later, which merely lengthens the reboot loop.
+ *
+ * Cleared only by a non-watchdog reset.
+ */
+void imuQuarantine(IMUDevice &dev);
+
+/** @brief True when the IMU has been abandoned for this boot. */
+bool isIMUQuarantined(const IMUDevice &dev);
+
+/**
+ * @brief Switches the LSM6DSOX between full-rate FIFO capture and low power.
+ *
+ * Rewrites the output data rates, the high-performance-mode bits and the FIFO
+ * mode, then flushes: samples already buffered were taken at the OLD rate and in
+ * the old power mode, and decoding them afterwards would attribute them to the
+ * new configuration.
+ *
+ * Cheap enough to call on a state change but not on every loop — it is six
+ * verified register writes.  Returns immediately when already in @p mode, so an
+ * unconditional call from a state machine costs nothing.
+ *
+ * FAILURE-ATOMIC.  The first write puts the FIFO into Bypass, so mid-sequence
+ * the hardware matches neither mode.  If any write fails the device is left
+ * marked NOT ready, so the caller's recovery path performs one rate-limited full
+ * reconfiguration rather than decoding against a configuration the part no
+ * longer has.  @c dev.mode and readiness are committed together, only once every
+ * register has read back.
+ *
+ * DRIVEN BY VEHICLE POWER STATE, not by motion.  The caller decides from
+ * ignition — sustained OBD-II silence after the link has been up — because a
+ * noise floor has a tail and no amplitude threshold separates a parked car from
+ * a moving one reliably.  An earlier revision tried and produced repeated false
+ * wakes on a motionless bench.
+ *
+ * The consequence to accept: a parked vehicle is sampled coarsely, so an impact
+ * while parked is not characterised well.  Fixing that properly needs the
+ * LSM6DSOX wake-up interrupt on a wired INT pin, which this build lacks.
+ *
+ * @param[in,out] dev   Initialised device bundle.
+ * @param[in]     mode  Desired sampling scheme.
+ * @return @c OK on success, @c NOK_BUS_STUCK when the bus was unusable,
+ *         @c NOK_CONFIG_FAILED when a register did not read back as written, or
+ *         @c NOK_ACCEL_MISSING when the LSM6DSOX is not currently live.
+ */
+IMUReturnStatus setIMUSampleMode(IMUDevice &dev, IMUSampleMode mode);
+
+/** @brief The sampling scheme the LSM6DSOX is currently configured for. */
+IMUSampleMode imuSampleMode(const IMUDevice &dev);
 
 /** @brief True when any device that should be running has gone silent. */
 bool isIMUDegraded(const IMUDevice &dev);

@@ -28,8 +28,12 @@
  * right and silently discarding it on size.
  *
  * 0x03 added the nine-axis IMU block plus die temperature (83 -> 123 bytes).
+ *
+ * 0x04 added the windowed inertial peaks (123 -> 131 bytes), once the LSM6DSOX
+ * FIFO began being drained in full rather than the output registers sampled at
+ * 20 Hz, plus the IMU_DATA_GAP and IMU_LOWPOWER flags that qualify them.
  */
-#define COMM_VERSION         0x03u
+#define COMM_VERSION         0x04u
 #define COMM_MAX_PAYLOAD     255u   ///< Largest payload (LEN is one byte).
 #define COMM_FRAME_OVERHEAD  6u     ///< SOF+VER+TYPE+LEN + CRC16(2).
 #define COMM_MAX_FRAME       (COMM_FRAME_OVERHEAD + COMM_MAX_PAYLOAD)
@@ -75,6 +79,43 @@
  * power and should not be trusted either.
  */
 #define COMM_FLAG_IMU_DEGRADED 0x20u
+/**
+ * There is a HOLE in the inertial record for this window.
+ *
+ * Raised for either of two causes, because the consequence is the same: the
+ * sensor overwrote unread samples (a true FIFO overrun), or the master
+ * discarded a backlog that was already older than its freshness window and
+ * would otherwise have been transmitted stamped as current.
+ *
+ * So @c imuAccelPeak and @c imuGyroPeak are peaks over LESS than the interval
+ * they claim.  A consumer doing incident detection must not read a quiet window
+ * carrying this flag as evidence that nothing happened.
+ *
+ * Named for the consequence, not one cause: it was briefly called
+ * IMU_FIFO_OVERRUN while already being raised by both, so anyone chasing an
+ * overrun found a counter that had never incremented.
+ */
+#define COMM_FLAG_IMU_DATA_GAP 0x40u
+/**
+ * The IMU is in its low-power sampling mode, because the vehicle is powered off.
+ *
+ * Set from IGNITION STATE, not from whether the vehicle appears to be moving:
+ * the master infers a shutdown from sustained OBD-II silence after the link has
+ * been up.  A vehicle stopped at a light is powered on and stays in full capture.
+ *
+ * The readings are honest but coarse: the sensor is at a reduced output rate
+ * with its FIFO bypassed, so only the samples a 20 Hz poll lands on are seen,
+ * and @c imuAccelPeak is a peak over those rather than over every sample.
+ * Enough to show the vehicle is still; NOT enough to characterise an impact on a
+ * parked car.  Anything grading severity from the peaks must check this first.
+ */
+#define COMM_FLAG_IMU_LOWPOWER 0x80u
+/**
+ * NOTE: @c TelemetryPayload::flags is one byte and 0x80 is the last bit of it.
+ * The next flag needs the field widened to @c uint16_t, which is a payload size
+ * change and therefore a COMM_VERSION bump — not something to discover halfway
+ * through adding one.
+ */
 
 /** Message / command identifiers. High bit set = master (MKR) -> slave (C3). */
 enum CommMsgType : uint8_t {
@@ -170,18 +211,37 @@ struct __attribute__((packed)) TelemetryPayload {
     float imuMagY;         ///< Magnetic flux density along sensor Y (µT), uncalibrated.
     float imuMagZ;         ///< Magnetic flux density along sensor Z (µT), uncalibrated.
     float imuTempC;        ///< LSM6DSOX die temperature (°C) — board, not cabin.
+    /**
+     * Peak |a| and |ω| over the master's trailing window, not over this instant.
+     *
+     * The axes above are ONE sample — the most recent of the ten the sensor
+     * produced since the last frame at 10 Hz.  A pothole or kerb strike is a
+     * 10-50 ms impulse, so the sample that catches it is usually not the sample
+     * that gets transmitted.  These are computed on the master from every sample
+     * the sensor converted, which is the reason its FIFO is used at all.
+     *
+     * Magnitudes, so they do not depend on how the breakout is bolted in.
+     * Gravity is included in @c imuAccelPeak: a stationary vehicle reads about
+     * 9.81, not 0, and the excursion is what remains after subtracting it.
+     *
+     * NAN when the matching channel is stale or absent.  Check
+     * @c COMM_FLAG_IMU_DATA_GAP before trusting a window, and
+     * @c COMM_FLAG_IMU_LOWPOWER before trusting its resolution.
+     */
+    float imuAccelPeak;    ///< Peak |a| over the window (m/s², gravity included).
+    float imuGyroPeak;     ///< Peak |ω| over the window (deg/s).
     // ---- status ----
     uint8_t flags;         ///< COMM_FLAG_* bitfield.
 };
 
 /// The wire contract depends on this exact size on both MCUs.
-static_assert(sizeof(TelemetryPayload) == 123, "TelemetryPayload must be tightly packed to 123 bytes");
+static_assert(sizeof(TelemetryPayload) == 131, "TelemetryPayload must be tightly packed to 131 bytes");
 /**
  * The payload has to fit the frame's one-byte LEN field, and the bridge's
  * one-byte @c telemetryBytes self-check.  Worth stating now that the struct has
- * grown 79 -> 83 -> 123: the next addition of this size lands at 163, and the
- * failure mode past 255 is a silently truncated length rather than anything that
- * looks like an error.
+ * grown 79 -> 83 -> 123 -> 131: another addition the size of the IMU block lands
+ * at 171, and the failure mode past 255 is a silently truncated length rather
+ * than anything that looks like an error.
  */
 static_assert(sizeof(TelemetryPayload) <= COMM_MAX_PAYLOAD,
               "TelemetryPayload no longer fits the frame's one-byte LEN field");

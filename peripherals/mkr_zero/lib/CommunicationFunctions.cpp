@@ -99,6 +99,11 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     out.imuMagY   = imu.magY;
     out.imuMagZ   = imu.magZ;
     out.imuTempC  = imu.temperatureC;
+    // Peaks, not another instantaneous sample.  At 10 Hz the axes above carry
+    // one of roughly ten samples the sensor produced since the last frame, so
+    // these are the only fields in which a transient between frames survives.
+    out.imuAccelPeak = imu.accelPeakMs2;
+    out.imuGyroPeak  = imu.gyroPeakDps;
 
     uint8_t flags = 0;
     // OBD2 is "live" only if tickOBD2() stored a reading within the freshness window,
@@ -118,6 +123,12 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     // raised as its own flag rather than left for the consumer to infer from
     // which axes happen to be NAN.
     if (imu.devicePresent && !imu.allDevicesPresent) flags |= COMM_FLAG_IMU_DEGRADED;
+    // Both of these qualify the peaks above rather than the axes.  Sent as flags
+    // instead of poisoning the peak with NAN because the value is still the best
+    // available estimate — it just is not the guarantee the field normally is,
+    // and a consumer weighing an incident needs to know which it is holding.
+    if (imu.dataGap) flags |= COMM_FLAG_IMU_DATA_GAP;
+    if (imu.lowPower) flags |= COMM_FLAG_IMU_LOWPOWER;
     out.flags = flags;
 }
 

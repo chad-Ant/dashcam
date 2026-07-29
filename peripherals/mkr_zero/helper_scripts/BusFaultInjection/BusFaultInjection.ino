@@ -391,11 +391,19 @@ static void testStuckPhase1(void)
     const GPSReturnStatus gst = initializeGPS_I2C(myGNSS);
     const uint32_t gpsUs = micros() - t2;
     {
-        char detail[64];
-        snprintf(detail, sizeof(detail), "status=%d (want -1) in %lu us",
-                 (int)gst, (unsigned long)gpsUs);
-        report("S4 initializeGPS_I2C refuses",
-               gst == GPSReturnStatus::NOK_INIT_FAILED, detail);
+        // NOK_BUS_STUCK (-7), not NOK_INIT_FAILED (-1).  This test predates the
+        // status, and kept passing only because the old code could not tell the
+        // two apart.  The distinction is the point of the fault injection: -1
+        // says nothing answered at 0x42, which on a held-low bus would be a
+        // WRONG diagnosis — nothing was ever asked.  -7 says the bus was unsafe
+        // to touch, which is what is actually true here and what sends someone
+        // looking at the lines rather than at the receiver.
+        char detail[72];
+        snprintf(detail, sizeof(detail), "status=%d (want %d) in %lu us",
+                 (int)gst, (int)GPSReturnStatus::NOK_BUS_STUCK,
+                 (unsigned long)gpsUs);
+        report("S4 initializeGPS_I2C refuses with NOK_BUS_STUCK",
+               gst == GPSReturnStatus::NOK_BUS_STUCK, detail);
     }
 
     // The retry rate limit: hammering i2cBusBegin() while stuck must not run

@@ -88,6 +88,43 @@ struct OverlayData {
     float   headingDeg      = 90.0f;      ///< True heading in degrees (0 = North, clockwise).
     int64_t timestampMs     = 1777633580000LL; ///< UNIX epoch timestamp in milliseconds.
 
+    // ── per-source validity ───────────────────────────────────────────────────
+    // THREE domains, not one, because three sources fail independently:
+    //   speed        — GNSS ground speed, else the ECU wheel speed
+    //   acceleration — derived on the master from ECU speed only
+    //   position     — GNSS fix (lat/lon/alt/heading together)
+    //
+    // Grouping speed and acceleration under one "motion" flag was not enough:
+    // a live GNSS fix refreshes speed while a dead ECU leaves acceleration at
+    // whatever the previous frame held, and one shared flag then certified both.
+    // The stale half is the dangerous half — an inherited acceleration rendered
+    // as current is fabricated evidence, and it is wrong by an amount too small
+    // to look wrong.
+    //
+    // Position stays a single domain because its four fields genuinely do come
+    // from one source and fail together.
+    //
+    // Same reasoning, and the same shape, as laneValid / driverValid below.
+    // An invalid domain renders as dashes, never as a stale reading.
+    bool    speedValid    = false;  ///< speedKmh is backed by a live source.
+    bool    accelValid    = false;  ///< accelerationMs2 is backed by a live ECU.
+    bool    positionValid = false;  ///< lat / lon / alt are backed by a valid fix.
+    /**
+     * headingDeg is backed by a course the master judged trustworthy.
+     *
+     * Separate from @c positionValid even though both come from the GNSS
+     * receiver, because they do NOT fail together.  Below roughly 5 km/h a
+     * receiver reports a course that wanders the full circle, so the master
+     * sends NaN — while the fix itself stays perfectly good.  Folding heading
+     * into positionValid therefore certified whatever heading was last held (or
+     * the struct's 90.0f placeholder) as live every time the vehicle stopped.
+     */
+    bool    headingValid  = false;
+    int64_t speedTimestampMs    = 0; ///< Epoch ms speedKmh last refreshed.
+    int64_t accelTimestampMs    = 0; ///< Epoch ms accelerationMs2 last refreshed.
+    int64_t positionTimestampMs = 0; ///< Epoch ms lat/lon/alt last refreshed.
+    int64_t headingTimestampMs  = 0; ///< Epoch ms headingDeg last refreshed.
+
     // ── ADAS telemetry (computed onboard; no GPS/IMU needed) ──────────────────
     // When adasValid is false the ADAS overlay banner and telemetry are omitted.
     // These are deliberately plain scalars so librecord stays decoupled from
@@ -271,10 +308,20 @@ private:
 
     /// Append one telemetry sample (4 Dialogue events) at video time @p posNs.
     /// The bottom-right clock is drawn from @p wallNowMs (the device clock, so
-    /// it stays live regardless of telemetry age); when @p stale is true the
-    /// motion/position fields render as a dash instead of a frozen reading.
+    /// it stays live regardless of telemetry age).
+    ///
+    /// Staleness is per SOURCE, and there are FOUR because four things fail
+    /// independently: @p speedStale dashes SPD, @p accelStale dashes ACC,
+    /// @p positionStale dashes LAT/LON/ALT, @p headingStale dashes HDG.
+    ///
+    /// Speed and acceleration split because a GNSS fix can supply speed while a
+    /// dead ECU leaves acceleration stale.  Heading splits from position because
+    /// a stationary vehicle has a good fix and no trustworthy course.  Any flag
+    /// covering two of these necessarily lies about one of them, and a frozen
+    /// reading rendered as current is fabricated evidence.
     void writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
-                        int64_t wallNowMs, bool stale);
+                        int64_t wallNowMs, bool speedStale, bool accelStale,
+                        bool positionStale, bool headingStale);
 };
 
 } // namespace dashcam::record

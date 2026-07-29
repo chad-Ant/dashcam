@@ -83,6 +83,8 @@ static_assert(offsetof(TelemetryPayload, imuAccelX) == offsetof(hostproto::Telem
               "TelemetryPayload/hostproto::Telemetry field order diverged (imuAccelX)");
 static_assert(offsetof(TelemetryPayload, imuTempC) == offsetof(hostproto::Telemetry, imuTempC),
               "TelemetryPayload/hostproto::Telemetry field order diverged (imuTempC)");
+static_assert(offsetof(TelemetryPayload, imuAccelPeak) == offsetof(hostproto::Telemetry, imuAccelPeak),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuAccelPeak)");
 static_assert(offsetof(TelemetryPayload, flags) == offsetof(hostproto::Telemetry, flags),
               "TelemetryPayload/hostproto::Telemetry field order diverged (flags)");
 

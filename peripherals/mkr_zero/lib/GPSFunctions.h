@@ -94,6 +94,12 @@ GPSReturnStatus initializeGPS(SFE_UBLOX_GNSS &myGNSS);
  * Connects at the standard u-blox I2C address (0x42). Initialises the I2C bus
  * if not already done.
  *
+ * BLOCKING.  Runs the staged machine to completion in one call, so it can hold
+ * the CPU for the whole bring-up.  Kept for callers that have no @c loop() to
+ * drive the machine — the validation and fault-injection sketches.  The
+ * production sketch must use @c gpsInitTick() instead; see its documentation for
+ * what a straight-line bring-up costs there.
+ *
  * @param[in,out] myGNSS  SparkFun GNSS object to initialise.
  * @return @c GPSReturnStatus::OK on success, @c NOK_INIT_FAILED if the receiver
  *         does not respond at 0x42.
@@ -115,14 +121,140 @@ GPSReturnStatus initializeGPS_I2C(SFE_UBLOX_GNSS &myGNSS);
  * Both calls made here allocate BEFORE they transmit, so the RAM is claimed even
  * with nothing on the bus, which is the case that matters.
  *
- * One buffer cannot be forced this way: @c packetUBXCFGPRT is allocated inside
- * the private @c getPortSettingsInternal(), which @c isConnected() only reaches
- * once the receiver has ACKed.  It stays lazy, and that is accepted — a single
- * allocation, at most once per boot, never freed, so it cannot fragment.
+ * ONE ALLOCATION REMAINS OUTSIDE OUR CONTROL, and it is worse than "lazy":
+ * @c getPortSettingsInternal() allocates @c packetUBXCFGPRT with @c new on entry
+ * and @c delete s it before returning, so @c isConnected() churns a
+ * @c UBX_CFG_PRT_t on EVERY call — up to three per @c begin(), on every retry,
+ * from @c loop().  That is a genuine new/delete cycle after initialisation and
+ * cannot be prevented from outside the library; only vendoring the GNSS driver
+ * would close it.  It is a small fixed-size object on a heap nothing else
+ * allocates from after setup, so fragmentation risk is low — but the
+ * no-allocation-after-init rule is NOT fully satisfied for GNSS, and claiming
+ * otherwise would be wrong.
  *
  * @return @c OK, or @c NOK_BUS_STUCK if the bus could not be brought up.
  */
 GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS);
+
+/** Steps of the staged GNSS bring-up, in execution order. */
+enum class GPSInitStage : uint8_t{
+    Idle = 0,      ///< Not started.
+    Begin,         ///< Establish communication (up to three isConnected probes).
+    SetI2COutput,  ///< Restrict the DDC port to UBX.
+    SetDynModel,   ///< Automotive dynamic model.
+    SetNavFreq,    ///< Navigation solution rate.
+    SetNavRate,    ///< Measurements per navigation solution.
+    SetAutoPVT,    ///< Ask the receiver to push PVT automatically.
+    Done,          ///< Receiver configured and streaming.
+    Failed,        ///< A step refused; holds the retry backoff — NOT terminal.
+    /**
+     * Abandoned for this boot because the previous run hung.  TERMINAL.
+     *
+     * Distinct from @c Failed, and the distinction is the whole point.  Failed
+     * retries, which is correct for a receiver that merely refused a setting —
+     * and catastrophic after a hang, because the retry re-enters the same
+     * unbounded SERCOM wait, the watchdog resets the board, and the reboot loop
+     * resumes at the retry interval.  Nothing moves out of this state except a
+     * non-watchdog reset.
+     */
+    Quarantined,
+};
+
+/** Fixed upper bound on steps for the blocking wrapper; one per stage plus slack. */
+#define GPS_INIT_MAX_STEPS 12u
+
+/**
+ * @brief Progress of a staged GNSS bring-up.  One instance per receiver.
+ *
+ * Plain aggregate, owns no memory, safe to hold at file scope and drive from
+ * @c loop().
+ */
+struct GPSInitState{
+    GPSInitStage    stage      = GPSInitStage::Idle;
+    GPSInitStage    failedAt   = GPSInitStage::Idle; ///< Stage that refused, for logs.
+    GPSReturnStatus lastStatus = GPSReturnStatus::OK; ///< Why the last attempt failed.
+    uint32_t        nextStepMs = 0;   ///< Earliest @c millis() for the next attempt.
+    uint16_t        attempts   = 0;   ///< Steps executed since the last restart.
+    uint16_t        failures   = 0;   ///< Consecutive failed bring-ups, for backoff.
+};
+
+/**
+ * Failed bring-ups tolerated at the fast retry rate before backing off.
+ *
+ * The u-blox DDC bring-up is measurably flaky — repeated runs on the bench show
+ * it refusing with NOK_INIT_FAILED, NOK_SET_RATE_FAILED or NOK_CONFIG_FAILED on
+ * a good fraction of attempts, then succeeding unchanged moments later.  Going
+ * straight to the GPS_RETRY_MS backoff treats that ordinary flakiness like an
+ * absent receiver and turns a sub-second bring-up into tens of seconds with no
+ * position.
+ *
+ * So retry quickly a few times first, and only escalate once the failures start
+ * to look like real absence rather than noise.
+ */
+#define GPS_INIT_FAST_RETRIES 8u
+
+/** Delay between fast retries (ms).  Long enough to let the DDC port settle. */
+#define GPS_INIT_FAST_RETRY_MS 250UL
+
+/**
+ * @brief Advances the GNSS bring-up by ONE STAGE. Call from @c loop().
+ *
+ * A stage is not a single UBX exchange, and the difference matters — an earlier
+ * version of this comment claimed a call costs at most @c GPS_CMD_TIMEOUT_MS,
+ * which is false.  Counted from the installed SparkFun 2.2.29 source:
+ *
+ *   @c Begin           up to 3 x isConnected()  -> up to 750 ms
+ *   poll-plus-set setters (I2COutput, DynModel, NavFreq, NavRate)
+ *                      2 exchanges each         -> up to 500 ms
+ *   @c SetAutoPVT      1 exchange               -> up to 250 ms
+ *
+ * So the worst single pass is ~750 ms, not 250 ms.  That is still an enormous
+ * improvement on the ~3 s straight-line bring-up it replaces, and it is bounded,
+ * but it EXCEEDS @c IMU_MAX_DATA_AGE_MS.  A slow bring-up will therefore leave
+ * more than @c IMU_FIFO_BACKLOG_WORDS queued and be reported as a data gap.
+ * That is correct behaviour, not a defect: samples older than the freshness
+ * contract must not be published as current, and the flag says so.  It is also
+ * the explanation for the gap events seen at startup.
+ *
+ * Driving it below the freshness window would mean issuing raw UBX
+ * request/response substages instead of using the library's setters — worth
+ * doing only if uninterrupted inertial capture during bring-up is required.
+ *
+ * @c Failed is a WAITING state carrying the @c GPS_RETRY_MS backoff, not a
+ * terminal one — it re-enters @c Begin by itself, so the caller never has to
+ * restart the machine.
+ *
+ * @return The stage AFTER this step; @c Done when the receiver is configured.
+ */
+GPSInitStage gpsInitTick(SFE_UBLOX_GNSS &myGNSS, GPSInitState &state);
+
+/** @brief (Re)starts the staged bring-up from the first step, immediately. */
+void gpsInitBegin(GPSInitState &state);
+
+/** @brief Forces the machine into its backoff state with a stated reason. */
+void gpsInitFail(GPSInitState &state, GPSReturnStatus why);
+
+/**
+ * @brief Clears the retry backoff. Call ONLY when a PVT packet has arrived.
+ *
+ * Reaching @c Done proves the receiver ACKed its configuration, which is not
+ * the same as working.  A receiver that accepts every setting and then streams
+ * nothing would loop at the fast retry rate indefinitely if @c Done cleared the
+ * counter, because the escalation could never accumulate.
+ */
+void gpsInitConfirmStreaming(GPSInitState &state);
+
+/**
+ * @brief Abandons GNSS for this boot. Terminal — nothing retries afterwards.
+ *
+ * For use after a watchdog reset, where any retry would re-enter the hang that
+ * caused it.  Use @c gpsInitFail() for an ordinary refusal that should be
+ * retried; the two must not be confused.
+ */
+void gpsInitQuarantine(GPSInitState &state);
+
+/** @brief Short human-readable name for a stage, for logs. */
+const char *gpsInitStageName(GPSInitStage stage);
 
 /** Resets a GPS snapshot to a known invalid state. */
 void initGPSData(GPSData &data);

@@ -64,8 +64,12 @@ constexpr uint8_t  SOF            = 0x7E; ///< Start-of-frame delimiter.
  *
  * 0x03 added the nine-axis IMU block plus die temperature (83 -> 123 bytes),
  * again in step with COMM_VERSION.
+ *
+ * 0x04 added the windowed inertial peaks (123 -> 131 bytes) once the LSM6DSOX
+ * FIFO started being drained in full, together with the IMU_DATA_GAP and
+ * IMU_LOWPOWER flags that say when a peak may not be trusted.
  */
-constexpr uint8_t  VERSION        = 0x03;
+constexpr uint8_t  VERSION        = 0x04;
 constexpr uint16_t MAX_PAYLOAD    = 255;  ///< Largest payload (LEN is one byte).
 constexpr uint16_t FRAME_OVERHEAD = 6;    ///< SOF+VER+TYPE+LEN + CRC16(2).
 constexpr uint16_t MAX_FRAME      = FRAME_OVERHEAD + MAX_PAYLOAD;
@@ -174,6 +178,32 @@ constexpr uint8_t TLM_FLAG_GPS_PRESENT = 0x10;
  * parasitically powered part and should not be trusted.
  */
 constexpr uint8_t TLM_FLAG_IMU_DEGRADED = 0x20;
+/**
+ * There is a HOLE in the inertial record for this window.
+ *
+ * Either the sensor overwrote unread samples, or the master discarded a backlog
+ * already older than its freshness window rather than send it stamped current.
+ * Same consequence either way: @c imuAccelPeak and @c imuGyroPeak cover less
+ * than the interval they claim, so a quiet window carrying this flag is not
+ * evidence that nothing happened.
+ */
+constexpr uint8_t TLM_FLAG_IMU_DATA_GAP = 0x40;
+/**
+ * The IMU is in low-power sampling because the vehicle is powered off.
+ *
+ * Driven by IGNITION state — sustained OBD-II silence after the link has been up
+ * — not by apparent stillness, so a vehicle waiting at a light stays in full
+ * capture.  Readings are honest but coarse: reduced output rate, FIFO bypassed,
+ * so @c imuAccelPeak is a peak over sampled points rather than over every sample.
+ * Enough to show the vehicle is still, not enough to characterise an impact on a
+ * parked car.
+ */
+constexpr uint8_t TLM_FLAG_IMU_LOWPOWER = 0x80;
+/**
+ * NOTE: @c Telemetry::flags is one byte and 0x80 is its last bit.  A further
+ * flag requires widening the field, which changes the payload size and so
+ * requires a VERSION bump on both hops.
+ */
 
 /** @c LogHeader::level values (mirrors dashcam::log::LogLevel). */
 enum LogLevel : uint8_t { LOG_DEBUG = 0, LOG_INFO = 1, LOG_WARN = 2, LOG_ERROR = 3 };
@@ -253,6 +283,23 @@ struct __attribute__((packed)) Telemetry {
     float imuMagY;         ///< Magnetic flux density along sensor Y (µT), uncalibrated.
     float imuMagZ;         ///< Magnetic flux density along sensor Z (µT), uncalibrated.
     float imuTempC;        ///< LSM6DSOX die temperature (°C) — board, not cabin.
+    /**
+     * Peak |a| and |ω| over the master's trailing window, not at this instant.
+     *
+     * The axes above are one sample; at 10 Hz that is one of roughly ten the
+     * sensor produced since the last frame, so the sample that caught a 10-50 ms
+     * impact is usually not the one transmitted.  These are folded on the master
+     * from every sample the sensor converted.
+     *
+     * Magnitudes, so mounting orientation does not matter.  Gravity is included
+     * in @c imuAccelPeak — a stationary vehicle reads about 9.81.
+     *
+     * NAN when the channel is stale or absent.  Check
+     * @c TLM_FLAG_IMU_DATA_GAP before trusting a window, and
+     * @c TLM_FLAG_IMU_LOWPOWER before trusting its resolution.
+     */
+    float imuAccelPeak;    ///< Peak |a| over the window (m/s², gravity included).
+    float imuGyroPeak;     ///< Peak |ω| over the window (deg/s).
     // ---- status ----
     uint8_t flags;         ///< TLM_FLAG_* bitfield.
 };
@@ -319,7 +366,7 @@ constexpr size_t MAX_LOG_TEXT = MAX_PAYLOAD - sizeof(LogHeader);
 // The wire contract depends on these exact sizes on both ends.  Telemetry must
 // also equal sizeof(TelemetryPayload) in CommProtocol.h — the bridge asserts
 // that separately, where both headers are visible.
-static_assert(sizeof(Telemetry)    == 123, "hostproto::Telemetry must be tightly packed to 123 bytes");
+static_assert(sizeof(Telemetry)    == 131, "hostproto::Telemetry must be tightly packed to 131 bytes");
 /**
  * Must fit the frame's one-byte LEN field and @c Hello::telemetryBytes, which is
  * also one byte.  Stated explicitly now the struct has grown 79 -> 83 -> 123:

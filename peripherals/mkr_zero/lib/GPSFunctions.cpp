@@ -59,59 +59,233 @@ GPSReturnStatus initializeGPS(SFE_UBLOX_GNSS &myGNSS){
 }
 
 GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
-    if (i2cBusBegin() != I2CBusState::Ready) return GPSReturnStatus::NOK_BUS_STUCK;
+    // NOTHING here touches the bus, which is the whole point of the rewrite.
+    //
+    // This used to call begin(..., 0) and setAutoPVTrate(..., 0) for their
+    // allocation side effects.  Both transact: begin() probes the address and
+    // then polls CFG-PRT, setAutoPVTrate() sends CFG-MSG, and a zero deadline
+    // means neither waits for the reply it just asked for.  The receiver still
+    // queues those replies, so the REAL bring-up moments later could parse an
+    // answer to a question this function asked — and could pass on it.  A
+    // pre-flight step that leaves stale traffic in the DDC buffer is worse than
+    // no pre-flight step at all.
+    //
+    // Both allocations are reachable without any of that:
+    //   setPacketCfgPayloadSize() allocates payloadCfg directly.
+    //   assumeAutoPVT() calls initPacketUBXNAVPVT() and then only writes flags.
+    // Neither sends a byte, so this is safe to call before the bus is known good
+    // and cannot hang in the SAMD driver's undeadlined waits.
+    if (!myGNSS.setPacketCfgPayloadSize(MAX_PAYLOAD_SIZE)) return GPSReturnStatus::NOK_INIT_FAILED;
 
-    // A zero deadline, and the result is deliberately discarded.  This call is
-    // not trying to reach the receiver — it is here to bind Wire to the driver
-    // and to run the "if (packetCfgPayloadSize == 0) setPacketCfgPayloadSize()"
-    // branch inside begin(), both of which happen before the first probe.  With
-    // maxWait 0 the three isConnected() attempts cost only their I2C address
-    // probes, so this is bounded at a few hundred microseconds either way.
-    (void)myGNSS.begin(Wire, GPS_DEFAULT_I2C_ADDRESS, 0u);
-
-    // Allocates UBX_NAV_PVT_t and only then transmits, so the storage is claimed
-    // whether or not anything is listening.  The rate set here is overwritten by
-    // the real bring-up; only the allocation side effect is wanted.
-    (void)myGNSS.setAutoPVTrate(1, true, 0u);
+    // false, not true: this claims the RAM without asserting that automatic PVT
+    // is actually running.  Setting the flag before the real CFG-MSG has been
+    // acknowledged would make getPVT() believe the receiver is streaming when a
+    // failed bring-up means it is not.
+    //
+    // The return is deliberately NOT the allocation result — assumeAutoPVT()
+    // returns whether the FLAGS CHANGED, and passing false when they are already
+    // false legitimately returns false.  So allocation success is checked
+    // directly instead, via the pointer the call exists to populate.
+    (void)myGNSS.assumeAutoPVT(false, true);
+    if (myGNSS.packetUBXNAVPVT == nullptr) return GPSReturnStatus::NOK_INIT_FAILED;
 
     return GPSReturnStatus::OK;
 }
 
-GPSReturnStatus initializeGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
-    // Enter through the shared bus manager rather than opening Wire here.  The
-    // receiver is often the FIRST client on the bus, and whoever is first is
-    // the one that has to unwedge it: a slave left holding SDA by an unclean
-    // reset would otherwise hang myGNSS.begin() inside the SAMD driver's
-    // unbounded flag wait, with no code left to run that could have recovered.
-    if (i2cBusBegin() != I2CBusState::Ready) return GPSReturnStatus::NOK_BUS_STUCK;
+// ─── staged bring-up ──────────────────────────────────────────────────────────
 
-    // Every exchange below carries an EXPLICIT deadline instead of SparkFun's
-    // 1100 ms default, and the watchdog is fed between them.  Both halves are
-    // needed.  The deadline is what keeps the total bounded — the chain is
-    // twelve ACK waits deep, so at the default it can outlast WATCHDOG_PERIOD_MS
-    // on a slow but SUCCESSFUL bring-up and reboot the board before the receiver
-    // is ever usable.  The feeds are what keep the watchdog honest across a
-    // legitimately slow bring-up without blinding it: each feed sits between two
-    // individually bounded operations, so the hazard the watchdog actually
-    // exists for — an unbounded SERCOM flag wait inside a single Wire call — is
-    // still fully exposed to it.  Feeding inside a loop with no deadline is what
-    // would defeat it, and there is none here.
-    if (!myGNSS.begin(Wire, GPS_DEFAULT_I2C_ADDRESS, GPS_CMD_TIMEOUT_MS)) return GPSReturnStatus::NOK_INIT_FAILED;
-    watchdogFeed();
-#ifndef GPS_ENABLE_NMEA
-    if (!myGNSS.setI2COutput(COM_TYPE_UBX, GPS_CMD_TIMEOUT_MS)) return GPSReturnStatus::NOK_CONFIG_FAILED;
-    watchdogFeed();
+const char *gpsInitStageName(GPSInitStage stage){
+    switch (stage){
+        case GPSInitStage::Idle:          return "idle";
+        case GPSInitStage::Begin:         return "begin";
+        case GPSInitStage::SetI2COutput:  return "i2c-output";
+        case GPSInitStage::SetDynModel:   return "dynamic-model";
+        case GPSInitStage::SetNavFreq:    return "nav-frequency";
+        case GPSInitStage::SetNavRate:    return "nav-rate";
+        case GPSInitStage::SetAutoPVT:    return "auto-pvt";
+        case GPSInitStage::Done:          return "done";
+        case GPSInitStage::Quarantined:   return "quarantined";
+        default:                          return "failed";
+    }
+}
+
+void gpsInitBegin(GPSInitState &state){
+    state.stage      = GPSInitStage::Begin;
+    state.lastStatus = GPSReturnStatus::OK;
+    state.attempts   = 0u;
+    state.nextStepMs = millis();
+}
+
+void gpsInitFail(GPSInitState &state, GPSReturnStatus why){
+    // Remember WHICH step refused before overwriting the stage, or the log can
+    // only report "failed", which says nothing: -1 at Begin means nothing
+    // answered at 0x42, while -6 at SetNavRate means the receiver is right there
+    // and rejected a setting.  Those are opposite repairs.
+    if (state.stage != GPSInitStage::Failed) state.failedAt = state.stage;
+
+    state.stage      = GPSInitStage::Failed;
+    state.lastStatus = why;
+    if (state.failures < 0xFFFFu) state.failures++;
+
+    // Escalating backoff.  The first several retries come quickly because this
+    // bring-up is known to refuse and then succeed unchanged; only once that
+    // stops looking like flakiness does the interval stretch out to the rate
+    // used for hardware that is genuinely absent.
+    state.nextStepMs = millis() + ((state.failures <= GPS_INIT_FAST_RETRIES)
+                                       ? GPS_INIT_FAST_RETRY_MS
+                                       : GPS_RETRY_MS);
+}
+
+/**
+ * @brief Runs the next stage. ONE STAGE per call — which is not one exchange.
+ *
+ * The bring-up used to be a straight-line function holding the CPU for as long
+ * as the receiver took to answer twelve exchanges — up to 3 s even with bounded
+ * deadlines, and unbounded if the bus wedged mid-way.  Nothing else ran during
+ * that: not the C3 link, not the IMU drain, not the watchdog feed in loop().
+ * Two separate defects came out of it.  A hang repeated identically on every
+ * boot because the same stage ran at the same point under the same armed
+ * watchdog; and a 3 s block outlasts the LSM6DSOX FIFO's 2.32 s depth, so the
+ * drain afterwards published seconds-old backlog stamped with the current time.
+ *
+ * Splitting the chain across loop() bounds it, but does NOT reduce it to one
+ * exchange, and an earlier version of this comment wrongly claimed it did.  A
+ * stage is up to 750 ms (@c Begin, three isConnected probes) or 500 ms (the
+ * poll-plus-set setters) — see @c gpsInitTick() in the header for the counted
+ * breakdown.  So other subsystems still pause for that long during bring-up,
+ * and a pause beyond IMU_MAX_DATA_AGE_MS is correctly reported as an inertial
+ * data gap rather than hidden.  That is accepted behaviour, not a closed
+ * optimisation: driving it under the freshness window needs raw UBX substages
+ * in place of the library's setters.
+ */
+void gpsInitConfirmStreaming(GPSInitState &state){
+    // Called when a PVT packet actually arrives.  This — not a successful
+    // configuration exchange — is what proves the receiver is working, so it is
+    // the only thing entitled to clear the backoff.
+    state.failures = 0u;
+}
+
+void gpsInitQuarantine(GPSInitState &state){
+    state.stage      = GPSInitStage::Quarantined;
+    state.failedAt   = GPSInitStage::Begin;
+    state.lastStatus = GPSReturnStatus::NOK_BUS_STUCK;
+}
+
+GPSInitStage gpsInitTick(SFE_UBLOX_GNSS &myGNSS, GPSInitState &state){
+    if (state.stage == GPSInitStage::Done) return state.stage;
+
+    // Terminal, checked FIRST and with no timer.  This is the state that breaks
+    // a persistent reboot loop, and it can only do that by never leaving: an
+    // earlier version put the machine into Failed here instead, which re-entered
+    // Begin 250 ms later, hung again, and reset the board again.  The loop was
+    // never broken, only slowed to the retry interval.
+    if (state.stage == GPSInitStage::Quarantined) return state.stage;
+
+    // Failed is a WAITING state, not a terminal one: it holds the retry backoff
+    // and re-enters Begin once GPS_RETRY_MS has passed.  Structured this way so
+    // the caller never has to remember to restart the machine.
+    if (state.stage == GPSInitStage::Failed || state.stage == GPSInitStage::Idle){
+        if (static_cast<int32_t>(millis() - state.nextStepMs) < 0) return state.stage;
+        gpsInitBegin(state);
+        return state.stage;
+    }
+
+    // The bus check is per STEP, not once per bring-up.  A slave can wedge the
+    // lines between two stages just as easily as before the first one.
+    if (i2cBusBegin() != I2CBusState::Ready){
+        gpsInitFail(state, GPSReturnStatus::NOK_BUS_STUCK);
+        return state.stage;
+    }
+
+    state.attempts++;
+
+    switch (state.stage){
+        case GPSInitStage::Begin:
+            if (!myGNSS.begin(Wire, GPS_DEFAULT_I2C_ADDRESS, GPS_CMD_TIMEOUT_MS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_INIT_FAILED);
+                break;
+            }
+#ifdef GPS_ENABLE_NMEA
+            state.stage = GPSInitStage::SetDynModel;
+#else
+            state.stage = GPSInitStage::SetI2COutput;
 #endif
-    if (!myGNSS.setDynamicModel(DYN_MODEL_AUTOMOTIVE, GPS_CMD_TIMEOUT_MS)) return GPSReturnStatus::NOK_CONFIG_FAILED;
-    watchdogFeed();
-    if (!myGNSS.setNavigationFrequency(GPS_REFRESH_RATE, GPS_CMD_TIMEOUT_MS)) return GPSReturnStatus::NOK_SET_RATE_FAILED;
-    watchdogFeed();
-    if (!myGNSS.setNavigationRate(1, GPS_CMD_TIMEOUT_MS)) return GPSReturnStatus::NOK_CONFIG_FAILED;
-    watchdogFeed();
-    if (!myGNSS.setAutoPVTrate(1, true, GPS_CMD_TIMEOUT_MS)) return GPSReturnStatus::NOK_CONFIG_FAILED;
-    watchdogFeed();
+            break;
 
-    return GPSReturnStatus::OK;
+        case GPSInitStage::SetI2COutput:
+            if (!myGNSS.setI2COutput(COM_TYPE_UBX, GPS_CMD_TIMEOUT_MS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_CONFIG_FAILED);
+                break;
+            }
+            state.stage = GPSInitStage::SetDynModel;
+            break;
+
+        case GPSInitStage::SetDynModel:
+            if (!myGNSS.setDynamicModel(DYN_MODEL_AUTOMOTIVE, GPS_CMD_TIMEOUT_MS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_CONFIG_FAILED);
+                break;
+            }
+            state.stage = GPSInitStage::SetNavFreq;
+            break;
+
+        case GPSInitStage::SetNavFreq:
+            if (!myGNSS.setNavigationFrequency(GPS_REFRESH_RATE, GPS_CMD_TIMEOUT_MS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_SET_RATE_FAILED);
+                break;
+            }
+            state.stage = GPSInitStage::SetNavRate;
+            break;
+
+        case GPSInitStage::SetNavRate:
+            if (!myGNSS.setNavigationRate(1, GPS_CMD_TIMEOUT_MS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_CONFIG_FAILED);
+                break;
+            }
+            state.stage = GPSInitStage::SetAutoPVT;
+            break;
+
+        case GPSInitStage::SetAutoPVT:
+            if (!myGNSS.setAutoPVTrate(1, true, GPS_CMD_TIMEOUT_MS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_CONFIG_FAILED);
+                break;
+            }
+            state.stage      = GPSInitStage::Done;
+            state.lastStatus = GPSReturnStatus::OK;
+            // The backoff counter is deliberately NOT reset here.  Reaching Done
+            // only means the receiver ACKed its configuration; it does not mean
+            // a single PVT packet has arrived.  A receiver that accepts every
+            // setting and then streams nothing would otherwise sit in a loop
+            // forever at the FAST retry rate: silence window fires, retry
+            // succeeds, counter clears, silence window fires again — the
+            // escalation to GPS_RETRY_MS could never happen because the counter
+            // was wiped before it could grow.  gpsInitConfirmStreaming() clears
+            // it, and only real data calls that.
+            break;
+
+        default:
+            break;
+    }
+
+    return state.stage;
+}
+
+GPSReturnStatus initializeGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
+    // Blocking wrapper around the staged machine, kept for callers that have no
+    // loop() to drive it — the validation and fault-injection sketches.  The
+    // production sketch must NOT use this: see gpsInitTick() for why a
+    // straight-line bring-up is a hazard there.
+    GPSInitState state;
+    gpsInitBegin(state);
+
+    // Bounded by construction: the chain is a fixed number of stages, each one
+    // GPS_CMD_TIMEOUT_MS, and Failed short-circuits rather than retrying here.
+    for (uint8_t guard = 0u; guard < GPS_INIT_MAX_STEPS; guard++){
+        const GPSInitStage stage = gpsInitTick(myGNSS, state);
+        watchdogFeed();
+        if (stage == GPSInitStage::Done)   return GPSReturnStatus::OK;
+        if (stage == GPSInitStage::Failed) return state.lastStatus;
+    }
+    return GPSReturnStatus::NOK_INIT_FAILED;
 }
 
 void invalidateGPSFix(GPSData &data){

@@ -51,7 +51,43 @@ static constexpr uint8_t SOX_STATUS_TDA      = 0x04u;
 /// in particular 0xFF, which is what a bus read that returns nothing looks like.
 static constexpr uint8_t SOX_STATUS_RESERVED_MASK = 0xF8u;
 /// First of the 14 contiguous output bytes: temp, gyro XYZ, accel XYZ, LSB first.
+/// Retained for the bring-up self-test; the steady-state path reads the FIFO.
 static constexpr uint8_t SOX_REG_OUT_TEMP_L  = 0x20u;
+
+// ─── LSM6DSOX FIFO ────────────────────────────────────────────────────────────
+
+/// FIFO_CTRL1: WTM[7:0].  Unused — the drain polls the fill level instead of
+/// waiting on a watermark interrupt, because no INT pin is wired on this build.
+static constexpr uint8_t SOX_REG_FIFO_CTRL1  = 0x07u;
+/// FIFO_CTRL2: STOP_ON_WTM[7], FIFO_COMPR_RT_EN[6], ODRCHG_EN[4], WTM[8].
+static constexpr uint8_t SOX_REG_FIFO_CTRL2  = 0x08u;
+/// FIFO_CTRL3: BDR_GY[7:4], BDR_XL[3:0] — per-sensor batch data rates.
+static constexpr uint8_t SOX_REG_FIFO_CTRL3  = 0x09u;
+/// FIFO_CTRL4: DEC_TS_BATCH[7:6], ODR_T_BATCH[5:4], FIFO_MODE[2:0].
+static constexpr uint8_t SOX_REG_FIFO_CTRL4  = 0x0Au;
+/// FIFO_STATUS1: DIFF_FIFO[7:0] — unread words currently buffered.
+static constexpr uint8_t SOX_REG_FIFO_STATUS1 = 0x3Au;
+/// FIFO_STATUS2: WTM_IA[7], OVR_IA[6], FULL_IA[5], COUNTER_BDR_IA[4],
+/// OVR_LATCHED[3], reserved[2], DIFF_FIFO[9:8][1:0].
+static constexpr uint8_t SOX_FIFO_ST2_DIFF_MASK   = 0x03u;
+/// Bit 2 is reserved and reads back zero, so a set bit here means the byte did
+/// not come from a healthy part — 0xFF in particular.
+static constexpr uint8_t SOX_FIFO_ST2_RESERVED    = 0x04u;
+static constexpr uint8_t SOX_FIFO_ST2_OVR_LATCHED = 0x08u;
+static constexpr uint8_t SOX_FIFO_ST2_OVR_IA      = 0x40u;
+
+/// First byte of a FIFO word: TAG_SENSOR[7:3], TAG_CNT[2:1], TAG_PARITY[0].
+/// A word is this tag plus six data bytes, read as one seven-byte burst.
+static constexpr uint8_t SOX_REG_FIFO_DATA_OUT_TAG = 0x78u;
+static constexpr uint8_t SOX_FIFO_WORD_BYTES       = 7u;
+
+/// TAG_SENSOR values for the three streams enabled here.  Anything else — the
+/// compression, sensor-hub and step-counter tags — is skipped rather than
+/// mis-decoded, since none of those features is turned on and a word carrying
+/// one would mean the configuration is not what this code believes.
+static constexpr uint8_t SOX_TAG_GYRO  = 0x01u;
+static constexpr uint8_t SOX_TAG_ACCEL = 0x02u;
+static constexpr uint8_t SOX_TAG_TEMP  = 0x03u;
 /// Die temperature: 256 LSB per degC, zero at +25 degC.
 static constexpr float SOX_TEMP_LSB_PER_C    = 256.0f;
 static constexpr float SOX_TEMP_OFFSET_C     = 25.0f;
@@ -107,6 +143,13 @@ static constexpr uint8_t MDL_AUTO_INCREMENT  = 0x80u;
 
 /// ODR field value for 104 Hz, shared by accelerometer and gyroscope.
 static constexpr uint8_t SOX_ODR_104_HZ   = 0x04u;
+/// ODR field value for 26 Hz — the low-power rate.
+///
+/// Chosen over the lower 12.5 Hz step so the 38.5 ms output period stays shorter
+/// than the 50 ms poll interval: every poll then finds a sample waiting, and the
+/// data-age and stall logic behave exactly as they do at 104 Hz instead of
+/// needing a second set of thresholds for the second mode.
+static constexpr uint8_t SOX_ODR_26_HZ    = 0x02u;
 /// FS_XL field value for +/-8 g (00=2g, 01=16g, 10=4g, 11=8g — not in order).
 static constexpr uint8_t SOX_FS_XL_8G     = 0x03u;
 /// CTRL2_G[3:0] for +/-500 dps: FS_G=01, FS_125=0.
@@ -116,6 +159,45 @@ static constexpr uint8_t SOX_CTRL1_XL_VALUE =
     static_cast<uint8_t>((SOX_ODR_104_HZ << 4) | (SOX_FS_XL_8G << 2));
 static constexpr uint8_t SOX_CTRL2_G_VALUE =
     static_cast<uint8_t>((SOX_ODR_104_HZ << 4) | SOX_FS_G_500DPS);
+
+/// BDR field value for 104 Hz, matching the ODR so nothing is decimated on its
+/// way into the FIFO.  Batching below the ODR would silently reintroduce the
+/// sample loss the FIFO was added to remove.
+static constexpr uint8_t SOX_BDR_104_HZ    = 0x04u;
+/// ODR_T_BATCH field value for 12.5 Hz.
+///
+/// The lowest available rate is 1.6 Hz, and it cannot be used: a 625 ms period
+/// is longer than IMU_MAX_DATA_AGE_MS, so every temperature reading would be
+/// stale on arrival and tempValid could never be true.  12.5 Hz gives an 80 ms
+/// period, comfortably inside the window, and costs 12.5 of 220.5 words/s.
+static constexpr uint8_t SOX_ODR_T_12_5_HZ = 0x02u;
+/// FIFO_MODE for Continuous ("stream") — when full, the OLDEST word is dropped.
+///
+/// The alternative, plain FIFO mode, stops collecting when full and would hold a
+/// snapshot of whatever happened at the moment the drain fell behind, then keep
+/// it forever.  For a dashcam the newest data is the data worth having, so the
+/// loss is taken at the old end.
+static constexpr uint8_t SOX_FIFO_MODE_STREAM = 0x06u;
+static constexpr uint8_t SOX_FIFO_MODE_BYPASS = 0x00u;
+
+static constexpr uint8_t SOX_FIFO_CTRL3_VALUE =
+    static_cast<uint8_t>((SOX_BDR_104_HZ << 4) | SOX_BDR_104_HZ);
+static constexpr uint8_t SOX_FIFO_CTRL4_VALUE =
+    static_cast<uint8_t>((SOX_ODR_T_12_5_HZ << 4) | SOX_FIFO_MODE_STREAM);
+
+/// Low-power counterparts.  Same full-scale ranges — only the rate changes, so a
+/// mode switch cannot silently rescale the readings either side of it.
+static constexpr uint8_t SOX_CTRL1_XL_LOWPOWER =
+    static_cast<uint8_t>((SOX_ODR_26_HZ << 4) | (SOX_FS_XL_8G << 2));
+static constexpr uint8_t SOX_CTRL2_G_LOWPOWER =
+    static_cast<uint8_t>((SOX_ODR_26_HZ << 4) | SOX_FS_G_500DPS);
+
+/// CTRL6_C: XL_HM_MODE[4] — set to LEAVE accelerometer high-performance mode.
+static constexpr uint8_t SOX_REG_CTRL6_C     = 0x15u;
+static constexpr uint8_t SOX_CTRL6_XL_HM_OFF = 0x10u;
+/// CTRL7_G: G_HM_MODE[7] — set to LEAVE gyroscope high-performance mode.
+static constexpr uint8_t SOX_REG_CTRL7_G     = 0x16u;
+static constexpr uint8_t SOX_CTRL7_G_HM_OFF  = 0x80u;
 
 /// OM field value for high-performance mode, used for XY (CTRL1) and Z (CTRL4).
 static constexpr uint8_t MDL_OM_HIGH       = 0x02u;
@@ -345,17 +427,142 @@ static bool waitResetComplete(uint8_t address, uint8_t reg, uint8_t bit){
     return false;
 }
 
+static constexpr uint32_t IMU_PEAK_BUCKET_MS = IMU_PEAK_WINDOW_MS / IMU_PEAK_BUCKETS;
+
+/** @brief Empties every bucket — after a mode change, a gap, or at bring-up. */
+static void resetPeakRing(IMUDevice &dev, uint32_t now){
+    for (uint8_t i = 0u; i < IMU_PEAK_BUCKETS; i++){
+        dev.accelPeakSq[i]  = NAN;
+        dev.gyroPeakSq[i]   = NAN;
+        dev.peakBucketMs[i] = now;
+    }
+    dev.peakBucketHead = 0u;
+}
+
+
 /**
- * @brief Resets and configures the LSM6DSOX, verifying every write.
+ * @brief Empties the FIFO and restarts it, after data has already been lost.
  *
- * A silently rejected range is the worst failure mode available here: the part
- * keeps converting at its previous full scale while this library keeps applying
- * the scale factor for the requested one, so every reading is wrong by a
- * constant multiple — plausible, self-consistent and undetectable downstream.
- * Hence write-then-read-back on the registers that define the scale.
- *
- * @return @c true when the part is present, identified and correctly configured.
+ * Called on overrun, where the buffer holds up to 2.3 s of backlog.  Draining
+ * that backlog would take several polls and deliver samples as "current" that
+ * are seconds old, so the newest data is worth more than the queue: bypass to
+ * discard, stream to resume.  The peak for the affected window is wrong either
+ * way — which is what @c IMUData::dataGap exists to say.
  */
+static bool resetAccelFifo(IMUDevice &dev){
+    const uint8_t address = dev.accelAddress;
+    // Read back, not fire-and-forget.  These two writes ARE the recovery, and an
+    // unverified write only proves the part ACKed its address — a device that
+    // acknowledges and then ignores the mode change would be treated as
+    // successfully recovered on every gap, forever, while the FIFO stayed
+    // exactly as wedged as before.  The failure would present as endless data
+    // gaps with no other symptom.
+    if (!writeVerifyReg8(address, SOX_REG_FIFO_CTRL4, SOX_FIFO_MODE_BYPASS)) return false;
+    return writeVerifyReg8(address, SOX_REG_FIFO_CTRL4, SOX_FIFO_CTRL4_VALUE);
+}
+
+/**
+ * @brief Writes the rate, power and FIFO registers for one sampling mode.
+ *
+ * The order is deliberate: FIFO to Bypass FIRST, so collection stops and the
+ * buffer empties before the rates move.  Changing an ODR while the FIFO is
+ * streaming leaves words in the buffer that were sampled at the old rate, and
+ * nothing in a FIFO word says which rate produced it — they would be decoded as
+ * current data taken at the new one.
+ *
+ * @return @c true when every register read back as written.
+ */
+static bool applySampleMode(IMUDevice &dev, IMUSampleMode mode){
+    const uint8_t address = dev.accelAddress;
+
+    // The FIRST write puts the FIFO into Bypass, so from here until the last
+    // write lands the hardware matches NEITHER mode.  dev.mode is only committed
+    // at the very end, which means a failure in between leaves software decoding
+    // against a configuration the part no longer has — in the worst case polling
+    // a bypassed FIFO forever, seeing zero words, and being retired by the stall
+    // check for a fault that is really a half-finished write.
+    //
+    // Marking the part unconfigured up front makes that state impossible to
+    // mistake for a working one: if any write below fails, the function returns
+    // with accelReady false, and the caller's existing IMU_RETRY_MS path does
+    // ONE full reconfiguration instead of hammering a half-configured device
+    // every 50 ms.  On success it is restored before returning.
+    const bool wasReady = dev.accelReady;
+    dev.accelReady = false;
+
+    // Bypass also FLUSHES: the buffer empties on entry, so the first word read
+    // after this function is guaranteed to belong to the configuration it just
+    // installed rather than to whatever the previous one left behind.
+    if (!writeVerifyReg8(address, SOX_REG_FIFO_CTRL4, SOX_FIFO_MODE_BYPASS)) return false;
+
+    // No watermark and no compression, in either mode.  The watermark exists to
+    // raise an interrupt and no INT pin is wired on this build, so the fill
+    // level is polled instead; compression is a lossy encoding that would trade
+    // away the sample fidelity this whole arrangement is for, to buy FIFO depth
+    // already in surplus.
+    if (!writeVerifyReg8(address, SOX_REG_FIFO_CTRL1, 0x00u)) return false;
+    if (!writeVerifyReg8(address, SOX_REG_FIFO_CTRL2, 0x00u)) return false;
+
+    const bool lowPower = (mode == IMUSampleMode::LowPower);
+
+    // High-performance mode off is where the current saving actually comes from;
+    // the lower ODR alone changes little, because the analogue front end stays
+    // fully powered in HP mode regardless of how often it is sampled.
+    if (!writeVerifyReg8(address, SOX_REG_CTRL6_C,
+                         lowPower ? SOX_CTRL6_XL_HM_OFF : 0x00u)) return false;
+    if (!writeVerifyReg8(address, SOX_REG_CTRL7_G,
+                         lowPower ? SOX_CTRL7_G_HM_OFF : 0x00u)) return false;
+
+    if (!writeVerifyReg8(address, SOX_REG_CTRL1_XL,
+                         lowPower ? SOX_CTRL1_XL_LOWPOWER : SOX_CTRL1_XL_VALUE)) return false;
+    if (!writeVerifyReg8(address, SOX_REG_CTRL2_G,
+                         lowPower ? SOX_CTRL2_G_LOWPOWER : SOX_CTRL2_G_VALUE)) return false;
+
+    // Batching and stream mode only in Fifo mode; LowPower reads the output
+    // registers directly and leaves the FIFO bypassed.
+    if (!lowPower){
+        if (!writeVerifyReg8(address, SOX_REG_FIFO_CTRL3, SOX_FIFO_CTRL3_VALUE)) return false;
+        if (!writeVerifyReg8(address, SOX_REG_FIFO_CTRL4, SOX_FIFO_CTRL4_VALUE)) return false;
+    }
+
+    // Committed together, and only now: the registers all read back as written,
+    // so the part and dev.mode agree from this instant on.
+    dev.mode       = mode;
+    dev.accelReady = wasReady;
+    return true;
+}
+
+IMUSampleMode imuSampleMode(const IMUDevice &dev){
+    return dev.mode;
+}
+
+IMUReturnStatus setIMUSampleMode(IMUDevice &dev, IMUSampleMode mode){
+    // Same reasoning as recoverIMU(): this writes seven registers, so it is a
+    // bus transaction like any other and must respect the quarantine.
+    if (dev.quarantined) return IMUReturnStatus::NOK_LINK_LOST;
+    if (dev.mode == mode) return IMUReturnStatus::OK;
+    if (!dev.accelReady)  return IMUReturnStatus::NOK_ACCEL_MISSING;
+    if (i2cBusBegin() != I2CBusState::Ready) return IMUReturnStatus::NOK_BUS_STUCK;
+
+    if (!applySampleMode(dev, mode)) return IMUReturnStatus::NOK_CONFIG_FAILED;
+
+    // The rate just changed, so the stall clocks have to be forgiven: a part
+    // moving from 104 Hz to 26 Hz produces nothing for up to 38 ms, and a clock
+    // left running across the switch could read that as a dead channel.
+    const uint32_t now = millis();
+    dev.lastAccelReadyMs = now;
+    dev.lastGyroReadyMs  = now;
+
+    // Peaks are discarded, not carried over.  They were folded from samples the
+    // part took under the OLD rate and power mode, and the digital filters need
+    // a few output periods to settle after an ODR change — so the first samples
+    // either side of a switch are not comparable with each other.  Keeping the
+    // old peak would attribute a 104 Hz measurement to a 26 Hz window, and
+    // keeping the settling samples would report the switch itself as motion.
+    resetPeakRing(dev, now);
+    return IMUReturnStatus::OK;
+}
+
 static bool configureAccel(IMUDevice &dev){
     const uint8_t address = dev.accelAddress;
 
@@ -385,13 +592,22 @@ static bool configureAccel(IMUDevice &dev){
     // unrelated bus activity, months later, with no clue pointing here.
     if (!writeVerifyReg8(address, SOX_REG_CTRL9_XL, ctrl9Wanted)) return false;
 
-    if (!writeVerifyReg8(address, SOX_REG_CTRL1_XL, SOX_CTRL1_XL_VALUE)) return false;
-    if (!writeVerifyReg8(address, SOX_REG_CTRL2_G, SOX_CTRL2_G_VALUE)) return false;
+    // Rates, power mode and FIFO all come from applySampleMode(), which is the
+    // single place that knows what each mode means.  Writing CTRL1_XL here as
+    // well would fork that knowledge in two, and the copy that is wrong is
+    // always the one nobody re-reads — a recovery would then silently restore
+    // 104 Hz on a parked car that had deliberately been put into low power.
+    if (!applySampleMode(dev, dev.mode)) return false;
 
-    // Derived from the values just verified on the device, not from a constant
-    // held in parallel — the scale and the hardware cannot drift apart.
+    // Both modes use the SAME full-scale ranges, so the scale factors are a
+    // property of the part's configuration rather than of the mode — which is
+    // what lets a mode switch happen mid-drive without rescaling anything.
     dev.accelScaleMs2 = accelScaleMs2((SOX_CTRL1_XL_VALUE >> 2) & 0x03u);
     dev.gyroScaleDps  = gyroScaleDps(SOX_CTRL2_G_VALUE & 0x0Fu);
+    static_assert(((SOX_CTRL1_XL_VALUE >> 2) & 0x03u) == ((SOX_CTRL1_XL_LOWPOWER >> 2) & 0x03u),
+                  "accelerometer full scale must match across sample modes");
+    static_assert((SOX_CTRL2_G_VALUE & 0x0Fu) == (SOX_CTRL2_G_LOWPOWER & 0x0Fu),
+                  "gyroscope full scale must match across sample modes");
 
     // Seed the stall clocks from now.  Without this they read zero, and the
     // first getIMUData() would measure a stall of however long the board had
@@ -399,6 +615,11 @@ static bool configureAccel(IMUDevice &dev){
     const uint32_t now = millis();
     dev.lastAccelReadyMs = now;
     dev.lastGyroReadyMs  = now;
+
+    // Buckets start empty rather than at zero: zero is a legitimate reading, and
+    // seeding with it would publish a 0 m/s2 peak for a stationary vehicle that
+    // is in fact sitting in a 9.81 field.  NAN says "nothing measured yet".
+    resetPeakRing(dev, now);
     return true;
 }
 
@@ -441,7 +662,7 @@ static IMUReturnStatus deviceStatus(const IMUDevice &dev){
     return IMUReturnStatus::NOK_INIT_FAILED;
 }
 
-IMUReturnStatus initializeIMU(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
+void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
     dev.accelAddress  = accelAddress;
     dev.magAddress    = magAddress;
     dev.accelReady    = false;
@@ -452,9 +673,33 @@ IMUReturnStatus initializeIMU(IMUDevice &dev, uint8_t accelAddress, uint8_t magA
     // part that has been retired and reconfigured five times still shows it.
     dev.accelIOErrors = 0u;
     dev.magIOErrors   = 0u;
+    dev.fifoOverruns  = 0u;
+    dev.fifoGapFlushes = 0u;
+    dev.lastOverrunMs  = millis();
+    dev.gapFlagActive  = false;
+    dev.gapFlagUntilMs = millis();
+    dev.quarantined   = false;
+    // Full capture until something establishes the vehicle is parked.  The safe
+    // default is the expensive one: starting in LowPower would mean a boot that
+    // happens to coincide with a collision records it at reduced fidelity.
+    dev.mode          = IMUSampleMode::Fifo;
     dev.accelScaleMs2 = NAN;
     dev.gyroScaleDps  = NAN;
     dev.magScaleUt    = NAN;
+    resetPeakRing(dev, millis());
+}
+
+void imuQuarantine(IMUDevice &dev){
+    imuMarkAbsent(dev, IMU_ACCEL_I2C_ADDRESS, IMU_MAG_I2C_ADDRESS);
+    // Terminal for the boot.  isIMUDegraded() is what schedules recoverIMU(),
+    // and recovery transacts — so without this flag the caller's retry timer
+    // would walk straight back into the hang that caused the reset, which is the
+    // loop the quarantine exists to break.
+    dev.quarantined = true;
+}
+
+IMUReturnStatus initializeIMU(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
+    imuMarkAbsent(dev, accelAddress, magAddress);
 
     if (!isUsableI2CAddress(accelAddress) || !isUsableI2CAddress(magAddress) ||
         (accelAddress == magAddress) ||
@@ -488,6 +733,12 @@ IMUReturnStatus initializeIMU(IMUDevice &dev){
 }
 
 IMUReturnStatus recoverIMU(IMUDevice &dev){
+    // Guarded here as well as at the caller.  isIMUDegraded() already returns
+    // false while quarantined so the scheduler will not call this, but recovery
+    // is the single most dangerous thing to run on a bus that just hung the
+    // board — it probes, resets and reconfigures both parts — and it must not
+    // depend on one caller remembering to ask the right question first.
+    if (dev.quarantined) return IMUReturnStatus::NOK_LINK_LOST;
     if (dev.accelReady && dev.magReady) return IMUReturnStatus::OK;
 
     if (i2cBusBegin() != I2CBusState::Ready) return IMUReturnStatus::NOK_BUS_STUCK;
@@ -527,6 +778,11 @@ void initIMUData(IMUData &data){
 
     data.temperatureC = NAN;
 
+    data.accelPeakMs2 = NAN;
+    data.gyroPeakDps  = NAN;
+    data.dataGap      = false;
+    data.lowPower     = false;
+
     data.accelSampleMs = 0u;
     data.gyroSampleMs  = 0u;
     data.tempSampleMs  = 0u;
@@ -546,6 +802,10 @@ static void invalidateAccel(IMUData &data){
     data.accelX = NAN;
     data.accelY = NAN;
     data.accelZ = NAN;
+    // The peak goes with the axes.  It is derived from the same samples, so a
+    // peak surviving its own channel's expiry would be the one number on the
+    // frame still claiming a measurement after the sensor stopped supplying one.
+    data.accelPeakMs2 = NAN;
     data.accelValid = false;
 }
 
@@ -553,6 +813,7 @@ static void invalidateGyro(IMUData &data){
     data.gyroX = NAN;
     data.gyroY = NAN;
     data.gyroZ = NAN;
+    data.gyroPeakDps = NAN;
     data.gyroValid = false;
 }
 
@@ -606,22 +867,369 @@ static inline bool isStalled(uint32_t lastReadyMs, uint32_t nowMs){
 }
 
 /** @brief Ages out any channel past its freshness window, without touching the bus. */
-static void expireChannels(const IMUDevice &dev, IMUData &data, uint32_t now){
+static void expireChannels(IMUDevice &dev, IMUData &data, uint32_t now){
     if (!dev.accelReady || isExpired(data.accelSampleMs, now)) invalidateAccel(data);
     if (!dev.accelReady || isExpired(data.gyroSampleMs, now))  invalidateGyro(data);
     if (!dev.accelReady || isExpired(data.tempSampleMs, now))  invalidateTemp(data);
     if (!dev.magReady   || isExpired(data.magSampleMs, now))   invalidateMagnetic(data);
+
+    // The overrun notice is HELD for the peak window rather than cleared on the
+    // next poll.  Polls run at 20 Hz and telemetry at 10 Hz, so a flag that
+    // lasted one poll would be missed by half the frames — and the frames it
+    // would be missed by are exactly the ones whose peak is untrustworthy.
+    // An explicit deadline compared with SIGNED arithmetic, not "counter is
+    // nonzero AND the timestamp looks recent".  That older form resurrects the
+    // flag at the millis() rollover: 49.7 days after a gap, `now` comes back
+    // around to the neighbourhood of lastOverrunMs, the elapsed test reads as
+    // ~0 again, and a long-finished gap is republished for 250 ms.  Rare, but it
+    // is a false report of missing data on a system whose whole point is not
+    // making those.  A deadline goes stale exactly once and stays stale.
+    if (dev.gapFlagActive && (static_cast<int32_t>(now - dev.gapFlagUntilMs) >= 0)){
+        dev.gapFlagActive = false;
+    }
+    data.dataGap = dev.gapFlagActive;
 }
 
 /** @brief Publishes hardware presence from device state, not from this poll's luck. */
 static void publishPresence(const IMUDevice &dev, IMUData &data){
     data.devicePresent     = dev.accelReady || dev.magReady;
     data.allDevicesPresent = dev.accelReady && dev.magReady;
+    data.lowPower          = (dev.mode == IMUSampleMode::LowPower);
+}
+
+// ─── FIFO drain ───────────────────────────────────────────────────────────────
+
+/**
+ * @brief Folds one sample's squared magnitude into a windowed running peak.
+ *
+ * Replaces the stored peak when the new sample is larger, OR when the stored one
+ * has aged past @c IMU_PEAK_WINDOW_MS — the second half is what stops a single
+ * hard impact pinning the reading high for the rest of the drive.
+ *
+ * Squared throughout; the caller takes one square root per channel per poll
+ * rather than one per sample.
+ */
+/**
+ * @brief Rotates the ring so the head bucket covers @p now, retiring stale ones.
+ *
+ * Advances at most @c IMU_PEAK_BUCKETS steps however long the gap: after a full
+ * window of silence every bucket is stale anyway, so spinning once per elapsed
+ * bucket would be wasted work with a peripheral-controlled bound.
+ */
+static void rollPeakRing(IMUDevice &dev, uint32_t now){
+    for (uint8_t i = 0u; i < IMU_PEAK_BUCKETS; i++){
+        if ((now - dev.peakBucketMs[dev.peakBucketHead]) < IMU_PEAK_BUCKET_MS) return;
+
+        dev.peakBucketHead = static_cast<uint8_t>((dev.peakBucketHead + 1u) % IMU_PEAK_BUCKETS);
+        dev.accelPeakSq[dev.peakBucketHead]  = NAN;
+        dev.gyroPeakSq[dev.peakBucketHead]   = NAN;
+        dev.peakBucketMs[dev.peakBucketHead] = now;
+    }
+}
+
+/** @brief Folds one sample's squared magnitude into the current bucket. */
+static void notePeakSq(float valueSq, float *ring, uint8_t head){
+    if (isnan(ring[head]) || (valueSq > ring[head])) ring[head] = valueSq;
+}
+
+/**
+ * @brief Largest value across the buckets still inside the window.
+ *
+ * @return @c NAN when every bucket is empty, which is honest: no sample has
+ *         arrived recently enough to support a peak.
+ */
+static float ringMaxSq(const IMUDevice &dev, const float *ring, uint32_t now){
+    float best = NAN;
+    for (uint8_t i = 0u; i < IMU_PEAK_BUCKETS; i++){
+        if (isnan(ring[i])) continue;
+        if ((now - dev.peakBucketMs[i]) > IMU_PEAK_WINDOW_MS) continue;
+        if (isnan(best) || (ring[i] > best)) best = ring[i];
+    }
+    return best;
+}
+
+/**
+ * @brief Converts the tracked squared peaks into the published magnitudes.
+ *
+ * One square root per channel per poll, taken once the whole window has been
+ * folded in rather than once per sample — on a Cortex-M0+ every sqrtf is a
+ * software routine, so where it is called from is not a detail.
+ */
+static void publishPeaks(const IMUDevice &dev, IMUData &data, uint32_t now){
+    const float aSq = ringMaxSq(dev, dev.accelPeakSq, now);
+    const float gSq = ringMaxSq(dev, dev.gyroPeakSq,  now);
+    data.accelPeakMs2 = isnan(aSq) ? NAN : sqrtf(aSq);
+    data.gyroPeakDps  = isnan(gSq) ? NAN : sqrtf(gSq);
+}
+
+/**
+ * @brief Reads the FIFO fill level and overrun state.
+ *
+ * @param[out] words    Unread words currently buffered.
+ * @param[out] overrun  True when the part reports samples were overwritten.
+ * @return @c false when the status bytes could not be read or did not come from
+ *         a healthy part.
+ */
+static bool readFifoStatus(const IMUDevice &dev, uint16_t &words, bool &overrun){
+    uint8_t st[2] = { 0u, 0u };
+    if (!readRegs(dev.accelAddress, SOX_REG_FIFO_STATUS1, st, sizeof(st))) return false;
+
+    // Reserved bit 2 reads back zero on a healthy part, so a set bit is the
+    // all-ones signature of a read that returned nothing — the same trick the
+    // old STATUS_REG path used, and the reason it is worth having here too.
+    if ((st[1] & SOX_FIFO_ST2_RESERVED) != 0u) return false;
+
+    const uint16_t count =
+        static_cast<uint16_t>((static_cast<uint16_t>(st[1] & SOX_FIFO_ST2_DIFF_MASK) << 8) | st[0]);
+    // A count past the physical depth cannot be true, so it is corruption rather
+    // than a very full buffer.  Rejecting it stops a bogus value driving the
+    // drain loop, which is the one place a peripheral gets to influence how much
+    // work this function does.
+    if (count > IMU_FIFO_DEPTH_WORDS) return false;
+
+    words   = count;
+    overrun = ((st[1] & (SOX_FIFO_ST2_OVR_IA | SOX_FIFO_ST2_OVR_LATCHED)) != 0u);
+    return true;
+}
+
+/**
+ * @brief Empties up to @c IMU_FIFO_MAX_WORDS_PER_POLL words, decoding each by tag.
+ *
+ * Every sample is folded into the peak; only the last of each kind is published
+ * as the current reading.  That asymmetry is the point of the FIFO — publishing
+ * at 10 Hz while measuring at 104 Hz is fine, so long as nothing between frames
+ * is thrown away unexamined.
+ *
+ * Words are read one at a time, seven bytes each, rather than as one long burst.
+ * The FIFO output registers are documented to roll over from 0x7E back to 0x78,
+ * which would allow several words per transaction — but ST's own driver does not
+ * rely on it, and a wrong assumption there does not fail loudly: it silently
+ * decodes whatever follows 0x7E as sensor data.  The saving is about a quarter
+ * of the transfer time and is not worth buying with that.
+ */
+static bool drainAccelFifo(IMUDevice &dev, IMUData &data, uint32_t now, bool &fresh){
+    uint16_t pending = 0u;
+    bool overrun = false;
+
+    if (!readFifoStatus(dev, pending, overrun)){
+        noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
+        return false;
+    }
+
+    // The part answered, so the transaction succeeded regardless of whether it
+    // had anything buffered.  Consecutive-fault counters measure bus health, not
+    // data availability, and conflating the two retires healthy sensors.
+    dev.accelFaults = 0u;
+
+    // Overrun means words were overwritten; backlog means the words still there
+    // are older than the freshness contract.  Both are data gaps, and both are
+    // handled the same way, because draining either one publishes samples that
+    // are not from the moment they would be stamped with.  Treating only the
+    // overrun case left the more common one — a loop stall of a few hundred
+    // milliseconds — silently mislabelling seconds-old motion as current.
+    if (overrun || (pending > IMU_FIFO_BACKLOG_WORDS)){
+        // Counted apart, because they are different faults with different fixes:
+        // an overrun says the drain fell far enough behind that the part
+        // overwrote unread words, a freshness discard says the loop was blocked
+        // long enough that the queue head aged out. One combined counter cannot
+        // tell a technician which happened.
+        if (overrun) { if (dev.fifoOverruns  < 0xFFFFu) dev.fifoOverruns++; }
+        else         { if (dev.fifoGapFlushes < 0xFFFFu) dev.fifoGapFlushes++; }
+        dev.lastOverrunMs  = now;
+        dev.gapFlagActive  = true;
+        dev.gapFlagUntilMs = now + IMU_PEAK_WINDOW_MS;
+
+        if (!resetAccelFifo(dev)){
+            noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
+            return false;
+        }
+
+        // A SUCCESSFUL recovery must not look like a dead sensor.  The stall
+        // clocks still hold the timestamp of the last sample before the gap, so
+        // leaving them alone means the caller's one-second stall test fires on
+        // this very pass and retires a part that has just been put right — the
+        // recovery would trigger the failure it exists to repair.  Same for the
+        // peak ring: its buckets describe the window that was just discarded.
+        dev.lastAccelReadyMs = now;
+        dev.lastGyroReadyMs  = now;
+        resetPeakRing(dev, now);
+
+        // The samples in hand pre-date the gap, so they are not evidence about
+        // now.  Blank them rather than carry them across the discontinuity.
+        invalidateAccel(data);
+        invalidateGyro(data);
+        publishPeaks(dev, data, now);
+        return true;   // tells the caller to skip the stall check this pass
+    }
+
+    const uint16_t toRead = (pending < IMU_FIFO_MAX_WORDS_PER_POLL)
+                                ? pending : IMU_FIFO_MAX_WORDS_PER_POLL;
+
+    for (uint16_t i = 0u; i < toRead; i++){
+        uint8_t word[SOX_FIFO_WORD_BYTES];
+        if (!readRegs(dev.accelAddress, SOX_REG_FIFO_DATA_OUT_TAG, word, sizeof(word))){
+            noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
+            return false; // the FIFO is a queue; carrying on past a failed read
+                          // would decode the rest against the wrong boundary
+        }
+
+        // TAG_SENSOR occupies bits 7:3; the low three bits are a 2-bit sample
+        // counter and a parity bit, neither of which this code needs.
+        switch (static_cast<uint8_t>(word[0] >> 3)){
+            case SOX_TAG_ACCEL: {
+                const float x = static_cast<float>(toInt16LE(&word[1])) * dev.accelScaleMs2;
+                const float y = static_cast<float>(toInt16LE(&word[3])) * dev.accelScaleMs2;
+                const float z = static_cast<float>(toInt16LE(&word[5])) * dev.accelScaleMs2;
+                notePeakSq((x * x) + (y * y) + (z * z), dev.accelPeakSq, dev.peakBucketHead);
+                data.accelX = x;
+                data.accelY = y;
+                data.accelZ = z;
+                data.accelSampleMs  = now;
+                data.accelValid     = true;
+                dev.lastAccelReadyMs = now;
+                fresh = true;
+                break;
+            }
+            case SOX_TAG_GYRO: {
+                const float x = static_cast<float>(toInt16LE(&word[1])) * dev.gyroScaleDps;
+                const float y = static_cast<float>(toInt16LE(&word[3])) * dev.gyroScaleDps;
+                const float z = static_cast<float>(toInt16LE(&word[5])) * dev.gyroScaleDps;
+                notePeakSq((x * x) + (y * y) + (z * z), dev.gyroPeakSq, dev.peakBucketHead);
+                data.gyroX = x;
+                data.gyroY = y;
+                data.gyroZ = z;
+                data.gyroSampleMs   = now;
+                data.gyroValid      = true;
+                dev.lastGyroReadyMs = now;
+                fresh = true;
+                break;
+            }
+            case SOX_TAG_TEMP: {
+                data.temperatureC = (static_cast<float>(toInt16LE(&word[1])) / SOX_TEMP_LSB_PER_C)
+                                    + SOX_TEMP_OFFSET_C;
+                data.tempSampleMs = now;
+                data.tempValid    = true;
+                fresh = true;
+                break;
+            }
+            default:
+                // Compression, sensor-hub and step-counter tags.  None of those
+                // features is enabled, so a word carrying one means the device
+                // is not configured the way this code believes — skip it rather
+                // than decode six bytes of something else as acceleration.
+                break;
+        }
+    }
+
+    publishPeaks(dev, data, now);
+    return false;
+}
+
+/**
+ * @brief Low-power read: STATUS register, then one burst of the output registers.
+ *
+ * The pre-FIFO scheme, retained rather than deleted because it is the right
+ * answer for a parked vehicle.  It sees only the samples a 20 Hz poll lands on —
+ * against a 26 Hz ODR that is most of them, but nothing here is buffered, so
+ * anything between two polls is gone.  That is an acceptable trade for a car
+ * that is not moving and an unacceptable one for a car that is, which is the
+ * whole reason the mode is switched rather than chosen once.
+ *
+ * Peaks are still maintained from every sample this DOES see.  They are what a
+ * motion detector watches to decide the vehicle has started moving, so leaving
+ * them stale in this mode would strand the system in low power.
+ */
+static void pollAccelRegisters(IMUDevice &dev, IMUData &data, uint32_t now, bool &fresh){
+    uint8_t status = 0u;
+    if (!readReg8(dev.accelAddress, SOX_REG_STATUS, status) ||
+        ((status & SOX_STATUS_RESERVED_MASK) != 0u)){
+        noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
+        return;
+    }
+
+    if ((status & (SOX_STATUS_XLDA | SOX_STATUS_GDA | SOX_STATUS_TDA)) == 0u){
+        // A clean status read with nothing ready is a SUCCESSFUL transaction —
+        // the part answered, it simply has no new sample yet.  The fault counter
+        // tracks CONSECUTIVE failures, so it has to be cleared here too;
+        // otherwise occasional glitches accumulate across thousands of healthy
+        // polls and eventually retire a device that is working fine.
+        dev.accelFaults = 0u;
+        return;
+    }
+
+    // One burst covers temperature, gyro and accelerometer: they are contiguous,
+    // and Block Data Update freezes the whole set until it has been read out.
+    uint8_t buf[14];
+    if (!readRegs(dev.accelAddress, SOX_REG_OUT_TEMP_L, buf, sizeof(buf))){
+        noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
+        return;
+    }
+    dev.accelFaults = 0u;
+
+    // Each channel is validated from ITS OWN ready bit.  The burst returns all
+    // 14 bytes whichever bit triggered it, but a gyro that has stopped
+    // converting still has its previous sample sitting in those registers —
+    // certifying it because the accelerometer happened to be ready would
+    // republish an old reading as a new one.
+    if ((status & SOX_STATUS_TDA) != 0u){
+        data.temperatureC = (static_cast<float>(toInt16LE(&buf[0])) / SOX_TEMP_LSB_PER_C)
+                            + SOX_TEMP_OFFSET_C;
+        data.tempSampleMs = now;
+        data.tempValid = true;
+        fresh = true;
+    }
+
+    if ((status & SOX_STATUS_GDA) != 0u){
+        const float x = static_cast<float>(toInt16LE(&buf[2])) * dev.gyroScaleDps;
+        const float y = static_cast<float>(toInt16LE(&buf[4])) * dev.gyroScaleDps;
+        const float z = static_cast<float>(toInt16LE(&buf[6])) * dev.gyroScaleDps;
+        notePeakSq((x * x) + (y * y) + (z * z), dev.gyroPeakSq, dev.peakBucketHead);
+        data.gyroX = x;
+        data.gyroY = y;
+        data.gyroZ = z;
+        data.gyroSampleMs = now;
+        data.gyroValid = true;
+        dev.lastGyroReadyMs = now;
+        fresh = true;
+    }
+
+    if ((status & SOX_STATUS_XLDA) != 0u){
+        const float x = static_cast<float>(toInt16LE(&buf[8]))  * dev.accelScaleMs2;
+        const float y = static_cast<float>(toInt16LE(&buf[10])) * dev.accelScaleMs2;
+        const float z = static_cast<float>(toInt16LE(&buf[12])) * dev.accelScaleMs2;
+        notePeakSq((x * x) + (y * y) + (z * z), dev.accelPeakSq, dev.peakBucketHead);
+        data.accelX = x;
+        data.accelY = y;
+        data.accelZ = z;
+        data.accelSampleMs = now;
+        data.accelValid = true;
+        dev.lastAccelReadyMs = now;
+        fresh = true;
+    }
+
+    publishPeaks(dev, data, now);
 }
 
 IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     const uint32_t now = millis();
     bool fresh = false;
+
+    // BEFORE i2cBusBegin(), and that ordering is the whole point.  A quarantined
+    // boot promises to touch no I2C at all, and i2cBusBegin() is not a passive
+    // question: on a stuck bus it performs GPIO-level recovery — nine clock
+    // pulses, a STOP, and Wire.begin() — every I2C_BUS_RECOVER_RETRY_MS.  With
+    // this call left below the bus check, a 20 Hz poll drove that recovery four
+    // times a second for the entire quarantined boot.  It issued no addressed
+    // transaction, so it did not reproduce the hang, but it plainly broke the
+    // promise the quarantine makes.
+    if (dev.quarantined){
+        invalidateAccel(data);
+        invalidateGyro(data);
+        invalidateTemp(data);
+        invalidateMagnetic(data);
+        publishPresence(dev, data);
+        return IMUReturnStatus::NOK_LINK_LOST;
+    }
 
     // Checked on EVERY poll, not just at bring-up.  A slave that browns out or
     // resets mid-drive holds SDA from that moment, and the reads below go
@@ -642,62 +1250,24 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
 
     // ── LSM6DSOX: accelerometer, gyroscope, die temperature ──────────────────
     if (dev.accelReady){
-        uint8_t status = 0u;
-        if (!readReg8(dev.accelAddress, SOX_REG_STATUS, status) ||
-            ((status & SOX_STATUS_RESERVED_MASK) != 0u)){
-            noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
-        } else if (((status & (SOX_STATUS_XLDA | SOX_STATUS_GDA | SOX_STATUS_TDA)) == 0u)){
-            // A clean status read with nothing ready is a SUCCESSFUL transaction
-            // — the part answered, it simply has no new sample yet.  The fault
-            // counter tracks CONSECUTIVE failures, so it has to be cleared here
-            // too; otherwise occasional glitches accumulate across thousands of
-            // healthy polls and eventually retire a device that is working fine.
-            dev.accelFaults = 0u;
-        } else {
-            // One burst covers temperature, gyro and accelerometer: they are
-            // contiguous, and Block Data Update freezes the whole set until it
-            // has been read out.
-            uint8_t buf[14];
-            if (!readRegs(dev.accelAddress, SOX_REG_OUT_TEMP_L, buf, sizeof(buf))){
-                noteFault(dev.accelFaults, dev.accelIOErrors, dev.accelReady);
-            } else {
-                dev.accelFaults = 0u;
+        // Dispatch on what the DEVICE was configured to do, not on what the
+        // application would like it to be doing.  dev.mode is only ever written
+        // by applySampleMode(), after the registers have read back — so the
+        // decoder and the part can never disagree about whether a FIFO is
+        // being filled.
+        // Rolled HERE, once, for both paths.  It used to live inside the FIFO
+        // drain only, which meant the low-power path wrote every sample into
+        // whichever bucket was current at the last mode change and never
+        // advanced it.  That bucket's timestamp then aged past the window and
+        // ringMaxSq() excluded it — permanently.  So in low power the peaks read
+        // correctly for 250 ms after entering the mode and were NAN from then
+        // on, deterministically.  A soak that stayed in FIFO mode could not see
+        // it, and the one that was run did.
+        rollPeakRing(dev, now);
 
-                // Each channel is validated from ITS OWN ready bit.  The burst
-                // returns all 14 bytes whichever bit triggered it, but a gyro
-                // that has stopped converting still has its previous sample
-                // sitting in those registers — certifying it because the
-                // accelerometer happened to be ready would republish an old
-                // reading as a new one.
-                if ((status & SOX_STATUS_TDA) != 0u){
-                    data.temperatureC = (static_cast<float>(toInt16LE(&buf[0])) / SOX_TEMP_LSB_PER_C)
-                                        + SOX_TEMP_OFFSET_C;
-                    data.tempSampleMs = now;
-                    data.tempValid = true;
-                    fresh = true;
-                }
-
-                if ((status & SOX_STATUS_GDA) != 0u){
-                    data.gyroX = static_cast<float>(toInt16LE(&buf[2])) * dev.gyroScaleDps;
-                    data.gyroY = static_cast<float>(toInt16LE(&buf[4])) * dev.gyroScaleDps;
-                    data.gyroZ = static_cast<float>(toInt16LE(&buf[6])) * dev.gyroScaleDps;
-                    data.gyroSampleMs = now;
-                    data.gyroValid = true;
-                    dev.lastGyroReadyMs = now;
-                    fresh = true;
-                }
-
-                if ((status & SOX_STATUS_XLDA) != 0u){
-                    data.accelX = static_cast<float>(toInt16LE(&buf[8]))  * dev.accelScaleMs2;
-                    data.accelY = static_cast<float>(toInt16LE(&buf[10])) * dev.accelScaleMs2;
-                    data.accelZ = static_cast<float>(toInt16LE(&buf[12])) * dev.accelScaleMs2;
-                    data.accelSampleMs = now;
-                    data.accelValid = true;
-                    dev.lastAccelReadyMs = now;
-                    fresh = true;
-                }
-            }
-        }
+        bool gapRecovered = false;
+        if (dev.mode == IMUSampleMode::Fifo) gapRecovered = drainAccelFifo(dev, data, now, fresh);
+        else                                 pollAccelRegisters(dev, data, now, fresh);
 
         // A channel that has gone quiet for far longer than its output period,
         // on a part that is otherwise answering every status read, is a broken
@@ -709,7 +1279,14 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
         // diagnostic, it runs at a lower rate than the inertial channels, and
         // resetting a working accelerometer and gyroscope over it would trade a
         // real signal for a nice-to-have.
-        if (dev.accelReady &&
+        //
+        // Skipped entirely on the pass that recovered a data gap.  The stall
+        // that caused the gap is exactly what this test measures, so running it
+        // here would retire the part for the fault the recovery has already
+        // repaired — punishing success.  The clocks were refreshed inside the
+        // recovery, so the next pass judges the part on what it does AFTER the
+        // gap, which is the only fair question.
+        if (!gapRecovered && dev.accelReady &&
             (isStalled(dev.lastAccelReadyMs, now) || isStalled(dev.lastGyroReadyMs, now))){
             dev.accelReady = false;
         }
@@ -769,5 +1346,14 @@ bool isIMULinkLost(const IMUDevice &dev){
 }
 
 bool isIMUDegraded(const IMUDevice &dev){
+    // A quarantined device is NOT reported as degraded, deliberately.  Degraded
+    // is what schedules recoverIMU(), and recovery transacts on a bus that has
+    // just hung the board — so answering true here would defeat the quarantine
+    // a few seconds after it was applied.
+    if (dev.quarantined) return false;
     return !dev.accelReady || !dev.magReady;
+}
+
+bool isIMUQuarantined(const IMUDevice &dev){
+    return dev.quarantined;
 }

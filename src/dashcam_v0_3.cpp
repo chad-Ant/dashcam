@@ -1239,13 +1239,22 @@ int main(int argc, char* argv[]) {
         rfmt.height     = uFmt.height;
         rfmt.fps        = uFmt.frameRate;
 
-        // Seed the telemetry clock as ALREADY STALE, so the motion/position
-        // corners start as dashes and only show numbers once the bridge has
-        // actually delivered a sample.  Seeding it to "now" would present
-        // OverlayData's built-in placeholder coordinates as a live fix for the
-        // first staleTimeoutMs of every recording.
+        // Start INVALID, so the motion/position corners are dashes until the
+        // bridge has actually delivered a sample.  Otherwise OverlayData's
+        // built-in placeholder coordinates would be presented as a live fix at
+        // the head of every recording.
+        //
+        // The validity flags say this directly, where the old zero timestamp
+        // only implied it — and implied it in a way that depended on
+        // staleTimeoutMs being non-zero, which is configurable and can be set to
+        // 0 to disable ageing entirely.  In that configuration the placeholders
+        // would have been drawn as real.
         dashcam::record::OverlayData od0 = rec.getOverlayData();
-        od0.timestampMs = 0;
+        od0.speedValid    = false;
+        od0.accelValid    = false;
+        od0.positionValid = false;
+        od0.headingValid  = false;
+        od0.timestampMs   = 0;
         rec.setOverlayData(od0);
 
         // Live-stream tap (direct precompressed path): fan the recording camera's
@@ -1559,55 +1568,107 @@ int main(int argc, char* argv[]) {
             dashcam::record::OverlayData od =
                 recActive ? rec.getOverlayData() : dashcam::record::OverlayData{};
 
-            // Vehicle telemetry.  Every field is written only when it is both
-            // fresh and a real number: the wire carries NaN for "the ECU never
-            // answered this PID", and copying that through would render "nan"
-            // in the burned-in overlay and poison the recorded sidecar.
-            const bool vehicleFresh = !bridge.isStale(kBridgeFreshnessMs);
-            if (vehicleFresh) {
-                const auto t = bridge.telemetry();
+            // Vehicle telemetry.  MOTION and POSITION are gated separately, on
+            // their own source's validity flag — not on whether the bridge is
+            // alive.  A live bridge says the C3 and the MKR are talking; it says
+            // nothing about whether the ECU answered or the receiver has a fix,
+            // and those fail independently of the link and of each other.
+            //
+            // Gating both on bridge liveness (as this did) meant a healthy link
+            // carrying a dead source kept that source's last values in od — od
+            // is inherited from the previous sample — and went on stamping them
+            // current.  A frozen speed or a minutes-old position burned into a
+            // recording and presented as live is false evidence, which is the one
+            // output a dashcam must never produce.
+            const bool bridgeFresh = !bridge.isStale(kBridgeFreshnessMs);
+            const auto t = bridge.telemetry();
 
-                // Prefer GPS ground speed when the fix is valid; fall back to the
-                // OBD2 wheel speed, which exists whenever the ECU is answering.
-                if (t.fixValid && !std::isnan(t.gpsSpeedKmh))  od.speedKmh = t.gpsSpeedKmh;
-                else if (!std::isnan(t.speed))                 od.speedKmh = t.speed;
+            // OBD2_VALID is the master's own freshness verdict on the ECU: it
+            // clears when no reading has arrived within the master's window, so
+            // it distinguishes "ECU answering" from "MKR alive but ECU silent".
+            const bool obdLive = bridgeFresh && (t.flags & hostproto::TLM_FLAG_OBD2_VALID) != 0;
+            const bool fixLive = bridgeFresh && t.fixValid;
 
-                // Acceleration is estimated on the MKR Zero (smoothed speed,
-                // differentiated, jerk-limited) rather than derived here: this
-                // stream repeats each 1 km/h reading several times, so a
-                // derivative taken on this side would be spikes, not motion.
-                // NaN means the estimator has not warmed up yet.
-                if (!std::isnan(t.accel)) od.accelerationMs2 = t.accel;
-
-                if (t.fixValid) {
-                    if (!std::isnan(t.latitude))  od.latitude   = t.latitude;
-                    if (!std::isnan(t.longitude)) od.longitude  = t.longitude;
-                    if (!std::isnan(t.altitude))  od.altitudeM  = t.altitude;
-
-                    // Heading is NaN whenever the master judged the course
-                    // untrustworthy — below ~5 km/h a GNSS receiver reports a
-                    // direction that wanders the whole circle.  Holding the last
-                    // travelled heading through a stop is deliberate and matches
-                    // how a vehicle compass behaves; it is not a stale reading
-                    // presented as new, because the whole motion block ages out
-                    // together via timestampMs below.
-                    if (!std::isnan(t.heading))   od.headingDeg = t.heading;
-                }
+            // Speed and acceleration are tracked SEPARATELY, not as one "motion"
+            // block.  Speed can come from either source; acceleration only ever
+            // comes from the ECU.  A shared flag therefore certified a stale
+            // acceleration whenever a live GNSS fix refreshed speed with the ECU
+            // dead — the inherited value from the previous frame, rendered as
+            // current.  Two flags cannot do that.
+            if (fixLive && !std::isnan(t.gpsSpeedKmh)) {
+                od.speedKmh         = t.gpsSpeedKmh;
+                od.speedValid       = true;
+                od.speedTimestampMs = epochMs();
+            } else if (obdLive && !std::isnan(t.speed)) {
+                od.speedKmh         = t.speed;
+                od.speedValid       = true;
+                od.speedTimestampMs = epochMs();
+            } else {
+                // Cleared, not inherited.  Leaving the previous number in place
+                // relies on every downstream consumer checking the flag, and one
+                // that forgets renders a stale speed indistinguishable from a
+                // live one.  A sentinel makes that mistake impossible.
+                od.speedValid = false;
+                od.speedKmh   = 0.0f;
             }
 
-            // timestampMs is not a "when was this frame drawn" clock — it is the
-            // age of the motion/position block, and librecord renders SPD/HDG/
-            // LAT/LON/ALT as dashes once it exceeds overlay.staleTimeoutMs.
+            // Acceleration is estimated on the MKR Zero (smoothed speed,
+            // differentiated, jerk-limited) rather than derived here: this
+            // stream repeats each 1 km/h reading several times, so a derivative
+            // taken on this side would be spikes, not motion.  NaN means the
+            // estimator has not warmed up yet.
+            if (obdLive && !std::isnan(t.accel)) {
+                od.accelerationMs2  = t.accel;
+                od.accelValid       = true;
+                od.accelTimestampMs = epochMs();
+            } else {
+                od.accelValid      = false;
+                od.accelerationMs2 = 0.0f;
+            }
+
+            if (fixLive && !std::isnan(t.latitude) && !std::isnan(t.longitude)) {
+                od.latitude  = t.latitude;
+                od.longitude = t.longitude;
+                if (!std::isnan(t.altitude)) od.altitudeM = t.altitude;
+
+                od.positionValid       = true;
+                od.positionTimestampMs = epochMs();
+            } else {
+                od.positionValid = false;
+                od.latitude      = 0.0;
+                od.longitude     = 0.0;
+                od.altitudeM     = 0.0;
+            }
+
+            // Heading is tracked SEPARATELY from the coordinates, even though
+            // both come from the receiver, because they do not fail together.
+            // The master sends NaN whenever it judged the course untrustworthy —
+            // below ~5 km/h a receiver reports a direction that wanders the whole
+            // circle — and that happens at every stop, with the fix itself
+            // perfectly good.  Folding heading into positionValid therefore
+            // certified the last travelled heading, or before any fix at all
+            // OverlayData's 90.0f placeholder, as a live reading every time the
+            // vehicle stopped.
+            if (fixLive && !std::isnan(t.heading)) {
+                od.headingDeg         = t.heading;
+                od.headingValid       = true;
+                od.headingTimestampMs = epochMs();
+            } else {
+                od.headingValid = false;
+                od.headingDeg   = 0.0f;
+            }
+
+            // The JSON sidecar's "t" field.  Advanced EVERY tick, on purpose and
+            // unlike the per-source stamps above: it is the time this SAMPLE was
+            // taken, and the sample always includes fresh ADAS state even when
+            // every vehicle source is dead.  Leaving it behind (or at the zero it
+            // is seeded with) would have published live lane and fatigue results
+            // stamped with a stale — or 1970 — timestamp.
             //
-            // So it may ONLY be advanced when those fields were actually
-            // refreshed above.  Stamping it every tick (as this did while the
-            // fields were fixed placeholders) defeats that protection the moment
-            // real telemetry feeds them: od is carried over from the previous
-            // sample, so a bridge that dies would leave the last real speed and
-            // GPS fix burned into every later frame, stamped fresh — false
-            // recorded evidence, which is the one thing a dashcam must not
-            // produce.  Leaving the timestamp behind ages the block out instead.
-            if (vehicleFresh) od.timestampMs = epochMs();
+            // It is deliberately NOT used to age the motion or position fields;
+            // that is what speedValid/accelValid/positionValid and their own
+            // stamps are for.
+            od.timestampMs = epochMs();
 
             // Build the ADAS block FRESH from this tick's results — never inherit
             // ADAS fields from the previous OverlayData.  A source contributes only

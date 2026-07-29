@@ -64,6 +64,40 @@ bool watchdogCausedReset(void){
     return (resetCause & PM_RCAUSE_WDT) != 0u;
 }
 
+// ─── hang quarantine ──────────────────────────────────────────────────────────
+
+bool bootAfterHang(void){
+    // RCAUSE, captured in watchdogArm() before anything can overwrite it, is the
+    // only reset-surviving state this chip offers.  It is enough, because it
+    // answers the one question that matters: did the previous run HANG?
+    //
+    // A finer marker naming WHICH step hung would be better, and is what an
+    // earlier revision attempted with a __attribute__((section(".noinit")))
+    // variable.  It does not work on this platform and the failure is silent.
+    // The mkrzero linker script (variants/mkrzero/linker_scripts/gcc/
+    // flash_with_bootloader.ld) defines no .noinit output section, so such a
+    // variable becomes an orphan placed inside the __bss_start__..__bss_end__
+    // range that the C runtime zeroes before setup() runs.  Measured on the
+    // bench: after a watchdog reset the marker read back magic=0x0 stage=0 on
+    // every single boot, so the quarantine never triggered and the board
+    // reboot-looped every ~9 s exactly as it had before.
+    //
+    // The alternatives were all worse than losing the stage detail: vendoring
+    // the variant linker script is per-variant, unguarded and easy to drop; a
+    // fixed absolute SRAM address collides with the descending stack; and flash
+    // would be worn out fastest by the reboot loop this exists to break.
+    //
+    // NOT consumed on read, and that is the correction that matters.  An earlier
+    // version cleared the flag for the first caller, which had two consequences,
+    // both wrong: a second subsystem asking the same question got "no", and —
+    // far worse — the quarantine only suppressed ONE attempt.  Anything that
+    // retried afterwards walked straight back into the hang, the watchdog reset
+    // the board, and the loop continued at the retry interval instead of being
+    // broken.  A boot either follows a hang or it does not; that fact is true
+    // for the whole boot and every caller must see the same answer.
+    return watchdogCausedReset();
+}
+
 /// Deadline for SCL to rise after being released during recovery.  A slave that
 /// is clock-stretching holds SCL down; counting that as a delivered clock pulse
 /// would burn all nine pulses without the slave seeing any of them.
