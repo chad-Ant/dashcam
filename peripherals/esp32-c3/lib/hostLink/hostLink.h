@@ -145,6 +145,16 @@ public:
     bool onceRequested()   { const bool r = onceReq_;   onceReq_   = false; return r; } ///< Consume a @c CMD_GET_ONCE.
     bool statusRequested() { const bool r = statusReq_; statusReq_ = false; return r; } ///< Consume a @c CMD_GET_STATUS.
 
+    /**
+     * @brief Consumes a pending @c CMD_SET_CAN_MODE; 0 when none is pending.
+     *
+     * Consume-on-read like the flags above, so the bridge relays each request
+     * exactly once. A latched value that survived reading would be re-sent to
+     * the MKR every loop, and the MKR's own rate limiter would reject nearly
+     * all of them - turning one host request into a stream of failures.
+     */
+    uint8_t takeCanModeRequest() { const uint8_t m = canModeReq_; canModeReq_ = 0; return m; }
+
     bool    streaming()  const { return streaming_; } ///< True while telemetry forwarding is enabled.
     uint8_t decimation() const { return decim_; }     ///< Forward every Nth master frame (>= 1).
 
@@ -180,6 +190,7 @@ private:
     bool     hostAlive_    = false;
     bool     connectSeen_  = false;
     bool     onceReq_      = false;
+    uint8_t canModeReq_ = 0;   ///< Pending CMD_SET_CAN_MODE arg; 0 = none.
     bool     statusReq_    = false;
     bool     streaming_    = false;
     uint8_t  decim_        = 1;

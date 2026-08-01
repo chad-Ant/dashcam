@@ -325,6 +325,21 @@ bool CommLink::setDecimation(uint8_t n) {
     return sendFrame(hostproto::CMD_SET_DECIM, &n, 1);
 }
 
+bool CommLink::setCanMode(uint8_t mode) {
+    if (mode < 1 || mode > 3) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "CommLink::setCanMode: expected 1 (discover), 2 (sniff) or 3 (obd2)");
+        return false;
+    }
+    // Deliberately NOT cached and re-applied on reconnect, unlike decimation.
+    // Decimation is a preference about this link; CAN mode is a decision about
+    // the vehicle bus, and mode 3 makes the MKR transmit on it. Silently
+    // restoring that after a cable glitch would put a node back on a live bus
+    // with nobody having asked for it in that session. The MKR boots into
+    // listen-only sniffing on its own; if the host wants OBD2 again it asks.
+    return sendFrame(hostproto::CMD_SET_CAN_MODE, &mode, 1);
+}
+
 // ─── state ────────────────────────────────────────────────────────────────────
 
 bool CommLink::isOpen() const {

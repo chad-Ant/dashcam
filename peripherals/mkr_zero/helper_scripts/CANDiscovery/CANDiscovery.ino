@@ -64,7 +64,11 @@
 #include <CAN.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <SD.h>
+// SdFat, not the Arduino SD library. The production firmware moved to SdFat
+// when lib/SDFunctions.cpp was implemented, and lib/ is compiled into this
+// sketch too — two filesystem stacks in one binary is waste at best. See
+// vendor/SdFat/PATCHES.md for why the SPI port must be named explicitly.
+#include <SdFat.h>
 
 // The project's own GNSS stack, reused rather than reimplemented. It carries
 // bring-up behaviour this sketch has no business duplicating - a non-blocking
@@ -312,7 +316,8 @@ static void focusTrack(const RawFrame &f)
 static const uint32_t SD_DUMP_INTERVAL_MS = 60000UL;
 
 static bool     gSdOk = false;
-static File     gSdFile;
+static SdFat32  gSd;
+static File32   gSdFile;
 static char     gSdName[13];        ///< 8.3, the only form the SD library accepts
 static uint32_t gSdDumps;
 static uint32_t gSdWriteMaxUs;      ///< worst drain stall caused by a card write
@@ -359,14 +364,19 @@ private:
  */
 static bool sdBegin()
 {
-    if (!SD.begin(SDCARD_SS_PIN)) return false;
+    // Explicit port: SdFat's own SDCARD_SPI define is Teensy-guarded and does
+    // NOT apply on SAMD21, so a bare begin() would put the card on the main SPI
+    // bus alongside the MCP2515 — exactly the contention this sketch's comments
+    // claim it avoids.
+    static const SdSpiConfig cfg(SDCARD_SS_PIN, DEDICATED_SPI, SD_SCK_MHZ(12), &SPI1);
+    if (!gSd.begin(cfg)) return false;
 
     for (uint8_t n = 0; n < 100; ++n) {
         snprintf(gSdName, sizeof(gSdName), "CANLOG%02u.TXT", n);
-        if (!SD.exists(gSdName)) break;
+        if (!gSd.exists(gSdName)) break;
     }
 
-    gSdFile = SD.open(gSdName, FILE_WRITE);
+    gSdFile.open(gSdName, O_WRONLY | O_CREAT | O_APPEND);
     return (bool)gSdFile;
 }
 

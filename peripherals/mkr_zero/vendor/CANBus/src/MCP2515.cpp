@@ -9,6 +9,25 @@
 #define REG_TXRTSCTRL              0x0d
 
 #define REG_CANCTRL                0x0f
+// DASHCAM PATCH: the achieved mode lives here, not in CANCTRL. CANCTRL only
+// echoes the REQUEST, and a mode change waits for any in-progress frame to
+// finish, so a readback of CANCTRL reports success before the controller has
+// actually left the old mode. Every mode switch below verifies CANSTAT instead.
+#define REG_CANSTAT                0x0e
+#define OPMOD_MASK                 0xe0
+#define REQOP_MASK                 0xe0
+#define MODE_NORMAL                0x00
+#define MODE_SLEEP                 0x20
+#define MODE_LOOPBACK              0x40
+#define MODE_LISTEN_ONLY           0x60
+#define MODE_CONFIG                0x80
+
+// DASHCAM PATCH: bound on every busy-wait in this file. At the slowest
+// supported bit rate an 8-byte frame occupies the bus for ~1.1 ms, and a mode
+// change costs at most one frame time, so ~50 ms is several orders of magnitude
+// of headroom while still being far below any sane watchdog period.
+#define DASHCAM_WAIT_TRIES         500
+#define DASHCAM_WAIT_STEP_US       100
 
 #define REG_CNF3                   0x28
 #define REG_CNF2                   0x29
@@ -229,8 +248,26 @@ int MCP2515Class::endPacket()
 
   // Wait until the transmission completes, or gets aborted.
   // Transmission is pending while TXREQ (TXBnCTRL[3]) bit is set.
+  //
+  // DASHCAM PATCH: upstream spins here with NO deadline, and arms its abort only
+  // once TXERR appears. On a stuck-dominant bus neither happens - the controller
+  // never starts sending because the bus never goes idle, so TXREQ stays set and
+  // TXERR stays clear, forever. One-Shot Mode does NOT bound this: OSM limits
+  // RE-transmission after an attempt, it does not bound waiting for an idle bus.
+  // Observed in this project: OBD2Probe hung exactly here, and in production the
+  // watchdog would reset the board straight back into the same call - a reboot
+  // loop, not a recovery.
+  //
+  // So: a hard deadline, then an unconditional abort, then a bounded wait for
+  // the abort itself to land. A transmit that cannot start is reported as a
+  // failure, which the caller can act on; a hang is not.
   bool aborted = false;
-  while (readRegister(REG_TXBnCTRL(n)) & 0x08) {
+  bool timedOut = true;
+  for (uint16_t tries = 0; tries < DASHCAM_WAIT_TRIES; tries++) {
+    if (!(readRegister(REG_TXBnCTRL(n)) & 0x08)) {
+      timedOut = false;
+      break;
+    }
     // Read the TXERR (TXBnCTRL[4]) bit to check for errors.
     if (readRegister(REG_TXBnCTRL(n)) & 0x10) {
       // Abort on errors by setting the ABAT bit. The MCP2515 will should the
@@ -239,7 +276,24 @@ int MCP2515Class::endPacket()
       aborted = true;
     }
 
+    delayMicroseconds(DASHCAM_WAIT_STEP_US);
     yield();
+  }
+
+  if (timedOut) {
+    // Never started, or never finished. Abort unconditionally and give the
+    // controller a bounded chance to drop TXREQ, so the buffer is not left
+    // armed to fire the moment the bus recovers - by then the request is stale
+    // and the caller has already been told it failed.
+    modifyRegister(REG_CANCTRL, 0x10, 0x10);
+    aborted = true;
+    for (uint16_t tries = 0; tries < DASHCAM_WAIT_TRIES; tries++) {
+      if (!(readRegister(REG_TXBnCTRL(n)) & 0x08)) {
+        break;
+      }
+      delayMicroseconds(DASHCAM_WAIT_STEP_US);
+      yield();
+    }
   }
 
   if (aborted) {
@@ -307,7 +361,18 @@ int MCP2515Class::parsePacket()
     _rxRtr = (regSIDL & FLAG_SRR) ? true : false;
   }
 
+  // DASHCAM PATCH: clamp to 8. The DLC field is four bits, and ISO 11898-1
+  // states that any value above 8 still means eight data bytes - a conforming
+  // transmitter may legally send DLC 9..15, and some ECUs do. Upstream copied
+  // _rxDlc bytes into _rxData[8] unclamped, so DLC 15 wrote SEVEN bytes past the
+  // end of the buffer. _rxData is the LAST member of CANControllerClass, so the
+  // overflow lands directly in MCP2515Class's own _spiSettings, _csPin and
+  // _intPin: one malformed frame silently repoints the driver's chip-select.
+  // The MCP2515 only stores eight data bytes anyway, so nothing is lost.
   _rxDlc = regDLC & 0x0f;
+  if (_rxDlc > 8) {
+    _rxDlc = 8;
+  }
   _rxIndex = 0;
 
   if (_rxRtr) {
@@ -350,24 +415,27 @@ int MCP2515Class::filter(int id, int mask)
   id &= 0x7ff;
   mask &= 0x7ff;
 
-  // config mode
-  writeRegister(REG_CANCTRL, 0x80);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x80) {
+  // DASHCAM PATCH: verify CANSTAT, not the CANCTRL readback. Upstream declared
+  // success as soon as CANCTRL echoed the request, but the controller finishes
+  // any frame in progress before the mode actually changes - so on an ACTIVE bus
+  // the filter register writes below could land while still in Normal mode,
+  // where they are ignored, and initialisation would report success anyway.
+  if (!switchToConfigurationMode()) {
     return 0;
   }
 
   for (int n = 0; n < 2; n++) {
-    // standard only
-    // TODO: This doesn't look correct. According to the datasheet, the RXM0 and
-    // RMX1 should either both be unset (in which case filters are active), or
-    // both be unset (in which case all filters are ignored).
-    // Either way, it's unclear why we write to the same register twice here.
-    writeRegister(REG_RXBnCTRL(n), FLAG_RXM0);
-    writeRegister(REG_RXBnCTRL(n), FLAG_RXM0);
+    // DASHCAM PATCH: RXM<1:0> = 00, "receive all valid messages that meet the
+    // filter criteria" - the only setting that actually applies the filters
+    // being written three lines below. Upstream wrote FLAG_RXM0 (RXM = 01),
+    // twice to the same register, with its own TODO doubting it. RXM 01 and 10
+    // are documented as reserved/not-supported on current silicon revisions.
+    // RXB0 also gets BUKT so a full RXB0 rolls over into RXB1, doubling the
+    // usable receive depth from one frame to two.
+    writeRegister(REG_RXBnCTRL(n), (n == 0) ? FLAG_RXB0CTRL_BUKT : 0x00);
 
-    writeRegister(REG_RXMnSIDH(n), mask >> 3);
-    writeRegister(REG_RXMnSIDL(n), mask << 5);
+    writeRegister(REG_RXMnSIDH(n), (uint8_t)(mask >> 3));
+    writeRegister(REG_RXMnSIDL(n), (uint8_t)((mask & 0x07) << 5));
     writeRegister(REG_RXMnEID8(n), 0);
     writeRegister(REG_RXMnEID0(n), 0);
   }
@@ -379,20 +447,18 @@ int MCP2515Class::filter(int id, int mask)
     writeRegister(REG_RXFnEID0(n), 0);
   }
 
-  // normal mode
-  writeRegister(REG_CANCTRL, 0x00);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x00) {
-    return 0;
-  }
-
-  return 1;
+  // DASHCAM PATCH: verified via CANSTAT. NOTE for callers: this function still
+  // ends in Normal mode, which CANCELS Listen-Only. That is upstream's contract
+  // and is left intact so existing callers keep working - but it means filter()
+  // must never appear in a read-only path. Use setFilterRegisters(), which takes
+  // the target mode as an argument.
+  return switchToNormalMode() ? 1 : 0;
 }
 
 boolean MCP2515Class::setFilterRegisters(
     uint16_t mask0, uint16_t filter0, uint16_t filter1,
     uint16_t mask1, uint16_t filter2, uint16_t filter3, uint16_t filter4, uint16_t filter5,
-    bool allowRollover)
+    bool allowRollover, uint8_t targetMode)
 {
   mask0 &= 0x7ff;
   filter0 &= 0x7ff;
@@ -409,29 +475,39 @@ boolean MCP2515Class::setFilterRegisters(
 
   writeRegister(REG_RXBnCTRL(0), allowRollover ? FLAG_RXB0CTRL_BUKT : 0);
   writeRegister(REG_RXBnCTRL(1), 0);
+
+  // DASHCAM PATCH: uint16_t, not uint8_t. Upstream copied the uint16_t
+  // parameters into uint8_t locals, so every 11-bit value lost its top three
+  // bits. The failure is quiet and asymmetric: mask 0x7FF became an effective
+  // 0x0FF and filter 0x158 became 0x058, so 0x158 was STILL accepted - along
+  // with 0x058, 0x258, 0x358 ... 0x758. The filter silently became eight times
+  // more permissive than asked for, which on a busy bus is precisely the RX
+  // overrun it was installed to prevent. The compiler said so: six narrowing
+  // warnings at -Wall.
+  const uint16_t masks[2] = { mask0, mask1 };
   for (int n = 0; n < 2; n++) {
-    uint8_t mask = (n == 0) ? mask0 : mask1;
-    writeRegister(REG_RXMnSIDH(n), mask >> 3);
-    writeRegister(REG_RXMnSIDL(n), mask << 5);
+    const uint16_t mask = masks[n];
+    writeRegister(REG_RXMnSIDH(n), (uint8_t)(mask >> 3));
+    writeRegister(REG_RXMnSIDL(n), (uint8_t)((mask & 0x07) << 5));
     writeRegister(REG_RXMnEID8(n), 0);
     writeRegister(REG_RXMnEID0(n), 0);
   }
 
-  uint8_t filter_array[6] =
+  const uint16_t filter_array[6] =
       {filter0, filter1, filter2, filter3, filter4, filter5};
   for (int n = 0; n < 6; n++) {
-    uint8_t id = filter_array[n];
-    writeRegister(REG_RXFnSIDH(n), id >> 3);
-    writeRegister(REG_RXFnSIDL(n), id << 5);
+    const uint16_t id = filter_array[n];
+    writeRegister(REG_RXFnSIDH(n), (uint8_t)(id >> 3));
+    writeRegister(REG_RXFnSIDL(n), (uint8_t)((id & 0x07) << 5));
     writeRegister(REG_RXFnEID8(n), 0);
     writeRegister(REG_RXFnEID0(n), 0);
   }
 
-  if (!switchToNormalMode()) {
-    return false;
-  }
-
-  return true;
+  // DASHCAM PATCH: the caller says where to end up. Upstream forced Normal mode
+  // here, which silently cancels Listen-Only - so "install filters, then sniff
+  // read-only" was impossible to express, and any listen-only path that
+  // configured filters became bus-active without saying so.
+  return switchToMode(targetMode);
 }
 
 int MCP2515Class::filterExtended(long id, long mask)
@@ -439,101 +515,110 @@ int MCP2515Class::filterExtended(long id, long mask)
   id &= 0x1FFFFFFF;
   mask &= 0x1FFFFFFF;
 
-  // config mode
-  writeRegister(REG_CANCTRL, 0x80);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x80) {
+  // DASHCAM PATCH: verified mode switch - see filter() for why the CANCTRL
+  // readback upstream used is not evidence.
+  if (!switchToConfigurationMode()) {
     return 0;
   }
 
   for (int n = 0; n < 2; n++) {
-    // extended only
-    // TODO: This doesn't look correct. According to the datasheet, the RXM0 and
-    // RMX1 should either both be unset (in which case filters are active), or
-    // both be unset (in which case all filters are ignored).
-    // Either way, it's unclear why we write to the same register twice here.
-    writeRegister(REG_RXBnCTRL(n), FLAG_RXM1);
-    writeRegister(REG_RXBnCTRL(n), FLAG_RXM1);
+    // DASHCAM PATCH: RXM<1:0> = 00 so the filters below actually apply, plus
+    // BUKT on RXB0 for rollover. Upstream wrote FLAG_RXM1 (RXM = 10) twice.
+    // The EXIDE bit in each FILTER decides standard-vs-extended matching; the
+    // reserved RXM encodings were never needed for that.
+    writeRegister(REG_RXBnCTRL(n), (n == 0) ? FLAG_RXB0CTRL_BUKT : 0x00);
 
-    writeRegister(REG_RXMnSIDH(n), mask >> 21);
-    writeRegister(REG_RXMnSIDL(n), (((mask >> 18) & 0x03) << 5) | FLAG_EXIDE | ((mask >> 16) & 0x03));
-    writeRegister(REG_RXMnEID8(n), (mask >> 8) & 0xff);
-    writeRegister(REG_RXMnEID0(n), mask & 0xff);
+    // DASHCAM PATCH: 0x07, not 0x03. SIDL bits 7:5 carry EID bits 20:18 - three
+    // bits. Masking with 0x03 kept only bits 19:18 and silently dropped bit 20,
+    // so any 29-bit filter or mask differing only in that bit was wrong.
+    writeRegister(REG_RXMnSIDH(n), (uint8_t)(mask >> 21));
+    writeRegister(REG_RXMnSIDL(n), (uint8_t)((((mask >> 18) & 0x07) << 5) | FLAG_EXIDE | ((mask >> 16) & 0x03)));
+    writeRegister(REG_RXMnEID8(n), (uint8_t)((mask >> 8) & 0xff));
+    writeRegister(REG_RXMnEID0(n), (uint8_t)(mask & 0xff));
   }
 
   for (int n = 0; n < 6; n++) {
-    writeRegister(REG_RXFnSIDH(n), id >> 21);
-    writeRegister(REG_RXFnSIDL(n), (((id >> 18) & 0x03) << 5) | FLAG_EXIDE | ((id >> 16) & 0x03));
-    writeRegister(REG_RXFnEID8(n), (id >> 8) & 0xff);
-    writeRegister(REG_RXFnEID0(n), id & 0xff);
+    writeRegister(REG_RXFnSIDH(n), (uint8_t)(id >> 21));
+    writeRegister(REG_RXFnSIDL(n), (uint8_t)((((id >> 18) & 0x07) << 5) | FLAG_EXIDE | ((id >> 16) & 0x03)));
+    writeRegister(REG_RXFnEID8(n), (uint8_t)((id >> 8) & 0xff));
+    writeRegister(REG_RXFnEID0(n), (uint8_t)(id & 0xff));
   }
 
-  // normal mode
-  writeRegister(REG_CANCTRL, 0x00);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x00) {
-    return 0;
-  }
+  // DASHCAM PATCH: verified via CANSTAT. NOTE for callers: this function still
+  // ends in Normal mode, which CANCELS Listen-Only. That is upstream's contract
+  // and is left intact so existing callers keep working - but it means filter()
+  // must never appear in a read-only path. Use setFilterRegisters(), which takes
+  // the target mode as an argument.
+  return switchToNormalMode() ? 1 : 0;
+}
 
-  return 1;
+/**
+ * DASHCAM PATCH: the single mode-switch primitive every other path now uses.
+ *
+ * Two changes against upstream, both load-bearing:
+ *
+ * 1. modifyRegister, not writeRegister. A full CANCTRL write clears ABAT, OSM,
+ *    CLKEN and CLKPRE along with the mode. Clearing OSM matters most: One-Shot
+ *    Mode is the only thing that stops endPacket() retrying forever on a bus
+ *    with no other node, so a mode switch used to silently disarm the very
+ *    protection the caller had just enabled.
+ *
+ * 2. It polls CANSTAT OPMOD, bounded. CANCTRL echoes the request immediately
+ *    while the controller finishes any frame in progress, so upstream's
+ *    readback of CANCTRL returns success before the mode has actually changed.
+ */
+bool MCP2515Class::switchToMode(uint8_t mode)
+{
+  modifyRegister(REG_CANCTRL, REQOP_MASK, mode);
+
+  for (uint16_t tries = 0; tries < DASHCAM_WAIT_TRIES; tries++) {
+    if ((readRegister(REG_CANSTAT) & OPMOD_MASK) == mode) {
+      return true;
+    }
+    delayMicroseconds(DASHCAM_WAIT_STEP_US);
+    yield();
+  }
+  return false;
 }
 
 bool MCP2515Class::switchToNormalMode() {
-  // TODO: Should we use modifyRegister(REG_CANCTRL, 0xe0, 0x00) here instead?
-  writeRegister(REG_CANCTRL, 0x00);
-  return (readRegister(REG_CANCTRL) & 0xe0) == 0x00;
+  return switchToMode(MODE_NORMAL);
 }
 
 bool MCP2515Class::switchToConfigurationMode()
 {
-  // TODO: Should we use modifyRegister(REG_CANCTRL, 0xe0, 0x80) here instead?
-  writeRegister(REG_CANCTRL, 0x80);
-  return (readRegister(REG_CANCTRL) & 0xe0) == 0x80;
+  return switchToMode(MODE_CONFIG);
 }
 
 int MCP2515Class::observe()
 {
-  // TODO: These should probably be 0x60, not 0x80.
-  writeRegister(REG_CANCTRL, 0x80);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x80) {
-    return 0;
-  }
-
-  return 1;
+  // DASHCAM PATCH: was writeRegister(REG_CANCTRL, 0x80) - CONFIGURATION mode,
+  // with an upstream TODO admitting it. In Configuration mode the controller is
+  // off the bus and receives NOTHING, which is indistinguishable from "the
+  // gateway bridges no broadcast traffic" and cost this project two sessions of
+  // chasing a hardware fault that did not exist. Listen-Only is 0x60.
+  return switchToMode(MODE_LISTEN_ONLY) ? 1 : 0;
 }
 
 int MCP2515Class::loopback()
 {
-  writeRegister(REG_CANCTRL, 0x40);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x40) {
-    return 0;
-  }
-
-  return 1;
+  return switchToMode(MODE_LOOPBACK) ? 1 : 0;
 }
 
 int MCP2515Class::sleep()
 {
-  writeRegister(REG_CANCTRL, 0x01);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x01) {
-    return 0;
-  }
-
-  return 1;
+  // DASHCAM PATCH: was writeRegister(REG_CANCTRL, 0x01). CANCTRL bits 1:0 are
+  // CLKPRE, the CLKOUT prescaler - not REQOP. Upstream therefore left the
+  // controller in NORMAL mode (REQOP 000) with a divided clock output, and then
+  // reported success because the readback matched what it wrote. A node that
+  // believes it is asleep while still ACKing every frame on the bus is a
+  // considerably worse outcome than a failed sleep. Sleep is REQOP 001 = 0x20.
+  return switchToMode(MODE_SLEEP) ? 1 : 0;
 }
 
 int MCP2515Class::wakeup()
 {
-  writeRegister(REG_CANCTRL, 0x00);
-  // TODO: The requested mode must be verified by reading the OPMODE[2:0] bits (CANSTAT[7:5])
-  if (readRegister(REG_CANCTRL) != 0x00) {
-    return 0;
-  }
-
-  return 1;
+  return switchToMode(MODE_NORMAL) ? 1 : 0;
 }
 
 void MCP2515Class::setPins(int cs, int irq)

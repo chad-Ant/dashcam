@@ -71,8 +71,14 @@ public:
     /** @brief Telemetry frames accepted since begin(). */
     uint32_t framesRx() const { return framesRx_; }
 
+    /**
+     * @brief Asks the MKR to switch CAN mode (1=discover 2=sniff 3=obd2).
+     * @return false if the value is out of range or the MKR's TX buffer is full.
+     */
+    bool setCanMode(uint8_t mode);
+
 private:
-    bool sendCmd(uint8_t type);
+    bool sendCmd(uint8_t type, const uint8_t *payload = nullptr, uint8_t len = 0);
 
     HardwareSerial  *uart_ = nullptr;
     CommRxState      rx_;

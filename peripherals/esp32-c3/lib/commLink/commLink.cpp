@@ -12,11 +12,17 @@ void CommLink::begin(unsigned long baud, int8_t rxPin, int8_t txPin, HardwareSer
     framesRx_  = 0;
 }
 
-bool CommLink::sendCmd(uint8_t type)
+bool CommLink::sendCmd(uint8_t type, const uint8_t *payload, uint8_t len)
 {
     if (!uart_) return false;
-    uint8_t frame[COMM_FRAME_OVERHEAD]; // zero-length-payload command frames
-    size_t n = buildFrame(type, nullptr, 0, frame, sizeof(frame));
+    // Sized for the largest command this hop can carry, not for zero. It used
+    // to be exactly COMM_FRAME_OVERHEAD, which was correct only while every
+    // command was zero-payload: buildFrame() would have refused the first
+    // payload-bearing one for want of a single byte of buffer, and the caller
+    // would have read that as a busy link rather than a bug.
+    uint8_t frame[COMM_FRAME_OVERHEAD + COMM_MAX_CMD_PAYLOAD];
+    if (len > COMM_MAX_CMD_PAYLOAD) return false;
+    size_t n = buildFrame(type, payload, len, frame, sizeof(frame));
     if (n == 0) return false;
     // Non-blocking: only write when the whole frame fits, and confirm the byte count.
     if (uart_->availableForWrite() < static_cast<int>(n)) return false;
@@ -27,6 +33,15 @@ bool CommLink::requestOnce() { return sendCmd(CMD_GET_ONCE); }
 bool CommLink::startStream() { return sendCmd(CMD_START_STREAM); }
 bool CommLink::stopStream()  { return sendCmd(CMD_STOP_STREAM); }
 bool CommLink::ping()        { return sendCmd(CMD_PING); }
+
+bool CommLink::setCanMode(uint8_t mode)
+{
+    // Validated at this boundary as well as at the MKR. The bridge is where an
+    // out-of-range host value should die: relaying it would spend a UART frame
+    // to earn a NACK the host has no way to attribute to its own bad argument.
+    if (mode < 1u || mode > 3u) return false;
+    return sendCmd(CMD_SET_CAN_MODE, &mode, 1);
+}
 
 bool CommLink::poll()
 {

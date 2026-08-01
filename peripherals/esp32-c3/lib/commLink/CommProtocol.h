@@ -10,7 +10,7 @@
  * string / stdint, so it drags in no board-specific or project libraries.
  *
  * Frame: SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
- * VER is COMM_VERSION, currently 0x04; the payload is 131 bytes.
+ * VER is COMM_VERSION, currently 0x05; the payload is 148 bytes.
  * CRC-16/CCITT-FALSE over VER..last payload byte, transmitted low byte first.
  * Both MCUs are little-endian IEEE-754, so a packed struct copies verbatim.
  */
@@ -34,7 +34,7 @@
  * FIFO began being drained in full rather than the output registers sampled at
  * 20 Hz, plus the IMU_DATA_GAP and IMU_LOWPOWER flags that qualify them.
  */
-#define COMM_VERSION         0x04u
+#define COMM_VERSION         0x05u
 #define COMM_MAX_PAYLOAD     255u   ///< Largest payload (LEN is one byte).
 #define COMM_FRAME_OVERHEAD  6u     ///< SOF+VER+TYPE+LEN + CRC16(2).
 #define COMM_MAX_FRAME       (COMM_FRAME_OVERHEAD + COMM_MAX_PAYLOAD)
@@ -124,10 +124,51 @@ enum CommMsgType : uint8_t {
     CMD_START_STREAM = 0x10, ///< C3 -> MKR: begin the 10 Hz telemetry push.
     CMD_STOP_STREAM  = 0x11, ///< C3 -> MKR: stop streaming.
     CMD_PING         = 0x20, ///< C3 -> MKR: link check.
+    /**
+     * C3 -> MKR: payload uint8 CanMode (1=discover 2=sniff 3=obd2).
+     *
+     * The FIRST payload-bearing command on this hop. Everything before it was
+     * zero-payload, and the receiver exploited that with a blanket
+     * "len != 0 -> NACK" - so adding this without the helpers below would have
+     * had the MKR reject its own new command as malformed.
+     */
+    CMD_SET_CAN_MODE = 0x13,
     MSG_TELEMETRY    = 0x81, ///< MKR -> C3: telemetry payload.
     MSG_PONG         = 0xA0, ///< MKR -> C3: ping acknowledgement.
     MSG_NACK         = 0xEE, ///< MKR -> C3: malformed or unknown command.
 };
+
+/**
+ * @brief Largest payload any C3 -> MKR command carries.
+ *
+ * Exists so a command sender can size its frame buffer without either
+ * hard-coding zero (correct only while every command was zero-payload) or
+ * reserving the full COMM_MAX_PAYLOAD, which is sized for telemetry in the
+ * other direction and would put 148 bytes of stack in the sender for a
+ * one-byte command.
+ */
+#define COMM_MAX_CMD_PAYLOAD 1u
+
+/** @brief True for TYPEs the C3 may send to the MKR. */
+inline bool isCommand(uint8_t type)
+{
+    switch (type) {
+    case CMD_GET_ONCE:
+    case CMD_START_STREAM:
+    case CMD_STOP_STREAM:
+    case CMD_SET_CAN_MODE:
+    case CMD_PING:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/** @brief Expected payload length for a command TYPE; 0 for zero-payload commands. */
+inline uint8_t commandPayloadLen(uint8_t type)
+{
+    return (type == CMD_SET_CAN_MODE) ? 1 : 0;
+}
 
 /** Result codes for protocol operations. */
 enum class CommReturnStatus : int8_t {
@@ -233,15 +274,86 @@ struct __attribute__((packed)) TelemetryPayload {
     float imuGyroPeak;     ///< Peak |ω| over the window (deg/s).
     // ---- status ----
     uint8_t flags;         ///< COMM_FLAG_* bitfield.
+    /**
+     * ---- vehicle bus (v0x05) ----
+     *
+     * Filled by CAN sniffing when it is running and by OBD-II polling when it
+     * is not, so a consumer reads the same fields either way.  Which source
+     * actually supplied each one is in @c sigSource, and it matters: the two do
+     * not cover the same set.  @c steerMotorTorque, @c yawRateCdps and
+     * @c wheelRaw exist ONLY while sniffing, and are at their sentinels in OBD2
+     * mode because that mode structurally cannot supply them - which is a
+     * different statement from "the sensor went quiet".
+     */
+    uint8_t canMode;       ///< CanMode: 0=off 1=discover 2=sniff 3=obd2.
+    uint8_t sigSource;     ///< VehSource, 2 bits each: speed|rpm|gear|steer.
+    uint8_t gearPos;       ///< VehGear selector position (0 = unknown).
+    /**
+     * bit 0 brakePressed, bit 1 brakeSwitch,
+     * bit 2 turnLeft, bit 3 turnRight, bits 4-7 reserved (zero).
+     *
+     * Two brake bits because the car publishes two: a switch channel and a
+     * pressed channel, in different bytes of 0x17C.  They normally agree, and a
+     * disagreement is the interesting case, so collapsing them would discard
+     * the only evidence that one has failed.
+     *
+     * The turn bits are indicator ACTIVE, not indicator lamp lit.  The lamp
+     * blinks at ~1.5 Hz and this payload leaves at ~4 Hz, so the raw bit would
+     * alias into something dark for half the samples of a manoeuvre it was lit
+     * throughout; the sender holds each flash for 900 ms instead.  Both set at
+     * once is hazard lights.  Reading them is what separates a deliberate lane
+     * change from a lane departure.
+     *
+     * These bits were reserved-and-zero in earlier firmware, so a host built
+     * against that contract reads them as "not indicating" rather than as
+     * garbage - which is why adding them needed no version bump.
+     */
+    uint8_t vehFlags;
+    uint8_t pedalGas;      ///< Accelerator, raw 0-255; x0.5 = percent.
+    /**
+     * EPS motor assist torque, raw 0-511. @c 0xFFFF when unavailable.
+     *
+     * NOT a steering angle.  It is an unsigned MAGNITUDE that rises for either
+     * direction of turn and returns to exactly zero when the driver stops
+     * applying effort.  This vehicle publishes no steering angle anywhere on
+     * its bus, and SAE J1979 has no steering PID, so no angle field exists here
+     * to be filled in later.  For heading change use @c yawRateCdps.
+     */
+    uint16_t steerMotorTorque;
+    /**
+     * Yaw rate, centi-degrees/s, LEFT POSITIVE. @c INT16_MIN when unavailable.
+     *
+     * Derived on the master from the rear wheel-speed pair at 50 Hz, because
+     * this stream runs at ~10 Hz and the signal swings 30 deg/s inside a single
+     * U-turn - reconstructing it here would be aliased beyond use.
+     *
+     * The sentinel is NOT zero.  Zero is the value for genuinely travelling
+     * straight; the wheel-speed sensors report nothing below about 3 km/h, and
+     * "going straight" is the most dangerous possible lie at parking speeds.
+     *
+     * Curvature and an effective steering angle are deliberately absent: both
+     * are this, @c speed and one vehicle constant away, so the consumer can
+     * derive them and revise the wheelbase without a firmware flash.
+     */
+    int16_t yawRateCdps;
+    /**
+     * Per-wheel speeds in raw 0.01 km/h counts, FL FR RL RR.
+     * @c 0xFFFF per channel when unavailable.
+     *
+     * Carried as well as the scalar @c speed because per-wheel speed is what
+     * reveals lockup, slip and ABS activity at the moment of an incident, and a
+     * scalar can never reconstruct that afterwards.
+     */
+    uint16_t wheelRaw[4];
 };
 
 /// The wire contract depends on this exact size on both MCUs.
-static_assert(sizeof(TelemetryPayload) == 131, "TelemetryPayload must be tightly packed to 131 bytes");
+static_assert(sizeof(TelemetryPayload) == 148, "TelemetryPayload must be tightly packed to 148 bytes");
 /**
  * The payload has to fit the frame's one-byte LEN field, and the bridge's
  * one-byte @c telemetryBytes self-check.  Worth stating now that the struct has
- * grown 79 -> 83 -> 123 -> 131: another addition the size of the IMU block lands
- * at 171, and the failure mode past 255 is a silently truncated length rather
+ * grown 79 -> 83 -> 123 -> 131 -> 148: another addition the size of the IMU block
+ * lands at 188, and the failure mode past 255 is a silently truncated length rather
  * than anything that looks like an error.
  */
 static_assert(sizeof(TelemetryPayload) <= COMM_MAX_PAYLOAD,

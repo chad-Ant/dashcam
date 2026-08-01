@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include "CommProtocol.h"
+#include "VehicleSignals.h"
 #include "DataDictionary.h"
 #include "IMUFunctions.h"   // IMUData, carried in the telemetry payload
 
@@ -81,14 +82,14 @@ CommReturnStatus sendFrame(uint8_t type, const uint8_t *payload, uint8_t len);
  *                       because these are derived, not sensor readings.
  * @param[out] out       Telemetry struct to fill.
  */
-void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, TelemetryPayload &out);
+void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode, TelemetryPayload &out);
 
 /**
  * @brief Builds and transmits one @c MSG_TELEMETRY frame on @c Serial1.
  *
  * @return @c CommReturnStatus::OK, or @c NOK_OVERFLOW if framing failed.
  */
-CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived);
+CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode);
 
 /**
  * @brief Runtime state for the master link: streaming toggle + RX decoder.
@@ -112,6 +113,16 @@ struct CommMaster {
      * 0 = nothing has ever been received.
      */
     unsigned long lastCommandMs;
+    /**
+     * A CMD_SET_CAN_MODE the sketch has not acted on yet. 0 = none pending.
+     *
+     * Recorded rather than executed here: this module owns the wire, not the
+     * CAN controller, and calling canSetMode() from inside the frame decoder
+     * would drag a bus-mode transition - which passes through Configuration
+     * mode and drops frames - into the middle of servicing a command budget.
+     * The sketch applies it at a point of its own choosing.
+     */
+    uint8_t       canModeRequest;
 };
 
 /**
@@ -140,6 +151,6 @@ void initCommMaster(CommMaster &m);
  * @param[in]     gps       Latest GPS snapshot to publish.
  * @param[in]     derived   Latest master-computed signals.
  */
-void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived);
+void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode);
 
 #endif

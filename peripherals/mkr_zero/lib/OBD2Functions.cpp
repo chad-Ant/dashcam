@@ -126,8 +126,17 @@ CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxA
     //if (status != CANReturnStatus::OK) return status; 
 
     if (!CAN.filter(config.RxAddress)) return CANReturnStatus::NOK_INIT_FAILED;
-    // OSM bounds endPacket() so a missing ACK cannot hang the poller — verify it latched.
+    // OSM caps retransmission so a missing ACK cannot make the controller retry
+    // forever — verify it latched. It does NOT bound endPacket(); that bound is
+    // the explicit deadline in the vendored driver.
     if (!mcp2515EnableOneShot(csPin)) return CANReturnStatus::NOK_STATUS_BAD;
+
+    // Called from INSIDE init, not left to the caller. resetOBD2Poll() was dead
+    // code: after a re-init txFailures was still at OBD2_TX_FAIL_LIMIT, so the
+    // very next failed transmit re-declared link loss instead of granting a
+    // fresh budget — a re-init that could never actually recover. Putting it
+    // here makes it impossible to forget at a future call site.
+    resetOBD2Poll();
     return CANReturnStatus::OK;
 }
 
@@ -142,8 +151,10 @@ bool isCommandSupported(const OBD2Config &config, const OBD2_S1Command command){
 }
 
 CANReturnStatus sendS1Command(OBD2Config &config, const OBD2_S1Command command){
-    // Check every CAN operation; endPacket() is bounded because One-Shot Mode is
-    // enabled in initializeOBD2(), and it returns 0 on a TX error (e.g. no ACK).
+    // Check every CAN operation. endPacket() is bounded by an explicit deadline
+    // in the vendored driver - NOT by One-Shot Mode, which this comment used to
+    // claim. OSM limits retransmission after an attempt; it does nothing about
+    // waiting for an idle bus, so the unpatched call could spin forever.
     if (!CAN.beginPacket(config.TxAddress, 8)) return CANReturnStatus::NOK_TX;
     if (CAN.write(0x02)    != 1) return CANReturnStatus::NOK_TX; // additional data byte count
     if (CAN.write(0x01)    != 1) return CANReturnStatus::NOK_TX; // service 01 (current data)
@@ -187,11 +198,11 @@ CANReturnStatus receiveS1Command(OBD2Config &config, uint8_t *outputBuffer, byte
 
 static const OBD2_S1Command kPollPipeline[] = {
     RPM, SPEED, ENGINE_TEMP, FUEL_LVL, FUEL_RATE,
-    THROTTLE_POSN, ENGINE_LOAD, AIR_PRES, GEAR_CMD, GEAR_RTIO, ODOMETER
+    THROTTLE_POSN, ENGINE_LOAD, AIR_PRES, GEAR_RTIO, ODOMETER
 };
 static const uint8_t kPollBytes[] = {
     RPM_T, SPEED_T, ENGINE_TEMP_T, FUEL_LVL_T, FUEL_RATE_T,
-    THROTTLE_POSN_T, ENGINE_LOAD_T, AIR_PRES_T, GEAR_CMD_T, GEAR_RTIO_T, ODOMETER_T
+    THROTTLE_POSN_T, ENGINE_LOAD_T, AIR_PRES_T, GEAR_RTIO_T, ODOMETER_T
 };
 static const uint8_t kPollCount = sizeof(kPollPipeline) / sizeof(kPollPipeline[0]);
 
@@ -200,41 +211,77 @@ static bool          awaitingReply = false;
 static unsigned long requestedAt   = 0;
 static uint16_t      txFailures    = 0;   // consecutive TX failures (link-loss detector)
 static unsigned long lastTxAttempt = 0;   // for retry backoff after a failed transmit
+static unsigned long lastReplyMs   = 0;   // last DECODED ECU reply — see isOBD2LinkLost()
+static bool          silenceArmed  = false; // true once one reply has ever been decoded
 
 void initOBD2Data(OBD2Data &data)
 {
     data.rpm = data.speed = data.coolantTemp = data.fuelLevel = data.fuelRate =
     data.throttle = data.engineLoad = data.airPressure = data.gear = data.gearRatio = data.odo = NAN;
     data.lastUpdateMs = 0;
+    for (uint8_t i = 0; i < OBD2_FIELD_COUNT; ++i) data.fieldMs[i] = 0;
+}
+
+void expireStaleOBD2Fields(OBD2Data &data, uint32_t maxAgeMs)
+{
+    const uint32_t now = millis();
+
+    // Table rather than eleven if-statements, so adding a field cannot silently
+    // skip its expiry. A field that is never expired is worse than one that is
+    // never published: it is published, and believed.
+    float *const values[OBD2_FIELD_COUNT] = {
+        &data.rpm, &data.speed, &data.coolantTemp, &data.fuelLevel,
+        &data.fuelRate, &data.throttle, &data.engineLoad, &data.airPressure,
+        &data.gear, &data.gearRatio, &data.odo
+    };
+
+    for (uint8_t i = 0; i < OBD2_FIELD_COUNT; ++i) {
+        // Stamp 0 means never seen. Those are already NAN from initOBD2Data()
+        // and must not be treated as "infinitely old but once valid".
+        if (data.fieldMs[i] == 0) continue;
+        if ((now - data.fieldMs[i]) > maxAgeMs) *values[i] = NAN;
+    }
 }
 
 static void storeReading(OBD2_S1Command pid, const uint8_t *buf, OBD2Data &data)
 {
+    const uint32_t now = millis();
     switch (pid) {
         case RPM:
-            data.rpm         = ((float)buf[0] * 256.0f + (float)buf[1]) * 0.25f;         break;
+            data.rpm         = ((float)buf[0] * 256.0f + (float)buf[1]) * 0.25f;
+            data.fieldMs[OBD2F_RPM] = now;                                            break;
         case SPEED:
-            data.speed       = (float)buf[0];                                             break;
+            data.speed       = (float)buf[0];
+            data.fieldMs[OBD2F_SPEED] = now;                                          break;
         case ENGINE_TEMP:
-            data.coolantTemp = (float)buf[0] - 40.0f;                                    break;
+            data.coolantTemp = (float)buf[0] - 40.0f;
+            data.fieldMs[OBD2F_COOLANT] = now;                                        break;
         case FUEL_LVL:
-            data.fuelLevel   = interpolate((float)buf[0], 255.0f, 0.0f);                 break;
+            data.fuelLevel   = interpolate((float)buf[0], 255.0f, 0.0f);
+            data.fieldMs[OBD2F_FUEL_LVL] = now;                                       break;
         case FUEL_RATE:
-            data.fuelRate    = ((float)buf[0] * 256.0f + (float)buf[1]) * 0.05f;         break;
+            data.fuelRate    = ((float)buf[0] * 256.0f + (float)buf[1]) * 0.05f;
+            data.fieldMs[OBD2F_FUEL_RATE] = now;                                      break;
         case THROTTLE_POSN:
-            data.throttle    = interpolate((float)buf[0], 255.0f, 0.0f);                 break;
+            data.throttle    = interpolate((float)buf[0], 255.0f, 0.0f);
+            data.fieldMs[OBD2F_THROTTLE] = now;                                       break;
         case ENGINE_LOAD:
-            data.engineLoad  = interpolate((float)buf[0], 255.0f, 0.0f);                 break;
+            data.engineLoad  = interpolate((float)buf[0], 255.0f, 0.0f);
+            data.fieldMs[OBD2F_ENGINE_LOAD] = now;                                    break;
         case AIR_PRES:
-            data.airPressure = (float)buf[0];                                             break;
-        case GEAR_CMD:
-            data.gear        = (float)buf[0];                                             break;
+            data.airPressure = (float)buf[0];
+            data.fieldMs[OBD2F_AIR_PRES] = now;                                       break;
         case GEAR_RTIO:
-            data.gearRatio   = ((float)buf[2] * 256.0f + (float)buf[3]) * 0.001f;        break;
+            // J1979 PID 0xA4, 4 bytes: A = support bits, B = actual gear,
+            // C:D = ratio / 1000. One response carries both, which is why 0xA3
+            // is gone rather than replaced - see the enum comment.
+            data.gear        = (float)buf[1];
+            data.gearRatio   = ((float)buf[2] * 256.0f + (float)buf[3]) * 0.001f;
+            data.fieldMs[OBD2F_GEAR] = data.fieldMs[OBD2F_GEAR_RATIO] = now;          break;
         case ODOMETER:
             data.odo         = (float)(((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
                                        ((uint32_t)buf[2] << 8)  |  (uint32_t)buf[3]) * 0.1f;
-                                                                                          break;
+            data.fieldMs[OBD2F_ODO] = now;                                            break;
         default: break;
     }
 }
@@ -245,11 +292,23 @@ void resetOBD2Poll()
     awaitingReply = false;
     txFailures    = 0;
     lastTxAttempt = 0;
+    lastReplyMs   = 0;
+    silenceArmed  = false;
 }
 
 bool isOBD2LinkLost()
 {
-    return txFailures >= OBD2_TX_FAIL_LIMIT;
+    // Two independent ways the link can be gone, and they are NOT the same
+    // question. txFailures covers "the frame never got onto the wire". The
+    // silence window covers the far more likely vehicle case: the frame went
+    // out cleanly, some other node ACKed it because a live bus always has one,
+    // and the ECU we are actually talking to said nothing at all. Only the
+    // second catches a wrong filter, a wrong response ID, or a dead ECM.
+    if (txFailures >= OBD2_TX_FAIL_LIMIT) return true;
+    // Not armed until the first reply: before that there is no evidence either
+    // way, and declaring loss during bring-up would fight the retry logic.
+    if (silenceArmed && (millis() - lastReplyMs) > OBD2_RX_SILENCE_MS) return true;
+    return false;
 }
 
 // Sends the request for pipeline entry [idx] with TX-failure bookkeeping that drives
@@ -258,9 +317,25 @@ static CANReturnStatus fireRequest(OBD2Config &config, uint8_t idx)
 {
     lastTxAttempt = millis();
     CANReturnStatus st = sendS1Command(config, kPollPipeline[idx]);
+    // NOTE: OK here means the frame was ACKed by SOME node, which on a vehicle
+    // bus proves only that the bus is alive - not that the ECU we addressed is.
+    // That is why clearing txFailures is no longer sufficient evidence of a
+    // healthy link; see isOBD2LinkLost().
     if (st == CANReturnStatus::OK) txFailures = 0;
     else if (txFailures < 0xFFFFu) ++txFailures;
     return st;
+}
+
+/**
+ * @brief Fires the next request once the pacing floor has elapsed.
+ *
+ * Returns false without transmitting if it is too soon, leaving the caller
+ * un-armed so the next loop() pass retries. Never busy-waits.
+ */
+static bool fireRequestPaced(OBD2Config &config, uint8_t idx)
+{
+    if ((millis() - lastTxAttempt) < OBD2_MIN_REQUEST_GAP_MS) return false;
+    return fireRequest(config, idx) == CANReturnStatus::OK;
 }
 
 bool tickOBD2(OBD2Config &config, OBD2Data &data)
@@ -270,22 +345,41 @@ bool tickOBD2(OBD2Config &config, OBD2Data &data)
     // SPI/CAN interface with thousands of failed transactions per second.
     if (!awaitingReply) {
         if (txFailures > 0 && (millis() - lastTxAttempt) < OBD2_TX_BACKOFF_MS) return false;
-        if (fireRequest(config, pollIdx) == CANReturnStatus::OK) {
+        if (fireRequestPaced(config, pollIdx)) {
             requestedAt   = millis();
             awaitingReply = true;
         }
         return false;
     }
 
-    // Timeout: skip this PID, advance, and immediately fire the next request.
-    if (isTimeout(OBD2_TICK_TIMEOUT_MS, requestedAt)) {
-        pollIdx = (pollIdx + 1u) % kPollCount;
-        if (fireRequest(config, pollIdx) == CANReturnStatus::OK) requestedAt = millis();
-        else                                                     awaitingReply = false;
+    // Read BEFORE testing the timeout. The old order tested the clock first, so
+    // a reply that had already physically arrived and was sitting in the RX
+    // buffer got thrown away whenever this loop was serviced late - and because
+    // the timeout path also advances pollIdx, the poller then ran one PID out of
+    // phase with the ECU and every subsequent reply failed its PID check too.
+    // A frame in hand is evidence; the clock is not.
+    const int rxDlc = CAN.parsePacket();
+    if (rxDlc == 0 && CAN.packetId() == -1) {
+        // Genuinely nothing waiting. parsePacket() returns the DLC, so a valid
+        // DLC-0 frame also reads as 0 - packetId() is what distinguishes them.
+        if (isTimeout(OBD2_TICK_TIMEOUT_MS, requestedAt)) {
+            pollIdx = (pollIdx + 1u) % kPollCount;
+            if (fireRequestPaced(config, pollIdx)) requestedAt = millis();
+            else                                   awaitingReply = false;
+        }
         return false;
     }
 
-    if (CAN.parsePacket() == 0) return false;
+    // Frame-level checks the hardware filter is not a substitute for. The filter
+    // narrows what reaches the buffer; it does not prove what did. A truncated
+    // filter (which upstream's did produce), a bus with 11-bit and 29-bit
+    // traffic, or a remote-transmission request would all otherwise be decoded
+    // as if they were the ECU's answer.
+    if (CAN.packetId() != static_cast<long>(config.RxAddress) ||
+        CAN.packetExtended() || CAN.packetRtr()) {
+        while (CAN.available()) CAN.read();
+        return false;
+    }
 
     // Require the whole single-frame response (PCI + service + PID + data) to have
     // physically arrived before reading. Otherwise a short frame lets CAN.read()
@@ -314,10 +408,16 @@ bool tickOBD2(OBD2Config &config, OBD2Data &data)
 
     storeReading(rxPID, buf, data);
     data.lastUpdateMs = millis();
+    // The ECU itself answered - the only evidence that clears the silence
+    // watchdog. A clean transmit does not, because any node can ACK.
+    lastReplyMs  = data.lastUpdateMs;
+    silenceArmed = true;
     pollIdx = (pollIdx + 1u) % kPollCount;
 
     // Fire the next request; only remain "awaiting" if it actually went out.
-    if (fireRequest(config, pollIdx) == CANReturnStatus::OK) requestedAt = millis();
-    else                                                     awaitingReply = false;
+    // Paced: if the floor has not elapsed we simply drop out un-armed and the
+    // next loop() pass sends it, rather than blocking here for the remainder.
+    if (fireRequestPaced(config, pollIdx)) requestedAt = millis();
+    else                                   awaitingReply = false;
     return true;
 }

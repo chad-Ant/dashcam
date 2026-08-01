@@ -1,0 +1,65 @@
+# 2019 Honda Brio (DD1), CVT, 500 kbps F-CAN tapped at OBD-II pins 6/14.
+#
+# Copy to the SD card root as canmap.txt.
+#
+# name,id,startBit,len,sign,scale
+#
+# startBit is DBC Motorola (start|len@0) as used by opendbc: the number of the
+# signal's MOST SIGNIFICANT bit, walking DOWN and wrapping to bit 7 of the next
+# byte. Copy the numbers straight out of opendbc or off a CANDiscovery capture.
+#
+# Every row here was measured on this car, not inferred. See the project plan
+# for the evidence behind each one.
+
+# XMISSION_SPEED. Preferred over the wheel pair: +0.29% against GNSS over 23
+# paired samples above 20 km/h, where wheel FL came in at +0.65%. Reads all
+# zeros in Park - it wakes when the shifter leaves P.
+speed,0x158,7,16,u,0.01
+
+# POWERTRAIN_DATA - opendbc's layout byte for byte, corroborated on a 2012
+# Civic/CR-V by NIJ report 311503.
+rpm,0x17C,23,16,u,1
+pedal,0x17C,7,8,u,1
+brake_switch,0x17C,32,1,u,1
+brake_pressed,0x17C,53,1,u,1
+
+# Selector position. Byte 5 is exactly opendbc's GEAR_SHIFTER enum.
+gear,0x191,47,8,u,1
+
+# EPS motor assist torque: 9-bit UNSIGNED magnitude spanning a byte boundary.
+# Rises for either direction of turn, exactly 0 when effort stops. NOT an angle
+# - this vehicle publishes none anywhere on its bus.
+steer_torque,0x1AB,0,9,u,1
+
+# Indicator lamps. Byte 0 carries exactly three values across the whole census -
+# 0x00, 0x20, 0x40, never 0x60 - so bits 5 and 6 are two mutually exclusive
+# flags, which is what a stalk is. (0x60 WOULD be hazards; they were never used
+# in the capture, so that combination is expected but unconfirmed.)
+#
+# Left/right was not assumed from opendbc, it was derived from this car's own
+# wheel speeds: over the moving samples the mean rear-pair difference (RR-RL) is
+# +102.6 counts while bit 5 is set and -64.0 while bit 6 is set, against +20.3
+# with neither. Positive is a left turn, so bit 5 is left and bit 6 is right.
+# The +20.3 baseline is itself the tyre-radius mismatch the yaw estimator
+# corrects for, arrived at independently - a useful check on both.
+#
+# These blink at ~1.5 Hz. The decoder HOLDS each flash for 900 ms before
+# calling the indicator off, because telemetry leaves the board at ~4 Hz and
+# would otherwise alias the blink into a signal that is dark half the time.
+turn_left,0x294,5,1,u,1
+turn_right,0x294,6,1,u,1
+
+# WHEEL_SPEEDS: four unaligned 15-bit fields. Scale confirmed on the road at
+# 101.36 counts per km/h over 555 GNSS-paired samples.
+wheel_fl,0x1D0,7,15,u,0.01
+wheel_fr,0x1D0,8,15,u,0.01
+wheel_rl,0x1D0,25,15,u,0.01
+wheel_rr,0x1D0,42,15,u,0.01
+
+# Raw selector codes. Manufacturer-specific; omit to keep the built-in default.
+gearmap,P=1,R=2,N=3,D=4,L=7,S=0x0A
+
+# Centi-deg/s per count of rear-pair difference. Absorbs 2*pi*rear_track, so the
+# true track width never has to be known - calibrate the product against GNSS
+# heading rate, exactly as the wheel scale was calibrated against GNSS speed.
+yawscale,10.83

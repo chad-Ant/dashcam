@@ -35,7 +35,7 @@
  *
  * ── Frame layout ─────────────────────────────────────────────────────────────
  *   SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
- *   VER is hostproto::VERSION, currently 0x04; Telemetry is 131 bytes.
+ *   VER is hostproto::VERSION, currently 0x05; Telemetry is 148 bytes.
  *
  * CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over VER..last payload byte,
  * transmitted low byte first.  Both ends are little-endian IEEE-754, so a
@@ -70,7 +70,7 @@ constexpr uint8_t  SOF            = 0x7E; ///< Start-of-frame delimiter.
  * FIFO started being drained in full, together with the IMU_DATA_GAP and
  * IMU_LOWPOWER flags that say when a peak may not be trusted.
  */
-constexpr uint8_t  VERSION        = 0x04;
+constexpr uint8_t  VERSION        = 0x05;
 constexpr uint16_t MAX_PAYLOAD    = 255;  ///< Largest payload (LEN is one byte).
 constexpr uint16_t FRAME_OVERHEAD = 6;    ///< SOF+VER+TYPE+LEN + CRC16(2).
 constexpr uint16_t MAX_FRAME      = FRAME_OVERHEAD + MAX_PAYLOAD;
@@ -108,6 +108,16 @@ enum MsgType : uint8_t {
     CMD_START_STREAM = 0x10, ///< Begin forwarding master telemetry as it arrives (~10 Hz).
     CMD_STOP_STREAM  = 0x11, ///< Stop forwarding telemetry (MSG_STATUS keeps flowing).
     CMD_SET_DECIM    = 0x12, ///< Payload uint8 N (1..255): forward every Nth master frame.
+    /**
+     * Payload uint8: 1=discover 2=sniff 3=obd2. Relayed to the MKR.
+     *
+     * There is deliberately NO automatic fallback from sniffing to OBD2 on the
+     * MKR. OBD2 mode transmits on a live vehicle bus, and a node that decides
+     * on its own to start doing that - unattended, on a car in motion, because
+     * a signal went quiet for a second - is not a decision firmware should make.
+     * The host asks, or it does not happen.
+     */
+    CMD_SET_CAN_MODE = 0x13,
     CMD_PING         = 0x20, ///< Link check.
 
     // ── C3 -> Jetson ──
@@ -303,6 +313,70 @@ struct __attribute__((packed)) Telemetry {
     float imuGyroPeak;     ///< Peak |ω| over the window (deg/s).
     // ---- status ----
     uint8_t flags;         ///< TLM_FLAG_* bitfield.
+    /**
+     * ---- vehicle bus (v0x05) ----
+     *
+     * Byte-for-byte the tail of @c TelemetryPayload on the MKR hop; the bridge
+     * memcpy()s the whole struct, so these must stay in lockstep.
+     *
+     * Filled by CAN sniffing when it is running and by OBD-II polling when it
+     * is not, so the host reads the same fields either way.  @c sigSource says
+     * which source supplied each, and that matters: the two do not cover the
+     * same set.  @c steerMotorTorque, @c yawRateCdps and @c wheelRaw exist ONLY
+     * while sniffing and sit at their sentinels in OBD2 mode, because that mode
+     * structurally cannot supply them - a different statement from "the sensor
+     * went quiet".
+     */
+    uint8_t canMode;       ///< 0=off 1=discover 2=sniff 3=obd2.
+    uint8_t sigSource;     ///< 2 bits each: speed|rpm|gear|steer. 0=none 1=CAN 2=OBD2.
+    uint8_t gearPos;       ///< 0=unknown 1=P 2=R 3=N 4=D 5=L 6=S.
+    /**
+     * bit 0 brakePressed, bit 1 brakeSwitch,
+     * bit 2 turnLeft, bit 3 turnRight, bits 4-7 reserved (zero).
+     *
+     * The turn bits are indicator ACTIVE, not indicator lamp lit: the lamp
+     * blinks at ~1.5 Hz and telemetry arrives at ~4 Hz, so the sender holds
+     * each flash for 900 ms rather than let the blink alias.  Both set at once
+     * is hazard lights.  Earlier firmware left bits 2-7 zero, so a host that
+     * predates this reads "not indicating" rather than garbage.
+     */
+    uint8_t vehFlags;
+    uint8_t pedalGas;      ///< Accelerator, raw 0-255; x0.5 = percent.
+    /**
+     * EPS motor assist torque, raw 0-511. @c 0xFFFF when unavailable.
+     *
+     * NOT a steering angle - an unsigned MAGNITUDE that rises for either
+     * direction of turn and returns to exactly zero when effort stops.  The
+     * vehicle publishes no steering angle anywhere on its bus and J1979 has no
+     * steering PID, so no angle field exists here to be filled in later.  For
+     * heading change use @c yawRateCdps.
+     */
+    uint16_t steerMotorTorque;
+    /**
+     * Yaw rate, centi-degrees/s, LEFT POSITIVE. @c INT16_MIN when unavailable.
+     *
+     * Derived on the MKR from the rear wheel pair at 50 Hz: this stream runs at
+     * ~10 Hz and the signal swings 30 deg/s inside one U-turn, so deriving it
+     * host-side would be aliased beyond use.
+     *
+     * The sentinel is NOT zero - zero means genuinely straight.  The wheel
+     * sensors report nothing below about 3 km/h, and asserting "straight" at
+     * parking speeds is the most dangerous available error.
+     *
+     * Curvature and effective steering angle are absent by design: both are
+     * this, @c speed and one vehicle constant away, so the host can derive them
+     * and revise the wheelbase without reflashing the MKR.
+     */
+    int16_t yawRateCdps;
+    /**
+     * Per-wheel speeds in raw 0.01 km/h counts, FL FR RL RR.
+     * @c 0xFFFF per channel when unavailable.
+     *
+     * Carried alongside the scalar @c speed because per-wheel speed is what
+     * shows lockup, slip and ABS activity at the instant of an incident, which
+     * a scalar cannot reconstruct afterwards.
+     */
+    uint16_t wheelRaw[4];
 };
 
 /**
@@ -367,7 +441,7 @@ constexpr size_t MAX_LOG_TEXT = MAX_PAYLOAD - sizeof(LogHeader);
 // The wire contract depends on these exact sizes on both ends.  Telemetry must
 // also equal sizeof(TelemetryPayload) in CommProtocol.h — the bridge asserts
 // that separately, where both headers are visible.
-static_assert(sizeof(Telemetry)    == 131, "hostproto::Telemetry must be tightly packed to 131 bytes");
+static_assert(sizeof(Telemetry)    == 148, "hostproto::Telemetry must be tightly packed to 148 bytes");
 /**
  * Must fit the frame's one-byte LEN field and @c Hello::telemetryBytes, which is
  * also one byte.  Stated explicitly now the struct has grown 79 -> 83 -> 123 -> 131:
@@ -578,6 +652,7 @@ inline const char *typeName(uint8_t type)
     case CMD_START_STREAM: return "CMD_START_STREAM";
     case CMD_STOP_STREAM:  return "CMD_STOP_STREAM";
     case CMD_SET_DECIM:    return "CMD_SET_DECIM";
+    case CMD_SET_CAN_MODE: return "CMD_SET_CAN_MODE";
     case CMD_PING:         return "CMD_PING";
     case MSG_TELEMETRY:    return "MSG_TELEMETRY";
     case MSG_STATUS:       return "MSG_STATUS";
@@ -606,6 +681,7 @@ inline bool isCommand(uint8_t type)
     case CMD_START_STREAM:
     case CMD_STOP_STREAM:
     case CMD_SET_DECIM:
+    case CMD_SET_CAN_MODE:
     case CMD_PING:
         return true;
     default:
@@ -616,7 +692,7 @@ inline bool isCommand(uint8_t type)
 /** @brief Expected payload length for a command TYPE; 0 for the zero-payload commands. */
 inline uint8_t commandPayloadLen(uint8_t type)
 {
-    return (type == CMD_SET_DECIM) ? 1 : 0;
+    return (type == CMD_SET_DECIM || type == CMD_SET_CAN_MODE) ? 1 : 0;
 }
 
 } // namespace hostproto

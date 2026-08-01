@@ -48,7 +48,7 @@ CommReturnStatus sendFrame(uint8_t type, const uint8_t *payload, uint8_t len){
     return (written == n) ? CommReturnStatus::OK : CommReturnStatus::NOK_BUSY;
 }
 
-void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, TelemetryPayload &out){
+void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode, TelemetryPayload &out){
     out.masterMillis = millis();
 
     out.speed       = obd.speed;
@@ -130,11 +130,39 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     if (imu.dataGap) flags |= COMM_FLAG_IMU_DATA_GAP;
     if (imu.lowPower) flags |= COMM_FLAG_IMU_LOWPOWER;
     out.flags = flags;
+
+    // ---- vehicle bus ----
+    // Copied verbatim from the template, sentinels included. expireVehicleSignals()
+    // has already turned staleness into absence upstream, so nothing here needs
+    // to re-judge freshness - and re-judging it against a second window is how
+    // the two would drift apart.
+    out.canMode          = canMode;
+    out.sigSource        = packVehSourceByte(veh);
+    out.gearPos          = (uint8_t)veh.gear;
+    // Turn bits are the HELD indicator state, not the raw lamp — the blink is
+    // ~1.5 Hz and this payload leaves at ~4 Hz, so the decoder holds each flash
+    // and what ships is "indicating", which is the question a lane-keeping
+    // consumer is actually asking.
+    out.vehFlags         = (uint8_t)((veh.brakePressed ? 0x01u : 0x00u) |
+                                     (veh.brakeSwitch  ? 0x02u : 0x00u) |
+                                     (veh.turnLeft     ? 0x04u : 0x00u) |
+                                     (veh.turnRight    ? 0x08u : 0x00u));
+    out.pedalGas         = veh.pedalGas;
+    out.steerMotorTorque = veh.steerMotorTorque;
+    out.yawRateCdps      = veh.yawRateCdps;
+    for (uint8_t i = 0; i < VEH_WHEEL_COUNT; ++i) out.wheelRaw[i] = veh.wheelRaw[i];
+
+    // Sniffed speed and rpm outrank the OBD2 copies when both exist: 50-100 Hz
+    // against a ~500 ms poll cycle, and 0.01 km/h against whole km/h. The OBD2
+    // values stay in their own fields; this only decides what the primary
+    // `speed`/`rpm` carry, which is what the overlay reads.
+    if (veh.speedSrc != VehSource::NONE && !isnan(veh.speedKmh)) out.speed = veh.speedKmh;
+    if (veh.rpmSrc   != VehSource::NONE && !isnan(veh.rpm))      out.rpm   = veh.rpm;
 }
 
-CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived){
+CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
     TelemetryPayload p;
-    buildTelemetry(obd, gps, imu, derived, p);
+    buildTelemetry(obd, gps, imu, derived, veh, canMode, p);
     return sendFrame(MSG_TELEMETRY, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
 }
 
@@ -144,10 +172,11 @@ void initCommMaster(CommMaster &m){
     m.lastCommandMs = 0;
     m.oncePending   = false;
     m.onceRequestMs = 0;
+    m.canModeRequest = 0;
     commRxInit(m.rx);
 }
 
-void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived){
+void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
     // 1) Service inbound C3 commands: non-blocking and bounded to a fixed budget
     //    per call so a command flood cannot monopolise the loop.
     uint8_t  type = 0, len = 0;
@@ -162,8 +191,20 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
         // marked healthy even when nothing is streaming.
         m.lastCommandMs = millis();
 
-        // Every defined command is zero-payload; a payload marks a malformed frame.
-        if (len != 0){
+        // Unknown TYPE before bad LENGTH, deliberately. The reverse order tells
+        // a peer that speaks a LATER protocol version its command was the right
+        // command with the wrong length, which sends the investigation looking
+        // at framing instead of at the version mismatch that actually caused it.
+        //
+        // This replaces a blanket "len != 0 -> NACK", which was correct only for
+        // as long as every command was zero-payload. CMD_SET_CAN_MODE is the
+        // first that is not, and under the old rule the MKR would have rejected
+        // it as malformed - a bug that would only ever appear in the car.
+        if (!isCommand(type)){
+            sendFrame(MSG_NACK, nullptr, 0);
+            continue;
+        }
+        if (len != commandPayloadLen(type)){
             sendFrame(MSG_NACK, nullptr, 0);
             continue;
         }
@@ -173,7 +214,7 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
                 // A one-shot must not be lost to a momentarily full TX buffer:
                 // the requester gets no answer and no error, and simply waits.
                 // Latch it instead and let the retry below deliver it.
-                if (sendTelemetry(obd, gps, imu, derived) != CommReturnStatus::OK){
+                if (sendTelemetry(obd, gps, imu, derived, veh, canMode) != CommReturnStatus::OK){
                     m.oncePending   = true;
                     m.onceRequestMs = millis();
                 }
@@ -184,6 +225,17 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
                 break;
             case CMD_STOP_STREAM:
                 m.streaming = false;
+                break;
+            case CMD_SET_CAN_MODE:
+                // Latched, not applied. See CommMaster::canModeRequest for why
+                // the transition does not happen inside the frame decoder.
+                // Validated here so an out-of-range value is rejected at the
+                // wire boundary rather than reaching the CAN driver.
+                if (payload[0] >= 1u && payload[0] <= 3u){
+                    m.canModeRequest = payload[0];
+                } else {
+                    sendFrame(MSG_NACK, nullptr, 0);
+                }
                 break;
             case CMD_PING:
                 sendFrame(MSG_PONG, nullptr, 0);
@@ -200,7 +252,7 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
     if (m.oncePending){
         if ((millis() - m.onceRequestMs) >= COMM_ONCE_TIMEOUT_MS){
             m.oncePending = false;  // give up: the answer would be stale anyway
-        } else if (sendTelemetry(obd, gps, imu, derived) == CommReturnStatus::OK){
+        } else if (sendTelemetry(obd, gps, imu, derived, veh, canMode) == CommReturnStatus::OK){
             m.oncePending = false;
         }
     }
@@ -210,7 +262,7 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
     //    the clock only when the frame actually went out, so a NOK_BUSY (congested TX)
     //    retries on the next loop instead of being silently dropped for a full period.
     if (m.streaming && (millis() - m.lastPushMs) >= COMM_STREAM_INTERVAL_MS){
-        if (sendTelemetry(obd, gps, imu, derived) == CommReturnStatus::OK){
+        if (sendTelemetry(obd, gps, imu, derived, veh, canMode) == CommReturnStatus::OK){
             m.lastPushMs = millis();
         }
     }

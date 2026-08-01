@@ -4,7 +4,21 @@
 #include <cstdint>
 #include <Arduino.h>
 #include <SPI.h>
+#include <CAN.h>
 #include "DataDictionary.h"
+
+// This module transmits on a live vehicle bus, so it depends on fixes that only
+// exist in the vendored CAN library.  Building against the global Arduino copy
+// would compile and link perfectly and then, on a bus that is not idle, spin
+// inside CAN.endPacket() forever - which the watchdog turns into a reboot loop
+// straight back into the same call, not a recovery.  It would also accept a DLC
+// above 8 and overflow the driver's own 8-byte receive buffer into its SPI
+// settings and pin numbers.  Neither failure is visible at build time, and the
+// two library copies are similar enough that nothing would look wrong.
+// See peripherals/mkr_zero/vendor/CANBus/PATCHES.md.
+#ifndef DASHCAM_CANBUS_VENDORED_FIXES
+#error "Stock arduino-CAN detected. Build with --library peripherals/mkr_zero/vendor/CANBus (see vendor/CANBus/PATCHES.md); upstream endPacket() has no deadline and parsePacket() overflows its RX buffer on DLC > 8."
+#endif
 
 /// Default timeout for OBD-II response polling (ms).
 #define OBD2_TIMEOUT_MSEC 10000UL
@@ -44,8 +58,17 @@ enum OBD2_S1Command{
     NONE          = 0x00, ///< Placeholder / no command.
     RPM           = 0x0C, ///< Engine RPM.
     SPEED         = 0x0D, ///< Vehicle speed (km/h).
-    GEAR_CMD      = 0xA3, ///< Commanded gear (0 = Park/Neutral, 1–8 = gears 1–8).
-    GEAR_RTIO     = 0xA4, ///< Transmission actual gear ratio.
+    /// Transmission actual gear — 4 bytes: A/B gear+support, C/D ratio.
+    ///
+    /// PID 0xA3 used to be polled here as "commanded gear". It is not: in the
+    /// SAE J1979DA digital annex 0xA3 is a NINE-byte evaporative-system vapour
+    /// pressure record. Two things followed from that. The decoder read byte 0
+    /// of an evap-pressure record as a gear number, so @c gear was never once a
+    /// gear; and a nine-byte response cannot fit a single ISO-TP frame, so it
+    /// would arrive as a multi-frame transfer this poller cannot parse at all
+    /// and would simply time out, costing one slot of every poll cycle.
+    /// Both gear and ratio come from 0xA4.
+    GEAR_RTIO     = 0xA4,
     AIR_PRES      = 0x33, ///< Barometric pressure (kPa).
     ODOMETER      = 0xA6, ///< Odometer reading (km).
     FUEL_LVL      = 0x2F, ///< Fuel tank level (%).
@@ -61,7 +84,6 @@ enum OBD2_S1Command{
 #define NONE_T          0
 #define RPM_T           2
 #define SPEED_T         1
-#define GEAR_CMD_T      1
 #define GEAR_RTIO_T     4
 #define AIR_PRES_T      1
 #define ODOMETER_T      4
@@ -70,6 +92,27 @@ enum OBD2_S1Command{
 #define FUEL_RATE_T     2
 #define ENGINE_LOAD_T   1
 #define THROTTLE_POSN_T 1
+
+/**
+ * @brief Index into @c OBD2Data::fieldMs, one per published reading.
+ *
+ * Separate from @c OBD2_S1Command because the mapping is not one-to-one: PID
+ * 0xA4 fills two fields (gear and ratio) from a single response.
+ */
+enum OBD2Field : uint8_t {
+    OBD2F_RPM = 0,
+    OBD2F_SPEED,
+    OBD2F_COOLANT,
+    OBD2F_FUEL_LVL,
+    OBD2F_FUEL_RATE,
+    OBD2F_THROTTLE,
+    OBD2F_ENGINE_LOAD,
+    OBD2F_AIR_PRES,
+    OBD2F_GEAR,
+    OBD2F_GEAR_RATIO,
+    OBD2F_ODO,
+    OBD2_FIELD_COUNT
+};
 
 /** Runtime configuration for a single OBD-II session. */
 struct OBD2Config{
@@ -103,7 +146,13 @@ CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxA
  * @param[in]     timeoutInterval Per-group response timeout in milliseconds.
  * @return @c CANReturnStatus::OK, @c NOK_STATUS_BAD if the MCP2515
  *         self-check fails, or @c NOK_TIMEOUT if a group has no response.
- * @note Currently disabled in @c initializeOBD2() pending validation.
+ * @warning Disabled in @c initializeOBD2(), and it CANNOT simply be
+ *          uncommented. It blocks: up to seven PID groups, each waiting
+ *          @p timeoutInterval (default @c OBD2_TIMEOUT_MSEC = 10 s) inside a
+ *          busy loop with no watchdog feed. Worst case is ~70 s against an 8 s
+ *          watchdog, so a vehicle that does not answer group 0 turns every boot
+ *          into a reset. Re-enabling it means converting it to the same
+ *          non-blocking staged shape as @c gpsInitTick() first.
  */
 CANReturnStatus getSupportedPIDs(OBD2Config &config, unsigned long timeoutInterval = OBD2_TIMEOUT_MSEC);
 
@@ -116,8 +165,14 @@ CANReturnStatus getSupportedPIDs(OBD2Config &config, unsigned long timeoutInterv
  * @param[in] config   Active OBD2Config.
  * @param[in] command  PID to request (from @c OBD2_S1Command).
  * @return @c CANReturnStatus::OK on success, or @c NOK_TX if any CAN transmit
- *         operation failed (e.g. no ACK on a disconnected bus). @c endPacket()
- *         is bounded because One-Shot Mode is enabled in @c initializeOBD2().
+ *         operation failed (e.g. no ACK on a disconnected bus).
+ *
+ * @note This used to claim @c endPacket() was bounded by One-Shot Mode. It is
+ *       not. OSM limits RE-transmission after an attempt; it does not bound
+ *       waiting for the bus to go idle in the first place, so on a
+ *       stuck-dominant bus upstream spun here forever. The bound now comes from
+ *       an explicit deadline inside the vendored @c endPacket(), which is what
+ *       the @c DASHCAM_CANBUS_VENDORED_FIXES guard above exists to enforce.
  */
 CANReturnStatus sendS1Command(OBD2Config &config, const OBD2_S1Command command);
 
@@ -153,6 +208,31 @@ CANReturnStatus receiveS1Command(OBD2Config &config, uint8_t *outputBuffer, byte
 #define OBD2_TX_FAIL_LIMIT      20U
 
 /**
+ * Silence, in ms, after which the ECU is considered gone.
+ *
+ * A transmit "succeeding" only means some node on the bus ACKed the frame, and
+ * on a vehicle bus something always will.  Without this, a wrong filter, a wrong
+ * response ID or a powered-down ECM produced an endless run of clean sends and
+ * silent timeouts while @c isOBD2LinkLost() stayed false forever — the poller
+ * reported a healthy link to an ECU that was not there.
+ *
+ * A full pipeline sweep is ~10 x @c OBD2_TICK_TIMEOUT_MS, so this is several
+ * complete cycles of total silence: long enough that a busy ECU dropping one
+ * request cannot trip it.
+ */
+#define OBD2_RX_SILENCE_MS      3000UL
+
+/**
+ * Floor on the gap between consecutive requests.
+ *
+ * Previously the next request went out the instant a reply was decoded, which
+ * on a healthy ECU meant ~20 functional broadcasts per second at 0x7DF. Real
+ * scan tools pace themselves; flooding a live vehicle bus with diagnostic
+ * requests is exactly the kind of guest behaviour that gets noticed.
+ */
+#define OBD2_MIN_REQUEST_GAP_MS 20UL
+
+/**
  * @brief Latest OBD-II sensor readings maintained by the non-blocking @c tickOBD2() poller.
  *
  * Fields that have not yet been received from the ECU hold @c NAN.
@@ -167,11 +247,39 @@ struct OBD2Data {
     float throttle;    ///< Throttle plate position (%) — PID @c THROTTLE_POSN.
     float engineLoad;  ///< Calculated engine load (%) — PID @c ENGINE_LOAD.
     float airPressure; ///< Barometric pressure (kPa) — PID @c AIR_PRES.
-    float gear;        ///< Commanded gear (0 = Park/Neutral, 1–8) — PID @c GEAR_CMD.
+    float gear;        ///< Transmission actual gear — PID @c GEAR_RTIO byte B.
     float gearRatio;   ///< Transmission gear ratio — PID @c GEAR_RTIO.
     float odo;         ///< Odometer reading (km) — PID @c ODOMETER.
-    uint32_t lastUpdateMs; ///< @c millis() when @c tickOBD2() last stored a reading (0 = never), for liveness checks.
+    uint32_t lastUpdateMs; ///< @c millis() when @c tickOBD2() last stored ANY reading (0 = never).
+
+    /**
+     * Per-field @c millis() stamps, indexed by @c OBD2Field. 0 = never seen.
+     *
+     * @c lastUpdateMs alone cannot express what a round-robin poller actually
+     * knows.  One cycle takes up to 550 ms and any single reply refreshed it,
+     * so a live RPM response certified a speed reading ten PIDs stale as
+     * current — and @c COMM_FLAG_OBD2_VALID then vouched for the entire
+     * payload.  A frozen speed is the worst case: it fed the acceleration
+     * estimator over and over, which reads as a real deceleration to zero.
+     *
+     * Kept ALONGSIDE @c lastUpdateMs rather than replacing it, because the two
+     * answer different questions: "is this number current" and "is the ECU
+     * answering at all".
+     */
+    uint32_t fieldMs[OBD2_FIELD_COUNT];
 };
+
+/**
+ * @brief Overwrites any field older than @p maxAgeMs with @c NAN.
+ *
+ * Call immediately before publishing.  Staleness has to become absence at the
+ * boundary, because @c NAN is the only "unavailable" every downstream consumer
+ * already handles; anything else needs every one of them to remember a rule.
+ *
+ * @param[in,out] data      Readings to expire in place.
+ * @param[in]     maxAgeMs  Age at which a reading stops counting as current.
+ */
+void expireStaleOBD2Fields(OBD2Data &data, uint32_t maxAgeMs = OBD2_FRESH_WINDOW_MS);
 
 /**
  * @brief Sets all fields of @p data to @c NAN.

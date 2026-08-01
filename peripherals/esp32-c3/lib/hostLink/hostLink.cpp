@@ -148,6 +148,19 @@ void HostLink::handleCommand(uint8_t type, const uint8_t *payload, uint8_t len)
         decim_ = payload[0];
         break;
 
+    case hostproto::CMD_SET_CAN_MODE:
+        // Range-checked here so a bad value dies at the first hop it reaches
+        // and the host gets a NACK it can attribute to its own argument. 0 is
+        // rejected rather than mapped to OFF: turning the vehicle bus off
+        // entirely is not something a stream command should be able to do by
+        // passing a falsy value.
+        if (payload[0] < 1 || payload[0] > 3) {
+            (void)sendNack(type, hostproto::NACK_BAD_VALUE);
+            break;
+        }
+        canModeReq_ = payload[0];
+        break;
+
     default:
         break; // unreachable: isCommand() already filtered unknown types
     }

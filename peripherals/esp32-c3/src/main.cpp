@@ -85,6 +85,17 @@ static_assert(offsetof(TelemetryPayload, imuTempC) == offsetof(hostproto::Teleme
               "TelemetryPayload/hostproto::Telemetry field order diverged (imuTempC)");
 static_assert(offsetof(TelemetryPayload, imuAccelPeak) == offsetof(hostproto::Telemetry, imuAccelPeak),
               "TelemetryPayload/hostproto::Telemetry field order diverged (imuAccelPeak)");
+// The vehicle-bus tail. Checked at BOTH ends of the block, not just the start:
+// the fields between are mixed 1/2-byte and the array is last, so a single
+// anchor would pass while an interior field had drifted.
+static_assert(offsetof(TelemetryPayload, canMode) == offsetof(hostproto::Telemetry, canMode),
+              "canMode offset differs between the two protocol headers");
+static_assert(offsetof(TelemetryPayload, steerMotorTorque) == offsetof(hostproto::Telemetry, steerMotorTorque),
+              "steerMotorTorque offset differs between the two protocol headers");
+static_assert(offsetof(TelemetryPayload, yawRateCdps) == offsetof(hostproto::Telemetry, yawRateCdps),
+              "yawRateCdps offset differs between the two protocol headers");
+static_assert(offsetof(TelemetryPayload, wheelRaw) == offsetof(hostproto::Telemetry, wheelRaw),
+              "wheelRaw offset differs between the two protocol headers");
 static_assert(offsetof(TelemetryPayload, flags) == offsetof(hostproto::Telemetry, flags),
               "TelemetryPayload/hostproto::Telemetry field order diverged (flags)");
 
@@ -337,6 +348,19 @@ void loop()
         gForwardOnce   = true;
         gForwardOnceMs = now;
         gOncePendingTx = !gLink.requestOnce();
+    }
+
+    // 2b) CAN mode request, relayed straight down.
+    //
+    // Deliberately NOT latched-and-retried the way a one-shot is. A one-shot
+    // has an answer the host is blocked on, so losing it strands the host; a
+    // mode request has no reply, and a stale one delivered seconds later would
+    // switch the bus mode at a moment the host has long since moved past. If
+    // the MKR's TX is busy, say so and let the host ask again.
+    if (const uint8_t m = gHost.takeCanModeRequest()) {
+        if (!gLink.setCanMode(m)) {
+            bridgeLog(hostproto::LOG_WARN, "CMD_SET_CAN_MODE dropped: master TX busy");
+        }
     }
 
     expireOneShot(now);

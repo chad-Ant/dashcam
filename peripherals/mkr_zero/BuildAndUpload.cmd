@@ -23,6 +23,17 @@ rem               flag is ever lost, lib\I2CBus.h fails the build on a missing
 rem               marker rather than silently linking the buggy one.
 rem               See vendor\Wire\README.md.
 rem
+rem   vendor\CANBus  A patched copy of timurrrr's arduino-CAN fork. WITHOUT this
+rem               flag arduino-cli resolves <CAN.h> from the global Arduino
+rem               libraries folder - an unpinned directory nothing version-checks
+rem               - and every fix in vendor\CANBus silently stops reaching the
+rem               firmware. The upstream copy hangs forever in endPacket() on a
+rem               stuck bus, overflows its 8-byte RX buffer on a DLC above 8,
+rem               truncates 11-bit filters to 8 bits, and puts the controller in
+rem               Configuration mode when asked for Listen-Only. lib\OBD2Functions.h
+rem               fails the build on a missing marker if this flag is ever lost.
+rem               See vendor\CANBus\PATCHES.md.
+rem
 rem This also depends on mkr_zero.ino including the headers by BARE name
 rem ("OBD2Functions.h", not "lib/OBD2Functions.h"): a path-qualified include is
 rem treated as a plain relative file and never binds to the library, which
@@ -39,6 +50,8 @@ if errorlevel 1 (
 for %%I in ("%~dp0.") do set "SKETCH_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\lib") do set "LIB_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\vendor\Wire") do set "WIRE_DIR=%%~fI"
+for %%I in ("%SKETCH_DIR%\vendor\CANBus") do set "CAN_DIR=%%~fI"
+for %%I in ("%SKETCH_DIR%\vendor\SdFat") do set "SDFAT_DIR=%%~fI"
 
 set "FQBN=arduino:samd:mkrzero"
 set "CORE_REQUIRED=1.8.14"
@@ -61,9 +74,9 @@ if not "%CORE_FOUND%"=="%CORE_REQUIRED%" (
 )
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

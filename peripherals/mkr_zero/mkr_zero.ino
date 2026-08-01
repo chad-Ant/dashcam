@@ -31,6 +31,9 @@
 #include "OBD2Functions.h"
 #include "GPSFunctions.h"
 #include "CommunicationFunctions.h"
+#include "CANSniffFunctions.h"
+#include "SDFunctions.h"
+#include "VehicleSignals.h"
 #include "SignalProcessingFunctions.h"
 #include "IMUFunctions.h"
 
@@ -82,6 +85,25 @@ enum class VehiclePower : uint8_t { Unknown, On, Off };
 
 OBD2Config OBD2S1Commands;
 OBD2Data   obdData;
+
+/**
+ * The common template both sources fill, and the CAN controller's current mode.
+ *
+ * Boot default is SNIFF, not OBD2 — inverting what this sketch used to do.
+ * Listen-only emits neither ACK bits nor error frames, so until the bit timing
+ * has been proven on a given vehicle the node cannot disturb the bus at all;
+ * and sniffing is the better source anyway (50-100 Hz and 0.01 km/h, against a
+ * ~500 ms poll cycle quantised to whole km/h). OBD2 is entered only when the
+ * Jetson asks, via CMD_SET_CAN_MODE.
+ */
+VehicleSignals vehSignals;
+YawEstimator   yawEst;
+CanMode        canMode = CanMode::OFF;
+/// The vehicle signal map, read from the card at boot. Falls back to the
+/// compiled-in Honda map when the card holds none.
+CanSignalMap   canMap;
+/// Boot-time "is this map for this car?" decision. Runs to a verdict ONCE.
+CanProbeState  canProbe = { CanProbeStage::Idle, 0, false };
 GPSData    gpsData;
 CommMaster commMaster;
 
@@ -153,7 +175,7 @@ static unsigned long lastOBD2Retry  = 0;
 /// configures a chip on the SPI bus; it succeeds with no vehicle attached at
 /// all.  Only a decoded reply proves an ECU is powered and talking, which is the
 /// thing "is the vehicle on?" is really asking.
-static bool          obdEcuEverLive = false;
+static bool          vehBusEverLive = false;
 /// @c millis() of the last decoded ECU reply, for the shutdown timer.
 static unsigned long lastEcuReplyMs = 0;
 static unsigned long lastLEDBlink   = 0;
@@ -199,10 +221,11 @@ static void logSubsystemEdge(const char *name, bool nowUp, bool &prevUp)
  */
 static VehiclePower vehiclePowerState()
 {
-    // No ECU has ever answered, so there is no evidence about the vehicle —
-    // whether that is because no CAN shield is fitted, the wiring is wrong, or
-    // the car was already off at boot.  Unknown, and Unknown behaves like On.
-    if (!obdEcuEverLive) return VehiclePower::Unknown;
+    // Nothing has ever arrived from the vehicle — no decoded broadcast frame in
+    // a listen-only mode, and no ECU reply in OBD2 mode.  No evidence either
+    // way: no CAN shield fitted, wrong wiring, or the car was already off at
+    // boot.  Unknown, and Unknown behaves like On.
+    if (!vehBusEverLive) return VehiclePower::Unknown;
 
     // Deliberately NOT gated on obdReady.  Controller state answers "can I
     // transmit?", which is a different question: the MCP2515 stays perfectly
@@ -302,11 +325,71 @@ static void updateHeading(bool freshSample)
 
     const float r = headingFilter.resultantLength();
     derived.headingDeg = (!isnan(r) && r >= HEADING_MIN_RESULTANT) ? mean : NAN;
+
+    // ── Teach the yaw estimator what "straight" looks like ───────────────────
+    //
+    // GNSS is the independent reference here, which is the whole point: the
+    // wheel pair cannot tell a genuine turn from a tyre-radius mismatch, because
+    // both produce a persistent left-right difference. Only something that
+    // measures heading by other means can attribute the residual to the tyres.
+    //
+    // The mismatch is worth correcting: measured on this vehicle at about
+    // +0.74 %, which at 40 km/h fakes ~3.5 deg/s and renders straight motorway
+    // driving as a permanent 180 m left-hand curve.
+    static float    prevHeadingDeg = NAN;
+    static uint32_t prevHeadingMs  = 0;
+
+    const uint32_t nowMs = millis();
+    if (!isnan(derived.headingDeg)) {
+        if (!isnan(prevHeadingDeg) && prevHeadingMs != 0) {
+            const uint32_t dtMs = nowMs - prevHeadingMs;
+            // Bounded both ways: too short and the rate is quantisation noise,
+            // too long and the vehicle may have turned and come back between
+            // samples, which reads as straight and is not.
+            if (dtMs >= 100u && dtMs <= 1000u) {
+                // angleDiff360 because heading wraps - 359 to 1 is +2, not -358.
+                const float rateDps =
+                    angleDiff360(derived.headingDeg, prevHeadingDeg) * 1000.0f / (float)dtMs;
+                if (fabsf(rateDps) < YAW_STRAIGHT_MAX_DPS &&
+                    vehSignals.wheelRaw[VEH_WHEEL_RL] != VEH_WHEEL_INVALID &&
+                    vehSignals.wheelRaw[VEH_WHEEL_RR] != VEH_WHEEL_INVALID) {
+                    yawObserveStraight(yawEst,
+                                       vehSignals.wheelRaw[VEH_WHEEL_RL],
+                                       vehSignals.wheelRaw[VEH_WHEEL_RR]);
+                }
+            }
+        }
+        prevHeadingDeg = derived.headingDeg;
+        prevHeadingMs  = nowMs;
+    } else {
+        // No trustworthy course: drop the anchor rather than measure a rate
+        // across the gap, which would span an unknown amount of turning.
+        prevHeadingDeg = NAN;
+        prevHeadingMs  = 0;
+    }
 }
 
-/** @brief Brings up the CAN/OBD-II interface. @return true on success. */
+/**
+ * @brief Brings up the CAN/OBD-II interface. @return true on success.
+ *
+ * REFUSES unless the controller is off or already in OBD2 mode.  Both calls
+ * inside `initializeOBD2()` end in Normal mode — `CAN.begin()` because
+ * `stayInConfigurationMode` defaults false, and `CAN.filter()` by upstream's own
+ * documented contract — so running this during a listen-only session silently
+ * puts the node on the bus with a 0x7E8-only filter while `canMode` still says
+ * SNIFF.  That is not a theoretical risk: it used to happen five seconds into
+ * every boot, and the guard is here because a comment claiming it could not was
+ * not enough.
+ */
 static bool startOBD2()
 {
+    const CanMode m = canGetMode();
+    if (m != CanMode::OFF && m != CanMode::OBD2) {
+        Serial.print("OBD2: refusing CAN init while in ");
+        Serial.println(canModeName(m));
+        return false;
+    }
+
     const CANReturnStatus st =
         initializeOBD2(OBD2S1Commands, OBD2_TX_GLOBAL, OBD2_RX_ECM_1);
     if (st != CANReturnStatus::OK) {
@@ -314,6 +397,63 @@ static bool startOBD2()
         return false;
     }
     Serial.println("OBD2: CAN started");
+    return true;
+}
+
+/** @brief Human-readable name for a mode, for the console log only. */
+static const char *canModeName(CanMode m)
+{
+    switch (m) {
+        case CanMode::DISCOVER: return "discover";
+        case CanMode::SNIFF:    return "sniff";
+        case CanMode::OBD2:     return "obd2";
+        default:                return "off";
+    }
+}
+
+/**
+ * @brief Applies a mode transition and re-arms whatever the new mode owns.
+ *
+ * Both directions have to be handled, not just the interesting one.  Leaving
+ * SNIFF must clear the sniffed values, because they are about to stop being
+ * updated and a consumer would otherwise keep reading a speed frozen at the
+ * instant of the switch; leaving OBD2 must clear the poller, because its
+ * failure counters describe a session that has ended.
+ */
+static bool applyCanMode(CanMode want)
+{
+    const CanModeStatus st = canSetMode(want, MCP2515_DEFAULT_CS_PIN);
+    if (st == CanModeStatus::UNCHANGED) return true;
+    if (st != CanModeStatus::OK) {
+        Serial.print("CAN: mode ");
+        Serial.print(canModeName(want));
+        Serial.print(" REFUSED, status ");
+        Serial.println(static_cast<int>(st));
+        return false;
+    }
+
+    canMode = want;
+
+    // Whatever the previous mode was publishing is now unmaintained. Blank it
+    // rather than let it age out: the freshness window would hold values live
+    // for up to a second after the source that fed them was switched off.
+    initVehicleSignals(vehSignals);
+    initYawEstimator(yawEst, canSniffGetMap());
+
+    if (want == CanMode::OBD2) {
+        obdReady = true;
+        resetOBD2Poll();
+    } else {
+        // Just "not polling". This comment used to claim obdReady=false also
+        // stopped the retry path re-initialising into Normal mode; it did the
+        // opposite — see the retry branch in loop(), which is now gated on the
+        // mode instead. Keeping obdReady false here is still right, it simply
+        // is not the thing protecting listen-only.
+        obdReady = false;
+    }
+
+    Serial.print("CAN: mode -> ");
+    Serial.println(canModeName(want));
     return true;
 }
 
@@ -443,10 +583,99 @@ void setup()
     watchdogFeed();
 #endif
 
-    // Controller only.  Liveness is stamped in loop(), where an actual ECU reply
-    // can be observed — see vehiclePowerState().
-    obdReady      = startOBD2();
+    // ── Onboard microSD ──────────────────────────────────────────────────────
+    //
+    // Mounted here, before anything touches the CAN controller, so the vehicle
+    // signal map (Phase B) can be read before the first mode is chosen. The card
+    // is on SPI1, a different SERCOM from the MCP2515, so this cannot contend
+    // with the CAN bring-up below; it is still ordered first so there is no
+    // question about interleaved chip selects.
+    //
+    // NOT skipped on a quarantined boot. The quarantine exists for the shared
+    // I2C bus, whose SERCOM waits are unbounded; SdFat's begin() is bounded by
+    // its own card-init timeout and fails fast on an empty slot.
+    //
+    // Non-fatal by design. A rig with no card is still a working telemetry node.
+    if (initializeSD() == SDReturnStatus::OK) {
+        Serial.println("SD: card mounted (SPI1)");
+        SDConfig cfg;
+        initSDConfigDefaults(cfg);
+        const SDReturnStatus cs = readConfig(SD_CONFIG_FILENAME, cfg);
+        if      (cs == SDReturnStatus::OK)            Serial.println("SD: config.txt loaded");
+        else if (cs == SDReturnStatus::NOK_NOT_FOUND) Serial.println("SD: no config.txt; using defaults");
+        else                                          Serial.println("SD: config.txt unreadable; using defaults");
+    } else {
+        Serial.println("SD: no card - defaults only");
+    }
+    watchdogFeed();
+
+    // Bring the controller up and go straight to listen-only sniffing.
+    //
+    // startOBD2() is still what configures the MCP2515 (bit timing, pins, OSM),
+    // so it runs first — but the node does NOT stay bus-active. applyCanMode()
+    // immediately moves it to Listen-Only, where it emits neither ACK bits nor
+    // error frames. That ordering matters on a vehicle whose bit timing has not
+    // been proven: a wrong CNF setting in Normal mode produces error frames and
+    // can set a VSA light, while in listen-only it costs nothing but frames.
+    //
+    // If the controller fails to come up at all, the retry path below handles
+    // it exactly as before.
+    // The vehicle signal map decides what happens next. Read before anything
+    // touches the CAN controller, because canSetMode(SNIFF) programs the
+    // hardware filter from the map's ID set.
+    const CanMapStatus ms = canMapLoad(canMap, CAN_MAP_FILENAME);
+    Serial.print("CANMAP: ");
+    Serial.println(canMapStatusName(ms));
+    if (ms == CanMapStatus::OK) {
+        Serial.print("CANMAP: ");
+        Serial.print(canMap.rowCount);
+        Serial.print(" signals across ");
+        Serial.print(canMap.idCount);
+        Serial.print(" ids, id=0x");
+        Serial.println(canMap.checksum, HEX);
+    } else {
+        Serial.println("CANMAP: falling back to the compiled-in map");
+    }
+    canSniffSetMap(ms == CanMapStatus::OK ? &canMap : nullptr);
+    initYawEstimator(yawEst, canSniffGetMap());
+    watchdogFeed();
+
+    if (!startOBD2()) {
+        obdReady = false;
+        canProbeSkip(canProbe);
+    } else if (ms != CanMapStatus::OK) {
+        // No usable map: OBD-II, immediately, without a probe.
+        //
+        // The compiled-in map is deliberately NOT used to sniff here. It exists
+        // as the Phase 2 A/B artefact and as null-safety for canSniffGetMap();
+        // sniffing a hardcoded Honda map on an unknown car would decode another
+        // manufacturer's bits and publish the results as measurements. OBD-II is
+        // a standard every compliant vehicle answers, so an unconfigured install
+        // still produces telemetry - just slower and coarser.
+        //
+        // And there is nothing to probe FOR: with no map, a ten-second window
+        // could only reach the same answer ten seconds later.
+        canProbeSkip(canProbe);
+        applyCanMode(CanMode::OBD2);
+        Serial.println("CAN: no vehicle map; using OBD2 query");
+    } else {
+        if (applyCanMode(CanMode::SNIFF)) {
+            // ARMED, not run. setup() must not hold the boot for the probe
+            // window: the C3 link, the IMU drain and the GNSS machine all need
+            // loop() passes during it, and the 8 s watchdog would fire long
+            // before ten seconds elapsed.
+            canProbeArm(canProbe);
+        } else {
+            // Sniffing refused: fall back to a mode we can verify rather than
+            // to a controller in an unknown state.
+            canProbeSkip(canProbe);
+            applyCanMode(CanMode::OBD2);
+            Serial.println("CAN: sniff unavailable; using OBD2");
+        }
+    }
     lastOBD2Retry = millis();
+    initVehicleSignals(vehSignals);
+    initYawEstimator(yawEst, canSniffGetMap());
 
     watchdogFeed();
 }
@@ -462,6 +691,70 @@ void loop()
     // freshness window and be reported as a data gap.  Every OTHER branch is
     // non-blocking by construction.
     watchdogFeed();
+    // ── 0) CAN mode requests from the Jetson, relayed by the C3 ──────────────
+    //
+    // Applied HERE, once per pass, rather than inside the frame decoder: a
+    // transition passes through Configuration mode and drops frames, which has
+    // no business happening in the middle of servicing a command budget.
+    if (commMaster.canModeRequest != 0) {
+        // The host outranks the boot heuristic. A probe that later "decided" to
+        // switch modes out from under an explicit CMD_SET_CAN_MODE would be
+        // overriding a human with a guess.
+        canProbeSkip(canProbe);
+        applyCanMode(static_cast<CanMode>(commMaster.canModeRequest));
+        // Cleared whether or not it succeeded. A refused mode that stayed
+        // latched would be retried every pass forever, and canSetMode()'s rate
+        // limiter would reject most of those - producing a steady stream of
+        // failures for a request the host made exactly once.
+        commMaster.canModeRequest = 0;
+    }
+
+    // ── 0b) Passive decode, whenever a listen-only mode is active ────────────
+    //
+    // The match counter is read either side so a decoded frame can stamp vehicle
+    // liveness. Sniffed traffic is BETTER evidence of a live vehicle than an
+    // OBD-II reply: it is passive, arrives at 50-100 Hz, and needs no request.
+    // Without this the liveness clock was only ever stamped inside the OBD2
+    // poll block, so booting into SNIFF left the vehicle state at Unknown for
+    // the whole drive - and the IMU, which picks its sampling mode from that
+    // state, never dropped to low power on a parked car.
+    const uint32_t matchesBefore = canSniffMatchCount();
+    tickCANSniff(vehSignals, yawEst);
+    if (canSniffMatchCount() != matchesBefore) {
+        vehBusEverLive = true;
+        lastEcuReplyMs = millis();
+    }
+
+    // ── 0c) Boot-time source decision. Runs to a verdict ONCE, never again ───
+    if (canProbe.stage == CanProbeStage::Probing) {
+        const CanProbeStage st = canProbeTick(canProbe, millis());
+        if (st == CanProbeStage::Sniffing) {
+            Serial.print("CAN: probe passed (");
+            Serial.print(canSniffMatchCount());
+            Serial.println(" matching frames); sniffing this vehicle");
+        } else if (st == CanProbeStage::FellBack) {
+            // Two different faults needing different repairs, told apart by the
+            // frame count: traffic but no matches means the map is for another
+            // vehicle; no traffic at all means wrong bit rate, wrong wiring, or
+            // a sleeping bus. Reporting both as "no CAN" sends someone looking
+            // for a broken cable on a car whose only problem is a config file.
+            Serial.print("CAN: probe saw ");
+            Serial.print(canSniffMatchCount());
+            Serial.print(" matching of ");
+            Serial.print(canSniffFrameCount());
+            Serial.println(canSniffFrameCount()
+                ? " accepted - map is for another vehicle; using OBD2"
+                : " accepted - nothing on the bus; using OBD2");
+            applyCanMode(CanMode::OBD2);
+        }
+    }
+
+    // Age each signal on its own source's clock. Sniffed IDs repeat every
+    // 10-20 ms so 200 ms of silence is a genuine outage; an OBD-II field is
+    // expected to be most of a poll cycle old, and holding it to the sniff
+    // window would blank a perfectly healthy fallback mode.
+    expireVehicleSignals(vehSignals, millis(), VEH_FRESH_SNIFF_MS, VEH_FRESH_OBD2_MS);
+
     // ── 1) OBD-II poll, with bounded recovery ────────────────────────────────
     if (obdReady) {
         // The return value is the vehicle-power signal: true means a reply was
@@ -469,9 +762,16 @@ void loop()
         // to be discarded and the clock stamped unconditionally, which made
         // every pass look like proof of life and kept the vehicle "on" forever.
         if (tickOBD2(OBD2S1Commands, obdData)) {
-            obdEcuEverLive = true;
+            vehBusEverLive = true;
             lastEcuReplyMs = millis();
         }
+        // Age each reading out on its OWN clock, every pass.  A full sweep of
+        // the pipeline takes ~10 x OBD2_TICK_TIMEOUT_MS, so without this a live
+        // RPM response certified a speed value most of a second old as current,
+        // and COMM_FLAG_OBD2_VALID then vouched for the whole payload.  Speed is
+        // the one that matters: it is fed to the acceleration estimator, and a
+        // frozen value re-fed repeatedly reads as a genuine deceleration.
+        expireStaleOBD2Fields(obdData);
         if (isOBD2LinkLost()) {
             // Defined fallback rather than silently publishing frozen readings:
             // drop the ready flag so the retry path below re-initialises, and
@@ -480,14 +780,45 @@ void loop()
             lastOBD2Retry = millis();
             Serial.println("OBD2: link lost; will re-init");
         }
-    } else if (isTimeout(OBD2_RETRY_MS, lastOBD2Retry)) {
+    } else if ((canMode == CanMode::OBD2 || canMode == CanMode::OFF) &&
+               isTimeout(OBD2_RETRY_MS, lastOBD2Retry)) {
+        // Gated on the MODE, not on obdReady.
+        //
+        // This used to read `else if (isTimeout(...))`, which fires precisely
+        // BECAUSE obdReady is false — and obdReady is false for the whole of
+        // every listen-only session. So five seconds into every sniff the
+        // controller was re-initialised into Normal mode with a 0x7E8-only
+        // filter, while canMode still reported SNIFF and tickCANSniff() polled
+        // a filter that admitted nothing. Sniffing silently stopped working
+        // after five seconds and the node went bus-active on a vehicle whose
+        // bit timing nothing had confirmed.
+        //
+        // A comment in applyCanMode() asserted that obdReady=false PREVENTED
+        // this. It was exactly backwards, which is why the guard is now a
+        // condition rather than a claim.
+        //
         // Only the controller comes back here.  Nothing about this success says
         // an ECU is present, so the liveness clock is deliberately NOT stamped:
         // a parked vehicle re-initialises the MCP2515 every 5 s quite happily,
         // and refreshing liveness on each attempt would hold the system awake
         // for as long as it stayed parked.
+        // OFF is included deliberately. It means the controller never came up at
+        // all, which is exactly the fault this retry exists for — gating on OBD2
+        // alone would have made a failed boot permanent.
+        const bool wasOff = (canMode == CanMode::OFF);
         obdReady      = startOBD2();
         lastOBD2Retry = millis();
+
+        // Recovering from OFF means the controller is back but no mode has been
+        // chosen. Try sniffing again rather than silently settling for OBD2:
+        // one unlucky boot used to cost the whole drive, because nothing ever
+        // re-attempted SNIFF after setup().
+        if (wasOff && obdReady) {
+            if (!applyCanMode(CanMode::SNIFF)) {
+                obdReady = true;   // applyCanMode() left state untouched on failure
+                Serial.println("CAN: sniff still unavailable; OBD2 poller armed");
+            }
+        }
     }
 
 #ifdef USE_GPS
@@ -656,7 +987,7 @@ void loop()
     // ── 3) Serve the ESP32-C3 link ───────────────────────────────────────────
     // Non-blocking: services queued commands and pushes the 10 Hz stream.
     // Must run every pass — this is the only thing that answers the bridge.
-    tickCommMaster(commMaster, obdData, gpsData, imuData, derived);
+    tickCommMaster(commMaster, obdData, gpsData, imuData, derived, vehSignals, (uint8_t)canMode);
 
     // ── 3b) Subsystem transitions ────────────────────────────────────────────
     // Every module is optional at runtime: any of them can be absent at boot or
@@ -704,12 +1035,34 @@ void loop()
     if (isTimeout(DEBUG_PRINT_MS, lastDebugPrint)) {
         // Serial is the USB console, a different peripheral from Serial1 —
         // printing here cannot corrupt the C3 link.
+        // Vehicle signals, from whichever source is live. These used to read
+        // obdData only, which showed "--" for the whole of a healthy sniffing
+        // session because sniffed values land in vehSignals instead.
         Serial.print("spd=");
-        if (isnan(obdData.speed)) Serial.print("--"); else Serial.print(obdData.speed, 1);
+        if      (!isnan(vehSignals.speedKmh)) Serial.print(vehSignals.speedKmh, 2);
+        else if (!isnan(obdData.speed))       Serial.print(obdData.speed, 1);
+        else                                  Serial.print("--");
         Serial.print(" rpm=");
-        if (isnan(obdData.rpm)) Serial.print("--"); else Serial.print(obdData.rpm, 0);
-        Serial.print("  obd=");
-        Serial.print(obdReady ? "up" : "down");
+        if      (!isnan(vehSignals.rpm)) Serial.print(vehSignals.rpm, 0);
+        else if (!isnan(obdData.rpm))    Serial.print(obdData.rpm, 0);
+        else                             Serial.print("--");
+
+        // Held indicator state, so this reads steadily while indicating rather
+        // than flickering with the lamp. Both arrows at once is hazards.
+        Serial.print(" turn=");
+        if      (vehSignals.turnLeft && vehSignals.turnRight) Serial.print("<>");
+        else if (vehSignals.turnLeft)                         Serial.print("<-");
+        else if (vehSignals.turnRight)                        Serial.print("->");
+        else if (vehSignals.turnSrc == VehSource::NONE)       Serial.print("--");
+        else                                                  Serial.print("..");
+
+        // The MODE, not obdReady. "obd=down" during a healthy listen-only
+        // session reads as a fault and is not one — obdReady is false because
+        // we are deliberately not transmitting. Printing the mode says which of
+        // the three the node is actually in, which is the thing worth knowing.
+        Serial.print("  can=");
+        Serial.print(canModeName(canMode));
+        if (canMode == CanMode::OBD2) Serial.print(obdReady ? "/up" : "/down");
 #ifdef USE_GPS
         // Reported alongside OBD-II because the receiver is now a live
         // subsystem that can fail on its own.  Without this the only GNSS

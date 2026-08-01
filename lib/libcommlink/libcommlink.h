@@ -213,6 +213,18 @@ public:
      */
     bool setDecimation(uint8_t n);
 
+    /**
+     * @brief Switches the MKR's CAN controller mode.
+     *
+     * @param mode 1 = discover (listen-only, accept-all), 2 = sniff
+     *             (listen-only, filtered, decoding), 3 = obd2 (BUS-ACTIVE:
+     *             the MKR transmits diagnostic requests on the vehicle bus).
+     *
+     * Not restored automatically after a reconnect - see the implementation.
+     * @return false on an out-of-range mode or a failed write.
+     */
+    bool setCanMode(uint8_t mode);
+
     // ── state ─────────────────────────────────────────────────────────────────
     bool isOpen()      const; ///< The device node is currently open.
     bool isRunning()   const; ///< The RX thread is running.

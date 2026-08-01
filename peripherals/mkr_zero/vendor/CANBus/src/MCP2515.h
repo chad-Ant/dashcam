@@ -12,6 +12,15 @@
 
 #define MCP2515_DEFAULT_CLOCK_FREQUENCY 16e6
 
+// Build-time proof that the VENDORED copy of this library is the one being
+// compiled, not the unpinned copy in the user's global Arduino libraries
+// folder. arduino-cli resolves <CAN.h> from the sketchbook unless an explicit
+// --library flag outranks it, and the two copies are byte-similar enough that
+// nothing would look wrong if the fixes below silently stopped applying.
+// Project headers that depend on those fixes #error on this being absent.
+// Mirrors the vendor/Wire marker; see vendor/CANBus/PATCHES.md.
+#define DASHCAM_CANBUS_VENDORED_FIXES 1
+
 #if defined(ARDUINO_ARCH_SAMD) && defined(PIN_SPI_MISO) && defined(PIN_SPI_MOSI) && defined(PIN_SPI_SCK) && (PIN_SPI_MISO == 10) && (PIN_SPI_MOSI == 8) && (PIN_SPI_SCK == 9)
 // Arduino MKR board: MKR CAN shield CS is pin 3, INT is pin 7
 #define MCP2515_DEFAULT_CS_PIN          3
@@ -49,10 +58,15 @@ public:
   //   should be put in RXB1 instead.
   //
   // See the MCP2515 datasheet for more info.
+  //
+  // DASHCAM PATCH: targetMode says where to leave the controller. Upstream
+  // forced Normal mode, which cancels Listen-Only - so a read-only sniffer
+  // could not install filters without going bus-active. Defaults to Normal so
+  // existing callers are unaffected. Pass 0x60 for Listen-Only.
   boolean setFilterRegisters(
       uint16_t mask0, uint16_t filter0, uint16_t filter1,
       uint16_t mask1, uint16_t filter2, uint16_t filter3, uint16_t filter4, uint16_t filter5,
-      bool allowRollover);
+      bool allowRollover, uint8_t targetMode = 0x00);
 
   using CANControllerClass::filterExtended;
   virtual int filterExtended(long id, long mask);
@@ -60,6 +74,9 @@ public:
 
   bool switchToNormalMode();
   bool switchToConfigurationMode();
+  // DASHCAM PATCH: requests a REQOP mode and confirms it via CANSTAT OPMOD,
+  // preserving the other CANCTRL bits (notably One-Shot Mode). Bounded.
+  bool switchToMode(uint8_t mode);
   virtual int observe();
   virtual int loopback();
   virtual int sleep();
