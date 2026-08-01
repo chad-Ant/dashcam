@@ -42,9 +42,27 @@ static std::string gstQuoted(const std::string& value) {
 
 // ─── telemetry formatting (same content the Cairo overlay drew) ───────────────
 
+/// True when @p deg is a heading this file can format without invoking UB.
+///
+/// std::lround() below is undefined — not merely wrong — for an argument that
+/// does not fit a long, and std::isfinite() does NOT bound that: 1e30f is
+/// perfectly finite and 1e30/45 overflows every integer type.  So the range is
+/// checked, not just the finiteness.  The bound is the semantic one rather than
+/// the representable one: a heading outside [0, 360] is not a heading, and a
+/// caller sending one has a defect that should surface as a dash rather than as
+/// a plausible-looking direction computed modulo 8.
+static bool headingRenderable(float deg) {
+    return std::isfinite(deg) && (deg >= 0.0f) && (deg <= 360.0f);
+}
+
 static const char* headingToCardinal(float deg) {
     static const char* kCardinals[] = {
         "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+    // Total by construction.  Callers already gate on headingRenderable(), but
+    // this is a file-static helper next to a formatter, and relying on every
+    // future call site remembering the precondition is how the original defect
+    // got in.  The clamp costs nothing and removes the UB at the source.
+    if (!headingRenderable(deg)) return kCardinals[0];
     const int idx = static_cast<int>(std::lround(deg / 45.0f)) & 7;
     return kCardinals[idx];
 }
@@ -357,11 +375,16 @@ void Recorder::subtitleLoop() {
         // A non-finite value is treated as stale REGARDLESS of its validity
         // flag.  The flag is set by the application, which is outside this
         // library's control, and a NaN or Inf reaching the formatters below
-        // becomes "nan" burned into the recording — or, for heading, is fed
-        // straight to std::lround(), whose result is undefined for values that
-        // do not fit an integer.  Trusting a caller-supplied bool over the
-        // number it describes would put an undefined conversion in the render
-        // path of a device whose output is evidence.
+        // becomes "nan" burned into the recording.  Trusting a caller-supplied
+        // bool over the number it describes would put a garbage reading in the
+        // render path of a device whose output is evidence.
+        //
+        // Heading is checked for RANGE, not just finiteness, because finiteness
+        // is not enough for it: the cardinal-point conversion divides by 45 and
+        // calls std::lround(), which is undefined for an argument that does not
+        // fit a long — and 1e30f is finite.  An out-of-range heading is also
+        // simply not a heading, so dashing it is the correct rendering as well
+        // as the safe one.
         const bool speedStale =
             !od.speedValid || !std::isfinite(od.speedKmh) ||
             (staleMs > 0 && (nowMs - od.speedTimestampMs) > staleMs);
@@ -374,7 +397,7 @@ void Recorder::subtitleLoop() {
             !std::isfinite(od.altitudeM) ||
             (staleMs > 0 && (nowMs - od.positionTimestampMs) > staleMs);
         const bool headingStale =
-            !od.headingValid || !std::isfinite(od.headingDeg) ||
+            !od.headingValid || !headingRenderable(od.headingDeg) ||
             (staleMs > 0 && (nowMs - od.headingTimestampMs) > staleMs);
 
         writeAssSample(pos, durNs, od, nowMs, speedStale, accelStale,

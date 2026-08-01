@@ -451,7 +451,15 @@ int main(int argc, char* argv[]) {
             csiCam->captureFrame(buf.data(), bufSize, written);
 
             // Telemetry hook: inject live GPS/IMU data before the next GStreamer render tick.
-            // recorder.setOverlayData({lat, lon, altM, speedKmh, accMs2, headingDeg, epochMs});
+            // Fill an OverlayData and set its per-source validity flags and
+            // timestamps — they default false, so a brace initialiser of just
+            // the seven numeric fields renders the overlay as dashes.  See the
+            // usage example at the top of librecord.h.
+            //   dashcam::record::OverlayData od;
+            //   od.latitude = lat; od.longitude = lon; od.altitudeM = altM;
+            //   od.positionValid = fixIsGood; od.positionTimestampMs = fixMs;
+            //   ...
+            //   recorder.setOverlayData(od);
 
             // Inference hook: buf contains 1080p BGRx at 60fps.
             // Lane detection runs every frame; sign recognition at ~5fps via throttle counter.

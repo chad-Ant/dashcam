@@ -229,16 +229,25 @@ int main(int argc, char* argv[]) {
 
         // Feed live telemetry into the recording overlay.
         if (recording) {
-            recorder.setOverlayData({
-                10.7725 + static_cast<double>(frameCount) * 5e-5,
-                106.6581 + static_cast<double>(frameCount) * 5e-5,
-                52.3,
-                static_cast<float>(30 + (frameCount % 50)),
-                0.2f,
-                static_cast<float>(frameCount % 360),
+            // Validity flags and per-source stamps set EXPLICITLY: they default
+            // false (fail-closed, correct for a real feed that has not reported
+            // yet), so the seven-field brace initialiser this replaces rendered
+            // the whole overlay as dashes.
+            const int64_t nowMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()
-            });
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            dashcam::record::OverlayData od;
+            od.latitude        = 10.7725  + static_cast<double>(frameCount) * 5e-5;
+            od.longitude       = 106.6581 + static_cast<double>(frameCount) * 5e-5;
+            od.altitudeM       = 52.3;
+            od.speedKmh        = static_cast<float>(30 + (frameCount % 50));
+            od.accelerationMs2 = 0.2f;
+            od.headingDeg      = static_cast<float>(frameCount % 360);
+            od.timestampMs     = nowMs;
+            od.speedValid = od.accelValid = od.positionValid = od.headingValid = true;
+            od.speedTimestampMs = od.accelTimestampMs = nowMs;
+            od.positionTimestampMs = od.headingTimestampMs = nowMs;
+            recorder.setOverlayData(od);
         }
 
         // ── HUD panels ────────────────────────────────────────────────────────

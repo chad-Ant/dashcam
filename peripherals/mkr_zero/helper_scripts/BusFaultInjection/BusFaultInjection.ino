@@ -240,7 +240,7 @@ static void runFullTest(void)
     }
 
     // ---- 4: a real sensor still reads correctly -----------------------------
-    IMUDevice dev;
+    IMUDevice dev{};   // value-initialised: initializeIMU() reads dev.lifecycle
     IMUData   data;
     initIMUData(data);
     const IMUReturnStatus ist = initializeIMU(dev);
@@ -375,7 +375,7 @@ static void testStuckPhase1(void)
     const uint32_t probeUs = timedCall("i2cProbeAddress", ok, true);
     report("S2 probe refuses without transacting", ok && (probeUs < 5000u), "");
 
-    IMUDevice dev;
+    IMUDevice dev{};   // value-initialised: initializeIMU() reads dev.lifecycle
     const uint32_t t1 = micros();
     const IMUReturnStatus ist = initializeIMU(dev);
     const uint32_t imuUs = micros() - t1;
@@ -467,7 +467,7 @@ static void testStuckPhase2(void)
         report("S8 all three devices ACK again", a && m && g, detail);
     }
 
-    IMUDevice dev;
+    IMUDevice dev{};   // value-initialised: initializeIMU() reads dev.lifecycle
     IMUData   data;
     initIMUData(data);
     const IMUReturnStatus ist = initializeIMU(dev);

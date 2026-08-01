@@ -116,16 +116,25 @@ bool test_recording_overlay(const cameraInfo& info,
         cam.captureFrame(buffer.data(), buffer.size(), written);
         if (written > 0) {
             frames++;
-            recorder.setOverlayData({
-                10.7725 + (frames * 0.0001),
-                106.6581 + (frames * 0.0001),
-                52.3 + (frames * 0.05),
-                static_cast<float>(frames % 80),
-                1.2f,
-                static_cast<float>(frames % 360),
+            // Validity flags and per-source stamps set EXPLICITLY: they default
+            // false (fail-closed, correct for a real feed that has not reported
+            // yet), so the seven-field brace initialiser this replaces rendered
+            // the whole overlay as dashes.
+            const int64_t nowMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()
-            });
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            dashcam::record::OverlayData od;
+            od.latitude        = 10.7725  + (frames * 0.0001);
+            od.longitude       = 106.6581 + (frames * 0.0001);
+            od.altitudeM       = 52.3 + (frames * 0.05);
+            od.speedKmh        = static_cast<float>(frames % 80);
+            od.accelerationMs2 = 1.2f;
+            od.headingDeg      = static_cast<float>(frames % 360);
+            od.timestampMs     = nowMs;
+            od.speedValid = od.accelValid = od.positionValid = od.headingValid = true;
+            od.speedTimestampMs = od.accelTimestampMs = nowMs;
+            od.positionTimestampMs = od.headingTimestampMs = nowMs;
+            recorder.setOverlayData(od);
             // Print capture rate every second.
             auto now = std::chrono::steady_clock::now();
             if (now - last_report >= std::chrono::seconds(1)) {

@@ -268,9 +268,16 @@ int main(int argc, char* argv[]) {
     std::ifstream in3(ass3);
     int dashTL = 0, freshSpd = 0, clockEvents = 0, adasBanner3 = 0;
     int dashHdg = 0, freshHdg = 0, dashPos = 0;
+    // Acceleration is checked here too.  It was the ONE of the four domains
+    // this test never looked at, so a broken accelTimestampMs would have gone
+    // through it untouched — the assertions covered speed, heading and position
+    // and simply did not mention the fourth.
+    int dashAcc = 0, freshAcc = 0;
     while (std::getline(in3, line)) {
         if (line.find(",TL,,0,0,0,,SPD -- km/h") != std::string::npos) ++dashTL;
         if (line.find(",TL,,0,0,0,,SPD 42")      != std::string::npos) ++freshSpd;
+        if (line.find("ACC -- m/s2")             != std::string::npos) ++dashAcc;
+        if (line.find("ACC +3.5")                != std::string::npos) ++freshAcc;
         if (line.find(",TR,,0,0,0,,HDG --")      != std::string::npos) ++dashHdg;
         if (line.find(",TR,,0,0,0,,HDG 123")     != std::string::npos) ++freshHdg;
         if (line.find(",BL,,0,0,0,,LAT --")      != std::string::npos) ++dashPos;
@@ -279,6 +286,8 @@ int main(int argc, char* argv[]) {
     }
     check(dashTL > 0,       "per-source stale timestamp renders 'SPD -- km/h'");
     check(freshSpd == 0,    "no fresh speed leaks through on a stale speed stamp");
+    check(dashAcc > 0,      "per-source stale timestamp renders 'ACC -- m/s2'");
+    check(freshAcc == 0,    "no fresh acceleration leaks through on a stale accel stamp");
     check(dashHdg > 0,      "per-source stale timestamp renders 'HDG --'");
     check(freshHdg == 0,    "no fresh heading leaks through on a stale heading stamp");
     check(dashPos > 0,      "per-source stale timestamp renders 'LAT --'");
@@ -334,6 +343,98 @@ int main(int argc, char* argv[]) {
     check(posLive > 0, "live position still renders when heading is invalid");
     check(hdgDash > 0, "invalid heading renders 'HDG --' beside a live position");
     check(hdgLive == 0, "placeholder heading never leaks under a live position");
+
+    // ── Test 7: sources AGE independently ────────────────────────────────────
+    // Test 6 proves the four validity FLAGS are honoured separately, which is a
+    // different property from the four TIMEOUTS being applied separately: every
+    // field it marks invalid carries Valid=false, so the timestamps are never
+    // what decides.  A renderer that ignored the per-source stamps entirely and
+    // keyed staleness off one shared clock would pass Test 6 unchanged.
+    //
+    // Here every flag is TRUE and only the stamps differ, so the per-domain
+    // timeout is the sole thing that can produce a dash.
+    std::cout << "\n--- Test 7: independent per-source ageing ---\n";
+    const std::string mkv5 = "/tmp/record_test5.mkv";
+    const std::string ass5 = "/tmp/record_test5.ass";
+    fs::remove(mkv5); fs::remove(ass5);
+    check(rec.startRecording(usb->address, rf, mkv5), "start (ageing case) OK");
+    for (int t = 0; t < 3 * 5 && rec.isRecording(); ++t) {
+        dashcam::record::OverlayData od;
+        const int64_t nowT     = epochMs();
+        const int64_t oldT     = nowT - 10000;      // 10 s old
+        od.timestampMs         = nowT;
+        // All four VALID; only the stamps differ.
+        od.speedValid = od.accelValid = od.positionValid = od.headingValid = true;
+        od.speedKmh            = 61.0f;
+        od.speedTimestampMs    = nowT;              // fresh
+        od.accelerationMs2     = 7.7f;              // must NOT appear
+        od.accelTimestampMs    = oldT;              // aged out
+        od.latitude            = 20.25;
+        od.longitude           = 100.25;
+        od.altitudeM           = 33.0;
+        od.positionTimestampMs = nowT;              // fresh
+        od.headingDeg          = 210.0f;            // must NOT appear
+        od.headingTimestampMs  = oldT;              // aged out
+        rec.setOverlayData(od);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    rec.stopRecording();
+
+    std::ifstream in5(ass5);
+    int aSpd = 0, aAccDash = 0, aAccLive = 0;
+    int aPos = 0, aHdgDash = 0, aHdgLive = 0;
+    while (std::getline(in5, line)) {
+        if (line.find(",TL,,0,0,0,,SPD 61")  != std::string::npos) ++aSpd;
+        if (line.find("ACC -- m/s2")         != std::string::npos) ++aAccDash;
+        if (line.find("ACC +7.7")            != std::string::npos) ++aAccLive;
+        if (line.find(",BL,,0,0,0,,LAT 20.25")!= std::string::npos) ++aPos;
+        if (line.find(",TR,,0,0,0,,HDG --")  != std::string::npos) ++aHdgDash;
+        if (line.find(",TR,,0,0,0,,HDG 210") != std::string::npos) ++aHdgLive;
+    }
+    check(aSpd > 0,      "fresh speed stamp renders while the accel stamp is aged out");
+    check(aAccDash > 0,  "aged accel stamp dashes even with accelValid true");
+    check(aAccLive == 0, "aged acceleration never leaks beside a fresh speed");
+    check(aPos > 0,      "fresh position stamp renders while the heading stamp is aged out");
+    check(aHdgDash > 0,  "aged heading stamp dashes even with headingValid true");
+    check(aHdgLive == 0, "aged heading never leaks beside a fresh position");
+
+    // ── Test 8: an out-of-range heading is refused ───────────────────────────
+    // isfinite() is not sufficient for heading, and this is the case that shows
+    // why: 1e30f passes every finiteness check and then divides by 45 into a
+    // value no integer type holds, which made std::lround() in the cardinal
+    // conversion undefined.  The renderer must dash it rather than print a
+    // direction derived from an undefined conversion.
+    std::cout << "\n--- Test 8: out-of-range heading -> dash ---\n";
+    const std::string mkv6 = "/tmp/record_test6.mkv";
+    const std::string ass6 = "/tmp/record_test6.ass";
+    fs::remove(mkv6); fs::remove(ass6);
+    check(rec.startRecording(usb->address, rf, mkv6), "start (range case) OK");
+    for (int t = 0; t < 3 * 5 && rec.isRecording(); ++t) {
+        dashcam::record::OverlayData od;
+        const int64_t nowT     = epochMs();
+        od.timestampMs         = nowT;
+        od.speedKmh            = 44.0f;
+        od.speedValid          = true;
+        od.speedTimestampMs    = nowT;
+        // Claimed valid and freshly stamped — only the VALUE is impossible.
+        od.headingDeg          = 1e30f;
+        od.headingValid        = true;
+        od.headingTimestampMs  = nowT;
+        rec.setOverlayData(od);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    rec.stopRecording();
+
+    std::ifstream in6(ass6);
+    int rSpd = 0, rHdgDash = 0, rHdgAny = 0;
+    while (std::getline(in6, line)) {
+        if (line.find(",TL,,0,0,0,,SPD 44") != std::string::npos) ++rSpd;
+        if (line.find(",TR,,0,0,0,,HDG --") != std::string::npos) ++rHdgDash;
+        else if (line.find(",TR,,0,0,0,,HDG") != std::string::npos) ++rHdgAny;
+    }
+    check(rSpd > 0,      "live speed unaffected by an out-of-range heading");
+    check(rHdgDash > 0,  "out-of-range heading renders 'HDG --' despite headingValid");
+    check(rHdgAny == 0,  "no numeric heading emitted for an out-of-range value");
 
     std::cout << "\n" << (g_fails == 0 ? "RESULT: PASS" : "RESULT: FAIL")
               << " (" << g_fails << " failures)\n";

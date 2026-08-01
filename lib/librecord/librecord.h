@@ -45,8 +45,22 @@
  *   fmt.width = 1280; fmt.height = 720; fmt.fps = 30.0f;
  *
  *   rec.startRecording("/dev/video2", fmt, "clip.mkv");
- *   while (running)
- *       rec.setOverlayData({lat, lon, alt, spd, acc, hdg, epochMs()});
+ *   while (running) {
+ *       // Set the per-source validity flags and stamps EXPLICITLY.  They
+ *       // default false so an application that never sets them renders dashes
+ *       // rather than the struct's placeholder coordinates — which is the
+ *       // right default, but it does mean a brace initialiser of the seven
+ *       // numeric fields produces an overlay with no telemetry in it.
+ *       dashcam::record::OverlayData od;
+ *       od.latitude = lat; od.longitude = lon; od.altitudeM = alt;
+ *       od.speedKmh = spd; od.accelerationMs2 = acc; od.headingDeg = hdg;
+ *       od.timestampMs = epochMs();
+ *       od.positionValid = fixIsGood;   od.positionTimestampMs = fixMs;
+ *       od.headingValid  = courseIsGood; od.headingTimestampMs = fixMs;
+ *       od.speedValid    = speedIsLive;  od.speedTimestampMs    = speedMs;
+ *       od.accelValid    = ecuIsLive;    od.accelTimestampMs    = ecuMs;
+ *       rec.setOverlayData(od);
+ *   }
  *   rec.stopRecording();                      // EOS-finalises clip.mkv + clip.ass
  * @endcode
  *

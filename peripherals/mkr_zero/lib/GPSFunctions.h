@@ -22,6 +22,16 @@ enum class GPSReturnStatus{
     /// about the receiver at all.  Reported rather than swallowed because the
     /// repair is different — a line held low, versus a module that is absent.
     NOK_BUS_STUCK = -7,
+    /// A driver buffer could not be allocated, so GNSS was never attempted.
+    ///
+    /// Distinct from @c NOK_BUS_STUCK for the same reason that one is distinct
+    /// from @c NOK_INIT_FAILED: it names a different repair.  A stuck bus is a
+    /// wiring fault, an absent module is a hardware fault, and this is neither —
+    /// it is the board being out of RAM, which no amount of inspecting the
+    /// harness will reveal.  The quarantine path used to record every cause as
+    /// @c NOK_BUS_STUCK, so an out-of-memory boot sent a technician looking for
+    /// a held line that was never there.
+    NOK_OUT_OF_MEMORY = -8,
 };
 
 
@@ -109,30 +119,44 @@ GPSReturnStatus initializeGPS_I2C(SFE_UBLOX_GNSS &myGNSS);
 /**
  * @brief Claims the SparkFun driver's heap buffers up front. Call once, in setup().
  *
- * The driver allocates lazily and idempotently — @c packetCfg's payload inside
- * @c begin(), the @c UBX_NAV_PVT_t inside @c setAutoPVTrate() — each behind an
- * "if still null" guard, so nothing is ever allocated twice and nothing is freed
- * before the destructor runs.  The problem is not churn, it is TIMING: when no
- * receiver answers at boot, @c begin() fails before reaching either allocation,
- * and the buffers are then claimed by the first successful retry from @c loop().
- * That is an allocation after initialisation, on a path taken precisely when the
- * hardware is already misbehaving.
+ * The two buffers are @c packetCfg's payload, normally claimed inside
+ * @c begin(), and the @c UBX_NAV_PVT_t, normally claimed inside
+ * @c setAutoPVTrate().  The problem is TIMING: when no receiver answers at
+ * boot, @c begin() fails before reaching either allocation, and the buffers are
+ * then claimed by the first successful retry from @c loop().  That is an
+ * allocation after initialisation, on a path taken precisely when the hardware
+ * is already misbehaving.  Neither call made here transmits, so the RAM is
+ * claimed even with nothing on the bus, which is the case that matters.
  *
- * Both calls made here allocate BEFORE they transmit, so the RAM is claimed even
- * with nothing on the bus, which is the case that matters.
+ * IDEMPOTENT — but the idempotence is enforced here, not by the driver, and an
+ * earlier version of this comment wrongly credited the driver with it.
+ * @c setPacketCfgPayloadSize() is NOT "if still null": with a buffer already
+ * allocated it takes a resize branch that allocates a replacement, copies,
+ * and deletes the original, EVEN WHEN THE SIZE IS UNCHANGED.  So a second call
+ * churned the heap for nothing, and a failed resize returned false — rejecting
+ * initialisation — while the driver quietly kept the perfectly good old buffer.
+ * This function now returns early via @c gpsBuffersPrepared() instead of
+ * re-entering that path, which matters because the blocking wrapper calls it on
+ * every invocation and the helper sketches retry that wrapper in a loop.
  *
- * ONE ALLOCATION REMAINS OUTSIDE OUR CONTROL, and it is worse than "lazy":
- * @c getPortSettingsInternal() allocates @c packetUBXCFGPRT with @c new on entry
- * and @c delete s it before returning, so @c isConnected() churns a
- * @c UBX_CFG_PRT_t on EVERY call — up to three per @c begin(), on every retry,
- * from @c loop().  That is a genuine new/delete cycle after initialisation and
- * cannot be prevented from outside the library; only vendoring the GNSS driver
- * would close it.  It is a small fixed-size object on a heap nothing else
- * allocates from after setup, so fragmentation risk is low — but the
- * no-allocation-after-init rule is NOT fully satisfied for GNSS, and claiming
+ * TWO ALLOCATIONS REMAIN OUTSIDE OUR CONTROL, both genuine new/delete cycles
+ * after initialisation, and the larger one was previously understated here:
+ *   - @c getPortSettingsInternal() news @c packetUBXCFGPRT on entry and deletes
+ *     it before returning, so @c isConnected() churns a @c UBX_CFG_PRT_t on
+ *     EVERY call — up to three per @c begin(), on every retry.
+ *   - @c process() news @c payloadAuto for each "automatic" message that is not
+ *     the packet currently being waited on, and deletes it when that message
+ *     completes.  With automatic PVT streaming that is the NORMAL path, so this
+ *     is a new/delete pair per PVT packet — 4 per second at our nav rate, not
+ *     the occasional cycle the old wording implied.
+ * Neither can be prevented from outside the library; only vendoring the GNSS
+ * driver would close them.  Both are small fixed-size objects on a heap nothing
+ * else allocates from after setup, so fragmentation risk is low — but the
+ * no-allocation-after-init rule is NOT satisfied for GNSS, and claiming
  * otherwise would be wrong.
  *
- * @return @c OK, or @c NOK_BUS_STUCK if the bus could not be brought up.
+ * @return @c OK — including when the buffers were already prepared — or
+ *         @c NOK_OUT_OF_MEMORY if either allocation failed.
  */
 GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS);
 
@@ -256,8 +280,32 @@ void gpsInitConfirmStreaming(GPSInitState &state);
  * For use after a watchdog reset, where any retry would re-enter the hang that
  * caused it.  Use @c gpsInitFail() for an ordinary refusal that should be
  * retried; the two must not be confused.
+ *
+ * @param why  Recorded as @c lastStatus, so the log can name the actual cause.
+ *             Not defaulted: the two callers give genuinely different reasons
+ *             (a watchdog-suspected hang versus an allocation failure), and an
+ *             earlier version hardcoded @c NOK_BUS_STUCK for both — which
+ *             reported an out-of-memory boot as a wiring fault.
  */
-void gpsInitQuarantine(GPSInitState &state);
+void gpsInitQuarantine(GPSInitState &state, GPSReturnStatus why);
+
+/**
+ * @brief True when this module has claimed both driver buffers for @p myGNSS.
+ *
+ * The buffers are @c payloadCfg (inside @c packetCfg) and the @c UBX_NAV_PVT_t.
+ * Only the second is a public member, so "prepared" is tracked HERE rather than
+ * inferred from the driver: this module records which object it prepared, and
+ * corroborates with the pointer it can see.
+ *
+ * WHAT THIS DOES NOT PROVE.  @c payloadCfg is private and unobservable, so a
+ * caller that frees it behind our back — @c setPacketCfgPayloadSize(0) is the
+ * one public way — leaves this reporting @c true with the buffer gone.  Nothing
+ * in this project does that, and there is no API that would let the check
+ * notice.  The converse is handled safely: @c end() frees the PVT buffer but
+ * deliberately keeps @c payloadCfg, and the pointer check catches that, so a
+ * re-preparation happens (costing one resize) rather than being skipped.
+ */
+bool gpsBuffersPrepared(const SFE_UBLOX_GNSS &myGNSS);
 
 /** @brief Short human-readable name for a stage, for logs. */
 const char *gpsInitStageName(GPSInitStage stage);

@@ -350,14 +350,27 @@ int main(int argc, char* argv[]) {
         ++frames;
 
         if (recOk) {
-            recorder.setOverlayData({
-                10.7725, 106.6581, 52.3,
-                static_cast<float>(30 + (frames % 50)),
-                0.2f,
-                static_cast<float>(frames % 360),
+            // The validity flags and per-source stamps are set EXPLICITLY, not
+            // left to the aggregate's defaults.  They default false — the
+            // fail-closed choice, right for a real telemetry feed that has not
+            // reported yet — so a seven-field brace initialiser silently
+            // produced an overlay of dashes.  This demo's telemetry is
+            // synthetic but deliberate, so it declares itself live.
+            const int64_t nowMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()
-            });
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            dashcam::record::OverlayData od;
+            od.latitude        = 10.7725;
+            od.longitude       = 106.6581;
+            od.altitudeM       = 52.3;
+            od.speedKmh        = static_cast<float>(30 + (frames % 50));
+            od.accelerationMs2 = 0.2f;
+            od.headingDeg      = static_cast<float>(frames % 360);
+            od.timestampMs     = nowMs;
+            od.speedValid = od.accelValid = od.positionValid = od.headingValid = true;
+            od.speedTimestampMs = od.accelTimestampMs = nowMs;
+            od.positionTimestampMs = od.headingTimestampMs = nowMs;
+            recorder.setOverlayData(od);
         }
 
         auto now = std::chrono::steady_clock::now();

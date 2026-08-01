@@ -100,8 +100,14 @@ enum class IMUSampleMode : uint8_t{
     LowPower = 1,
 };
 
-/// @c IMUDevice::lifecycle sentinels.  Arbitrary values, chosen only to be
-/// improbable as stack garbage.
+/// @c IMUDevice::lifecycle sentinels.
+///
+/// @c UNINIT is the member initialiser, so the field is NEVER read before it is
+/// written — see @c IMUDevice::lifecycle for why that initialiser is required
+/// rather than merely tidy.  The other two are arbitrary distinct values; being
+/// improbable as stack garbage is a convenience when reading a memory dump, not
+/// a safety argument.
+#define IMU_LIFECYCLE_UNINIT      0u
 #define IMU_LIFECYCLE_ACTIVE      0x9A1C0DE1u
 #define IMU_LIFECYCLE_QUARANTINED 0x9A1CDEADu
 
@@ -319,19 +325,22 @@ struct IMUDevice{
     /**
      * Lifecycle latch, so quarantine survives a later @c initializeIMU().
      *
-     * A plain bool cannot express this.  @c initializeIMU() begins by resetting
-     * every field — it has to, it is the initialiser — so it would clear
-     * @c quarantined and then transact, undoing the quarantine on any caller
-     * that simply calls it again.  The sketch happens not to, but the LIBRARY
-     * must not depend on one caller's discipline for a safety property.
+     * A separate field is needed because @c initializeIMU() begins by resetting
+     * every other one — it has to, it is the initialiser — so @c quarantined
+     * alone would be cleared and the device re-polled by any caller that simply
+     * calls it again.  The sketch happens not to, but the LIBRARY must not
+     * depend on one caller's discipline for a safety property.
      *
-     * A magic word rather than a flag, because the check has to be meaningful on
-     * an UNINITIALISED object: an automatic @c IMUDevice holds stack garbage
-     * before its first call, and reading a bool from that is as likely to say
-     * "quarantined" as not.  A 32-bit sentinel is wrong by chance once in 4.3
-     * billion, which is a risk worth taking to make the check safe at all.
+     * THE MEMBER INITIALISER IS LOAD-BEARING, not tidiness.  @c initializeIMU()
+     * and @c imuMarkAbsent() both READ this field before anything has written
+     * it, and the helper sketches declare @c IMUDevice as an automatic.  Without
+     * an initialiser that read is of an indeterminate value, which is undefined
+     * behaviour outright — not a small probability of a wrong answer.  An
+     * earlier version of this comment argued the 32-bit sentinel made a bad read
+     * unlikely enough to accept; that reasoning was wrong, because UB is not a
+     * probability. The sentinel's only remaining job is legibility in a dump.
      */
-    uint32_t lifecycle;
+    uint32_t lifecycle = IMU_LIFECYCLE_UNINIT;
     /// Deadline form, not elapsed-time form: the gap notice is HELD until
     /// @c gapFlagUntilMs and then latched off.  Deriving it from "counter
     /// nonzero and lastOverrunMs looks recent" republished a long-finished gap
@@ -464,6 +473,13 @@ bool isIMULinkLost(const IMUDevice &dev);
  * Every field is set exactly as @c initializeIMU() sets it before probing, so
  * the struct is safe to read and to publish; only the hardware access is
  * skipped.  Use when the bus must not be touched at all.
+ *
+ * ONE EXCEPTION, and it is deliberate: a quarantine is CARRIED ACROSS the reset
+ * rather than cleared.  Without that this function was a public way around
+ * @c imuQuarantine() — resetting the struct put a device that hung the board
+ * back into the polling and recovery paths.  Everything else here is scratch
+ * state a re-initialisation may discard; the quarantine is a decision about the
+ * hardware, which resetting software state does not change.
  */
 void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress);
 

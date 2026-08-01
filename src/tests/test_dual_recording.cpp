@@ -297,15 +297,23 @@ int main(int argc, char* argv[]) {
     int tick = 0;
     while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(recSeconds)) {
         ++tick;
-        dashcam::record::OverlayData od{
-            10.7725 + tick * 0.0002,          // latitude
-            106.6581 + tick * 0.0003,         // longitude
-            50.0 + tick * 0.1,                // altitude m
-            static_cast<float>((tick * 2) % 120),  // speed km/h
-            0.5f,                             // accel m/s^2
-            static_cast<float>((tick * 5) % 360),  // heading deg
-            epochMs()
-        };
+        // Validity flags and per-source stamps set EXPLICITLY: they default
+        // false (fail-closed, correct for a real feed that has not reported
+        // yet), so the seven-field brace initialiser this replaces made both
+        // overlays render as dashes — which would have made this test pass
+        // while proving nothing about the overlay it exists to exercise.
+        const int64_t nowMs = epochMs();
+        dashcam::record::OverlayData od;
+        od.latitude        = 10.7725  + tick * 0.0002;
+        od.longitude       = 106.6581 + tick * 0.0003;
+        od.altitudeM       = 50.0 + tick * 0.1;
+        od.speedKmh        = static_cast<float>((tick * 2) % 120);
+        od.accelerationMs2 = 0.5f;
+        od.headingDeg      = static_cast<float>((tick * 5) % 360);
+        od.timestampMs     = nowMs;
+        od.speedValid = od.accelValid = od.positionValid = od.headingValid = true;
+        od.speedTimestampMs = od.accelTimestampMs = nowMs;
+        od.positionTimestampMs = od.headingTimestampMs = nowMs;
         usbRec.setOverlayData(od);   // CSI debug feed has no overlay — not fed
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

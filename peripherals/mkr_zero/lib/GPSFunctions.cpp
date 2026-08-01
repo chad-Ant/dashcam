@@ -58,7 +58,40 @@ GPSReturnStatus initializeGPS(SFE_UBLOX_GNSS &myGNSS){
     return GPSReturnStatus::NOK_INIT_FAILED;
 }
 
+/// The one GNSS object whose buffers this module has claimed.
+///
+/// A pointer rather than a flag because the API takes the object by reference,
+/// so "prepared" is a property of that object, not of the module.  One slot is
+/// enough: every sketch here has a single GNSS instance with static storage
+/// duration, so the address cannot be recycled underneath us.  Were a second
+/// object introduced, preparing it would displace the first — which is safe,
+/// just not free: the first would then be re-prepared on its next call, paying
+/// one resize instead of skipping it.
+static const SFE_UBLOX_GNSS *s_preparedGNSS = nullptr;
+
+bool gpsBuffersPrepared(const SFE_UBLOX_GNSS &myGNSS){
+    // BOTH conditions, and neither is redundant.  The pointer identity is what
+    // covers payloadCfg, which is private and cannot be observed — this module
+    // knows the buffer exists because it is the code that allocated it.  The
+    // packetUBXNAVPVT check then catches the one documented way that allocation
+    // is undone without our knowledge: end() frees the PVT buffer while
+    // deliberately keeping payloadCfg, so identity alone would report a
+    // half-freed object as ready.
+    return (&myGNSS == s_preparedGNSS) && (myGNSS.packetUBXNAVPVT != nullptr);
+}
+
 GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
+    // Early return, not an optimisation: re-entering setPacketCfgPayloadSize()
+    // with a buffer already allocated takes its RESIZE branch, which allocates
+    // a replacement and frees the original even though the size is identical.
+    // Two things go wrong.  The obvious one is churn on a 32 KB part — the
+    // blocking wrapper calls this on every invocation and the fault-injection
+    // sketch retries that wrapper.  The subtle one is worse: a failed resize
+    // returns false while the driver KEEPS the old valid buffer, so this would
+    // report an allocation failure for a device whose buffers are fine, and the
+    // caller treats that as terminal.
+    if (gpsBuffersPrepared(myGNSS)) return GPSReturnStatus::OK;
+
     // NOTHING here touches the bus, which is the whole point of the rewrite.
     //
     // This used to call begin(..., 0) and setAutoPVTrate(..., 0) for their
@@ -75,7 +108,7 @@ GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
     //   assumeAutoPVT() calls initPacketUBXNAVPVT() and then only writes flags.
     // Neither sends a byte, so this is safe to call before the bus is known good
     // and cannot hang in the SAMD driver's undeadlined waits.
-    if (!myGNSS.setPacketCfgPayloadSize(MAX_PAYLOAD_SIZE)) return GPSReturnStatus::NOK_INIT_FAILED;
+    if (!myGNSS.setPacketCfgPayloadSize(MAX_PAYLOAD_SIZE)) return GPSReturnStatus::NOK_OUT_OF_MEMORY;
 
     // false, not true: this claims the RAM without asserting that automatic PVT
     // is actually running.  Setting the flag before the real CFG-MSG has been
@@ -87,8 +120,11 @@ GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
     // false legitimately returns false.  So allocation success is checked
     // directly instead, via the pointer the call exists to populate.
     (void)myGNSS.assumeAutoPVT(false, true);
-    if (myGNSS.packetUBXNAVPVT == nullptr) return GPSReturnStatus::NOK_INIT_FAILED;
+    if (myGNSS.packetUBXNAVPVT == nullptr) return GPSReturnStatus::NOK_OUT_OF_MEMORY;
 
+    // Recorded only after BOTH succeeded, so a partial preparation is not
+    // mistaken for a complete one on the next call.
+    s_preparedGNSS = &myGNSS;
     return GPSReturnStatus::OK;
 }
 
@@ -175,10 +211,14 @@ void gpsInitConfirmStreaming(GPSInitState &state){
     state.failures = 0u;
 }
 
-void gpsInitQuarantine(GPSInitState &state){
+void gpsInitQuarantine(GPSInitState &state, GPSReturnStatus why){
     state.stage      = GPSInitStage::Quarantined;
     state.failedAt   = GPSInitStage::Begin;
-    state.lastStatus = GPSReturnStatus::NOK_BUS_STUCK;
+    // Taken from the caller rather than hardcoded.  This used to record
+    // NOK_BUS_STUCK for every quarantine, including the out-of-memory one — so
+    // the only log line describing a board that had run out of RAM blamed a
+    // held bus line, and pointed the repair at the harness.
+    state.lastStatus = why;
 }
 
 GPSInitStage gpsInitTick(SFE_UBLOX_GNSS &myGNSS, GPSInitState &state){
@@ -218,11 +258,16 @@ GPSInitStage gpsInitTick(SFE_UBLOX_GNSS &myGNSS, GPSInitState &state){
             // path then writes payloadCfg[0] unconditionally.  A null dereference
             // is not something a caller can be trusted to avoid by convention.
             //
-            // packetUBXNAVPVT is the one allocation this code can observe (the
-            // payload members are private), and it is allocated by the same
-            // preallocation step, so it stands in for both.
-            if (myGNSS.packetUBXNAVPVT == nullptr){
-                gpsInitFail(state, GPSReturnStatus::NOK_INIT_FAILED);
+            // gpsBuffersPrepared(), not a bare packetUBXNAVPVT check.  The
+            // pointer alone was only a PROXY: it is the one allocation this
+            // code can observe, and inferring payloadCfg from it assumed the
+            // two are always claimed together.  Public driver calls can break
+            // that assumption in both directions.  Asking the module that owns
+            // the preparation is a direct answer for payloadCfg instead of an
+            // inference — see gpsBuffersPrepared() for what it still cannot
+            // prove.
+            if (!gpsBuffersPrepared(myGNSS)){
+                gpsInitFail(state, GPSReturnStatus::NOK_OUT_OF_MEMORY);
                 break;
             }
             if (!myGNSS.begin(Wire, GPS_DEFAULT_I2C_ADDRESS, GPS_CMD_TIMEOUT_MS)){

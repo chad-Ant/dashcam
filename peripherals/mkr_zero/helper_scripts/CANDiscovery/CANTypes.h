@@ -34,13 +34,34 @@ struct RawFrame {
 struct CanIdStat {
     uint16_t id;
     uint32_t count;
+    /// Count at the previous report. The Hz column is (count - lastCount) over
+    /// the interval since that report - an INSTANTANEOUS rate. Dividing the
+    /// cumulative count by the total elapsed time instead reports a lifetime
+    /// average, which for any signal whose rate changes is a number that was
+    /// never true: a 48 Hz message that briefly floods reads as ~4000 Hz
+    /// forever afterwards.
+    uint32_t lastCount;
     uint32_t firstMs;
     uint32_t lastMs;
     uint16_t minGapMs;
     uint16_t maxGapMs;
     uint8_t  dlc;
-    uint8_t  orMask[8];   ///< running OR  of every payload byte
-    uint8_t  andMask[8];  ///< running AND of every payload byte
+    uint8_t  orMask[8];   ///< running OR  of every payload byte, whole run
+    uint8_t  andMask[8];  ///< running AND of every payload byte, whole run
+    /**
+     * The same OR/AND pair, but reset after every report.
+     *
+     * The whole-run masks saturate and then stay saturated, which destroys the
+     * one thing they exist for. Turning the ignition on moves bytes that a
+     * parked car froze at 0xFF; from that moment those bytes read "changed"
+     * forever, and a field that later sweeps during a steering or throttle test
+     * is indistinguishable from one that moved once, an hour ago, for an
+     * unrelated reason. The per-window pair answers "what is moving RIGHT NOW",
+     * which is what differential identification actually needs - hold a state
+     * for one report interval and only the bits belonging to it light up.
+     */
+    uint8_t  winOr[8];
+    uint8_t  winAnd[8];
     uint8_t  last8[8];
 };
 

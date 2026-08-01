@@ -427,7 +427,13 @@ void setup()
         // "passed" only ever hung once, which is why it looked fixed.
         // Quarantined is terminal — nothing leaves it before the next
         // non-watchdog reset.
-        gpsInitQuarantine(gpsInit);
+        //
+        // The reason is passed, not assumed: these two paths are different
+        // faults with different repairs, and reporting both as a stuck bus (as
+        // this did) sent a technician looking for a held line on a board that
+        // had simply run out of RAM.
+        gpsInitQuarantine(gpsInit, hangQuarantine ? GPSReturnStatus::NOK_BUS_STUCK
+                                                 : GPSReturnStatus::NOK_OUT_OF_MEMORY);
         Serial.println("GPS: quarantined");
     } else {
         gpsInitBegin(gpsInit);

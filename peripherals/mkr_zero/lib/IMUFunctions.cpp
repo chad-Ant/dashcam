@@ -663,6 +663,14 @@ static IMUReturnStatus deviceStatus(const IMUDevice &dev){
 }
 
 void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
+    // Read BEFORE the reset below, because the reset is what would erase it.
+    // This function is public and is the raw "forget everything" helper, so on
+    // its own it was a way around the quarantine: calling it after
+    // imuQuarantine() cleared both the flag and the latch and put the device
+    // straight back into the polling and recovery paths.  A terminal state that
+    // any caller can leave by calling a different function is not terminal.
+    const bool wasQuarantined = (dev.lifecycle == IMU_LIFECYCLE_QUARANTINED);
+
     dev.accelAddress  = accelAddress;
     dev.magAddress    = magAddress;
     dev.accelReady    = false;
@@ -677,8 +685,13 @@ void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
     dev.fifoGapFlushes = 0u;
     dev.gapFlagActive  = false;
     dev.gapFlagUntilMs = millis();
-    dev.quarantined   = false;
-    dev.lifecycle     = IMU_LIFECYCLE_ACTIVE;
+    // Carried across the reset rather than cleared.  Everything else here is
+    // scratch state that a re-initialisation is entitled to discard; the
+    // quarantine is a decision about the HARDWARE, and no amount of resetting
+    // software state makes the bus that hung the board safe to transact on.
+    dev.quarantined   = wasQuarantined;
+    dev.lifecycle     = wasQuarantined ? IMU_LIFECYCLE_QUARANTINED
+                                       : IMU_LIFECYCLE_ACTIVE;
     // Full capture until something establishes the vehicle is parked.  The safe
     // default is the expensive one: starting in LowPower would mean a boot that
     // happens to coincide with a collision records it at reduced fidelity.
@@ -690,25 +703,27 @@ void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
 }
 
 void imuQuarantine(IMUDevice &dev){
-    imuMarkAbsent(dev, IMU_ACCEL_I2C_ADDRESS, IMU_MAG_I2C_ADDRESS);
-    // Set AFTER imuMarkAbsent(), which writes IMU_LIFECYCLE_ACTIVE.  Ordering
-    // matters: the latch is what makes the quarantine survive a later call to
-    // initializeIMU(), so it must be the last word on the subject.
-    dev.lifecycle   = IMU_LIFECYCLE_QUARANTINED;
+    // Latch set FIRST, then imuMarkAbsent() preserves it.  The reverse order
+    // also worked, but only because this function happened to write the latch
+    // last; setting it up front means the invariant is enforced by the one
+    // function that resets the struct, so it holds for every caller of that
+    // function rather than for this one path.
+    //
     // Terminal for the boot.  isIMUDegraded() is what schedules recoverIMU(),
-    // and recovery transacts — so without this flag the caller's retry timer
-    // would walk straight back into the hang that caused the reset, which is the
-    // loop the quarantine exists to break.
-    dev.quarantined = true;
+    // and recovery transacts — so without this the caller's retry timer would
+    // walk straight back into the hang that caused the reset, which is the loop
+    // the quarantine exists to break.
+    dev.lifecycle   = IMU_LIFECYCLE_QUARANTINED;
+    imuMarkAbsent(dev, IMU_ACCEL_I2C_ADDRESS, IMU_MAG_I2C_ADDRESS);
 }
 
 IMUReturnStatus initializeIMU(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress){
-    // Checked BEFORE the struct is reset, because resetting it is what would
-    // erase the answer.  Without this a caller could quarantine the device and
-    // then re-initialise it — clearing the flag and transacting on a bus that
-    // just hung the board.  The sketch does not do that, but a library whose
-    // safety property depends on callers not doing the obvious thing does not
-    // have the property.
+    // The SECOND of two layers, and it earns its place by returning a distinct
+    // status: imuMarkAbsent() now carries a quarantine across the reset, so the
+    // device would stay quarantined without this check — but the function would
+    // go on to probe addresses and call i2cBusBegin(), touching the very bus
+    // that hung the board.  Refusing here is what makes the quarantine mean
+    // "nothing is attempted" rather than merely "nothing is trusted".
     if (dev.lifecycle == IMU_LIFECYCLE_QUARANTINED) return IMUReturnStatus::NOK_LINK_LOST;
 
     imuMarkAbsent(dev, accelAddress, magAddress);
