@@ -134,7 +134,7 @@ struct OBD2Config{
  * @param[in]  irqPin   Interrupt pin (default @c MCP2515_DEFAULT_INT_PIN).
  * @return @c CANReturnStatus::OK on success, @c NOK_INIT_FAILED otherwise.
  */
-CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxAddress RxAddr, int csPin = MCP2515_DEFAULT_CS_PIN, int irqPin = MCP2515_DEFAULT_INT_PIN);
+CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxAddress RxAddr, int csPin = MCP2515_DEFAULT_CS_PIN, int irqPin = MCP2515_DEFAULT_INT_PIN, bool stayInConfigurationMode = false);
 
 /**
  * @brief Queries the ECU for its supported OBD-II PIDs and stores the result.
@@ -221,6 +221,13 @@ CANReturnStatus receiveS1Command(OBD2Config &config, uint8_t *outputBuffer, byte
  * request cannot trip it.
  */
 #define OBD2_RX_SILENCE_MS      3000UL
+
+/// How long a link that has NEVER answered stays credible, measured from the
+/// first request that reached the wire. Longer than OBD2_RX_SILENCE_MS on
+/// purpose: an ECU can take a moment to start answering after ignition, and
+/// this deadline is the only thing that ever fires when a live bus ACKs every
+/// request while the addressed ECU says nothing.
+#define OBD2_NO_REPLY_MS        8000UL
 
 /**
  * Floor on the gap between consecutive requests.
@@ -322,6 +329,20 @@ void resetOBD2Poll();
  * @return @c true when the transmit path has been failing continuously.
  */
 bool isOBD2LinkLost();
+
+/**
+ * @brief Whether any ECU has EVER answered a request since the last reset.
+ *
+ * Distinct from "the controller initialised", which is all an @c obdReady flag
+ * proves.  A status line that reports OBD-II as "up" on the strength of a
+ * successful @c initializeOBD2() claims a working diagnostic link on a vehicle
+ * that may never have said a word — which is exactly the reading that sends
+ * someone hunting for a decode bug when the real answer is that no reply ever
+ * arrived.
+ *
+ * @return @c true once at least one reply has been decoded.
+ */
+bool obd2EverReplied();
 
 /**
  * @brief Advances the non-blocking round-robin OBD-II polling state machine by one step.

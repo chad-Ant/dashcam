@@ -111,7 +111,7 @@ static bool mcp2515EnableOneShot(int csPin)
     return (canctrl & 0x08) != 0;   // OSM latched?
 }
 
-CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxAddress RxAddr, int csPin, int irqPin){
+CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxAddress RxAddr, int csPin, int irqPin, bool stayInConfigurationMode){
     // Zero the supported-PID bitmap so a later discovery failure can't expose stale bits.
     for (uint8_t i = 0; i < sizeof(config.supportedPIDs) / sizeof(config.supportedPIDs[0]); ++i) {
         config.supportedPIDs[i] = 0;
@@ -119,11 +119,27 @@ CANReturnStatus initializeOBD2(OBD2Config &config, CAN_TxAddress TxAddr, CAN_RxA
 
     CAN.setPins(csPin, irqPin);
     CAN.setClockFrequency(MCP2515_OSC_FREQ);   // MUST match the module crystal (DataDictionary.h)
-    if (!CAN.begin(CAN_BAUDRATE_DEFAULT)) return CANReturnStatus::NOK_INIT_FAILED;
+    if (!CAN.begin(CAN_BAUDRATE_DEFAULT, stayInConfigurationMode)) {
+        return CANReturnStatus::NOK_INIT_FAILED;
+    }
     config.TxAddress = TxAddr;
     config.RxAddress = RxAddr;
     //CANReturnStatus status = getSupportedPIDs(config); //currently bugged
-    //if (status != CANReturnStatus::OK) return status; 
+    //if (status != CANReturnStatus::OK) return status;
+
+    // Configure-only bring-up stops here, still off the bus.
+    //
+    // The boot path uses it because everything below ends in Normal mode:
+    // CAN.filter() does, and so does the default begin(). That left the
+    // controller ACK-capable for the whole window between bring-up and the
+    // canSetMode(SNIFF) that follows - short, but a window in which a node
+    // whose bit timing nothing had yet confirmed was participating in a live
+    // vehicle bus. canSetMode() programs its own filters and sets Normal+OSM in
+    // one atomic write for OBD2, so nothing here is lost by deferring to it.
+    if (stayInConfigurationMode) {
+        resetOBD2Poll();
+        return CANReturnStatus::OK;
+    }
 
     if (!CAN.filter(config.RxAddress)) return CANReturnStatus::NOK_INIT_FAILED;
     // OSM caps retransmission so a missing ACK cannot make the controller retry
@@ -213,6 +229,7 @@ static uint16_t      txFailures    = 0;   // consecutive TX failures (link-loss 
 static unsigned long lastTxAttempt = 0;   // for retry backoff after a failed transmit
 static unsigned long lastReplyMs   = 0;   // last DECODED ECU reply — see isOBD2LinkLost()
 static bool          silenceArmed  = false; // true once one reply has ever been decoded
+static unsigned long firstTxMs     = 0;   // first transmit since reset — see isOBD2LinkLost()
 
 void initOBD2Data(OBD2Data &data)
 {
@@ -275,9 +292,21 @@ static void storeReading(OBD2_S1Command pid, const uint8_t *buf, OBD2Data &data)
             // J1979 PID 0xA4, 4 bytes: A = support bits, B = actual gear,
             // C:D = ratio / 1000. One response carries both, which is why 0xA3
             // is gone rather than replaced - see the enum comment.
-            data.gear        = (float)buf[1];
-            data.gearRatio   = ((float)buf[2] * 256.0f + (float)buf[3]) * 0.001f;
-            data.fieldMs[OBD2F_GEAR] = data.fieldMs[OBD2F_GEAR_RATIO] = now;          break;
+            //
+            // Byte A says which of the two the ECU actually supports, and it is
+            // honoured per field rather than ignored: an unsupported field is
+            // returned as a defined value (usually zero), so publishing it
+            // unconditionally reported "gear 0, ratio 0.000" as a measurement on
+            // any vehicle that implements only one half of the PID.
+            if (buf[0] & 0x01u) {
+                data.gear      = (float)buf[1];
+                data.fieldMs[OBD2F_GEAR] = now;
+            }
+            if (buf[0] & 0x02u) {
+                data.gearRatio = ((float)buf[2] * 256.0f + (float)buf[3]) * 0.001f;
+                data.fieldMs[OBD2F_GEAR_RATIO] = now;
+            }
+            break;
         case ODOMETER:
             data.odo         = (float)(((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
                                        ((uint32_t)buf[2] << 8)  |  (uint32_t)buf[3]) * 0.1f;
@@ -296,6 +325,14 @@ void resetOBD2Poll()
     silenceArmed  = false;
 }
 
+bool obd2EverReplied()
+{
+    // silenceArmed is set by the first decoded reply and cleared only by
+    // resetOBD2Poll(), so it answers "has this link ever worked" rather than
+    // "is it working now" — which is the question a bring-up needs.
+    return silenceArmed;
+}
+
 bool isOBD2LinkLost()
 {
     // Two independent ways the link can be gone, and they are NOT the same
@@ -305,9 +342,20 @@ bool isOBD2LinkLost()
     // and the ECU we are actually talking to said nothing at all. Only the
     // second catches a wrong filter, a wrong response ID, or a dead ECM.
     if (txFailures >= OBD2_TX_FAIL_LIMIT) return true;
-    // Not armed until the first reply: before that there is no evidence either
-    // way, and declaring loss during bring-up would fight the retry logic.
-    if (silenceArmed && (millis() - lastReplyMs) > OBD2_RX_SILENCE_MS) return true;
+    if (silenceArmed) {
+        return (millis() - lastReplyMs) > OBD2_RX_SILENCE_MS;
+    }
+    // No reply has EVER been decoded. This used to return false unconditionally
+    // here, which left a link that never worked looking permanently healthy: on
+    // a live bus some other node ACKs every request, so txFailures stays at zero
+    // forever and the silence window — armed only by a first reply that never
+    // comes — never gets to fire. The node would sit at "OBD2 up" indefinitely
+    // publishing nothing, which is the most expensive possible way to be broken.
+    //
+    // Measured from the first transmit rather than from init, because before a
+    // request goes out there is genuinely nothing to be silent about. The window
+    // is generous: an ECU may take a moment after ignition to answer.
+    if (firstTxMs != 0u && (millis() - firstTxMs) > OBD2_NO_REPLY_MS) return true;
     return false;
 }
 

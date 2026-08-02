@@ -304,6 +304,20 @@ int MCP2515Class::endPacket()
   // Clear the pending TX interrupt, if any.
   modifyRegister(REG_CANINTF, FLAG_TXnIF(n), 0x00);
 
+  // DASHCAM PATCH: a timeout is a FAILURE, unconditionally.
+  //
+  // This used to fall through to the error-bit test below, which asks a
+  // different question: "did the controller record an error", not "did the
+  // frame go out". After the abort path above clears ABAT, ABTF does not
+  // necessarily remain latched, so a transmission that never completed and was
+  // then aborted could read back clean and be reported as SUCCESS. The caller
+  // then counts a delivered request that no ECU ever saw, and the TX-failure
+  // link detector never fires — the link looks healthy precisely because it is
+  // too broken to answer.
+  if (timedOut) {
+    return 0;
+  }
+
   // Report failure if either of the ABTF, MLOA or TXERR bits are set.
   // TODO: perhaps we can reuse the last value read from this register // earlier?
   return (readRegister(REG_TXBnCTRL(n)) & 0x70) ? 0 : 1;

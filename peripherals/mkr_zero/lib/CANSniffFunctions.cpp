@@ -71,15 +71,34 @@ static void rawBitModify(uint8_t reg, uint8_t mask, uint8_t value)
     SPI.endTransaction();
 }
 
-/** @brief Requests a mode and confirms it via CANSTAT OPMOD. Bounded. */
-static bool rawSetMode(uint8_t mode)
+/**
+ * @brief Requests a mode, possibly with extra CANCTRL bits, and confirms it.
+ *
+ * The poll is BOUNDED, never a single read. The MCP2515 completes a mode change
+ * only at the end of the message currently in progress, so an immediate readback
+ * can still show the old mode on a busy bus. Reading once and giving up reports
+ * failure on a transition that then completes anyway — and if the target was
+ * Normal, that leaves the controller bus-active while the caller believes it
+ * refused. A caller cannot recover from a state it was told does not exist.
+ *
+ * @param mask        CANCTRL bits to write.
+ * @param value       Values for those bits.
+ * @param expectMode  OPMOD value CANSTAT must report.
+ */
+static bool rawSetModeMasked(uint8_t mask, uint8_t value, uint8_t expectMode)
 {
-    rawBitModify(REG_CANCTRL, OPMOD_MASK, mode);
+    rawBitModify(REG_CANCTRL, mask, value);
     for (uint16_t tries = 0; tries < 500u; ++tries) {
-        if ((rawRead(REG_CANSTAT) & OPMOD_MASK) == mode) return true;
+        if ((rawRead(REG_CANSTAT) & OPMOD_MASK) == expectMode) return true;
         delayMicroseconds(100);
     }
     return false;
+}
+
+/** @brief Requests a mode and confirms it via CANSTAT OPMOD. Bounded. */
+static bool rawSetMode(uint8_t mode)
+{
+    return rawSetModeMasked(OPMOD_MASK, mode, mode);
 }
 
 // ─── the installed map ────────────────────────────────────────────────────────
@@ -347,6 +366,29 @@ static bool programSniffFilters()
         /* targetMode    */ MODE_LISTEN_ONLY);
 }
 
+/**
+ * @brief Fails a transition into a KNOWN state instead of an unknown one.
+ *
+ * Every failure path below has already changed hardware. Returning while gMode
+ * still holds the PREVIOUS mode leaves software asserting a mode the controller
+ * is not in — and if that stale value is SNIFF while the chip actually reached
+ * Normal, the node is bus-active and nothing in the system knows. Listen-only
+ * is a property this firmware claims; a claim that survives its own failure
+ * path is not a property.
+ *
+ * Configuration is where a failure parks: off the bus, and the only state every
+ * other transition can be entered from without a further reset. gMode becomes
+ * OFF to match, which also makes the next attempt a real transition rather than
+ * an UNCHANGED no-op.
+ */
+static CanModeStatus failToConfig(CanModeStatus why)
+{
+    (void)rawSetMode(MODE_CONFIG);   // best effort; we are already failing
+    gMode       = CanMode::OFF;
+    gLastModeMs = millis();
+    return why;
+}
+
 CanModeStatus canSetMode(CanMode mode, int csPin)
 {
     gCsPin = csPin;
@@ -363,7 +405,7 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
     // Configuration first, always. It is the only mode in which RXBnCTRL and the
     // filter registers are writable, and going via Configuration rather than
     // Normal means a read-only target is never bus-active even momentarily.
-    if (!rawSetMode(MODE_CONFIG)) return CanModeStatus::NOK_CONFIG;
+    if (!rawSetMode(MODE_CONFIG)) return failToConfig(CanModeStatus::NOK_CONFIG);
 
     // Clear anything the previous mode left pending, so the first frame decoded
     // after the switch belongs to the new mode.
@@ -376,15 +418,22 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
         // point of it.
         rawWrite(REG_RXB0CTRL, 0x64);     // RXM=11 | BUKT
         rawWrite(REG_RXB0CTRL + 0x10, 0x60);
-        if (!rawSetMode(MODE_LISTEN_ONLY)) return CanModeStatus::NOK_VERIFY;
+        if (!rawSetMode(MODE_LISTEN_ONLY)) return failToConfig(CanModeStatus::NOK_VERIFY);
         break;
 
     case CanMode::SNIFF:
         // setFilterRegisters() ends in the mode we ask for, so the controller
         // goes Configuration -> Listen-Only without touching Normal.
-        if (!programSniffFilters()) return CanModeStatus::NOK_FILTER;
-        if ((rawRead(REG_CANSTAT) & OPMOD_MASK) != MODE_LISTEN_ONLY) {
-            return CanModeStatus::NOK_VERIFY;
+        if (!programSniffFilters()) return failToConfig(CanModeStatus::NOK_FILTER);
+        // Bounded, for the same reason as everywhere else: a single read can
+        // catch the controller mid-transition and call a good change a failure.
+        {
+            bool ok = false;
+            for (uint16_t tries = 0; tries < 500u && !ok; ++tries) {
+                ok = ((rawRead(REG_CANSTAT) & OPMOD_MASK) == MODE_LISTEN_ONLY);
+                if (!ok) delayMicroseconds(100);
+            }
+            if (!ok) return failToConfig(CanModeStatus::NOK_VERIFY);
         }
         break;
 
@@ -393,19 +442,28 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
         if (!CAN.setFilterRegisters(0x7FFu, 0x7E8u, 0x7E8u,
                                     0x7FFu, 0x7E8u, 0x7E8u, 0x7E8u, 0x7E8u,
                                     true, MODE_CONFIG)) {
-            return CanModeStatus::NOK_FILTER;
+            return failToConfig(CanModeStatus::NOK_FILTER);
         }
         // Normal AND One-Shot in one write. Doing it as begin-then-bit-modify
         // leaves the controller bus-active without OSM for a few microseconds,
         // which is a window in which it can start retrying forever.
-        rawBitModify(REG_CANCTRL, OPMOD_MASK | FLAG_OSM, MODE_NORMAL | FLAG_OSM);
-        if ((rawRead(REG_CANSTAT) & OPMOD_MASK) != MODE_NORMAL) {
-            return CanModeStatus::NOK_VERIFY;
+        //
+        // The verify is BOUNDED. It used to be one immediate read, which is the
+        // one place in this function that could hand back NOK_VERIFY for a
+        // transition that then completed a few microseconds later — leaving the
+        // chip in Normal while gMode still said SNIFF. Failing here now parks
+        // the controller in Configuration, so the reported state is true either
+        // way.
+        if (!rawSetModeMasked(OPMOD_MASK | FLAG_OSM,
+                              MODE_NORMAL | FLAG_OSM, MODE_NORMAL)) {
+            return failToConfig(CanModeStatus::NOK_VERIFY);
         }
         // REFUSE if OSM did not latch. It is the only cap on retransmission,
         // and the alternative is an unattended node that hammers a live vehicle
         // bus indefinitely.
-        if ((rawRead(REG_CANCTRL) & FLAG_OSM) == 0u) return CanModeStatus::NOK_NO_OSM;
+        if ((rawRead(REG_CANCTRL) & FLAG_OSM) == 0u) {
+            return failToConfig(CanModeStatus::NOK_NO_OSM);
+        }
         break;
     }
 
@@ -431,8 +489,16 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
  * the bus for only ~222 us, so the cheaper read is what makes keeping up
  * possible. The instruction also auto-clears RXnIF on the CS rising edge.
  */
-static void readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
+static bool readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
 {
+    // RXBnCTRL first, because the READ RX BUFFER below clears RXnIF on its CS
+    // rising edge and we want the control byte that belongs to THIS frame.
+    // RXRTR (bit 3) is the only place a STANDARD remote frame is flagged: the
+    // RTR bit in RXBnDLC is defined for extended frames only, so the bytes the
+    // buffer read returns cannot answer the question on their own.
+    const uint8_t ctrl = rawRead((instr == INSTR_READ_RXB0) ? REG_RXB0CTRL
+                                                            : (uint8_t)(REG_RXB0CTRL + 0x10));
+
     uint8_t b[13];
     SPI.beginTransaction(kSniffSPI);
     digitalWrite(gCsPin, LOW);
@@ -441,10 +507,24 @@ static void readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
     digitalWrite(gCsPin, HIGH);
     SPI.endTransaction();
 
+    // Rejected AFTER the buffer read, never before: the read is what clears
+    // RXnIF, so returning early would leave the flag set and the drain would
+    // spin on the same frame forever.
+    //
+    // A remote frame carries NO data bytes, and the MCP2515 leaves the data
+    // registers holding whatever the previous frame put there. Decoding one
+    // would publish a stale payload under a live ID — a reading that is not
+    // merely wrong but plausible. An extended frame is rejected for the mirror
+    // reason: only its low 11 bits are compared here, so a 29-bit ID could
+    // masquerade as a mapped standard one.
+    if (ctrl & 0x08u) return false;             // RXRTR: remote request
+    if (b[1] & 0x08u) return false;             // IDE: extended identifier
+
     id  = (uint16_t)(((uint16_t)b[0] << 3) | (b[1] >> 5));
     dlc = b[4] & 0x0F;
     if (dlc > 8) dlc = 8;                       // DLC > 8 still means 8 bytes
     for (uint8_t i = 0; i < 8; ++i) data[i] = (i < dlc) ? b[5 + i] : 0x00;
+    return true;
 }
 
 /**
@@ -539,9 +619,14 @@ uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
         uint16_t id;
         uint8_t  dlc;
         uint8_t  d[8];
-        readFrame((intf & 0x01u) ? INSTR_READ_RXB0 : INSTR_READ_RXB1, id, dlc, d);
+        const bool usable = readFrame((intf & 0x01u) ? INSTR_READ_RXB0 : INSTR_READ_RXB1,
+                                      id, dlc, d);
         ++decoded;
         ++gFrames;
+        // Counted as a frame (it occupied a buffer and cost a drain slot) but
+        // not decoded, and deliberately not counted as a probe match either —
+        // a remote frame is not evidence that this map fits this vehicle.
+        if (!usable) continue;
 
         const uint32_t now = millis();
 

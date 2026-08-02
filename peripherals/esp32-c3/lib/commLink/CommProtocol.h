@@ -41,6 +41,39 @@
 #define COMM_RX_TIMEOUT_MS   50UL   ///< Abort a partial frame after this inter-byte gap (ms).
 
 /// Telemetry @c flags bits.
+/**
+ * @c TelemetryPayload::vehFlags bits.
+ *
+ * Named because a lane-keeping consumer reading bit 2 as bit 3 is a silent
+ * left/right swap, and a magic number is how that happens.
+ */
+#define COMM_VEH_FLAG_BRAKE_PRESSED 0x01u
+#define COMM_VEH_FLAG_BRAKE_SWITCH  0x02u
+#define COMM_VEH_FLAG_TURN_LEFT     0x04u
+#define COMM_VEH_FLAG_TURN_RIGHT    0x08u
+/**
+ * Both indicator bits. NOT a "hazards" predicate.
+ *
+ * Named for what it is because the obvious use of a constant called HAZARDS is
+ * `flags & COMM_VEH_FLAG_HAZARDS`, and that is true for a single indicator too
+ * - a left turn would read as hazard lights. Hazards are the EQUALITY case:
+ *
+ *     const bool hazards = (vehFlags & COMM_VEH_FLAG_TURN_MASK)
+ *                                   == COMM_VEH_FLAG_TURN_MASK;
+ */
+#define COMM_VEH_FLAG_TURN_MASK     (COMM_VEH_FLAG_TURN_LEFT | COMM_VEH_FLAG_TURN_RIGHT)
+
+/// Validity bits. Zero in these means "no data", NOT "released / not indicating".
+///
+/// Without them an absent or stale signal serialises identically to the safe-
+/// looking state: brake released, indicators off. For lane keeping that inverts
+/// the verdict - every lane change in OBD2 mode, where the indicator bits cannot
+/// be populated at all, would read as an UNSIGNALLED departure. A consumer must
+/// check these before believing a cleared bit.
+#define COMM_VEH_FLAG_BRAKE_VALID   0x10u
+#define COMM_VEH_FLAG_TURN_VALID    0x20u
+#define COMM_VEH_FLAG_PEDAL_VALID   0x40u
+
 #define COMM_FLAG_OBD2_VALID 0x01u  ///< OBD2 data is live (a reading arrived within the master's freshness window).
 #define COMM_FLAG_GPS_FIX    0x02u  ///< GPS reported a valid fix.
 #define COMM_FLAG_TIME_VALID 0x04u  ///< UTC date and time are valid.
@@ -290,7 +323,8 @@ struct __attribute__((packed)) TelemetryPayload {
     uint8_t gearPos;       ///< VehGear selector position (0 = unknown).
     /**
      * bit 0 brakePressed, bit 1 brakeSwitch,
-     * bit 2 turnLeft, bit 3 turnRight, bits 4-7 reserved (zero).
+     * bit 2 turnLeft, bit 3 turnRight,
+     * bit 4 brakeValid, bit 5 turnValid, bit 6 pedalValid, bit 7 reserved.
      *
      * Two brake bits because the car publishes two: a switch channel and a
      * pressed channel, in different bytes of 0x17C.  They normally agree, and a

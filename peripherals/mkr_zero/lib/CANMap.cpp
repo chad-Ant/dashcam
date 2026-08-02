@@ -382,17 +382,107 @@ CanMapStatus canMapFinalise(CanSignalMap &m)
 
     // 8-bit checksum over the accepted rows: identifies WHICH map produced a
     // given telemetry frame, which the host otherwise has no way to know.
+    //
+    // Scale and signedness are folded in, not just the bit geometry. Two maps
+    // that read the same bits and divide them differently produce numerically
+    // different telemetry from identical frames — a wheel scale of 0.01 against
+    // 0.1 is a factor of ten on every speed — so a checksum blind to them would
+    // certify the second as the first. The scale is quantised to 1e-6 to keep
+    // the sum reproducible rather than dependent on float formatting.
     uint8_t sum = 0;
     for (uint8_t i = 0; i < m.rowCount; ++i) {
         const CanSigRow &r = m.row[i];
         sum = (uint8_t)(sum + (uint8_t)r.canId + (uint8_t)(r.canId >> 8) +
-                        r.startBit + r.len + r.slot);
+                        r.startBit + r.len + r.slot +
+                        (uint8_t)(r.flags & (CAN_ROW_SIGNED | CAN_ROW_SINGLEBIT | CAN_ROW_ALIGNED)));
+        const uint32_t q = (uint32_t)(r.scale * 1000000.0f + 0.5f);
+        sum = (uint8_t)(sum + (uint8_t)q + (uint8_t)(q >> 8) +
+                        (uint8_t)(q >> 16) + (uint8_t)(q >> 24));
     }
     m.checksum = (sum == 0u) ? 1u : sum;   // 0 is reserved for "no map"
 
     m.statusFlags |= CAN_MAP_F_LOADED;
     m.loaded = true;
     return CanMapStatus::OK;
+}
+
+// ─── finding the map ──────────────────────────────────────────────────────────
+
+/** @brief ASCII case-insensitive compare. Not strcasecmp(): locale-free, tiny. */
+static bool ciEqualN(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca == '\0' || cb == '\0') return false;   // shorter than n: no match
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+bool canMapVehicleFromName(const char *name, char *vehicleOut, size_t vehicleLen)
+{
+    if (vehicleOut != nullptr && vehicleLen > 0) vehicleOut[0] = '\0';
+    if (name == nullptr) return false;
+
+    const size_t pre = sizeof(CAN_MAP_PREFIX) - 1u;
+    const size_t suf = sizeof(CAN_MAP_SUFFIX) - 1u;
+    const size_t len = strlen(name);
+
+    // Strictly greater, not >=: the vehicle portion must be non-empty, so a bare
+    // "canmap.txt" is NOT a match. One convention, not two — a second accepted
+    // spelling would only raise the question of which wins when both exist.
+    if (len <= pre + suf)                        return false;
+    if (!ciEqualN(name, CAN_MAP_PREFIX, pre))    return false;
+    if (!ciEqualN(name + len - suf, CAN_MAP_SUFFIX, suf)) return false;
+
+    const size_t vlen = len - pre - suf;
+    if (vehicleOut != nullptr && vehicleLen > 0) {
+        const size_t n = (vlen < vehicleLen - 1u) ? vlen : vehicleLen - 1u;
+        memcpy(vehicleOut, name + pre, n);
+        vehicleOut[n] = '\0';
+    }
+    return true;
+}
+
+uint8_t canMapFindFile(char *pathOut, size_t pathLen,
+                       char *vehicleOut, size_t vehicleLen)
+{
+    if (pathOut == nullptr || pathLen == 0) return 0;
+    pathOut[0] = '\0';
+    if (vehicleOut != nullptr && vehicleLen > 0) vehicleOut[0] = '\0';
+
+    File32 dir;
+    if (!sdOpenRoot(dir)) return 0;
+
+    char    name[CAN_MAP_NAME_MAX];
+    char    best[CAN_MAP_NAME_MAX];
+    uint8_t matches = 0;
+    best[0] = '\0';
+
+    File32 f;
+    while (f.openNext(&dir, O_RDONLY)) {
+        const bool isDir = f.isDir();
+        if (!isDir && f.getName(name, sizeof(name)) &&
+            canMapVehicleFromName(name, nullptr, 0)) {
+            ++matches;
+            // Lexicographically smallest wins, so two cards holding the same
+            // pair of maps choose the same one regardless of write order.
+            if (best[0] == '\0' || strcmp(name, best) < 0) {
+                strncpy(best, name, sizeof(best) - 1u);
+                best[sizeof(best) - 1u] = '\0';
+            }
+        }
+        f.close();
+    }
+    dir.close();
+
+    if (matches == 0) return 0;
+    strncpy(pathOut, best, pathLen - 1u);
+    pathOut[pathLen - 1u] = '\0';
+    (void)canMapVehicleFromName(best, vehicleOut, vehicleLen);
+    return matches;
 }
 
 CanMapStatus canMapLoad(CanSignalMap &m, const char *filename)

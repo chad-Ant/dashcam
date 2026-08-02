@@ -1,6 +1,11 @@
 # 2019 Honda Brio (DD1), CVT, 500 kbps F-CAN tapped at OBD-II pins 6/14.
 #
-# Copy to the SD card root as canmap.txt.
+# Copy to the SD card root AS IS - the firmware finds it by pattern.
+#
+# Convention: canmap.<vehicle>.txt. The vehicle is in the filename rather than a
+# key inside the file, so which map a card carries is legible from any host OS
+# without opening it, one card can hold several, and preparing a card is a copy
+# with no rename. The boot log names the vehicle it loaded.
 #
 # name,id,startBit,len,sign,scale
 #

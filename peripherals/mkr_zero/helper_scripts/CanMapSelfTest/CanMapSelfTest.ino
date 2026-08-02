@@ -192,6 +192,48 @@ static void testParser()
         check("bit6 not left",    (long)canExtractBit(leftOnly,  6), 0);
     }
 
+    Serial.println(F("\n-- filename convention: canmap.<vehicle>.txt --"));
+    {
+        char v[CAN_MAP_VEHICLE_MAX];
+        check("canmap.brio.txt",  canMapVehicleFromName("canmap.brio.txt", v, sizeof(v)) ? 1 : 0, 1);
+        check("  vehicle=brio",   strcmp(v, "brio") == 0 ? 1 : 0, 1);
+        // FAT short names come back upper-case whatever was typed.
+        check("CANMAP.BRIO.TXT",  canMapVehicleFromName("CANMAP.BRIO.TXT", v, sizeof(v)) ? 1 : 0, 1);
+        check("  vehicle=BRIO",   strcmp(v, "BRIO") == 0 ? 1 : 0, 1);
+        check("long vehicle ok",  canMapVehicleFromName("canmap.civic_2016.txt", v, sizeof(v)) ? 1 : 0, 1);
+        check("  vehicle kept",   strcmp(v, "civic_2016") == 0 ? 1 : 0, 1);
+        // A bare canmap.txt is NOT the convention: one spelling, so there is
+        // never a question of which wins when both are present.
+        check("canmap.txt rejected",   canMapVehicleFromName("canmap.txt", v, sizeof(v)) ? 1 : 0, 0);
+        // "canmap..txt" is exactly prefix+suffix, so the vehicle is empty.
+        check("empty vehicle rejected",canMapVehicleFromName("canmap..txt", v, sizeof(v)) ? 1 : 0, 0);
+        check("wrong prefix",          canMapVehicleFromName("vehmap.brio.txt", v, sizeof(v)) ? 1 : 0, 0);
+        check("wrong suffix",          canMapVehicleFromName("canmap.brio.cfg", v, sizeof(v)) ? 1 : 0, 0);
+        check("prefix only",           canMapVehicleFromName("canmap.", v, sizeof(v)) ? 1 : 0, 0);
+        check("unrelated file",        canMapVehicleFromName("record.txt", v, sizeof(v)) ? 1 : 0, 0);
+    }
+
+    Serial.println(F("\n-- checksum must see scale and signedness, not just bit geometry --"));
+    {
+        CanSignalMap a, b2;
+        canMapInitDefaults(a);
+        (void)feed(a, "speed,0x158,7,16,u,0.01");
+        (void)canMapFinalise(a);
+        // Same ID, same bits, ten times the scale: identical telemetry frames
+        // decode to numbers an order of magnitude apart, so the maps must not
+        // share an identity on the wire.
+        canMapInitDefaults(b2);
+        (void)feed(b2, "speed,0x158,7,16,u,0.1");
+        (void)canMapFinalise(b2);
+        check("scale changes checksum", (a.checksum != b2.checksum) ? 1 : 0, 1);
+
+        CanSignalMap c;
+        canMapInitDefaults(c);
+        (void)feed(c, "speed,0x158,7,16,s,0.01");
+        (void)canMapFinalise(c);
+        check("signedness changes checksum", (a.checksum != c.checksum) ? 1 : 0, 1);
+    }
+
     Serial.println(F("\n-- >6 ids: priority decides who is dropped, not ID order --"));
     CanSignalMap p;
     canMapInitDefaults(p);

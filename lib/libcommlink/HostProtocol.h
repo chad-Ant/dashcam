@@ -111,11 +111,21 @@ enum MsgType : uint8_t {
     /**
      * Payload uint8: 1=discover 2=sniff 3=obd2. Relayed to the MKR.
      *
-     * There is deliberately NO automatic fallback from sniffing to OBD2 on the
-     * MKR. OBD2 mode transmits on a live vehicle bus, and a node that decides
-     * on its own to start doing that - unattended, on a car in motion, because
-     * a signal went quiet for a second - is not a decision firmware should make.
-     * The host asks, or it does not happen.
+     * The MKR never switches to OBD2 MID-DRIVE on its own. OBD2 transmits on a
+     * live vehicle bus, and a node that decides that unattended, on a car in
+     * motion, because a signal went quiet for a second, is not a decision
+     * firmware should make.
+     *
+     * It DOES choose at boot, once, and then never revisits it: no vehicle map
+     * on the SD card, or a map whose IDs never appear during the probe window,
+     * selects OBD2 before the vehicle is moving. That is a human choosing - the
+     * card is written by hand - and the alternative is an unconfigured install
+     * that produces no telemetry at all. The boot decision is reported in
+     * @c Telemetry::canMode rather than left to be inferred.
+     *
+     * This comment previously claimed there was no automatic fallback at all,
+     * which the boot path had already contradicted. A host command still
+     * outranks the boot decision and skips the probe entirely.
      */
     CMD_SET_CAN_MODE = 0x13,
     CMD_PING         = 0x20, ///< Link check.
@@ -155,6 +165,52 @@ constexpr uint8_t BRIDGE_FLAG_BATT_LOW    = 0x04; ///< Bridge battery below the 
 constexpr uint8_t BRIDGE_FLAG_BATT_CRIT   = 0x08; ///< Bridge battery below the critical threshold.
 constexpr uint8_t BRIDGE_FLAG_CHARGING    = 0x10; ///< Bridge battery is charging.
 constexpr uint8_t BRIDGE_FLAG_PM_PRESENT  = 0x20; ///< A PowerManager is fitted; battery fields are real.
+
+/** @brief Provenance codes packed two bits at a time into @c Telemetry::sigSource. */
+enum class VehSigSource : uint8_t {
+    NONE      = 0, ///< Never written, or structurally unavailable in this mode.
+    CAN_SNIFF = 1, ///< Decoded from a broadcast frame.
+    OBD2      = 2  ///< Answered by an ECU to a Mode 01 request.
+};
+
+/// Unpack @c Telemetry::sigSource. Two bits each, low pair first.
+inline VehSigSource sigSourceSpeed(uint8_t s) { return static_cast<VehSigSource>( s        & 0x03); }
+inline VehSigSource sigSourceRpm  (uint8_t s) { return static_cast<VehSigSource>((s >> 2)  & 0x03); }
+inline VehSigSource sigSourceGear (uint8_t s) { return static_cast<VehSigSource>((s >> 4)  & 0x03); }
+inline VehSigSource sigSourceSteer(uint8_t s) { return static_cast<VehSigSource>((s >> 6)  & 0x03); }
+
+/**
+ * @c Telemetry::vehFlags bits.
+ *
+ * Named because a lane-keeping consumer reading bit 2 as bit 3 is a silent
+ * left/right swap, and a magic number is how that happens.
+ */
+constexpr uint8_t VEH_FLAG_BRAKE_PRESSED = 0x01;
+constexpr uint8_t VEH_FLAG_BRAKE_SWITCH  = 0x02;
+constexpr uint8_t VEH_FLAG_TURN_LEFT     = 0x04;
+constexpr uint8_t VEH_FLAG_TURN_RIGHT    = 0x08;
+/**
+ * Both indicator bits. NOT a "hazards" predicate.
+ *
+ * Named for what it is because the obvious use of a constant called HAZARDS is
+ * `flags & VEH_FLAG_HAZARDS`, and that is true for a single indicator too - a
+ * left turn would read as hazard lights. Hazards are the EQUALITY case:
+ *
+ *     const bool hazards = (t.vehFlags & VEH_FLAG_TURN_MASK) == VEH_FLAG_TURN_MASK;
+ */
+constexpr uint8_t VEH_FLAG_TURN_MASK     = VEH_FLAG_TURN_LEFT | VEH_FLAG_TURN_RIGHT;
+
+/**
+ * Validity bits. Zero means "no data", NOT "released / not indicating".
+ *
+ * Without them an absent or stale signal serialises identically to the safe-
+ * looking state. For lane keeping that inverts the verdict: in OBD2 mode the
+ * indicator bits cannot be populated at all, so every lane change would read as
+ * an UNSIGNALLED departure. Check these before believing a cleared bit.
+ */
+constexpr uint8_t VEH_FLAG_BRAKE_VALID   = 0x10;
+constexpr uint8_t VEH_FLAG_TURN_VALID    = 0x20;
+constexpr uint8_t VEH_FLAG_PEDAL_VALID   = 0x40;
 
 /** @c Telemetry::flags bits — identical to the COMM_FLAG_* set on the MKR hop. */
 constexpr uint8_t TLM_FLAG_OBD2_VALID = 0x01; ///< OBD2 data is live.
@@ -332,7 +388,8 @@ struct __attribute__((packed)) Telemetry {
     uint8_t gearPos;       ///< 0=unknown 1=P 2=R 3=N 4=D 5=L 6=S.
     /**
      * bit 0 brakePressed, bit 1 brakeSwitch,
-     * bit 2 turnLeft, bit 3 turnRight, bits 4-7 reserved (zero).
+     * bit 2 turnLeft, bit 3 turnRight,
+     * bit 4 brakeValid, bit 5 turnValid, bit 6 pedalValid, bit 7 reserved.
      *
      * The turn bits are indicator ACTIVE, not indicator lamp lit: the lamp
      * blinks at ~1.5 Hz and telemetry arrives at ~4 Hz, so the sender holds

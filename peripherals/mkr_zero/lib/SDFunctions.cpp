@@ -46,6 +46,12 @@ bool sdOpenRead(const char *path, File32 &f)
     return f.open(path, O_RDONLY);
 }
 
+bool sdOpenRoot(File32 &dir)
+{
+    if (!gMounted) return false;
+    return dir.open("/", O_RDONLY);
+}
+
 bool sdReadLine(File32 &f, char *buf, size_t bufLen)
 {
     if (buf == nullptr || bufLen == 0) return false;
@@ -76,71 +82,4 @@ bool sdReadLine(File32 &f, char *buf, size_t bufLen)
     buf[n] = '\0';
     (void)over;   // the caller sees truncation as a line that fails to parse
     return any;
-}
-
-// ─── config.txt ───────────────────────────────────────────────────────────────
-
-void initSDConfigDefaults(SDConfig &config)
-{
-    config.defaultLat  = GPS_DEFAULT_LAT;
-    config.defaultLon  = GPS_DEFAULT_LON;
-    config.defaultAlt  = GPS_DEFAULT_ALT;
-    config.defaultPacc = GPS_DEFAULT_PACC;
-    config.timezone    = LOCAL_TIMEZONE;
-    config.servoXPin   = SERVO_XAXIS_PIN;
-    config.servoYPin   = SERVO_YAXIS_PIN;
-    config.canCSPin    = MCP2515_DEFAULT_CS_PIN;
-    config.canIntPin   = MCP2515_DEFAULT_INT_PIN;
-}
-
-/** @brief Trims leading and trailing ASCII whitespace in place. @return start. */
-static char *trim(char *s)
-{
-    while (*s == ' ' || *s == '\t') ++s;
-    size_t n = strlen(s);
-    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
-    return s;
-}
-
-SDReturnStatus readConfig(const char *filename, SDConfig &config)
-{
-    if (!gMounted) return SDReturnStatus::NOK_INIT_FAILED;
-
-    File32 f;
-    if (!sdOpenRead(filename, f)) return SDReturnStatus::NOK_NOT_FOUND;
-
-    char     line[SD_MAX_LINE];
-    uint16_t matched = 0;
-
-    while (sdReadLine(f, line, sizeof(line))) {
-        char *p = trim(line);
-        if (*p == '\0' || *p == '#' || *p == ';') continue;
-        if (*p == '[') continue;   // section headers are accepted and ignored
-
-        char *eq = strchr(p, '=');
-        if (eq == nullptr) continue;
-        *eq = '\0';
-        char *key = trim(p);
-        char *val = trim(eq + 1);
-        if (*key == '\0' || *val == '\0') continue;
-
-        // strtod, not atof, and only here: this runs once at boot on a handful
-        // of lines, so the software-double cost is paid in setup() rather than
-        // anywhere the vehicle signals are decoded.
-        if      (strcmp(key, "lat")      == 0) { config.defaultLat  = (float)strtod(val, nullptr); ++matched; }
-        else if (strcmp(key, "lon")      == 0) { config.defaultLon  = (float)strtod(val, nullptr); ++matched; }
-        else if (strcmp(key, "alt")      == 0) { config.defaultAlt  = (float)strtod(val, nullptr); ++matched; }
-        else if (strcmp(key, "pacc")     == 0) { config.defaultPacc = (float)strtod(val, nullptr); ++matched; }
-        else if (strcmp(key, "timezone") == 0) { config.timezone    = (int8_t)atoi(val);           ++matched; }
-        else if (strcmp(key, "servo_x")  == 0) { config.servoXPin   = (uint8_t)atoi(val);          ++matched; }
-        else if (strcmp(key, "servo_y")  == 0) { config.servoYPin   = (uint8_t)atoi(val);          ++matched; }
-        else if (strcmp(key, "can_cs")   == 0) { config.canCSPin    = (uint8_t)atoi(val);          ++matched; }
-        else if (strcmp(key, "can_int")  == 0) { config.canIntPin   = (uint8_t)atoi(val);          ++matched; }
-    }
-
-    f.close();
-    // A file that parsed to nothing is reported rather than passed off as a
-    // success with defaults: "the card holds a config.txt I could not read" and
-    // "there is no config.txt" need different repairs.
-    return (matched > 0) ? SDReturnStatus::OK : SDReturnStatus::NOK_PARSE_ERROR;
 }

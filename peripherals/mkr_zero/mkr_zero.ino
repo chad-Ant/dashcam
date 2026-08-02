@@ -381,7 +381,17 @@ static void updateHeading(bool freshSample)
  * every boot, and the guard is here because a comment claiming it could not was
  * not enough.
  */
-static bool startOBD2()
+/**
+ * @brief Brings the MCP2515 up.
+ *
+ * @param stayInConfig Leave the controller in Configuration mode — off the bus —
+ *        for the caller to move with @c applyCanMode(). The boot path uses this:
+ *        the default bring-up ends in Normal, which made the node ACK-capable on
+ *        a live vehicle bus for the window between here and the first mode
+ *        selection. Short, but listen-only is a property this firmware claims
+ *        from power-on, and a property with a hole in it is a hope.
+ */
+static bool startOBD2(bool stayInConfig = false)
 {
     const CanMode m = canGetMode();
     if (m != CanMode::OFF && m != CanMode::OBD2) {
@@ -391,9 +401,28 @@ static bool startOBD2()
     }
 
     const CANReturnStatus st =
-        initializeOBD2(OBD2S1Commands, OBD2_TX_GLOBAL, OBD2_RX_ECM_1);
+        initializeOBD2(OBD2S1Commands, OBD2_TX_GLOBAL, OBD2_RX_ECM_1,
+                       MCP2515_DEFAULT_CS_PIN, MCP2515_DEFAULT_INT_PIN, stayInConfig);
     if (st != CANReturnStatus::OK) {
-        Serial.println("OBD2: CAN init failed");
+        // Which failure, not just that there was one. NOK_INIT_FAILED means the
+        // MCP2515 never acknowledged a mode change across a 50 ms bounded poll —
+        // i.e. the chip is not answering SPI, which is a wiring or supply fault
+        // and not something a retry will argue with. NOK_STATUS_BAD means it
+        // answered but One-Shot Mode would not latch. Those need opposite
+        // investigations, and one message for both sent this bring-up looking
+        // for a software cause that was never there.
+        Serial.print("OBD2: CAN init failed - ");
+        switch (st) {
+            case CANReturnStatus::NOK_INIT_FAILED:
+                Serial.println("controller not responding (check power and SPI wiring)");
+                break;
+            case CANReturnStatus::NOK_STATUS_BAD:
+                Serial.println("One-Shot Mode did not latch; refusing to transmit");
+                break;
+            default:
+                Serial.println((int)st);
+                break;
+        }
         return false;
     }
     Serial.println("OBD2: CAN started");
@@ -596,14 +625,14 @@ void setup()
     // its own card-init timeout and fails fast on an empty slot.
     //
     // Non-fatal by design. A rig with no card is still a working telemetry node.
+    // config.txt is gone, not merely unread. It was parsed into an SDConfig that
+    // then went out of scope untouched, and the boot printed "config.txt loaded"
+    // for a file that changed nothing — a capability that looked supported and
+    // was not. Every field it carried mirrors a compile-time constant consumed
+    // directly elsewhere (the CS pin reaches the vendored library's own default),
+    // so honouring it is a feature to design, not a line to restore.
     if (initializeSD() == SDReturnStatus::OK) {
         Serial.println("SD: card mounted (SPI1)");
-        SDConfig cfg;
-        initSDConfigDefaults(cfg);
-        const SDReturnStatus cs = readConfig(SD_CONFIG_FILENAME, cfg);
-        if      (cs == SDReturnStatus::OK)            Serial.println("SD: config.txt loaded");
-        else if (cs == SDReturnStatus::NOK_NOT_FOUND) Serial.println("SD: no config.txt; using defaults");
-        else                                          Serial.println("SD: config.txt unreadable; using defaults");
     } else {
         Serial.println("SD: no card - defaults only");
     }
@@ -623,24 +652,56 @@ void setup()
     // The vehicle signal map decides what happens next. Read before anything
     // touches the CAN controller, because canSetMode(SNIFF) programs the
     // hardware filter from the map's ID set.
-    const CanMapStatus ms = canMapLoad(canMap, CAN_MAP_FILENAME);
+    // canmap.<vehicle>.txt, found by pattern — see CAN_MAP_PREFIX. The vehicle
+    // is named so the log can say WHICH map is live, which a fixed filename
+    // could never report and which is the first thing to check when the numbers
+    // look like another car's.
+    char mapPath[CAN_MAP_NAME_MAX];
+    char mapVehicle[CAN_MAP_VEHICLE_MAX];
+    const uint8_t mapMatches = canMapFindFile(mapPath, sizeof(mapPath),
+                                              mapVehicle, sizeof(mapVehicle));
+    if (mapMatches > 1u) {
+        // Loaded anyway rather than refused: a second map on the card is an
+        // operator slip, and refusing would cost the whole drive's telemetry to
+        // punish it. The choice is deterministic and named, so it is checkable.
+        Serial.print("CANMAP: ");
+        Serial.print(mapMatches);
+        Serial.println(" maps on the card; remove the ones you are not using");
+    }
+
+    const CanMapStatus ms = (mapMatches == 0u)
+        ? CanMapStatus::NOK_NOT_FOUND
+        : canMapLoad(canMap, mapPath);
     Serial.print("CANMAP: ");
     Serial.println(canMapStatusName(ms));
     if (ms == CanMapStatus::OK) {
         Serial.print("CANMAP: ");
+        Serial.print(mapVehicle);
+        Serial.print(" - ");
         Serial.print(canMap.rowCount);
         Serial.print(" signals across ");
         Serial.print(canMap.idCount);
         Serial.print(" ids, id=0x");
         Serial.println(canMap.checksum, HEX);
     } else {
-        Serial.println("CANMAP: falling back to the compiled-in map");
+        // NOT "falling back to the compiled-in map", which is what this said and
+        // which the very next line contradicted. The compiled-in map is installed
+        // below for null-safety only; it is deliberately NOT used to sniff, so
+        // the node goes to OBD-II. Say the actionable thing instead — the fix is
+        // one file copy, and an operator should not have to read the source to
+        // find that out.
+        Serial.print("CANMAP: no usable map -> OBD2 only. Copy ");
+        Serial.print("config/canmap.<vehicle>.txt to the card root, e.g. ");
+        Serial.println("canmap.brio.txt");
     }
     canSniffSetMap(ms == CanMapStatus::OK ? &canMap : nullptr);
     initYawEstimator(yawEst, canSniffGetMap());
     watchdogFeed();
 
-    if (!startOBD2()) {
+    // Configure-only: the controller comes up off the bus and the mode choice
+    // below is what first puts it on. applyCanMode(OBD2) programs its own filter
+    // and sets Normal+OSM atomically, so the OBD-II path loses nothing.
+    if (!startOBD2(/*stayInConfig=*/true)) {
         obdReady = false;
         canProbeSkip(canProbe);
     } else if (ms != CanMapStatus::OK) {
@@ -814,7 +875,25 @@ void loop()
         // one unlucky boot used to cost the whole drive, because nothing ever
         // re-attempted SNIFF after setup().
         if (wasOff && obdReady) {
-            if (!applyCanMode(CanMode::SNIFF)) {
+            // Gated on a loaded map, exactly as the boot path is.
+            //
+            // This used to re-attempt SNIFF unconditionally, which quietly
+            // bypassed the whole "no map -> OBD2" policy: a boot whose CAN init
+            // failed would recover here and start sniffing with the COMPILED-IN
+            // Honda map, on whatever vehicle it happened to be plugged into.
+            // Observed doing exactly that. It looked fine because the car was a
+            // Brio; on anything else it would have decoded another
+            // manufacturer's bits and published them as measurements, which is
+            // worse than publishing nothing.
+            if (!canMap.loaded) {
+                canProbeSkip(canProbe);
+                applyCanMode(CanMode::OBD2);
+                Serial.println("CAN: controller back, but no vehicle map; using OBD2 query");
+            } else if (applyCanMode(CanMode::SNIFF)) {
+                // Probe armed, for the same reason the boot arms it: this is the
+                // first time the map has met the bus, so it is still unproven.
+                canProbeArm(canProbe);
+            } else {
                 obdReady = true;   // applyCanMode() left state untouched on failure
                 Serial.println("CAN: sniff still unavailable; OBD2 poller armed");
             }
@@ -977,7 +1056,21 @@ void loop()
     // Sampled on a fixed cadence, not on ECU updates: see ACCEL_SAMPLE_MS.
     if (isTimeout(ACCEL_SAMPLE_MS, lastAccelSample)) {
         lastAccelSample = millis();
-        (void)accelEst.update(obdData.speed, lastAccelSample); // NAN handled inside
+        // Sniffed speed first, OBD-II second — the same precedence buildTelemetry()
+        // applies to the primary `speed` field, and for the same reason.
+        //
+        // This fed obdData.speed unconditionally, which meant SNIFF mode had NO
+        // acceleration at all: obdData.speed is NAN whenever the poller is not
+        // running, so the estimator was handed nothing for the entire sniffing
+        // session and derived.accelMs2 stayed NAN. Sniffed speed is also the
+        // better input by a wide margin — 0.01 km/h at 50-100 Hz against whole
+        // km/h at ~2 Hz — and a differentiator is exactly where that resolution
+        // pays, because quantisation noise is what a difference amplifies.
+        const float accelInput =
+            (vehSignals.speedSrc != VehSource::NONE && !isnan(vehSignals.speedKmh))
+                ? vehSignals.speedKmh
+                : obdData.speed;
+        (void)accelEst.update(accelInput, lastAccelSample); // NAN handled inside
         derived.accelMs2 = accelEst.value();
         // false: this tick may only INVALIDATE. Feeding here is what
         // oversampled a 4 Hz receiver at 10 Hz; see updateHeading().
@@ -1062,7 +1155,29 @@ void loop()
         // the three the node is actually in, which is the thing worth knowing.
         Serial.print("  can=");
         Serial.print(canModeName(canMode));
-        if (canMode == CanMode::OBD2) Serial.print(obdReady ? "/up" : "/down");
+        // matched/total frames off the drain. Cheap, and it settles a question
+        // no amount of datasheet reading does: if the hardware filter is doing
+        // its job these two track each other, because only mapped IDs are
+        // admitted. A matched count that is a small fraction of the total means
+        // the filter is being bypassed and the drain is spending its budget on
+        // traffic it throws away — which is the difference between "sniffing
+        // works" and "sniffing works until the bus gets busy".
+        if (canMode == CanMode::SNIFF) {
+            Serial.print(" rx=");
+            Serial.print(canSniffMatchCount());
+            Serial.print("/");
+            Serial.print(canSniffFrameCount());
+        }
+        // Three states, not two. obdReady only says the CONTROLLER came up;
+        // printing that as "/up" claims a working diagnostic link on a vehicle
+        // that may never have answered, which reads as "OBD-II is fine, the
+        // decode must be broken" when the truth is the opposite. "/noecu" is
+        // the case where we are transmitting into silence.
+        if (canMode == CanMode::OBD2) {
+            if      (!obdReady)         Serial.print("/down");
+            else if (obd2EverReplied()) Serial.print("/up");
+            else                        Serial.print("/noecu");
+        }
 #ifdef USE_GPS
         // Reported alongside OBD-II because the receiver is now a live
         // subsystem that can fail on its own.  Without this the only GNSS

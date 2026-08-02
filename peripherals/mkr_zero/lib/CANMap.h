@@ -12,9 +12,14 @@
  *
  * ── BIT NUMBERING ────────────────────────────────────────────────────────────
  * `startBit` is DBC **Motorola** (`start|len@0`) as used by opendbc: the number
- * of the signal's MOST SIGNIFICANT bit, where bit j of byte i is i*8+j with j
- * counted MSB-first.  A signal walks DOWN through bit positions and wraps to
- * bit 7 of the NEXT byte.
+ * of the signal's MOST SIGNIFICANT bit, where bit j of byte i is at position
+ * i*8+j and j is the ordinary LSB-first index within the byte (j=7 is that
+ * byte's MSB, j=0 its LSB).  It is the SIGNAL that runs MSB-first: it starts at
+ * `startBit`, walks DOWN through positions, and wraps to bit 7 of the NEXT byte.
+ *
+ * So position 7 is the top bit of byte 0 — which is why a plain big-endian
+ * 16-bit field at byte 0 is written `7|16@0+` and not `0|16@0+`. A single bit
+ * is easier: byte 0 bit 5 is simply position 5, mask 0x20.
  *
  * That wrap is the whole reason a byte-pair read gives the wrong answer for an
  * unaligned field.  Honda's four wheel speeds read as aligned 16-bit pairs give
@@ -29,13 +34,37 @@
 
 #include "VehicleSignals.h"
 
-/// Map file on the card root. LFN is enabled, but this stays 8.3 so the file is
-/// still readable if anything ever reads the card with a simpler stack.
-#define CAN_MAP_FILENAME     "canmap.txt"
+// ─── where the map lives ──────────────────────────────────────────────────────
+//
+// Convention: `canmap.<vehicle>.txt` in the card root — `canmap.brio.txt`.
+//
+// Found by PATTERN rather than by a fixed name, and the vehicle is in the
+// filename rather than a key inside the file, so that which map a card carries
+// is legible from any host OS without opening anything, and one card can hold
+// several without them overwriting each other. The reference map in
+// config/ already follows it, so preparing a card is a copy with no rename —
+// and a rename is exactly the step that gets skipped.
+//
+// Long file names are enabled in the vendored SdFat, so `<vehicle>` is not
+// limited to the three characters an 8.3 name would leave.
+#define CAN_MAP_PREFIX       "canmap."
+#define CAN_MAP_SUFFIX       ".txt"
+/// Longest full filename this will accept, including the NUL.
+#define CAN_MAP_NAME_MAX     40u
+/// Longest `<vehicle>` portion reported to the log, including the NUL.
+#define CAN_MAP_VEHICLE_MAX  20u
 
-/// Refused, never truncated, above this. A truncated map is a WRONG map, and it
-/// would be wrong silently — some signals present, others quietly missing.
-#define CAN_MAP_MAX_BYTES    2048u
+/**
+ * Refused, never truncated, above this. A truncated map is a WRONG map, and it
+ * would be wrong silently — some signals present, others quietly missing.
+ *
+ * The gate is against a corrupt or binary file, not against a long one: parsing
+ * is line-by-line into a CAN_MAP_MAX_LINE buffer, so the file size costs no RAM.
+ * It was 2048 and the reference map outgrew it — these files carry the EVIDENCE
+ * for each row, which is the point of them, and a map that documents why a bit
+ * means what it means is worth more than the two kilobytes it saves.
+ */
+#define CAN_MAP_MAX_BYTES    8192u
 /// Longer lines are skipped whole and counted as an error.
 #define CAN_MAP_MAX_LINE     96u
 /// Past this the file is rejected outright: nine typos is a half-edited file,
@@ -224,6 +253,33 @@ bool canMapParseLine(CanSignalMap &m, char *line);
 
 /** @brief Finalises a map after the last line: sort, directory, derived constants. */
 CanMapStatus canMapFinalise(CanSignalMap &m);
+
+/**
+ * @brief Extracts the `<vehicle>` portion of a `canmap.<vehicle>.txt` name.
+ *
+ * Pure, so the self-test can exercise the convention without a card. Matching
+ * is case-insensitive: a card written on a PC may present either case, and FAT
+ * short names are upper-case regardless of what was typed.
+ *
+ * @param[in]  name        Filename with no directory part.
+ * @param[out] vehicleOut  The `<vehicle>` portion, NUL-terminated. May be nullptr.
+ * @return true if @p name follows the convention with a non-empty vehicle.
+ */
+bool canMapVehicleFromName(const char *name, char *vehicleOut, size_t vehicleLen);
+
+/**
+ * @brief Finds the vehicle map on the card.
+ *
+ * @param[out] pathOut     Filename to hand to @c canMapLoad().
+ * @param[out] vehicleOut  The `<vehicle>` portion, for the log. May be nullptr.
+ * @return How many files matched. 0 means none — the caller falls back to
+ *         OBD-II. More than 1 is an operator error rather than a fault, so it
+ *         still loads: @p pathOut holds the lexicographically FIRST match, which
+ *         is reproducible, where "whichever the directory yields first" depends
+ *         on the order the card happened to be written in.
+ */
+uint8_t canMapFindFile(char *pathOut, size_t pathLen,
+                       char *vehicleOut, size_t vehicleLen);
 
 /**
  * @brief Loads the map from the SD card.

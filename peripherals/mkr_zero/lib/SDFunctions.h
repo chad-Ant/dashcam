@@ -33,9 +33,16 @@
 #error "Stock SdFat detected. Build with --library peripherals/mkr_zero/vendor/SdFat (see vendor/SdFat/PATCHES.md); the global copy is unpinned and nothing version-checks it."
 #endif
 
-/// Installation config read by @c readConfig(). LFN is enabled, so long names
-/// would work — this one stays short because it is also read by other tools.
-#define SD_CONFIG_FILENAME  "config.txt"
+/**
+ * @brief Opens the card root so a caller can walk it with @c File32::openNext().
+ *
+ * Exists because the vehicle map is found by PATTERN, not by a fixed name, and
+ * only this translation unit knows whether the card is mounted.
+ *
+ * @param[out] dir Directory handle; the caller closes it.
+ * @return false if no card is mounted or the root could not be opened.
+ */
+bool sdOpenRoot(File32 &dir);
 
 /// Longest line any parser built on @c sdReadLine() will accept.
 #define SD_MAX_LINE         96u
@@ -48,25 +55,6 @@ enum class SDReturnStatus {
     NOK_NOT_FOUND    = -3, ///< Target file does not exist.
     NOK_WRITE_FAILED = -4, ///< Open, write or sync failed.
     NOK_PARSE_ERROR  = -5, ///< File opened but contained nothing usable.
-};
-
-/**
- * @brief Installation settings read from @c config.txt.
- *
- * The six WiFi credential fields this struct used to declare are gone.  A MKR
- * Zero has no radio, so roughly 200 bytes of SRAM were reserved for values this
- * firmware could never act on.
- */
-struct SDConfig {
-    float   defaultLat;   ///< Fallback latitude (decimal degrees).
-    float   defaultLon;   ///< Fallback longitude (decimal degrees).
-    float   defaultAlt;   ///< Fallback altitude above MSL (m).
-    float   defaultPacc;  ///< Fallback position-accuracy estimate (m).
-    int8_t  timezone;     ///< UTC offset in whole hours (-12 … +12).
-    uint8_t servoXPin;    ///< Servo X-axis PWM pin.
-    uint8_t servoYPin;    ///< Servo Y-axis PWM pin.
-    uint8_t canCSPin;     ///< MCP2515 chip-select pin.
-    uint8_t canIntPin;    ///< MCP2515 interrupt pin.
 };
 
 /**
@@ -100,21 +88,6 @@ bool sdOpenRead(const char *path, File32 &f);
  * @return false at end of file with nothing read.
  */
 bool sdReadLine(File32 &f, char *buf, size_t bufLen);
-
-/** @brief Fills @p config with the compile-time defaults from DataDictionary.h. */
-void initSDConfigDefaults(SDConfig &config);
-
-/**
- * @brief Parses an INI-style @c key=value file into @p config.
- *
- * Sections are accepted and ignored; keys are matched globally.  Lines beginning
- * @c # or @c ; are comments.  Keys absent from the file leave their field
- * untouched, so call @c initSDConfigDefaults() first.
- *
- * @return @c OK, @c NOK_INIT_FAILED if the card is not mounted,
- *         @c NOK_NOT_FOUND, or @c NOK_PARSE_ERROR if no key was recognised.
- */
-SDReturnStatus readConfig(const char *filename, SDConfig &config);
 
 /*
  * Deliberately NOT declared here: OBD2 CSV logging.

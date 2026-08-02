@@ -34,6 +34,12 @@ void HostLink::resetSessionState()
     decim_     = 1;
     onceReq_   = false;
     statusReq_ = false;
+    // Pending mode change too. A CMD_SET_CAN_MODE that arrived just as the host
+    // died would otherwise survive into the next session and be applied to a
+    // process that never asked for it — and the mode it selects decides whether
+    // this node transmits on a live vehicle bus. That is not a decision any
+    // client should inherit from its predecessor.
+    canModeReq_ = 0;
 }
 
 bool HostLink::sendFrame(uint8_t type, const uint8_t *payload, uint8_t len)

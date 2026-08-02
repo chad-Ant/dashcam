@@ -143,10 +143,21 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     // ~1.5 Hz and this payload leaves at ~4 Hz, so the decoder holds each flash
     // and what ships is "indicating", which is the question a lane-keeping
     // consumer is actually asking.
-    out.vehFlags         = (uint8_t)((veh.brakePressed ? 0x01u : 0x00u) |
-                                     (veh.brakeSwitch  ? 0x02u : 0x00u) |
-                                     (veh.turnLeft     ? 0x04u : 0x00u) |
-                                     (veh.turnRight    ? 0x08u : 0x00u));
+    //
+    // The *_VALID bits are what stop a cleared state bit being read as a
+    // measurement. Every one of these signals has a false value that looks
+    // perfectly safe — brake released, not indicating — so an absent or expired
+    // signal is indistinguishable from a live negative reading without them.
+    // In OBD2 mode none of the three can be populated at all, and a lane-keeping
+    // consumer that trusted the raw bits there would call every signalled lane
+    // change unsignalled.
+    out.vehFlags         = (uint8_t)((veh.brakePressed ? COMM_VEH_FLAG_BRAKE_PRESSED : 0x00u) |
+                                     (veh.brakeSwitch  ? COMM_VEH_FLAG_BRAKE_SWITCH  : 0x00u) |
+                                     (veh.turnLeft     ? COMM_VEH_FLAG_TURN_LEFT     : 0x00u) |
+                                     (veh.turnRight    ? COMM_VEH_FLAG_TURN_RIGHT    : 0x00u) |
+                                     (veh.brakeSrc != VehSource::NONE ? COMM_VEH_FLAG_BRAKE_VALID : 0x00u) |
+                                     (veh.turnSrc  != VehSource::NONE ? COMM_VEH_FLAG_TURN_VALID  : 0x00u) |
+                                     (veh.pedalSrc != VehSource::NONE ? COMM_VEH_FLAG_PEDAL_VALID : 0x00u));
     out.pedalGas         = veh.pedalGas;
     out.steerMotorTorque = veh.steerMotorTorque;
     out.yawRateCdps      = veh.yawRateCdps;
@@ -158,6 +169,31 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     // `speed`/`rpm` carry, which is what the overlay reads.
     if (veh.speedSrc != VehSource::NONE && !isnan(veh.speedKmh)) out.speed = veh.speedKmh;
     if (veh.rpmSrc   != VehSource::NONE && !isnan(veh.rpm))      out.rpm   = veh.rpm;
+
+    // Provenance for the OBD-II case, which nothing used to fill.
+    //
+    // VehSource::OBD2 is never assigned anywhere: OBD-II readings land in
+    // OBD2Data, not in the VehicleSignals template, so packVehSourceByte() had
+    // no way to see them and reported NONE for a speed the payload was carrying
+    // perfectly well. A host reading sigSource then concluded there was no
+    // speed source while `speed` held a live number - the two fields
+    // contradicting each other, with the more authoritative-looking one wrong.
+    //
+    // Stamped here rather than by writing OBD2 into the template, because the
+    // template's per-signal ages drive expireVehicleSignals() and OBD-II
+    // freshness is already tracked, differently, by COMM_FLAG_OBD2_VALID.
+    // Duplicating it would give one reading two clocks.
+    if ((flags & COMM_FLAG_OBD2_VALID) != 0u) {
+        if (veh.speedSrc == VehSource::NONE && !isnan(obd.speed)) {
+            out.sigSource = (uint8_t)((out.sigSource & ~0x03u) | (uint8_t)VehSource::OBD2);
+        }
+        if (veh.rpmSrc == VehSource::NONE && !isnan(obd.rpm)) {
+            out.sigSource = (uint8_t)((out.sigSource & ~0x0Cu) | ((uint8_t)VehSource::OBD2 << 2));
+        }
+        if (veh.gearSrc == VehSource::NONE && !isnan(obd.gear)) {
+            out.sigSource = (uint8_t)((out.sigSource & ~0x30u) | ((uint8_t)VehSource::OBD2 << 4));
+        }
+    }
 }
 
 CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
