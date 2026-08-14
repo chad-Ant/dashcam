@@ -1642,7 +1642,15 @@ int main(int argc, char* argv[]) {
             // stream repeats each 1 km/h reading several times, so a derivative
             // taken on this side would be spikes, not motion.  NaN means the
             // estimator has not warmed up yet.
-            if (obdLive && !std::isnan(t.accel)) {
+            //
+            // Gated on EITHER source. It was `obdLive` alone, which is the
+            // OBD-II poller's own verdict and is false throughout a healthy
+            // SNIFF session — so the master computed acceleration from sniffed
+            // speed and this side threw all of it away. Sniffed speed is the
+            // better input to a differentiator anyway: 0.01 km/h at 50-100 Hz
+            // against whole km/h at ~2 Hz, and quantisation noise is exactly
+            // what differentiating amplifies.
+            if ((canSpeedLive || obdLive) && !std::isnan(t.accel)) {
                 od.accelerationMs2  = t.accel;
                 od.accelValid       = true;
                 od.accelTimestampMs = tickMs;

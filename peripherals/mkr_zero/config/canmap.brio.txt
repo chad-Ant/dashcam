@@ -38,8 +38,13 @@ steer_torque,0x1AB,0,9,u,1
 
 # Indicator lamps. Byte 0 carries exactly three values across the whole census -
 # 0x00, 0x20, 0x40, never 0x60 - so bits 5 and 6 are two mutually exclusive
-# flags, which is what a stalk is. (0x60 WOULD be hazards; they were never used
-# in the capture, so that combination is expected but unconfirmed.)
+# flags, which is what a stalk is.
+#
+# The census note used to guess 0x60 would be hazards. IT IS NOT. Tested on the
+# car: with the hazards switched on, BOTH bits stay clear and the decoder reads
+# "not indicating". This message reports the STALK, and the hazard switch
+# bypasses the stalk, so hazards are a separate signal on this platform - see
+# the `hazard` row below, which is not yet filled in.
 #
 # Left/right was not assumed from opendbc, it was derived from this car's own
 # wheel speeds: over the moving samples the mean rear-pair difference (RR-RL) is
@@ -53,6 +58,32 @@ steer_torque,0x1AB,0,9,u,1
 # would otherwise alias the blink into a signal that is dark half the time.
 turn_left,0x294,5,1,u,1
 turn_right,0x294,6,1,u,1
+
+# Hazard lights - NOT LOCATED YET, but narrowed. Uncomment once confirmed; the
+# firmware already carries the slot, so this is a card edit, not a reflash.
+#
+# NOT on 0x294. A 16-window census with the hazards switched on and off three
+# times left every byte of 0x294 frozen - byte 0 read 0x00 with a zero change
+# mask throughout. This message carries the STALK only.
+#
+# Two candidates from that run, by per-window change mask:
+#   0x1A6 byte 4 bits 1-3  active in windows 1, 6-7, 10  (THREE episodes)
+#   0x221 byte 0 bits 0-2  active in windows 6-7, 10     (two episodes)
+# 0x1A6 is the stronger one: its snapshot returns to 0xB7 every time, which is
+# what a flashing signal looks like when sampled, whereas 0x221 byte 0 steps
+# 0x24 -> 0x23 and STAYS - a state change, not a lamp.
+#
+# To settle it: CANDiscovery, then `f1A6`, hazards OFF ~10 s, `m` to clear the
+# extremes, hazards ON ~10 s, `d` to report. Byte 4's min..max span will widen
+# beyond B6..B7 only if the hazards drive it, and the differing bits name the
+# bit. Repeat with `f221` to eliminate the other.
+#
+# ⚠ ADDING THIS COSTS A SIGNAL. The map already names exactly six IDs, which is
+# every hardware filter slot the MCP2515 has. A seventh drops the lowest
+# priority one - steer_torque on 0x1AB. Decide which you would rather have
+# before uncommenting; the boot log names whatever it drops.
+#
+# hazard,0x1A6,<startBit>,1,u,1
 
 # WHEEL_SPEEDS: four unaligned 15-bit fields. Scale confirmed on the road at
 # 101.36 counts per km/h over 555 GNSS-paired samples.

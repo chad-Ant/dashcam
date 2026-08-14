@@ -1,618 +1,488 @@
 /**
- * IMUValidation — bring-up and coexistence test for the Adafruit LSM6DSOX +
- * LIS3MDL 9-DoF breakout on the MKR Zero's shared I2C bus.
+ * @file IMUValidation.ino
+ * @brief Phase 3's gate: proves the BNO055 is producing data worth believing.
  *
- * It answers three questions in order, and stops being interesting only when
- * all three are boring:
+ * Bring-up succeeding says the part accepted its configuration. It says nothing
+ * about whether the numbers coming out mean anything, and on this project that
+ * gap is not theoretical — the sensor this replaces spent 40 % of its samples
+ * returning a fixed 27.8 m/s2 and 104 C from transactions that all succeeded.
+ * A driver that reports "OK" is exactly what that failure looked like.
  *
- *   1. WHAT IS ON THE BUS?  Full address sweep, every responder named against
- *      the project's address map (DataDictionary.h).
- *   2. IS THERE A CONFLICT WITH THE GPS?  Both the GNSS receiver and the IMU
- *      are brought up on the same Wire, then polled together at their real
- *      production rates (GPS 4 Hz, IMU 20 Hz) while every failed transaction is
- *      counted.  An address clash shows up in step 1; the subtler failures —
- *      one device wedging the bus, pull-ups too weak for three boards, a driver
- *      resetting the clock underneath another — only show up here, under load.
- *   3. ARE THE READINGS PLAUSIBLE?  Live values plus a stationary sanity check:
- *      the accelerometer vector should measure 1 g, the gyro should read zero,
- *      and the magnetometer should see roughly Earth's field.
+ * So this sketch checks the readings against physics rather than against status
+ * codes:
  *
- * Wiring (Adafruit STEMMA QT breakout, PID 4517):
- *   MKR Zero VCC (3.3 V) -> breakout VIN      <-- NOT 5 V.  The breakout's level
- *   MKR Zero GND         -> breakout GND          shifters reference VIN, so a
- *   MKR Zero D11 / SDA   -> breakout SDA          5 V supply puts 5 V on SDA and
- *   MKR Zero D12 / SCL   -> breakout SCL          SCL, and no MKR Zero I/O pin
- *                                                 is 5 V tolerant.
+ *   GRAVITY    |g| must be about 9.81 whatever the board is doing. The fusion
+ *              CONSTRUCTS this vector, so its length is near-constant —
+ *              rotating the board moves its direction, not its size. This is
+ *              the strongest single check available, and the previous hardware
+ *              could not offer it at all.
+ *   LINEAR     |linear a| must be about 0 on a still bench. It is acceleration
+ *              with gravity already removed, so anything else means either
+ *              motion or a fusion that has not converged.
+ *   SUM        linear + gravity must reconstruct the raw accelerometer vector.
+ *              That is the fusion's own internal consistency, checked from
+ *              outside.
+ *   PEAK       a tap on the desk must move the peak while the instantaneous
+ *              magnitude beside it stays near 9.81. That difference IS the
+ *              feature: the peak sees samples the published frame does not.
  *
- * Comment out USE_GPS below to test the IMU on its own.
+ * Commands:  c calibration   z zero the stats   r restart bring-up
+ *            a AMG mode      i IMUPLUS mode     b bus survey
+ *            s inject a 500 ms loop stall  <- the Phase 4 gate
+ *            w save calibration to SD      <- the Phase 6 gate
+ *            l show the stored profile
  */
 
-#define USE_GPS 1
+#include <Wire.h>
 
-#include "DataDictionary.h"
-#include "TimerFunctions.h"
 #include "IMUFunctions.h"
-#ifdef USE_GPS
-#include "GPSFunctions.h"
-#endif
+#include "BNO055Calib.h"
+#include "SDFunctions.h"
+#include "I2CBus.h"
 
-static constexpr unsigned long SERIAL_READY_TIMEOUT_MS = 2000;
-// GPS_POLL_MS comes from DataDictionary.h so this test polls at exactly the
-// production cadence — a soak that used a different interval would not be
-// measuring the thing that ships.
-static constexpr unsigned long REPORT_MS               = 1000;
-static constexpr unsigned long IMU_RETRY_INTERVAL_MS   = IMU_RETRY_MS;
+/// Loaded at boot and handed to the bring-up. File scope because the bring-up
+/// state holds a POINTER to it and dereferences it from loop().
+static uint8_t gCalibProfile[BNO055_CALIB_BYTES];
+static bool    gCalibValid = false;
 
-/// Stationary sanity limits.  Loose on purpose: this is a "the sensor is wired
-/// up and pointing at reality" check, not a calibration.
-static constexpr float GRAVITY_MIN_MS2   = 9.0f;   ///< |a| at rest, lower bound.
-static constexpr float GRAVITY_MAX_MS2   = 10.6f;  ///< |a| at rest, upper bound.
-static constexpr float GYRO_REST_MAX_DPS = 5.0f;   ///< Bias-dominated rate at rest.
-static constexpr float MAG_MIN_UT        = 20.0f;  ///< Earth's field is 25-65 uT;
-static constexpr float MAG_MAX_UT        = 120.0f; ///< car ironwork widens both ends.
+/// Static storage duration is REQUIRED: the Bosch driver keeps a pointer to
+/// dev.init.dev, so an automatic here would leave it dangling.
+static IMUDevice gDev;
+static IMUData   gData;
 
-IMUDevice imu;
-IMUData   imuData;
+static uint32_t gPolls      = 0;
+static uint32_t gOk         = 0;
+static uint32_t gPartial    = 0;
+static uint32_t gGravityBad = 0;
+static uint32_t gLinearBad  = 0;
+static uint32_t gSumBad     = 0;
 
-static unsigned long lastIMUPoll   = 0;
-static unsigned long lastIMURetry  = 0;
-static unsigned long lastReport    = 0;
+static float gGravityMin =  1e9f;
+static float gGravityMax = -1e9f;
+static float gLinearMax  =  0.0f;
 
-/// Counters, not just flags: a bus problem that bites once an hour is invisible
-/// in a live readout and obvious in a total.
-///
-/// There is no local "imuReady" mirror of the library's state — the IMUDevice
-/// ready flags are the single source of truth.  A second copy in the sketch is
-/// exactly how a partially-failed sensor gets stranded: the mirror says "fine"
-/// while the library knows better.
-static uint32_t imuPolls        = 0;
-static uint32_t imuFreshSamples = 0;  ///< At least one device returned new data.
-static uint32_t imuStalePolls   = 0;  ///< Polled faster than the output data rate.
-static uint32_t imuDegraded     = 0;  ///< Polls taken with one device down.
-static uint32_t imuLost         = 0;  ///< Polls taken with both devices down.
-static uint32_t imuErrors       = 0;  ///< Unexpected status codes.
-static uint32_t imuReinits      = 0;
-static uint32_t imuBusStuck     = 0;  ///< Recoveries that failed to free the lines.
-static uint32_t maxIMUPollUs    = 0;
+static BNO055InitStage gLastStage = BNO055InitStage::Idle;
 
-#ifdef USE_GPS
-SFE_UBLOX_GNSS myGNSS;
-GPSData        gpsData;
-static bool          gpsReady     = false;
-static unsigned long lastGPSPoll  = 0;
-static unsigned long lastGPSRetry = 0;
-static unsigned long lastGPSFresh = 0;
-static uint32_t gpsPolls     = 0;
-static uint32_t gpsFresh     = 0;   ///< Fresh PVT packet WITH a valid fix.
-/// Fresh PVT packet WITHOUT a fix.  Counted separately from gpsStale on
-/// purpose: both mean "no position", but this one proves the receiver is
-/// talking to us over I2C, which is the only thing this test can conclude
-/// indoors.  Folding them together turns "no sky view" into a false bus fault.
-static uint32_t gpsNoFix     = 0;
-/// Polls that found no packet buffered.
-///
-/// EXPECTED to be roughly 20 % of polls, and that is not a fault: the host polls
-/// at 5 Hz (GPS_POLL_MS 200) against a 4 Hz receiver precisely so it can never
-/// miss a packet, which arithmetically means one poll in five finds nothing new.
-/// Judge the link by the packet RATE below, not by this counter — reading a
-/// high stale count as a problem is how the previous 250 ms cadence looked
-/// healthy while quietly running a backlog.
-static uint32_t gpsStale     = 0;
-static uint32_t gpsOther     = 0;   ///< Any other GPS return status.
-static uint32_t maxGPSPollUs = 0;
-static uint32_t gpsProbeOk   = 0;   ///< 1 Hz address probes that ACKed.
-static uint32_t gpsProbeFail = 0;   ///< 1 Hz address probes that did not.
-/// @c millis() when GNSS polling actually began.
-///
-/// The packet rate must be measured from here, not from boot: setup() spends
-/// several seconds on the bus census and three device bring-ups, and counting
-/// that dead time in the denominator makes a perfectly healthy link read 3.69
-/// against a target of 4 — a false alarm in the very metric added to prevent
-/// false alarms.
-static uint32_t gpsStartMs   = 0;
-/// Raw GPSReturnStatus from the last init attempt.  Kept as an int because the
-/// interesting information is WHICH step refused: -1 no response at all,
-/// -2 rate rejected, -6 configuration rejected.  "GPS: module failed" on its
-/// own cannot distinguish a missing receiver from a rejected setting.
-static int gpsInitStatus = 99;
+/// Tolerance on |gravity| for the PASS verdict (m/s2). Tighter than the driver's
+/// own plausibility gate on purpose: that one is a discard threshold sized not
+/// to fire while the algorithm converges, this one is a quality bar.
+static const float GRAVITY_NOMINAL_MS2 = 9.81f;
+static const float GRAVITY_TOLERANCE   = 0.5f;
+/// Largest |linear a| a bench that is not being touched should ever show.
+static const float LINEAR_STILL_MAX    = 0.6f;
+/// Largest |w| that still counts as stationary (deg/s). A hand-held board that
+/// is "not moving" drifts a degree or two a second; a deliberate tilt is tens.
+static const float GYRO_STILL_MAX      = 3.0f;
+/// Tolerance on |raw - (linear + gravity)|, the fusion's internal consistency.
+static const float SUM_TOLERANCE       = 0.7f;
+/// Consecutive quiet samples before the sum check is believed. At 100 Hz this
+/// is a fifth of a second of stillness, comfortably past the fusion's catch-up.
+static const uint8_t QUIET_RUN_REQUIRED = 20u;
+static uint8_t gQuietRun = 0;
 
-/** @brief (Re)runs the GNSS I2C bring-up and records the exact status. */
-static bool startGPS()
-{
-    const GPSReturnStatus st = initializeGPS_I2C(myGNSS);
-    gpsInitStatus = static_cast<int>(st);
-    return (st == GPSReturnStatus::OK);
-}
-#endif
-
-// ─── reporting helpers ────────────────────────────────────────────────────────
-
-/** @brief Names a scanned address against the project's I2C allocation. */
-static const char *describeAddress(uint8_t address)
-{
-    switch (address) {
-        case IMU_ACCEL_I2C_ADDRESS:     return "LSM6DSOX accel/gyro";
-        case IMU_ACCEL_I2C_ADDRESS_ALT: return "LSM6DSOX (jumper closed)";
-        case IMU_MAG_I2C_ADDRESS:       return "LIS3MDL magnetometer";
-        case IMU_MAG_I2C_ADDRESS_ALT:   return "LIS3MDL (jumper closed)";
-        case GPS_DEFAULT_I2C_ADDRESS:   return "u-blox GNSS receiver";
-        case SEGLED_ADDRESS:            return "segment LED backpack";
-        case 0x60:                      return "ATECC508A (MKR Zero onboard)";
-        default:                        return "UNEXPECTED - not in DataDictionary.h";
-    }
+static void onHighG(){
+    imuNoteHighGPin(millis());
 }
 
-static void printHex8(uint8_t value)
-{
-    Serial.print("0x");
-    if (value < 0x10) Serial.print("0");
-    Serial.print(value, HEX);
+static float magnitude(float x, float y, float z){
+    return sqrtf((x * x) + (y * y) + (z * z));
 }
 
-/** @brief Prints a float, or "--" when it is NAN. */
-static void printFloatOrDash(float value, uint8_t decimals)
-{
-    if (isnan(value)) Serial.print("--");
-    else              Serial.print(value, decimals);
+static void printFloat(float v, uint8_t dp){
+    if (isnan(v)) Serial.print("--");
+    else          Serial.print(v, dp);
 }
 
-/** @brief Step 1 and 2: what is on the bus, and does anything clash. */
-static void reportBusCensus()
-{
-    Serial.println();
-    Serial.println("--- I2C bus census ---");
-
+static void busSurvey(){
     I2CBusReport report;
     const IMUReturnStatus st = checkI2CBusConflict(report);
 
-    Serial.print("devices found: ");
+    Serial.println();
+    Serial.println(F("---- bus survey ----"));
+    Serial.print(F("  responders: "));
     Serial.println(report.deviceCount);
-
-    const uint8_t shown = (report.deviceCount < I2C_SCAN_MAX_DEVICES)
-                              ? report.deviceCount : I2C_SCAN_MAX_DEVICES;
-    for (uint8_t i = 0; i < shown; i++) {
-        Serial.print("  ");
-        printHex8(report.addresses[i]);
-        Serial.print("  ");
-        Serial.println(describeAddress(report.addresses[i]));
+    for (uint8_t i = 0u; i < report.deviceCount && i < I2C_SCAN_MAX_DEVICES; i++){
+        Serial.print(F("    0x"));
+        Serial.print(report.addresses[i], HEX);
+        if (report.addresses[i] == GPS_DEFAULT_I2C_ADDRESS) Serial.print(F("  u-blox GNSS"));
+        if (report.addresses[i] == SEGLED_ADDRESS)          Serial.print(F("  segment LED"));
+        if (report.addresses[i] == report.imuAddress)       Serial.print(F("  BNO055"));
+        Serial.println();
     }
-    if (report.deviceCount > shown) {
-        Serial.print("  (");
-        Serial.print(report.deviceCount - shown);
-        Serial.println(" more not recorded)");
-    }
-
-    Serial.print("LSM6DSOX @ ");
-    printHex8(IMU_ACCEL_I2C_ADDRESS);
-    Serial.println(report.accelIdentified ? ": present, WHO_AM_I ok"
-                                          : (report.accelPresent ? ": PRESENT BUT WRONG WHO_AM_I"
-                                                                 : ": absent"));
-    Serial.print("LIS3MDL  @ ");
-    printHex8(IMU_MAG_I2C_ADDRESS);
-    Serial.println(report.magIdentified ? ": present, WHO_AM_I ok"
-                                        : (report.magPresent ? ": PRESENT BUT WRONG WHO_AM_I"
-                                                             : ": absent"));
-    Serial.print("u-blox   @ ");
-    printHex8(GPS_DEFAULT_I2C_ADDRESS);
-    Serial.println(report.gpsPresent ? ": present" : ": absent");
-
-    Serial.print("verdict: ");
-    if (st == IMUReturnStatus::NOK_BUS_STUCK) {
-        // Its own message on purpose. A stuck bus and an empty bus look
-        // identical in a device count, but they are opposite repairs: one is a
-        // line held low, the other is a missing connection.
-        Serial.println("BUS STUCK - a line is held low; scan impossible. NOT an empty bus:");
-        Serial.println("         check for a shorted SDA/SCL or a slave wedged mid-transaction.");
-    } else if (report.conflict) {
-        Serial.println("ADDRESS CONFLICT - an IMU address is held by another device");
-    } else if (st == IMUReturnStatus::OK) {
-        Serial.println("no conflict, both IMU parts identified");
-    } else if (st == IMUReturnStatus::NOK_INIT_FAILED) {
-        Serial.println("bus empty - check wiring, power and pull-ups");
+    Serial.print(F("  IMU: "));
+    if (report.imuIdentified){
+        Serial.print(F("identified at 0x"));
+        Serial.print(report.imuAddress, HEX);
+        Serial.println(F(" by CHIP_ID 0xA0"));
+    } else if (report.conflict){
+        // Identified by CHIP_ID, never by a bare ACK: something else can sit at
+        // 0x28 or 0x29, and configuring whatever answered is how a bus conflict
+        // turns into a sensor that reports plausible nonsense.
+        Serial.println(F("*** SOMETHING ANSWERS AT AN IMU ADDRESS BUT IS NOT A BNO055 ***"));
     } else {
-        Serial.println("no conflict, but a device is missing (see above)");
+        Serial.println(F("absent"));
     }
+    Serial.print(F("  status: "));
+    Serial.println(static_cast<int>(st));
     Serial.println();
 }
 
-/** @brief Step 3: does a stationary board read like a stationary board. */
-static void reportSanityCheck()
-{
-    if (imuData.accelValid) {
-        const float magnitude = sqrtf(imuData.accelX * imuData.accelX +
-                                      imuData.accelY * imuData.accelY +
-                                      imuData.accelZ * imuData.accelZ);
-        Serial.print("  |a|=");
-        Serial.print(magnitude, 2);
-        Serial.print(" m/s2 ");
-        Serial.println((magnitude >= GRAVITY_MIN_MS2 && magnitude <= GRAVITY_MAX_MS2)
-                           ? "[ok, 1 g]" : "[OUT OF RANGE at rest]");
+static void printCalibration(){
+    Serial.print(F("calib  gyro "));  Serial.print(gData.calibGyro);
+    Serial.print(F("  accel "));      Serial.print(gData.calibAccel);
+    Serial.print(F("  mag "));        Serial.print(gData.calibMag);
+    Serial.print(F("  sys "));        Serial.print(gData.calibSys);
+    if (gData.fusionMode){
+        // Said out loud every time, because two zeros here look like a fault and
+        // are not one: fusion mode switches the magnetometer off, and the system
+        // figure cannot rise without it.
+        Serial.print(F("   (mag and sys stay 0 in IMUPLUS - the magnetometer is off)"));
     }
-
-    if (imuData.gyroValid) {
-        const float worst = fmaxf(fmaxf(fabsf(imuData.gyroX), fabsf(imuData.gyroY)),
-                                  fabsf(imuData.gyroZ));
-        Serial.print("  gyro max=");
-        Serial.print(worst, 2);
-        Serial.print(" deg/s ");
-        Serial.println((worst <= GYRO_REST_MAX_DPS) ? "[ok at rest]" : "[MOVING or biased]");
-    }
-
-    if (imuData.magValid) {
-        const float field = sqrtf(imuData.magX * imuData.magX +
-                                  imuData.magY * imuData.magY +
-                                  imuData.magZ * imuData.magZ);
-        Serial.print("  |B|=");
-        Serial.print(field, 1);
-        Serial.print(" uT ");
-        Serial.println((field >= MAG_MIN_UT && field <= MAG_MAX_UT)
-                           ? "[ok, Earth field]" : "[OUT OF RANGE - magnet or interference?]");
-    }
-}
-
-static void reportLive()
-{
-    Serial.println("--- live ---");
-
-    Serial.print("  accel  x=");
-    printFloatOrDash(imuData.accelX, 2);
-    Serial.print(" y=");
-    printFloatOrDash(imuData.accelY, 2);
-    Serial.print(" z=");
-    printFloatOrDash(imuData.accelZ, 2);
-    Serial.println(" m/s2");
-
-    Serial.print("  gyro   x=");
-    printFloatOrDash(imuData.gyroX, 2);
-    Serial.print(" y=");
-    printFloatOrDash(imuData.gyroY, 2);
-    Serial.print(" z=");
-    printFloatOrDash(imuData.gyroZ, 2);
-    Serial.println(" deg/s");
-
-    Serial.print("  mag    x=");
-    printFloatOrDash(imuData.magX, 1);
-    Serial.print(" y=");
-    printFloatOrDash(imuData.magY, 1);
-    Serial.print(" z=");
-    printFloatOrDash(imuData.magZ, 1);
-    Serial.print(" uT   temp=");
-    printFloatOrDash(imuData.temperatureC, 1);
-    Serial.println(" C");
-
-    reportSanityCheck();
-
-    Serial.print("  imu    polls=");
-    Serial.print(imuPolls);
-    Serial.print(" fresh=");
-    Serial.print(imuFreshSamples);
-    Serial.print(" stale=");
-    Serial.print(imuStalePolls);
-    Serial.print(" degraded=");
-    Serial.print(imuDegraded);
-    Serial.print(" lost=");
-    Serial.print(imuLost);
-    Serial.print(" errors=");
-    Serial.print(imuErrors);
-    // The counter that can actually answer "did any read fail?".  `errors=`
-    // above counts unexpected RETURN CODES, and getIMUData() returns OK whenever
-    // either device supplied a fresh sample — so a device NACKing every single
-    // poll while its sibling works leaves errors= at zero for the whole run.
-    // A previous run reported errors=0 over 30,259 samples; that was evidence
-    // about status codes, not about the bus, and this pair is what makes the
-    // stronger claim checkable.
-    Serial.print(" io=");
-    Serial.print(imu.accelIOErrors);
-    Serial.print("/");
-    Serial.print(imu.magIOErrors);
-    Serial.print(" reinits=");
-    Serial.print(imuReinits);
-    Serial.print(" worst=");
-    Serial.print(maxIMUPollUs);
-    Serial.println(" us");
-
-    Serial.print("  imu    accel=");
-    Serial.print(imu.accelReady ? "up" : "DOWN");
-    Serial.print(" mag=");
-    Serial.print(imu.magReady ? "up" : "DOWN");
-    Serial.print("  busStuck=");
-    Serial.print(imuBusStuck);
-    Serial.print(" busState=");
-    Serial.println(static_cast<int>(i2cBusState()));
-
-#ifdef USE_GPS
-    // One address probe per report.  This is the measurement that separates
-    // "receiver is not on the bus" from "receiver is on the bus but has no sky
-    // view" — the packet counters alone cannot tell those apart indoors.
-    if (i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS)) gpsProbeOk++;
-    else                                          gpsProbeFail++;
-
-    Serial.print("  gps    polls=");
-    Serial.print(gpsPolls);
-    Serial.print(" fix=");
-    Serial.print(gpsFresh);
-    Serial.print(" nofix=");
-    Serial.print(gpsNoFix);
-    Serial.print(" stale=");
-    Serial.print(gpsStale);
-    Serial.print(" other=");
-    Serial.print(gpsOther);
-    Serial.print(" sats=");
-    Serial.print(gpsData.satellites);
-    Serial.print(" worst=");
-    Serial.print(maxGPSPollUs);
-    Serial.println(" us");
-
-    // Packets per second, x100 so it prints without float formatting. This is
-    // the honest health metric for the link: it should sit at the receiver's
-    // navigation rate (GPS_REFRESH_RATE) regardless of how often we poll.
-    const uint32_t elapsedMs = millis() - gpsStartMs;
-    const uint32_t packets   = gpsFresh + gpsNoFix;
-    const uint32_t rateX100  = (elapsedMs > 0UL) ? ((packets * 100000UL) / elapsedMs) : 0UL;
-
-    Serial.print("  gps    rate=");
-    Serial.print(rateX100 / 100UL);
-    Serial.print(".");
-    if ((rateX100 % 100UL) < 10UL) Serial.print("0");
-    Serial.print(rateX100 % 100UL);
-    Serial.print(" pkt/s (want ");
-    Serial.print(GPS_REFRESH_RATE);
-    Serial.print(")  ack=");
-    Serial.print(gpsProbeOk);
-    Serial.print("/");
-    Serial.print(gpsProbeOk + gpsProbeFail);
-    Serial.print("  initStatus=");
-    Serial.println(gpsInitStatus);
-
-    // The coexistence verdict.  What matters is whether each device still
-    // ANSWERS while the other is hammering the bus — not whether the GNSS has a
-    // fix, which depends on the sky, not on I2C.
-    Serial.print("  coexistence: ");
-    if (!gpsReady) {
-        Serial.println("GPS did not initialise - IMU-only run");
-    } else if (gpsProbeFail > 0) {
-        Serial.println("GPS STOPPED ACKING - real bus fault, check wiring/pull-ups");
-    } else if (imuErrors > 0 || imu.accelIOErrors > 0 || imu.magIOErrors > 0) {
-        Serial.println("IMU bus errors seen - check pull-ups and wiring");
-    } else if ((gpsFresh + gpsNoFix) == 0 && gpsPolls > 40) {
-        Serial.println("GPS acks but sends no PVT - receiver configured but not streaming");
-    } else if (gpsFresh == 0) {
-        Serial.println("bus OK both ways; GNSS has no fix yet (indoors?)");
-    } else {
-        Serial.println("bus OK both ways, GNSS has a fix");
-    }
-#endif
     Serial.println();
+
+    // The accelerometer figure needs a procedure, not patience, and the
+    // difference is not obvious from a number that simply refuses to move.
+    // Bosch raises it from STILL HOLDS in distinct orientations; vibration
+    // actively prevents it. On the bench it is routinely mistaken for a fault
+    // because the natural thing to do while watching an IMU is tap the desk —
+    // which is exactly the input that keeps it at 0.
+    if (!gCalibValid && imuIsReady(gDev) && gData.calibAccel < 3u){
+        Serial.println(F("   accel < 3: rest the board on each of its 6 faces, ~4 s each,"));
+        Serial.println(F("   moving SLOWLY between. Do not tap or shake - that undoes it."));
+        Serial.println(F("   At 3/3 press 'w' to store the profile. Do this BEFORE mounting:"));
+        Serial.println(F("   a bolted-in board never sees six orientations again."));
+    }
 }
 
-// ─── Arduino entry points ─────────────────────────────────────────────────────
-
-void setup()
-{
-    pinMode(STATUS_INDICATOR, OUTPUT);
-    digitalWrite(STATUS_INDICATOR, HIGH);
-
-    Serial.begin(SERIAL_BAUDRATE);
-    // Bounded: this sketch must still run when it is powered from the car
-    // rather than a laptop, with nothing listening on USB.
-    const unsigned long serialWaitStart = millis();
-    while (!Serial && !isTimeout(SERIAL_READY_TIMEOUT_MS, serialWaitStart)) {
-        // spin briefly; the timeout is the guarantee
-    }
-    Serial.println("MKR Zero IMU validation (LSM6DSOX + LIS3MDL)");
-
-    // Armed before the first I2C transaction, exactly as mkr_zero.ino does.
-    // Without it this sketch could not observe the one failure that matters
-    // most — a bring-up or a poll that hangs long enough to reset the board —
-    // because there was nothing to reset it, so a hang here simply stopped, and
-    // "no output after line 3" is not a result anyone can act on.
-    watchdogArm(WATCHDOG_PERIOD_MS);
-    if (watchdogCausedReset()) Serial.println("BOOT: previous run was ended by the watchdog");
-
-    initIMUData(imuData);
-
-    // GNSS FIRST, then the IMU, and the census AFTER BOTH — matching
-    // mkr_zero.ino.  The census used to run first, on the reasoning that it
-    // catches the bus in its power-on state.  That reasoning is sound and the
-    // placement was still wrong: scanI2CBus() enters through i2cBusBegin(), so
-    // running it first made the CENSUS the first I2C client and performed the
-    // one-time bus recovery on its behalf.  The property under test is that the
-    // GNSS receiver — the first client in production — recovers a wedged bus for
-    // everyone else, and a test that quietly recovers the bus before GNSS ever
-    // runs cannot fail when that property is broken.
-#ifdef USE_GPS
-    // I2C only.  initializeGPS() would seize Serial1, which belongs to the
-    // ESP32-C3 link in the production firmware.
-    initGPSData(gpsData);
-    watchdogFeed();
-    (void)preallocateGPS_I2C(myGNSS);
-    gpsReady = startGPS();
-    watchdogFeed();
-    Serial.print(gpsReady ? "GPS: module started on I2C" : "GPS: module FAILED");
-    Serial.print("  (status ");
-    Serial.print(gpsInitStatus);
-    Serial.println(")");
-    lastGPSPoll  = millis();
-    lastGPSRetry = lastGPSPoll;
-    gpsStartMs   = lastGPSPoll;
-    // Seeded, not left at its zero initialiser.  sinceFresh is computed as
-    // millis() - lastGPSFresh, so a zero here reads as "silent since boot" and
-    // the silence teardown fires on the very first pass — tearing down the
-    // receiver that had just come up, and reporting a fault the retry path then
-    // "recovered" from. The production sketch seeds it for the same reason.
-    lastGPSFresh = lastGPSPoll;
-#endif
-
-    const IMUReturnStatus st = initializeIMU(imu);
-    switch (st) {
-        case IMUReturnStatus::OK:
-            Serial.println("IMU: both devices up");
-            break;
-        case IMUReturnStatus::PARTIAL:
-            // Run with whatever answered — but the degraded-recovery timer in
-            // loop() keeps retrying the missing half, so this is not a
-            // permanent state.
-            Serial.print("IMU: PARTIAL - accel=");
-            Serial.print(imu.accelReady ? "up" : "down");
-            Serial.print(" mag=");
-            Serial.println(imu.magReady ? "up" : "down");
-            break;
-        case IMUReturnStatus::NOK_ADDRESS_CONFLICT:
-            Serial.println("IMU: ADDRESS CONFLICT - see census above");
-            break;
-        case IMUReturnStatus::NOK_BUS_STUCK:
-            Serial.println("IMU: bus stuck low - a slave is holding SDA");
-            break;
-        default:
-            Serial.println("IMU: init failed - no device answered");
-            break;
-    }
-
-    lastIMUPoll  = millis();
-    lastIMURetry = millis();
-    lastReport   = millis();
-
-    // Census LAST — see the note above.  By now GNSS and the IMU have both been
-    // through i2cBusBegin(), so this reports what is answering on a bus that
-    // production has already brought up, which is the state the rest of the run
-    // is measured in.
-    reportBusCensus();
-    watchdogFeed();
+static void resetStats(){
+    gPolls = 0; gOk = 0; gPartial = 0;
+    gGravityBad = 0; gLinearBad = 0; gSumBad = 0;
+    gGravityMin =  1e9f;
+    gGravityMax = -1e9f;
+    gLinearMax  =  0.0f;
 }
 
-void loop()
-{
+static void restart(IMUSampleMode mode){
+    resetStats();
+    initIMUData(gData);
+    gLastStage = BNO055InitStage::Idle;
+    // Offered on every restart, so 'r' after a save exercises the restore path
+    // rather than only the capture path — the two fail differently and the
+    // second is the one that runs in the vehicle.
+    bno055InitSetCalibProfile(gDev.init, gCalibValid ? gCalibProfile : nullptr);
+    const IMUReturnStatus st = initializeIMU(gDev, mode);
+    Serial.println();
+    Serial.print(F("Bring-up starting in "));
+    Serial.print(mode == IMUSampleMode::Raw ? F("AMG (raw)") : F("IMUPLUS (fusion)"));
+    Serial.print(F(", armed="));
+    Serial.println(static_cast<int>(st));
+}
+
+void setup(){
+    Serial.begin(115200);
+    const uint32_t t0 = millis();
+    while (!Serial && (millis() - t0) < 3000) { }
+
+    watchdogArm(8000UL);
+
+    Serial.println();
+    Serial.println(F("============ BNO055 data validation ============"));
+    Serial.println(F("Phase 3 gate: the readings must agree with physics."));
+    Serial.println();
+
+    // The clock is NOT set here. i2cBusBegin() runs i2cBusRecover() on the first
+    // transaction from any client, and that ends with Wire.begin() followed by
+    // Wire.setClock(IMU_I2C_CLOCK_HZ) — so a rate set in setup() is overwritten
+    // before the first register is read. Every earlier bench run printed 100 kHz
+    // and ran at 400. One owner for the bus clock, and it is not this sketch.
+    Wire.begin();
+
+    // The INT pin is optional: the latch is read over I2C on every poll
+    // regardless, so an unwired pin costs only latency, not the feature.
+    pinMode(IMU_HIGHG_INT_PIN, INPUT_PULLDOWN);
+    attachInterrupt(digitalPinToInterrupt(IMU_HIGHG_INT_PIN), onHighG, RISING);
+
+    Serial.print(F("I2C clock: "));
+    Serial.print(IMU_I2C_CLOCK_HZ / 1000UL);
+    Serial.print(F(" kHz   poll: "));
+    Serial.print(IMU_POLL_MS);
+    Serial.print(F(" ms   High-G INT: D"));
+    Serial.println(IMU_HIGHG_INT_PIN);
+
+    if (initializeSD() == SDReturnStatus::OK) {
+        Serial.println(F("SD: mounted"));
+        uint8_t chip = 0;
+        if (bno055CalibLoad(gCalibProfile, &chip)) {
+            if (chip != BNO055_EXPECTED_CHIP_ID) {
+                Serial.print(F("calibration on card is from chip 0x"));
+                Serial.print(chip, HEX);
+                Serial.println(F(" - IGNORED"));
+            } else {
+                gCalibValid = true;
+                char desc[80];
+                bno055CalibDescribe(gCalibProfile, desc, sizeof(desc));
+                Serial.print(F("calibration profile on card: "));
+                Serial.println(desc);
+            }
+        } else {
+            Serial.println(F("no calibration profile on card - press 'w' at 3/3 to make one"));
+        }
+    } else {
+        Serial.println(F("SD: no card - calibration cannot be saved or restored"));
+    }
+
+    busSurvey();
+    restart(IMUSampleMode::Fusion);
+}
+
+void loop(){
     watchdogFeed();
-    // ── IMU poll ─────────────────────────────────────────────────────────────
-    // Unconditional on the timer: getIMUData() returns immediately without
-    // touching the bus when a device is down, so there is nothing to gate on.
-    if (isTimeout(IMU_POLL_MS, lastIMUPoll)) {
-        lastIMUPoll = millis();
 
-        const uint32_t t0 = micros();
-        const IMUReturnStatus st = getIMUData(imu, imuData);
-        const uint32_t elapsed = micros() - t0;
-        if (elapsed > maxIMUPollUs) maxIMUPollUs = elapsed;
-
-        imuPolls++;
-        switch (st) {
-            case IMUReturnStatus::OK:            imuFreshSamples++; break;
-            case IMUReturnStatus::DATA_STALE:    imuStalePolls++;   break;
-            case IMUReturnStatus::PARTIAL:       imuDegraded++;     break;
-            case IMUReturnStatus::NOK_LINK_LOST: imuLost++;         break;
-            default:                             imuErrors++;       break;
+    const BNO055InitStage stage = imuInitTick(gDev);
+    if (stage != gLastStage){
+        gLastStage = stage;
+        Serial.print(F("  bring-up: "));
+        Serial.print(bno055InitStageName(stage));
+        if (stage == BNO055InitStage::Failed){
+            Serial.print(F("  at "));
+            Serial.print(bno055InitStageName(gDev.init.failedAt));
+            Serial.print(F("  why "));
+            Serial.print(bno055InitStatusName(gDev.init.lastStatus));
+        }
+        Serial.println();
+        if (stage == BNO055InitStage::Configured){
+            Serial.print(F("  address 0x"));  Serial.print(gDev.init.address, HEX);
+            Serial.print(F("  clock "));
+            Serial.print(gDev.init.externalCrystal ? F("external") : F("internal"));
+            Serial.print(F("  euler "));
+            Serial.print(gDev.eulerAndroid ? F("Android") : F("Windows"));
+            Serial.print(F("  calib-restore "));
+            if (!gDev.init.calibOffered)      Serial.println(F("none offered"));
+            else if (gDev.init.calibRestored) Serial.println(F("OK"));
+            else                              Serial.println(F("*** OFFERED BUT FAILED ***"));
+            if (gDev.init.calibRestored){
+                // Said here because the next thing that happens looks like a
+                // failure and is not. The figures start at 3/3 — which is the
+                // restore working — and then DECAY as the part runs. Bosch's
+                // CALIB_STAT is a live confidence estimate, not a record of what
+                // was loaded: sitting still gives the algorithm nothing to
+                // confirm the accelerometer against, so its confidence falls
+                // while the loaded offsets stay in force and keep working.
+                //
+                // This is why the accelerometer figure does not gate the fused
+                // output. Trusting it would put the system back to reporting
+                // PARTIAL forever, minutes after a successful restore.
+                Serial.println(F("  (3/3 now; the accel figure will decay as the algorithm"));
+                Serial.println(F("   re-estimates. The offsets stay applied - that is normal.)"));
+            }
+            Serial.println();
         }
     }
 
-    // ── bounded recovery, driven by isIMUDegraded() not isIMULinkLost() ──────
-    // A PARTIAL start-up (say the magnetometer absent while the accelerometer
-    // is fine) is a state "both devices lost" never becomes, so gating recovery
-    // on isIMULinkLost() would strand the missing sensor offline for the whole
-    // trip.  recoverIMU() reconfigures ONLY what is down, allocates nothing,
-    // and leaves the healthy device's stream untouched.
-    if (isIMUDegraded(imu) && isTimeout(IMU_RETRY_INTERVAL_MS, lastIMURetry)) {
-        lastIMURetry = millis();
-        imuReinits++;
+    static uint32_t lastPoll = 0;
+    if (imuIsReady(gDev) && (millis() - lastPoll) >= IMU_POLL_MS){
+        lastPoll = millis();
+        const IMUReturnStatus st = getIMUData(gDev, gData);
+        gPolls++;
+        if (st == IMUReturnStatus::OK)      gOk++;
+        if (st == IMUReturnStatus::PARTIAL) gPartial++;
 
-        // The return code is not redundant with the ready flags: NOK_BUS_STUCK
-        // says the bus itself could not be freed, which is a wiring or
-        // pull-up fault, whereas both-flags-down with a Ready bus means the
-        // devices are gone. Same symptom in the flags, different thing to fix.
-        const IMUReturnStatus rst = recoverIMU(imu);
-        if (rst == IMUReturnStatus::NOK_BUS_STUCK) imuBusStuck++;
+        if (gData.fusionValid){
+            const float g = magnitude(gData.gravityX, gData.gravityY, gData.gravityZ);
+            const float l = magnitude(gData.linAccelX, gData.linAccelY, gData.linAccelZ);
 
-        Serial.print("IMU: recovery status=");
-        Serial.print(static_cast<int>(rst));
-        Serial.print(" -> accel=");
-        Serial.print(imu.accelReady ? "up" : "down");
-        Serial.print(" mag=");
-        Serial.println(imu.magReady ? "up" : "down");
-    }
+            if (g < gGravityMin) gGravityMin = g;
+            if (g > gGravityMax) gGravityMax = g;
+            if (l > gLinearMax)  gLinearMax  = l;
 
-#ifdef USE_GPS
-    // ── GPS poll at the production rate, sharing the same bus ────────────────
-    // Automatic retry, mirroring production.  Manual re-init via 'g' is still
-    // available, but a test that only recovers when an operator types something
-    // cannot reproduce what the shipping firmware does unattended.
-    if (!gpsReady && isTimeout(GPS_RETRY_MS, lastGPSRetry)) {
-        lastGPSRetry = millis();
-        gpsReady     = startGPS();
-        lastGPSPoll  = lastGPSRetry;
-        lastGPSFresh = lastGPSRetry;
-        Serial.print("GPS: auto re-init ");
-        Serial.print(gpsReady ? "ok" : "FAILED");
-        Serial.print(" (status ");
-        Serial.print(gpsInitStatus);
-        Serial.println(")");
-    }
+            if (fabsf(g - GRAVITY_NOMINAL_MS2) > GRAVITY_TOLERANCE) gGravityBad++;
+            if (l > LINEAR_STILL_MAX) gLinearBad++;
 
-    if (gpsReady && isTimeout(GPS_POLL_MS, lastGPSPoll)) {
-        lastGPSPoll = millis();
+            // The fusion's own arithmetic, checked from outside: whatever it
+            // decides gravity and linear acceleration are, they have to add back
+            // up to what the accelerometer actually measured.
+            //
+            // ONLY WHILE QUASI-STATIC, and that restriction is a correction. The
+            // identity holds at rest and breaks under motion, because the fused
+            // vectors are the algorithm's output at the fusion rate while the
+            // raw accelerometer register is the sensor's own latest conversion —
+            // during a fast transient the fusion is still catching up, so the
+            // three are simply not the same instant. Checking it regardless
+            // produced 333 failures in 1682 polls, every one of them during a
+            // deliberate bench tap, and none of them a fault. At rest, where the
+            // identity does hold, the failure count was exactly zero.
+            // SUSTAINED quiet, not merely quiet at this instant. A tap's decay
+            // passes back down through the threshold while the fusion is still
+            // catching up, so an instantaneous test still caught the tail of
+            // every transient — 3 failures in 801 polls, all of them at the
+            // boundary, none of them a fault. Quasi-static means quiet for a
+            // while, and the check now says so.
+            // Quiet means NOT TRANSLATING AND NOT ROTATING. The rotation half
+            // was missing and this run exposed it: during the slow tilts that
+            // accelerometer calibration requires, linear acceleration stays
+            // small — a slow move produces almost none — while the gravity
+            // VECTOR swings right through the sensor frame. The fusion lags that
+            // rotation, so the identity breaks for the same reason it breaks
+            // during a tap, and the sum count crept 2 -> 6 -> 9 with the bench
+            // apparently still. A quiet test that ignores the gyroscope is not
+            // testing quiet.
+            const float w = magnitude(gData.gyroX, gData.gyroY, gData.gyroZ);
+            if (l <= LINEAR_STILL_MAX && w <= GYRO_STILL_MAX) {
+                if (gQuietRun < 255u) gQuietRun++;
+            } else {
+                gQuietRun = 0u;
+            }
 
-        const uint32_t t0 = micros();
-        const GPSReturnStatus st = getGPSData(myGNSS, gpsData);
-        const uint32_t elapsed = micros() - t0;
-        if (elapsed > maxGPSPollUs) maxGPSPollUs = elapsed;
-
-        gpsPolls++;
-        switch (st) {
-            case GPSReturnStatus::OK:         gpsFresh++; break;
-            case GPSReturnStatus::NO_FIX:     gpsNoFix++; break;
-            case GPSReturnStatus::DATA_STALE: gpsStale++; break;
-            default:                          gpsOther++; break;
-        }
-
-        if (st == GPSReturnStatus::OK || st == GPSReturnStatus::NO_FIX) lastGPSFresh = lastGPSPoll;
-
-        // Same freshness rules as production, so the soak measures what ships.
-        const unsigned long sinceFresh = millis() - lastGPSFresh;
-        if (sinceFresh > GPS_FIX_MAX_AGE_MS)  gpsData.fixValid = false;
-        if (sinceFresh > GPS_MAX_SILENCE_MS) {
-            Serial.println("GPS: silence window exceeded; will re-init");
-            gpsReady     = false;
-            lastGPSRetry = millis();
-        }
-    }
-#endif
-
-    // ── console commands ─────────────────────────────────────────────────────
-    // The setup() census is easy to miss: after an upload the board reboots and
-    // re-enumerates before the host can reopen the port, so the one-shot scan
-    // has usually already scrolled past. 's' re-runs it on demand.  Bounded by
-    // COMMAND_BUDGET so a stream of junk on the port cannot stall loop().
-    static constexpr uint8_t COMMAND_BUDGET = 4;
-    for (uint8_t i = 0; i < COMMAND_BUDGET && Serial.available() > 0; i++) {
-        const int command = Serial.read();
-        if (command == 's' || command == 'S') {
-            reportBusCensus();
-#ifdef USE_GPS
-        } else if (command == 'g' || command == 'G') {
-            // Re-run the GNSS bring-up on demand.  If it succeeds here but
-            // failed in setup(), the fault is ordering or timing against the
-            // IMU init, not the receiver.
-            gpsReady = startGPS();
-            Serial.print("GPS: re-init ");
-            Serial.print(gpsReady ? "ok" : "FAILED");
-            Serial.print("  (status ");
-            Serial.print(gpsInitStatus);
-            Serial.println(")");
-#endif
-        } else if (command == 'r' || command == 'R') {
-            // Soft reset, so bring-up reliability can be sampled over many
-            // boots instead of inferred from one.  An intermittent init fault
-            // is invisible in a single run and obvious over twenty.
-            Serial.println("resetting...");
-            Serial.flush();
-            NVIC_SystemReset();
-        } else if (command == 'h' || command == 'H') {
-            Serial.println("commands: s = rescan bus, g = re-init GPS, r = reset, h = help");
+            if (gData.accelValid && (gQuietRun >= QUIET_RUN_REQUIRED)){
+                const float sx = gData.linAccelX + gData.gravityX - gData.accelX;
+                const float sy = gData.linAccelY + gData.gravityY - gData.accelY;
+                const float sz = gData.linAccelZ + gData.gravityZ - gData.accelZ;
+                if (magnitude(sx, sy, sz) > SUM_TOLERANCE) gSumBad++;
+            }
         }
     }
 
-    // ── 1 Hz report ──────────────────────────────────────────────────────────
-    if (isTimeout(REPORT_MS, lastReport)) {
+    static uint32_t lastReport = 0;
+    if (imuIsReady(gDev) && (millis() - lastReport) >= 2000UL){
         lastReport = millis();
-        digitalWrite(STATUS_INDICATOR, !digitalRead(STATUS_INDICATOR));
-        reportLive();
+
+        Serial.print(F("|a|="));
+        printFloat(gData.accelValid ? magnitude(gData.accelX, gData.accelY, gData.accelZ) : NAN, 2);
+        Serial.print(F("  |grav|="));
+        printFloat(gData.fusionValid ? magnitude(gData.gravityX, gData.gravityY, gData.gravityZ) : NAN, 2);
+        Serial.print(F("  |lin|="));
+        printFloat(gData.fusionValid ? magnitude(gData.linAccelX, gData.linAccelY, gData.linAccelZ) : NAN, 2);
+        Serial.print(F("  pk="));
+        printFloat(gData.accelPeakMs2, 2);
+        Serial.print(F("/"));
+        printFloat(gData.linAccelPeakMs2, 2);
+        Serial.print(F("/"));
+        printFloat(gData.gyroPeakDps, 1);
+        if (gData.accelSaturated) Serial.print(F(" SAT"));
+        if (gData.highGEvent)     Serial.print(F(" HIGH-G"));
+        Serial.print(F("  hg="));
+        Serial.print(gDev.highGCount);
+        if (!gData.highGArmed) Serial.print(F(" NOT-ARMED"));
+        Serial.print(F("  yaw="));
+        printFloat(gData.yawRelDeg, 1);
+        Serial.print(F("  T="));
+        printFloat(gData.temperatureC, 0);
+        Serial.print(F("  ioerr/bad="));
+        Serial.print(gDev.ioErrors);
+        Serial.print(F("/"));
+        Serial.print(gDev.implausible);
+        if (gData.dataGap) Serial.print(F("  GAP"));
+        Serial.println();
+
+        Serial.print(F("   over "));
+        Serial.print(gPolls);
+        Serial.print(F(" polls: ok "));      Serial.print(gOk);
+        Serial.print(F("  partial "));       Serial.print(gPartial);
+        Serial.print(F("  |grav| "));
+        // The sentinels are never printed as numbers. Before this, the first
+        // report of every run showed "1000000000.00..-1000000000.00", which
+        // reads as a catastrophic sensor fault and is only an empty min/max.
+        if (gGravityMax < gGravityMin){
+            Serial.print(F("(no sample yet)"));
+        } else {
+            printFloat(gGravityMin, 2); Serial.print(F(".."));
+            printFloat(gGravityMax, 2);
+        }
+        Serial.print(F("  worst |lin| "));   printFloat(gLinearMax, 2);
+        Serial.println();
+
+        Serial.print(F("   FAILS: gravity "));  Serial.print(gGravityBad);
+        Serial.print(F("  linear "));           Serial.print(gLinearBad);
+        Serial.print(F("  sum "));              Serial.print(gSumBad);
+        // The linear count is expected to be non-zero the moment anyone touches
+        // the bench, which is the whole point of the tap test. GRAVITY AND SUM
+        // MUST BOTH STAY AT ZERO — those are the gate.
+        Serial.println(F("   (linear rises on a tap; gravity and sum must stay 0)"));
+        printCalibration();
+        Serial.println();
+    }
+
+    while (Serial.available()){
+        const int c = Serial.read();
+        if      (c == 'c') printCalibration();
+        else if (c == 'z') { resetStats(); Serial.println(F("stats zeroed")); }
+        else if (c == 'r') restart(imuSampleMode(gDev));
+        else if (c == 'a') restart(IMUSampleMode::Raw);
+        else if (c == 'i') restart(IMUSampleMode::Fusion);
+        else if (c == 'b') busSurvey();
+        else if (c == 'l'){
+            uint8_t chip = 0;
+            uint8_t p[BNO055_CALIB_BYTES];
+            if (bno055CalibLoad(p, &chip)){
+                char desc[80];
+                bno055CalibDescribe(p, desc, sizeof(desc));
+                Serial.print(F("stored profile (chip 0x"));
+                Serial.print(chip, HEX);
+                Serial.print(F("): "));
+                Serial.println(desc);
+            } else {
+                Serial.println(F("no valid profile on the card"));
+            }
+        }
+        else if (c == 'w'){
+            // THE PHASE 6 GATE, and it is worth doing at 3/3 rather than
+            // whenever: a partial profile restored at every future boot anchors
+            // the fusion to a half-finished estimate it then has to climb out of.
+            if (!imuIsReady(gDev)){
+                Serial.println(F("not configured yet"));
+            } else if (gData.calibGyro < 3u || gData.calibAccel < 3u){
+                Serial.print(F("calibration is "));
+                Serial.print(gData.calibGyro);
+                Serial.print(F("/"));
+                Serial.print(gData.calibAccel);
+                Serial.println(F(" - want 3/3."));
+                Serial.println(F("  Gyro:  leave it completely still for a few seconds."));
+                Serial.println(F("  Accel: rest the board on each of its 6 faces for ~4 s,"));
+                Serial.println(F("         moving SLOWLY between. Tapping or shaking undoes it."));
+                Serial.println(F("  Refused below 3/3 on purpose: a partial profile would be"));
+                Serial.println(F("  restored at every future boot and anchor the fusion to a"));
+                Serial.println(F("  half-finished estimate it then has to climb back out of."));
+            } else {
+                uint8_t fresh[BNO055_CALIB_BYTES];
+                // Costs ~60 ms in CONFIG producing nothing. Fine at a bench
+                // prompt; the production path rate-limits it and skips it during
+                // a High-G event for exactly this reason.
+                if (!bno055CalibCapture(gDev.init, fresh)){
+                    Serial.println(F("capture FAILED - sensor returned to its operating mode"));
+                } else if (!bno055CalibStore(fresh, gDev.init.dev.chip_id)){
+                    Serial.println(F("save FAILED - is a card fitted? previous profile intact"));
+                } else {
+                    memcpy(gCalibProfile, fresh, sizeof(fresh));
+                    gCalibValid = true;
+                    char desc[80];
+                    bno055CalibDescribe(fresh, desc, sizeof(desc));
+                    Serial.print(F("saved: "));
+                    Serial.println(desc);
+                    Serial.println(F("Press 'r' to restart bring-up and confirm it restores."));
+                }
+            }
+        }
+        else if (c == 's'){
+            // THE PHASE 4 GATE. With no FIFO, a poll that does not happen is
+            // data that no longer exists — so a peak from inside this window is
+            // gone for good, and nothing can bring it back. The High-G latch is
+            // held in the part's own register until cleared, so it is still
+            // there afterwards. That difference is the entire reason the
+            // interrupt was worth wiring, and this is the only way to see it.
+            Serial.println();
+            Serial.println(F("STALL: blocking the loop for 500 ms - TAP THE BENCH HARD NOW"));
+            const uint32_t stallStart = millis();
+            const uint16_t hgBefore   = gDev.highGCount;
+            // Genuinely blocked: no poll, no init tick, no watchdog feed. 500 ms
+            // is well inside the 8 s watchdog, so this stalls without resetting.
+            while ((millis() - stallStart) < 500UL) { }
+            Serial.print(F("STALL over after "));
+            Serial.print(millis() - stallStart);
+            Serial.println(F(" ms."));
+            Serial.print(F("  High-G latches during the stall: "));
+            Serial.println(gDev.highGCount - hgBefore);
+            Serial.println(F("  (0 here does not yet mean failure - the latch is read on the"));
+            Serial.println(F("   NEXT poll, so watch for HIGH-G on the line below.)"));
+        }
     }
 }

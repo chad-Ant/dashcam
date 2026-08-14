@@ -89,6 +89,33 @@ bool sdOpenRead(const char *path, File32 &f);
  */
 bool sdReadLine(File32 &f, char *buf, size_t bufLen);
 
+/**
+ * @brief Replaces a small text file, atomically. For CONFIG, not for logging.
+ *
+ * WHY THIS MODULE NOW WRITES AT ALL. It was read-only on purpose — see the note
+ * below on OBD2 logging, which still stands. This is not logging: it is an
+ * occasional, bounded write of a few dozen bytes that the BNO055's datasheet
+ * requires, because the sensor loses its calibration offsets on every power-on
+ * and cannot be told them again from anywhere else. Without it every drive
+ * begins with an uncalibrated inertial sensor.
+ *
+ * ATOMIC BECAUSE THE POWER IS NOT. This runs in a vehicle whose supply
+ * disappears with the ignition, and the file it writes is read back at the next
+ * boot and pushed into the sensor's registers. A half-written profile is worse
+ * than a missing one: a missing profile costs a warm-up, while a truncated one
+ * loads plausible-looking garbage into the offsets and biases every reading
+ * afterwards. So the write goes to a temporary file, is flushed, and only then
+ * replaces the target — a cut at any point leaves either the old profile or no
+ * new one, never a partial.
+ *
+ * @param path  Destination. A sibling temporary is created alongside it.
+ * @param text  NUL-terminated content, written verbatim.
+ * @return @c OK, @c NOK_INIT_FAILED when no card is mounted, or
+ *         @c NOK_WRITE_FAILED if any step failed — in which case the previous
+ *         contents of @p path are left untouched.
+ */
+SDReturnStatus sdWriteTextAtomic(const char *path, const char *text);
+
 /*
  * Deliberately NOT declared here: OBD2 CSV logging.
  *
@@ -97,6 +124,11 @@ bool sdReadLine(File32 &f, char *buf, size_t bufLen);
  * implemented.  Logging belongs to the Orin Nano, which has the storage, the
  * clock and the budget for it.  A declaration without an implementation is worse
  * than an absence: it advertises a capability that fails at link.
+ *
+ * @c sdWriteTextAtomic() above is not a step back toward that: it writes a fixed
+ * handful of bytes when a calibration converges, not a stream that grows with
+ * time. If a second caller ever wants it for something periodic, that is the
+ * moment to say no again.
  */
 
 #endif // SDFUNCTIONS_H

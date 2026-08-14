@@ -77,6 +77,15 @@ public:
      */
     bool setCanMode(uint8_t mode);
 
+    /**
+     * @brief Relays a filter set to the master. @return false if TX was busy.
+     *
+     * @p count of 0 is valid and means ACCEPT ALL — an MCP2515 with a zero mask
+     * compares no bits. Rejecting it as "empty" would remove the only way a host
+     * can widen a capture.
+     */
+    bool setCanFilter(const uint16_t *ids, uint8_t count);
+
 private:
     bool sendCmd(uint8_t type, const uint8_t *payload = nullptr, uint8_t len = 0);
 

@@ -155,6 +155,29 @@ public:
      */
     uint8_t takeCanModeRequest() { const uint8_t m = canModeReq_; canModeReq_ = 0; return m; }
 
+    /**
+     * @brief Consumes a pending @c CMD_SET_CAN_FILTER.
+     *
+     * Consume-on-read like the others, so each host request is relayed once.
+     *
+     * Returns a BOOL rather than the count, because zero is a real request —
+     * clearing the filters means accept-all on the master's MCP2515 — and a
+     * "0 means nothing pending" convention would make the one command that
+     * widens a capture the one command that silently does nothing.
+     *
+     * @param[out] ids    @c CAN_FILTER_SLOTS entries, always written.
+     * @param[out] count  How many are meaningful; may be 0.
+     * @return true when a request was pending.
+     */
+    bool takeCanFilterRequest(uint16_t *ids, uint8_t &count)
+    {
+        if (!canFilterPending_) return false;
+        for (uint8_t i = 0; i < hostproto::CAN_FILTER_SLOTS; ++i) ids[i] = canFilterIds_[i];
+        count = canFilterCount_;
+        canFilterPending_ = false;
+        return true;
+    }
+
     bool    streaming()  const { return streaming_; } ///< True while telemetry forwarding is enabled.
     uint8_t decimation() const { return decim_; }     ///< Forward every Nth master frame (>= 1).
 
@@ -191,6 +214,11 @@ private:
     bool     connectSeen_  = false;
     bool     onceReq_      = false;
     uint8_t canModeReq_ = 0;   ///< Pending CMD_SET_CAN_MODE arg; 0 = none.
+    /// Pending CMD_SET_CAN_FILTER. A separate flag, not "count != 0" — see
+    /// takeCanFilterRequest() for why zero is a request rather than an absence.
+    bool     canFilterPending_ = false;
+    uint8_t  canFilterCount_   = 0;
+    uint16_t canFilterIds_[hostproto::CAN_FILTER_SLOTS] = { 0, 0, 0, 0, 0, 0 };
     bool     statusReq_    = false;
     bool     streaming_    = false;
     uint8_t  decim_        = 1;

@@ -235,6 +235,63 @@ static uint32_t  gWindowStartMs;
 static uint32_t  gRateBaseMs;        ///< start of the CURRENT report interval
 static uint32_t  gIntAsserted;       ///< frames pending with INT pin LOW  (INT wired)
 static uint32_t  gIntMissed;         ///< frames pending with INT pin HIGH (INT NOT wired)
+// ─── ID-space sweep ───────────────────────────────────────────────────────────
+//
+// The census table is not the limit on what this tool can find: 39 of 64 slots
+// used and slotOverflow 0 means no identifier was ever turned away. The limit is
+// the DRAIN. About 1100 frames/s arrive, roughly 90 % of it a dozen 50-100 Hz
+// powertrain messages in 0x100-0x1FF, and the RX buffers overflow ~3 times a
+// second under that load. Every overrun discards a frame chosen by timing, not
+// by importance — so a message that appears once a minute (a door, a reverse
+// lamp, a fault) can be lost outright, and its absence looks exactly like it
+// was never sent.
+//
+// Filtering fixes that by taking the load off — and MASK GROUPING means almost
+// nothing has to be given up to do it.
+//
+// The two masks are independent and need not be the same WIDTH. MASK0 governs
+// RXB0 (filters 0-1); MASK1 governs RXB1 (filters 2-5). Set MASK1 coarse
+// (0x600, two bits) and each of its filters selects a PAIR of slices; set MASK0
+// fine (0x700, three bits) and its filter selects a single slice. The complement
+// of any one slice is exactly three pairs plus one single — which is precisely
+// what these six filters can express:
+//
+//     MASK1 0x600 -> three slice PAIRS   (six slices)
+//     MASK0 0x700 -> the excluded slice's PARTNER (one slice)
+//                                        = seven of eight, in one configuration
+//
+// So instead of admitting one slice at a time and rotating, the census admits
+// EVERYTHING EXCEPT the busiest slice, continuously. On this vehicle that one
+// slice is 0x100-0x1FF and carries 883 of 1058 Hz: excluding it removes 83 % of
+// the load, and the rest of the identifier space becomes quiet enough to receive
+// losslessly. Nothing is time-shared, so a message that fires once a minute
+// cannot fall in a gap between dwells.
+static const uint16_t SWEEP_MASK_FINE   = 0x700;  ///< Selects one 256-id slice.
+static const uint16_t SWEEP_MASK_COARSE = 0x600;  ///< Selects an aligned slice PAIR.
+static const uint8_t  SWEEP_SLICES      = 8;
+
+/** @brief What the hardware filter is currently doing. */
+enum SweepMode : uint8_t {
+    SWEEP_OFF = 0,  ///< RXM=11, accept everything. The default census.
+    SWEEP_GROUPED,  ///< Seven slices admitted; the busiest excluded.
+    SWEEP_PARK      ///< Exactly one slice admitted.
+};
+
+static SweepMode gSweepMode  = SWEEP_OFF;
+static uint8_t   gSweepSlice = 0;   ///< Excluded slice (GROUPED) or admitted one (PARK).
+static uint32_t  gSweepFrames[SWEEP_SLICES];   ///< Frames seen per slice while filtered.
+/**
+ * Overruns under the active filter configuration — ONE counter, not per slice.
+ *
+ * An overrun is a buffer event, not an identifier event: the frame that was
+ * dropped is by definition the one never read, so its ID is unknowable. Under
+ * grouping, seven slices share the two buffers, and charging the loss to any
+ * one of them invents information. It was previously indexed by gSweepSlice,
+ * which in grouped mode is the EXCLUDED slice — so every admitted row printed
+ * "no loss" while the excluded one accumulated a count for traffic it never saw.
+ */
+static uint32_t  gSweepOverrunsCfg;
+
 static uint16_t  gFocusId = 0xFFFF;  ///< stream every frame of this ID live; 0xFFFF = off
 
 // ─── focus-mode extremes ──────────────────────────────────────────────────────
@@ -526,6 +583,10 @@ static void censusReset()
     gIntMissed      = 0;
     gWindowStartMs  = millis();
     gRateBaseMs     = gWindowStartMs;
+    // The filter statistics describe the same evidence and must restart with
+    // it, or an 'r' leaves per-slice frame counts from a window whose census
+    // has been thrown away.
+    sweepStatsReset();
     // Entries survive a reset; only the evidence restarts.
     for (uint8_t i = 0; i < gWatchUsed; ++i) gWatch[i].count = 0;
 }
@@ -883,6 +944,61 @@ static void printReport(Print &out)
     // that IS working is working, and it is the half you cannot re-check later.
     printSpeedCrossCheck(out);
 
+    if (gSweepMode != SWEEP_OFF) {
+        out.println(F("\n---- hardware ID filter --------------------------------------"));
+        if (gSweepMode == SWEEP_GROUPED) {
+            out.print(F("GROUPED: admitting 7 of 8 slices, EXCLUDING 0x"));
+            out.print((uint16_t)(gSweepSlice << 8), HEX);
+            out.print(F("-0x"));
+            out.println((uint16_t)((gSweepSlice << 8) | 0x0FFu), HEX);
+            out.println(F("  mask0 0x700 (one slice) + mask1 0x600 (three pairs)"));
+        } else {
+            out.print(F("PARKED on 0x"));
+            out.print((uint16_t)(gSweepSlice << 8), HEX);
+            out.print(F("-0x"));
+            out.println((uint16_t)((gSweepSlice << 8) | 0x0FFu), HEX);
+        }
+        // Said plainly, because the rates in the table below are now wrong in a
+        // specific way: an excluded ID stops accumulating entirely, so its Hz
+        // decays toward zero and its maxGap grows without bound. A filtered run
+        // answers PRESENCE; rates come from an accept-all run.
+        out.println(F("Hz/maxGap below apply only to ADMITTED ids - an excluded"));
+        out.println(F("one keeps its old totals and its gap grows forever."));
+        // One number, stated once. A dropped frame is the one that was never
+        // read, so which slice it belonged to cannot be known - a per-slice
+        // loss column would be invention, and the version that had one printed
+        // "no loss" against seven slices that were sharing the losses.
+        uint32_t admitted = 0;
+        for (uint8_t s = 0; s < SWEEP_SLICES; ++s) admitted += gSweepFrames[s];
+        out.print(F("overruns under this configuration: "));
+        out.print(gSweepOverrunsCfg);
+        if (gSweepOverrunsCfg == 0) {
+            out.println(F("  (admitted load fits)"));
+        } else if (admitted < (uint32_t)elapsed * 300UL / 1000UL) {
+            // Narrowing further would not help and the advice used to say it
+            // would. At a low admitted rate the two RX buffers cannot overflow
+            // from traffic alone - something STALLED the drain. On this board
+            // that is the SD dump (measured at 252-292 ms) or a GNSS poll, both
+            // of which are visible in the header above.
+            out.println(F("  <- NOT bus load; the drain stalled"));
+            out.println(F("     see 'worst write' and GNSS 'worst stall' above"));
+        } else {
+            out.println(F("  <- still lossy; park on a narrower range"));
+        }
+        out.println(F("  slice        range   frames"));
+        for (uint8_t s = 0; s < SWEEP_SLICES; ++s) {
+            const bool admitted = (gSweepMode == SWEEP_GROUPED) ? (s != gSweepSlice)
+                                                                : (s == gSweepSlice);
+            out.print(admitted ? F("    0x") : F("  - 0x"));
+            out.print((uint16_t)(s << 8), HEX);
+            out.print(F("  0x"));    out.print((uint16_t)(s << 8), HEX);
+            out.print(F("-0x"));     out.print((uint16_t)((s << 8) | 0x0FFu), HEX);
+            out.print(F("  "));      out.print(gSweepFrames[s]);
+            if (!admitted) out.print(F("   excluded"));
+            out.println();
+        }
+    }
+
     if (gTotalFrames == 0) {
         out.println();
         if (gRxOverruns > 0) {
@@ -1013,6 +1129,11 @@ static uint16_t readHexId(uint8_t &digits)
 
     const uint32_t t0 = millis();
     while (digits < 3 && (millis() - t0) < 500) {
+        // Keep draining while waiting. This used to spin on Serial alone, and
+        // the bus does not pause for the operator: at ~1100 frames/s a 500 ms
+        // wait overflows the two RX buffers many times over, so every command
+        // typed punched a hole in the very census it was about to reconfigure.
+        busDrain(millis());
         if (Serial.available() <= 0) continue;
         const int c = Serial.read();
         int v = -1;
@@ -1033,6 +1154,9 @@ static void printHelp()
     Serial.println(F("       s = dump to SD now (do this before switching off)"));
     Serial.println(F("       f13C = focus 0x13C   f = focus off   m = clear focus min/max"));
     Serial.println(F("       w156 = watch 0x156 for presence   w = clear watchlist"));
+    Serial.println(F("       x = admit 7 of 8 ID slices, excluding the busiest"));
+    Serial.println(F("           x300 = park on 0x300-0x3FF only   x again = off"));
+    Serial.println(F("           (sheds the load that makes rare IDs get dropped)"));
     Serial.println(F("       g = GNSS cross-check on/off   k = clear calibration"));
     Serial.println(F("to calibrate wheel-speed scale: drive a steady 40-80 km/h for"));
     Serial.println(F("a minute, then read 'counts per km/h'. 100 = 0.01 km/h/count."));
@@ -1053,6 +1177,110 @@ static void printHelp()
  * controller would ACK frames and could emit error frames if the bit timing is
  * wrong, which is exactly what a read-only tap must never do.
  */
+/**
+ * @brief Admits only identifiers whose top three bits are @p slice.
+ *
+ * All six filters go on the SAME slice deliberately. Spreading them across six
+ * would admit six slices at once, which is the exact opposite of the point:
+ * this exists to take traffic OFF the drain so the quiet parts of the
+ * identifier space stop losing frames to overruns caused by the busy part.
+ *
+ * Ends in Listen-Only, never Normal — a census must not become bus-active.
+ */
+static bool sweepApplyPark(uint8_t slice)
+{
+    const uint16_t base = (uint16_t)((uint16_t)(slice & 0x07u) << 8);
+    if (!CAN.setFilterRegisters(SWEEP_MASK_FINE, base, base,
+                                SWEEP_MASK_FINE, base, base, base, base,
+                                /* allowRollover = */ true,
+                                /* targetMode    = */ MODE_LISTEN_ONLY)) {
+        return false;
+    }
+    mcpWrite(REG_CANINTF, 0x00);
+    mcpBitModify(REG_EFLG, EFLG_RX0OVR | EFLG_RX1OVR, 0x00);
+    return true;
+}
+
+/**
+ * @brief Admits every slice EXCEPT @p exclude, using both mask widths at once.
+ *
+ * Three coarse filters take the three slice pairs that do not contain the
+ * excluded slice; one fine filter picks up its pair-mate, which the coarse
+ * filters had to leave behind. Seven of eight slices, one configuration, no
+ * time-sharing — see the block comment on SWEEP_MASK_FINE.
+ *
+ * Works for any @p exclude: the complement of a single slice is always
+ * decomposable this way, which is why the six filters are exactly enough.
+ */
+static bool sweepApplyGrouped(uint8_t exclude)
+{
+    exclude &= 0x07u;
+    // The excluded slice's pair-mate: same pair, so the coarse filters cannot
+    // admit it without also admitting the one being excluded.
+    const uint16_t partner = (uint16_t)((uint16_t)(exclude ^ 1u) << 8);
+
+    uint16_t pair[3];
+    uint8_t  n = 0;
+    for (uint8_t p = 0; p < 4u; ++p) {
+        if (p == (uint8_t)(exclude >> 1)) continue;   // the pair holding it
+        pair[n++] = (uint16_t)((uint16_t)p << 9);
+    }
+
+    if (!CAN.setFilterRegisters(SWEEP_MASK_FINE,   partner, partner,
+                                SWEEP_MASK_COARSE, pair[0], pair[1], pair[2], pair[0],
+                                /* allowRollover = */ true,
+                                /* targetMode    = */ MODE_LISTEN_ONLY)) {
+        return false;
+    }
+    mcpWrite(REG_CANINTF, 0x00);
+    mcpBitModify(REG_EFLG, EFLG_RX0OVR | EFLG_RX1OVR, 0x00);
+    return true;
+}
+
+/** @brief Clears the per-configuration filter statistics. */
+static void sweepStatsReset()
+{
+    for (uint8_t s = 0; s < SWEEP_SLICES; ++s) gSweepFrames[s] = 0;
+    gSweepOverrunsCfg = 0;
+}
+
+/**
+ * @brief The slice carrying the most traffic, from the census table itself.
+ *
+ * @param[out] framesSeen Total frames the decision rests on. ZERO means there is
+ *        no evidence and the return value is meaningless - the caller must not
+ *        treat slice 0 as a real answer, because with an empty table every slice
+ *        ties at zero and the first one wins by position alone.
+ *
+ * Uses cumulative census totals, so a measurement taken while a filter was
+ * already active is biased toward whatever that filter admitted. Reset the
+ * census ('r') before choosing if the previous run was filtered.
+ */
+static uint8_t censusBusiestSlice(uint32_t &framesSeen)
+{
+    uint32_t load[SWEEP_SLICES];
+    for (uint8_t s = 0; s < SWEEP_SLICES; ++s) load[s] = 0;
+    framesSeen = 0;
+    for (uint8_t i = 0; i < gUsed; ++i) {
+        load[(gStat[i].id >> 8) & 0x07u] += gStat[i].count;
+        framesSeen += gStat[i].count;
+    }
+    uint8_t best = 0;
+    for (uint8_t s = 1; s < SWEEP_SLICES; ++s) if (load[s] > load[best]) best = s;
+    return best;
+}
+
+/** @brief Back to RXM=11, accept-all — the normal census configuration. */
+static bool sweepDisable()
+{
+    if (!mcpSetMode(MODE_CONFIG)) return false;
+    mcpWrite(REG_RXB0CTRL, 0x64);   // RXM=11 | BUKT
+    mcpWrite(REG_RXB1CTRL, 0x60);   // RXM=11
+    mcpWrite(REG_CANINTF, 0x00);
+    mcpBitModify(REG_EFLG, EFLG_RX0OVR | EFLG_RX1OVR, 0x00);
+    return mcpSetMode(MODE_LISTEN_ONLY);
+}
+
 static bool busBeginListenOnly()
 {
     pinMode(INT_PIN, INPUT_PULLUP);
@@ -1175,6 +1403,83 @@ void setup()
     gLastReportMs = millis();
 }
 
+/**
+ * @brief Drains up to MAX_FRAMES_PER_POLL frames and folds them into the census.
+ *
+ * A FUNCTION rather than inline in loop() so it can also be pumped while the
+ * command parser waits on serial input. readHexId() blocks up to 500 ms, and at
+ * ~1100 frames/s that is roughly 550 frames the two RX buffers cannot hold - lost
+ * on every keystroke, and then hidden, because the filter routines clear EFLG
+ * immediately afterwards. A tool whose own user interface destroys the evidence
+ * it exists to gather is worse than one that is merely slow.
+ */
+static void busDrain(uint32_t nowMs)
+{
+uint8_t serviced = 0;
+while (serviced < MAX_FRAMES_PER_POLL) {
+    const uint8_t intf = mcpRead(REG_CANINTF);
+    if ((intf & 0x03) == 0) break;         // neither RX buffer holds a frame
+
+    // Free diagnostic: with a frame provably pending, INT must be LOW if it
+    // is connected. Tallies whether this board can use the optimisation.
+    if (digitalRead(INT_PIN) == LOW) ++gIntAsserted; else ++gIntMissed;
+
+    RawFrame f;
+    if (intf & 0x01) mcpReadFrame(INSTR_READ_RXB0, f);
+    else             mcpReadFrame(INSTR_READ_RXB1, f);
+    censusAdd(f, nowMs);
+    // Attributed to the slice that was admitted when it arrived, so the
+    // report can show WHICH slices are lossy rather than one global count
+    // that says only that something, somewhere, was dropped.
+    if (gSweepMode != SWEEP_OFF) ++gSweepFrames[(f.id >> 8) & 0x07u];
+
+    // Snapshot the wheel speeds here rather than reading them back out of
+    // the census table later: the calibrator has to know how OLD its CAN
+    // sample is before pairing it with a GPS fix, and the table keeps only
+    // "the last payload", with no timestamp a consumer can check.
+    if (f.id == WHEEL_SPEED_ID && f.dlc == 8) {
+        decodeWheelSpeeds(f.data, gWheelRaw);
+        gWheelMs   = nowMs;
+        gWheelSeen = true;
+    }
+
+    // Focus mode: watch one ID closely. The 5 s table only ever shows the
+    // LAST payload, which is useless for watching a signal move - you
+    // cannot correlate a snapshot with a steering sweep.
+    if (f.id == gFocusId) {
+        focusTrack(f);                       // every frame, so extremes are exact
+        if (nowMs - gFocusLastPrintMs >= FOCUS_PRINT_INTERVAL_MS) {
+            gFocusLastPrintMs = nowMs;
+            Serial.print(F("  "));
+            Serial.print(nowMs);
+            Serial.print(F("  0x"));
+            Serial.print(f.id, HEX);
+            Serial.print(F("  "));
+            for (uint8_t i = 0; i < f.dlc; ++i) { printHex8(Serial, f.data[i]); Serial.print(' '); }
+            // Every big-endian pair decoded, so a swing is readable
+            // directly without hex arithmetic in your head.
+            // Aligned pairs only on the live line - it has to stay narrow
+            // enough to read while something is moving. The full adjacent
+            // scan is in the min/max summary. The last byte is
+            // counter+checksum, so it is never paired here.
+            Serial.print('|');
+            for (uint8_t p = 0; (uint8_t)(p * 2 + 2) < f.dlc; ++p) {
+                const int16_t v =
+                    (int16_t)(((uint16_t)f.data[p * 2] << 8) | f.data[p * 2 + 1]);
+                Serial.print(F("  b"));
+                Serial.print(p * 2);
+                Serial.print(':');
+                Serial.print(p * 2 + 1);
+                Serial.print('=');
+                Serial.print(v);
+            }
+            Serial.println();
+        }
+    }
+    ++serviced;
+}
+}
+
 void loop()
 {
     if (!gBusReady) { delay(1000); return; }   // refuse to run half-configured
@@ -1193,65 +1498,7 @@ void loop()
     // The lesson is the shape of the bug, not the pin: an optimisation whose
     // failure mode is silently reporting nothing, rather than being slower.
     // CANINTF is the authoritative source and costs ~5 us; that is affordable.
-    uint8_t serviced = 0;
-    while (serviced < MAX_FRAMES_PER_POLL) {
-        const uint8_t intf = mcpRead(REG_CANINTF);
-        if ((intf & 0x03) == 0) break;         // neither RX buffer holds a frame
-
-        // Free diagnostic: with a frame provably pending, INT must be LOW if it
-        // is connected. Tallies whether this board can use the optimisation.
-        if (digitalRead(INT_PIN) == LOW) ++gIntAsserted; else ++gIntMissed;
-
-        RawFrame f;
-        if (intf & 0x01) mcpReadFrame(INSTR_READ_RXB0, f);
-        else             mcpReadFrame(INSTR_READ_RXB1, f);
-        censusAdd(f, nowMs);
-
-        // Snapshot the wheel speeds here rather than reading them back out of
-        // the census table later: the calibrator has to know how OLD its CAN
-        // sample is before pairing it with a GPS fix, and the table keeps only
-        // "the last payload", with no timestamp a consumer can check.
-        if (f.id == WHEEL_SPEED_ID && f.dlc == 8) {
-            decodeWheelSpeeds(f.data, gWheelRaw);
-            gWheelMs   = nowMs;
-            gWheelSeen = true;
-        }
-
-        // Focus mode: watch one ID closely. The 5 s table only ever shows the
-        // LAST payload, which is useless for watching a signal move - you
-        // cannot correlate a snapshot with a steering sweep.
-        if (f.id == gFocusId) {
-            focusTrack(f);                       // every frame, so extremes are exact
-            if (nowMs - gFocusLastPrintMs >= FOCUS_PRINT_INTERVAL_MS) {
-                gFocusLastPrintMs = nowMs;
-                Serial.print(F("  "));
-                Serial.print(nowMs);
-                Serial.print(F("  0x"));
-                Serial.print(f.id, HEX);
-                Serial.print(F("  "));
-                for (uint8_t i = 0; i < f.dlc; ++i) { printHex8(Serial, f.data[i]); Serial.print(' '); }
-                // Every big-endian pair decoded, so a swing is readable
-                // directly without hex arithmetic in your head.
-                // Aligned pairs only on the live line - it has to stay narrow
-                // enough to read while something is moving. The full adjacent
-                // scan is in the min/max summary. The last byte is
-                // counter+checksum, so it is never paired here.
-                Serial.print('|');
-                for (uint8_t p = 0; (uint8_t)(p * 2 + 2) < f.dlc; ++p) {
-                    const int16_t v =
-                        (int16_t)(((uint16_t)f.data[p * 2] << 8) | f.data[p * 2 + 1]);
-                    Serial.print(F("  b"));
-                    Serial.print(p * 2);
-                    Serial.print(':');
-                    Serial.print(p * 2 + 1);
-                    Serial.print('=');
-                    Serial.print(v);
-                }
-                Serial.println();
-            }
-        }
-        ++serviced;
-    }
+    busDrain(nowMs);
 
     // ── GNSS, AFTER the drain ────────────────────────────────────────────────
     //
@@ -1312,6 +1559,11 @@ void loop()
     const uint8_t eflg = mcpRead(REG_EFLG);
     if (eflg & (EFLG_RX0OVR | EFLG_RX1OVR)) {
         ++gRxOverruns;
+        // Charged to the ACTIVE CONFIGURATION, never to a slice - the dropped
+        // frame's identifier is unknowable, so per-slice attribution would be
+        // fabricated. What a non-zero count does say is that even the filtered
+        // load is too much, which is the signal to park on a narrower range.
+        if (gSweepMode != SWEEP_OFF) ++gSweepOverrunsCfg;
         mcpBitModify(REG_EFLG, EFLG_RX0OVR | EFLG_RX1OVR, 0x00);
     }
 
@@ -1358,6 +1610,89 @@ void loop()
             Serial.print(F("\n[focus "));
             if (gFocusId == 0xFFFF) Serial.println(F("off]"));
             else { Serial.print(F("0x")); Serial.print(gFocusId, HEX); Serial.println(']'); }
+            break;
+        }
+        case 'x': {
+            // "x" toggles GROUPED: seven slices admitted, the busiest excluded.
+            // The busiest is taken from the census table rather than configured,
+            // so it is right for whatever vehicle this is plugged into.
+            //
+            // "x300" PARKS on the one slice holding 0x300. Grouped is the better
+            // default - it covers almost everything at once - but parking is
+            // what you want when even the filtered load still overruns, or to
+            // get maximum headroom on the busy slice itself, which grouped mode
+            // is precisely the one to exclude.
+            uint8_t n = 0;
+            const uint16_t id = readHexId(n);
+
+            // ── hardware FIRST, state only on confirmed success ──────────────
+            // Setting gSweepMode before programming meant a failed transition
+            // left the sketch describing a configuration the controller was not
+            // in - and on the disable path it reported "accept-all" while the
+            // chip could still be sitting in Configuration mode receiving
+            // nothing at all, which reads as a dead bus.
+            uint8_t   wantSlice = gSweepSlice;
+            SweepMode wantMode;
+
+            if (n > 0) {
+                if (id > 0x7FFu) {
+                    // Masking it into range would silently park on some other
+                    // slice and report success. An 11-bit bus has no 0x800.
+                    Serial.println(F("\n[id above 0x7FF - standard frames only]"));
+                    break;
+                }
+                wantSlice = (uint8_t)((id >> 8) & 0x07u);
+                wantMode  = SWEEP_PARK;
+            } else if (gSweepMode == SWEEP_OFF) {
+                uint32_t seen = 0;
+                wantSlice = censusBusiestSlice(seen);
+                if (seen == 0) {
+                    // Without traffic the "busiest" slice is just slice 0, and
+                    // excluding it would be a coin toss dressed as a decision.
+                    Serial.println(F("\n[no frames yet - let the census run first]"));
+                    break;
+                }
+                wantMode = SWEEP_GROUPED;
+            } else {
+                if (!sweepDisable()) {
+                    // Mode is left as it was: the filters may still be live, and
+                    // claiming accept-all would be the more dangerous error.
+                    Serial.println(F("\n[filter off: restore FAILED - state unchanged]"));
+                } else {
+                    gSweepMode = SWEEP_OFF;
+                    sweepStatsReset();
+                    Serial.println(F("\n[filter off - accept-all]"));
+                }
+                break;
+            }
+
+            if (!(wantMode == SWEEP_PARK ? sweepApplyPark(wantSlice)
+                                         : sweepApplyGrouped(wantSlice))) {
+                Serial.println(F("\n[filter programming FAILED]"));
+                if (sweepDisable()) gSweepMode = SWEEP_OFF;
+                else Serial.println(F("[and restore FAILED - controller state unknown]"));
+                break;
+            }
+            gSweepMode  = wantMode;
+            gSweepSlice = wantSlice;
+            // Per-configuration, so a grouped run and a parked run are never
+            // added together - they mean different things.
+            sweepStatsReset();
+
+            const uint16_t base = (uint16_t)((uint16_t)gSweepSlice << 8);
+            if (gSweepMode == SWEEP_GROUPED) {
+                Serial.print(F("\n[grouped: 7 of 8 slices, excluding 0x"));
+                Serial.print(base, HEX);
+                Serial.print(F("-0x"));
+                Serial.print((uint16_t)(base | 0x0FFu), HEX);
+                Serial.println(F(" (busiest)]"));
+            } else {
+                Serial.print(F("\n[parked on 0x"));
+                Serial.print(base, HEX);
+                Serial.print(F("-0x"));
+                Serial.print((uint16_t)(base | 0x0FFu), HEX);
+                Serial.println(']');
+            }
             break;
         }
         case 'w': {

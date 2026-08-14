@@ -36,6 +36,7 @@
 #include "VehicleSignals.h"
 #include "SignalProcessingFunctions.h"
 #include "IMUFunctions.h"
+#include "BNO055Calib.h"   // calibration offsets, saved to and restored from SD
 
 /**
  * ENABLED: the u-blox module is fitted on I2C, sharing the bus with the IMU.
@@ -115,6 +116,16 @@ CommMaster commMaster;
 /// switch, and there is no second build configuration to keep working.
 IMUDevice imuDev;
 IMUData   imuData;
+/// Calibration offsets read from the card at boot.
+///
+/// FILE SCOPE IS LOAD-BEARING: BNO055InitState holds a POINTER to this, not a
+/// copy, and the bring-up that dereferences it runs from loop(). A buffer local
+/// to setup() would be gone by then, and the sensor would be configured from
+/// whatever the stack had become.
+static uint8_t imuCalibProfile[BNO055_CALIB_BYTES];
+static bool    imuCalibProfileValid = false;
+/// Rate limiter for saving a newly converged calibration.
+static unsigned long lastCalibSaveMs = 0;
 static unsigned long lastIMUPoll  = 0;
 static unsigned long lastIMURetry = 0;
 /// Master-computed signals published alongside the raw sensor readings.
@@ -146,26 +157,33 @@ static GPSInitState  gpsInit;
 /// Stage reported by the last log line, so progress is logged on CHANGE only —
 /// the machine is ticked every pass and would otherwise flood the console.
 static GPSInitStage  prevGPSStage = GPSInitStage::Idle;
+/// Latches the one-off "bus is clamped, not attempting GNSS" notice.
+static bool          gpsBusBlockedLogged = false;
+/// Latches the one-off latch-up notice, cleared if the bus ever frees.
+static bool          imuLatchLogged = false;
 #endif
 
 /// Last-reported state for each subsystem's edge log.  Seeded false so the
 /// first successful bring-up is itself reported as a transition.
 static bool prevOBDUp  = false;
 static bool prevGPSUp  = false;
-/// Tracked PER DEVICE, not as one composite.  Pulling the breakout's VIN on the
-/// bench left the LIS3MDL still acknowledging — an unpowered I2C slave draws
-/// parasitic power through the bus pull-ups — while the LSM6DSOX went down.  A
-/// single OR-ed "IMU present" flag therefore reported a physically unpowered
-/// module as healthy, and no LOST line was ever logged.  Two flags cannot hide
-/// that.
-static bool prevIMUAccelUp = false;
-/// Edge memory for the "exactly one device answering" warning.
+/// One flag now, where the LSM6DSOX + LIS3MDL breakout needed two.
+///
+/// That pair was tracked per device because pulling the breakout's VIN left the
+/// LIS3MDL still acknowledging — an unpowered I2C slave draws parasitic power
+/// through the bus pull-ups — while the LSM6DSOX went down, so a single OR-ed
+/// flag reported a physically unpowered module as healthy. One chip cannot
+/// produce that state, and the second flag went with it.
+static bool prevIMUUp = false;
+/// Edge memory for the "fusion not yet trustworthy" notice.
 static bool prevIMUDegraded = false;
-static bool prevIMUMagUp   = false;
 static bool prevLinkUp = false;
 
 /// The MCP2515 controller initialised.  Says NOTHING about the ECU.
 static bool          obdReady       = false;
+/// Consecutive OBD-II sessions that ended without a single ECU reply. Bounds
+/// the retry loop; see OBD2_DEAD_SESSIONS.
+static uint8_t       obdDeadSessions = 0;
 static unsigned long lastOBD2Retry  = 0;
 /// True once an ECU has actually ANSWERED a request — not merely once the CAN
 /// controller came up.
@@ -237,46 +255,42 @@ static VehiclePower vehiclePowerState()
 }
 
 /**
- * @brief Selects the IMU sampling mode from vehicle power state.
+ * @brief BNO055 High-G interrupt handler. Timestamps an impact, nothing more.
  *
- * Low power exactly when the vehicle is powered off; full capture otherwise,
- * including whenever the power state cannot be established.
+ * Does NOT touch I2C, and must not: the poll it would race is very likely
+ * already inside Wire, and a nested transaction on a bus whose driver has
+ * unbounded waits is a hang rather than a corrupted read.
  *
- * WHAT THIS GIVES UP, stated plainly: a parked vehicle is sampled at 26 Hz with
- * no buffering, so an impact while parked — another car reversing into it — is
- * recorded coarsely and its peak is not a true peak.  That is inherent to
- * powering the sensor down, not an oversight.  Recovering it needs the
- * LSM6DSOX's own wake-up interrupt on a wired INT pin, which detects motion in
- * hardware at microamps and needs no threshold guessing at all; this build has
- * no INT line to the MKR.  COMM_FLAG_IMU_LOWPOWER is on the wire so a consumer
- * always knows which regime produced a frame.
+ * The library reads the same latch over I2C on the next poll regardless, so
+ * this handler is not what makes High-G work — it only makes the timestamp the
+ * instant of the impact rather than the instant it was noticed.
  */
-static void updateIMUSampleMode()
+static void onIMUHighG()
 {
-    if (!imuDev.accelReady) return;   // nothing to configure; recovery owns this
-
-    const VehiclePower power = vehiclePowerState();
-    const IMUSampleMode wanted = (power == VehiclePower::Off)
-                                     ? IMUSampleMode::LowPower
-                                     : IMUSampleMode::Fifo;
-
-    if (imuSampleMode(imuDev) == wanted) return;
-
-    const IMUReturnStatus st = setIMUSampleMode(imuDev, wanted);
-    if (st == IMUReturnStatus::OK) {
-        Serial.print("IMU: sample mode -> ");
-        Serial.println((wanted == IMUSampleMode::LowPower)
-                           ? "LOW POWER (vehicle powered off)"
-                           : "FIFO (vehicle powered on)");
-    } else {
-        // Logged, not retried here: the next pass re-evaluates and tries again,
-        // and a failed switch leaves the PREVIOUS mode running rather than an
-        // undefined one — applySampleMode() only updates dev.mode once every
-        // register has read back.
-        Serial.print("IMU: sample mode change failed, status ");
-        Serial.println(static_cast<int>(st));
-    }
+    imuNoteHighGPin(millis());
 }
+
+/*
+ * THE IMU MODE IS NO LONGER DRIVEN BY VEHICLE POWER, and that is a deliberate
+ * removal rather than a feature lost in the port.
+ *
+ * The previous sensor's two modes were a SAMPLING RATE choice — full FIFO
+ * capture while moving, a slower unbuffered poll while parked to save current —
+ * so following the ignition was the right rule and the cost was only resolution.
+ *
+ * The BNO055's two modes are a MEASUREMENT choice. Fusion yields linear
+ * acceleration and relative yaw and locks the accelerometer at ±4 g; Raw yields
+ * neither and can reach ±16 g. Switching between them changes what the numbers
+ * mean, discards the peak window, and costs a full re-configuration of roughly
+ * 700 ms — during which there is no inertial data at all. Doing that at every
+ * traffic light would blank the sensor exactly as often as the vehicle stops.
+ *
+ * So the mode is a session-level decision, set once at bring-up. Current draw
+ * while parked is a separate axis (PWR_MODE), and it stays at normal until the
+ * parked-mode work lands: the datasheet withdraws the High-G interrupt in low
+ * power, which would remove the hardware impact backstop precisely when a
+ * car-park bump is the thing being watched for.
+ */
 
 /**
  * @brief Updates the filtered course over ground.
@@ -458,6 +472,17 @@ static bool applyCanMode(CanMode want)
         Serial.print(canModeName(want));
         Serial.print(" REFUSED, status ");
         Serial.println(static_cast<int>(st));
+        // Resynchronise with the driver instead of keeping the old value.
+        //
+        // A rejected transition still changed hardware on every path except the
+        // rate limit, and canSetMode() parks the controller and reports OFF. If
+        // this kept reporting the PREVIOUS mode, telemetry, the poller gate and
+        // the retry gate would all be steering off a mode the controller is
+        // provably not in — and the one that matters is claiming SNIFF, because
+        // everything downstream then treats a possibly bus-active node as a
+        // silent one. NOK_RATE_LIMIT alone changed nothing, so canGetMode()
+        // still returns the real mode there and this is a no-op.
+        canMode = canGetMode();
         return false;
     }
 
@@ -508,7 +533,10 @@ void setup()
     // can overwrite it, and a watchdog reset is the one boot reason that says
     // "the last run hung" rather than "someone power-cycled it".
     watchdogArm(WATCHDOG_PERIOD_MS);
-    if (watchdogCausedReset()) Serial.println("BOOT: previous run was ended by the watchdog");
+    Serial.print("BOOT: reset cause 0x");
+    Serial.print(resetCauseRaw(), HEX);
+    Serial.print(" - ");
+    Serial.println(resetCauseName());
 
     initOBD2Data(obdData);
     initGPSData(gpsData);
@@ -550,13 +578,35 @@ void setup()
         imuQuarantine(imuDev);   // valid struct, no bus access, no recovery
         Serial.println("IMU: quarantined");
     } else {
-        const IMUReturnStatus st = initializeIMU(imuDev);
+        // The High-G INT line, if one is fitted. Pulled DOWN, so an unconnected
+        // pin reads low forever and produces no events — the feature degrades to
+        // reading the same latch over I2C on the next poll, which is the only
+        // reason the wire is optional at all.
+        pinMode(IMU_HIGHG_INT_PIN, INPUT_PULLDOWN);
+        attachInterrupt(digitalPinToInterrupt(IMU_HIGHG_INT_PIN), onIMUHighG, RISING);
+
+        // Starts the staged bring-up and returns immediately; imuInitTick() in
+        // loop() carries it to completion over roughly 700 ms of wall clock.
+        // setup() no longer waits for a verdict, because waiting means holding
+        // the CPU through the part's own 650 ms reset — with the C3 link, the
+        // CAN drain and the watchdog feed all stopped, and a hang landing at the
+        // same point on every boot under the same armed watchdog.
+        const IMUReturnStatus st = initializeIMU(imuDev, IMUSampleMode::Fusion);
         Serial.print("IMU: ");
-        if (st == IMUReturnStatus::OK)                        Serial.println("both devices up");
-        else if (st == IMUReturnStatus::PARTIAL)              Serial.println("PARTIAL - one device down");
-        else if (st == IMUReturnStatus::NOK_BUS_STUCK)        Serial.println("bus stuck - a line is held low");
-        else if (st == IMUReturnStatus::NOK_ADDRESS_CONFLICT) Serial.println("address conflict");
-        else                                                  Serial.println("not detected");
+        if (st == IMUReturnStatus::OK) Serial.println("bring-up started (IMUPLUS)");
+        else                           Serial.println("bring-up REFUSED");
+
+        // The bus is still worth naming at BOOT, before anything has run. A bus
+        // already down on a cold start is the single most diagnostic line in the
+        // log: nothing this firmware has done yet can be the cause, so it rules
+        // out the CAN drain, the SD card and every runtime path at once.
+        if (i2cBusBegin() != I2CBusState::Ready) {
+            Serial.print("     bus stuck at boot - ");
+            Serial.println(i2cStuckReason());
+            Serial.println("     Nothing has run yet, so this is wiring or a slave holding the");
+            Serial.println("     line from power-up - NOT anything this firmware did. The GNSS");
+            Serial.println("     shares this bus, so it will fail too until the line is freed.");
+        }
     }
     lastIMUPoll  = millis();
     lastIMURetry = lastIMUPoll;
@@ -635,6 +685,46 @@ void setup()
         Serial.println("SD: card mounted (SPI1)");
     } else {
         Serial.println("SD: no card - defaults only");
+    }
+    watchdogFeed();
+
+    // ── IMU calibration profile ──────────────────────────────────────────────
+    //
+    // Loaded here rather than beside initializeIMU() above, because the card is
+    // not mounted until now — and it does not need to be earlier: bring-up is
+    // staged, so nothing has reached the RestoreCalib step yet. That step runs
+    // from imuInitTick() in loop(), and setup() finishes first.
+    //
+    // The BNO055 loses its calibration on every power-on and nothing on the part
+    // remembers it, so without this each drive starts with an uncalibrated
+    // sensor. On the bench the accelerometer figure fell to 0 and stayed there
+    // for 9000 polls: a board bolted into a bracket does not see the
+    // orientations Bosch's algorithm wants, so it may never recover on its own.
+    {
+        uint8_t storedChip = 0;
+        if (bno055CalibLoad(imuCalibProfile, &storedChip)) {
+            // Refused if it came from a different part. These offsets are
+            // properties of the silicon, so a profile survives the board being
+            // unbolted and remounted — but not the sensor being replaced, and a
+            // stale one would bias every reading with nothing to show for it.
+            if (storedChip != BNO055_EXPECTED_CHIP_ID) {
+                Serial.print("IMU: stored calibration is from chip 0x");
+                Serial.print(storedChip, HEX);
+                Serial.println(" - IGNORED, offsets belong to the silicon");
+            } else {
+                imuCalibProfileValid = true;
+                bno055InitSetCalibProfile(imuDev.init, imuCalibProfile);
+                char desc[80];
+                bno055CalibDescribe(imuCalibProfile, desc, sizeof(desc));
+                Serial.print("IMU: calibration profile loaded - ");
+                Serial.println(desc);
+            }
+        } else {
+            // Not an error, and deliberately not logged as one: this is the
+            // ordinary state of a rig that has never been calibrated. Press 's'
+            // in IMUValidation once the figures reach 3 to create one.
+            Serial.println("IMU: no stored calibration - the sensor will earn its own");
+        }
     }
     watchdogFeed();
 
@@ -762,12 +852,48 @@ void loop()
         // switch modes out from under an explicit CMD_SET_CAN_MODE would be
         // overriding a human with a guess.
         canProbeSkip(canProbe);
+        // The give-up tally is cleared too. It bounds an AUTONOMOUS retry loop;
+        // a host that explicitly asks for OBD2 again is entitled to a full fresh
+        // budget rather than one attempt before the old count trips it again.
+        obdDeadSessions = 0;
         applyCanMode(static_cast<CanMode>(commMaster.canModeRequest));
         // Cleared whether or not it succeeded. A refused mode that stayed
         // latched would be retried every pass forever, and canSetMode()'s rate
         // limiter would reject most of those - producing a steady stream of
         // failures for a request the host made exactly once.
         commMaster.canModeRequest = 0;
+    }
+
+    // Filters, applied on the same principle and in the same place: writing the
+    // MCP2515's filter registers means dropping into Configuration mode, so the
+    // receive gap belongs here rather than inside the frame decoder.
+    if (commMaster.canFilterPending) {
+        const bool ok = canSniffSetFilters(commMaster.canFilterIds,
+                                           commMaster.canFilterCount);
+        Serial.print("CAN: host filter set -> ");
+        if (!ok) {
+            // Named rather than silently dropped. The overwhelmingly likely
+            // cause is not being in sniff mode, and a host that sent the command
+            // in OBD2 mode would otherwise see no effect and no explanation.
+            Serial.println("REFUSED (sniff mode only, or the controller declined)");
+        } else if (commMaster.canFilterCount == 0u) {
+            // Said out loud because it is the opposite of how it sounds, and on
+            // this bus it is a real capacity decision rather than a formality.
+            Serial.println("cleared - ACCEPT ALL. The drain holds ~267 frames/s "
+                           "against ~1100 arriving, so losses become random.");
+        } else {
+            Serial.print(commMaster.canFilterCount);
+            Serial.print(" ids:");
+            for (uint8_t i = 0; i < commMaster.canFilterCount; ++i) {
+                Serial.print(" 0x");
+                Serial.print(commMaster.canFilterIds[i], HEX);
+            }
+            Serial.println();
+        }
+        // Cleared whether or not it succeeded, for the same reason as the mode
+        // request above: a refused command retried every pass forever produces a
+        // stream of failures for something the host asked once.
+        commMaster.canFilterPending = false;
     }
 
     // ── 0b) Passive decode, whenever a listen-only mode is active ────────────
@@ -840,9 +966,40 @@ void loop()
             obdReady      = false;
             lastOBD2Retry = millis();
             Serial.println("OBD2: link lost; will re-init");
+
+            // A session that produced at least one reply is a link that WORKS
+            // and merely dropped out; one that never did is a link that has
+            // never existed. Only the second kind counts toward giving up, and
+            // any reply at all resets the tally.
+            if (obd2EverReplied()) {
+                obdDeadSessions = 0;
+            } else if (obdDeadSessions < 0xFFu) {
+                ++obdDeadSessions;
+            }
+
+            if (obdDeadSessions >= OBD2_DEAD_SESSIONS) {
+                // OFF, not another retry. Every one of those retries takes the
+                // controller bus-active on a live vehicle to transmit requests
+                // that have never once been answered - unattended, indefinitely,
+                // for no telemetry. Stopping is the honest outcome, and OFF
+                // parks it in Configuration where it emits nothing at all.
+                applyCanMode(CanMode::OFF);
+                Serial.print("OBD2: no ECU replied in ");
+                Serial.print((unsigned)obdDeadSessions);
+                Serial.println(" sessions - giving up, CAN now OFF (bus-idle)");
+                Serial.println("  This vehicle does not answer Mode 01 at this tap.");
+                Serial.println("  Fit a vehicle map (canmap.<vehicle>.txt) to sniff instead,");
+                Serial.println("  or send CMD_SET_CAN_MODE from the host to retry.");
+            }
         }
     } else if ((canMode == CanMode::OBD2 || canMode == CanMode::OFF) &&
+               obdDeadSessions < OBD2_DEAD_SESSIONS &&
                isTimeout(OBD2_RETRY_MS, lastOBD2Retry)) {
+        // The tally gate is load-bearing. Giving up sets the mode to OFF, and
+        // OFF is one of the modes this branch retries from - so without it the
+        // very next pass would re-initialise and the give-up would last five
+        // seconds. A controller that never came up at all still retries, because
+        // that path never ran a session and never incremented the tally.
         // Gated on the MODE, not on obdReady.
         //
         // This used to read `else if (isTimeout(...))`, which fires precisely
@@ -985,6 +1142,20 @@ void loop()
         // IMU_MAX_DATA_AGE_MS is reported as an inertial data gap.  Bounded and
         // visible rather than hidden, which is the improvement; not eliminated.
         // The machine owns its own backoff, so there is no retry timer here.
+        //
+        // Not attempted at all while a line is clamped low. Driving transactions
+        // into a bus whose SDA never moves is not merely futile - if the clamp
+        // is a latched-up device, every attempt pushes current into it, and the
+        // MKR's own pins are on the other end of that. The receiver may be
+        // perfectly healthy and simply unreachable; saying so once beats 11
+        // identical status -7 lines that all describe the OTHER device's fault.
+        if (i2cStuckLines() & I2C_STUCK_SDA_NEVER_MOVED) {
+            if (!gpsBusBlockedLogged) {
+                gpsBusBlockedLogged = true;
+                Serial.println("GPS: not attempted - I2C SDA is clamped low; free the bus first");
+            }
+            gpsReady = false;
+        } else {
         const GPSInitStage stage = gpsInitTick(myGNSS, gpsInit);
 
         if (stage != prevGPSStage) {
@@ -1014,6 +1185,7 @@ void loop()
             lastGPSPoll  = millis();
             lastGPSFresh = lastGPSPoll;
         }
+        }   // bus not clamped
     }
 
     // Hardware presence for the wire, kept in step with the retry state above.
@@ -1023,19 +1195,86 @@ void loop()
     // ── 2c) IMU poll, with bounded recovery ──────────────────────────────────
     // Unconditional on the timer: getIMUData() returns immediately without
     // touching the bus when a device is down, so there is nothing to gate on.
+    // EVERY pass, not on the poll timer. The bring-up has about a dozen steps
+    // and each is a few hundred microseconds; running them at 20 Hz would add
+    // half a second to a sequence whose real cost is the part's own reset delay.
+    // A no-op once configured, so the unconditional call costs one comparison.
+    (void)imuInitTick(imuDev);
+
     if (isTimeout(IMU_POLL_MS, lastIMUPoll)) {
         lastIMUPoll = millis();
         (void)getIMUData(imuDev, imuData);   // status is carried by the data's own valid flags
-        // Immediately after the poll, so a wake acts on THIS pass's peaks rather
-        // than on the previous 50 ms.  That one poll of latency is the entire
-        // budget the low-power mode is allowed to cost on the way back up.
-        updateIMUSampleMode();
     }
-    // Driven by isIMUDegraded(), not isIMULinkLost(): with only one of the two
-    // devices down the link is not "lost", and gating on that would strand the
-    // missing sensor offline for the whole drive.  recoverIMU() reconfigures
-    // only what is down and allocates nothing.
-    if (isIMUDegraded(imuDev) && isTimeout(IMU_RETRY_MS, lastIMURetry)) {
+
+    // ── 2c-i) Persist a calibration once it is fully converged ───────────────
+    //
+    // Only at 3/3. A partial profile is worse than none: it would be restored at
+    // every subsequent boot and would anchor the fusion to a half-finished
+    // estimate, which it would then have to climb back out of. Waiting for full
+    // convergence means the file is written rarely and is worth having when it is.
+    //
+    // NOT during a High-G event. Capturing costs about 60 ms with the sensor in
+    // CONFIG producing nothing, and the one moment that must never have a hole
+    // in it is an impact — which is precisely when this would otherwise fire, as
+    // a hard jolt is also what finally moves the accelerometer figure to 3.
+    if (imuIsReady(imuDev) && sdReady() && !imuData.highGEvent &&
+        imuData.calibGyro >= 3u && imuData.calibAccel >= 3u &&
+        (lastCalibSaveMs == 0 || isTimeout(IMU_CALIB_SAVE_INTERVAL_MS, lastCalibSaveMs))) {
+
+        uint8_t fresh[BNO055_CALIB_BYTES];
+        if (!bno055CalibCapture(imuDev.init, fresh)) {
+            Serial.println("IMU: calibration capture FAILED - sensor left in its operating mode");
+            lastCalibSaveMs = millis();   // do not retry every pass
+        } else if (imuCalibProfileValid && bno055CalibEqual(fresh, imuCalibProfile)) {
+            // Identical to what is already stored. Skipped silently and the
+            // timer reset, so a converged sensor does not rewrite the same 22
+            // bytes every ten minutes for the life of the vehicle.
+            lastCalibSaveMs = millis();
+        } else {
+            const bool ok = bno055CalibStore(fresh, imuDev.init.dev.chip_id);
+            if (ok) {
+                memcpy(imuCalibProfile, fresh, sizeof(fresh));
+                imuCalibProfileValid = true;
+                char desc[80];
+                bno055CalibDescribe(fresh, desc, sizeof(desc));
+                Serial.print("IMU: calibration saved - ");
+                Serial.println(desc);
+            } else {
+                Serial.println("IMU: calibration save FAILED - previous profile left intact");
+            }
+            lastCalibSaveMs = millis();
+        }
+    }
+    // Driven by isIMUDegraded(), not isIMULinkLost(). The distinction survives
+    // the move to a single chip: degraded now means "configured, then stopped
+    // delivering usable data", which includes a frozen data path on a part that
+    // is still answering every transaction — the failure that retired the last
+    // sensor. isIMUDegraded() is false while bring-up is still running, so this
+    // cannot restart a sequence that is merely part-way through.
+    // A clamped SDA stops the retry entirely rather than slowing it.
+    //
+    // This is protective, not cosmetic. A line held at a diode drop with the
+    // rail good is a LATCHED-UP device — a parasitic SCR conducting between the
+    // rails — and it clears only when the supply is fully discharged. Confirmed
+    // on this bench: the part came back after a night disconnected, so it was
+    // never destroyed. What keeps a latch alive is current, and every recovery
+    // attempt drives the bus and feeds it. Retrying every five seconds for a
+    // whole drive is how a recoverable latch-up becomes permanent damage.
+    //
+    // Nothing is lost by stopping: no amount of clocking clears a latch, and the
+    // fix is a power cycle the firmware cannot perform.
+    if (isIMUDegraded(imuDev) &&
+        (i2cStuckLines() & I2C_STUCK_SDA_NEVER_MOVED) != 0u) {
+        if (!imuLatchLogged) {
+            imuLatchLogged = true;
+            Serial.println("IMU: SDA clamped with the rail good - this is LATCH-UP, not a dead chip.");
+            Serial.println("     Retries STOPPED: driving the bus feeds the latch and can make it");
+            Serial.println("     permanent. Fully power down the rig (drain it, seconds are not");
+            Serial.println("     enough) and the part will come back. Then fix what triggers it:");
+            Serial.println("     I2C driven while the breakout's VIN is absent or sagging.");
+        }
+    } else if (isIMUDegraded(imuDev) && isTimeout(IMU_RETRY_MS, lastIMURetry)) {
+        imuLatchLogged = false;   // bus is free again; a real fault may still recover
         lastIMURetry = millis();
         // Outcome logged, not discarded: an IMU that drops off mid-drive was
         // previously retried forever in complete silence, so the console gave
@@ -1046,10 +1285,19 @@ void loop()
         // read as "fine" to anyone scanning the log.
         Serial.print("IMU: retry status=");
         Serial.print(static_cast<int>(rst));
-        Serial.print(" accel=");
-        Serial.print(imuDev.accelReady ? "up" : "down");
-        Serial.print(" mag=");
-        Serial.println(imuDev.magReady ? "up" : "down");
+        Serial.print(" stage=");
+        Serial.print(bno055InitStageName(imuDev.init.stage));
+        Serial.print(" why=");
+        Serial.print(bno055InitStatusName(imuDev.init.lastStatus));
+        // A stuck bus is not an IMU fault and must not read as one. Status -5
+        // repeated twenty times says only "recovery failed"; naming the line
+        // says which fault it is, and the GNSS shares this bus so the same
+        // answer explains both devices going quiet together.
+        if (rst == IMUReturnStatus::NOK_BUS_STUCK) {
+            Serial.print("  I2C: ");
+            Serial.print(i2cStuckReason());
+        }
+        Serial.println();
     }
 
     // ── 2b) Derived signals ──────────────────────────────────────────────────
@@ -1088,26 +1336,30 @@ void loop()
     // (missing values are NAN with their *_PRESENT flag clear).  What must never
     // happen is that it changes silently.
     logSubsystemEdge("OBD2", obdReady, prevOBDUp);
-    logSubsystemEdge("IMU accel/gyro", imuDev.accelReady, prevIMUAccelUp);
-    logSubsystemEdge("IMU mag",        imuDev.magReady,   prevIMUMagUp);
+    logSubsystemEdge("IMU", imuIsReady(imuDev), prevIMUUp);
 
-    // Exactly one device answering is a CONNECTION fault, not partial data.
-    // Both parts sit on one PCB behind one VIN and one ground, so there is no
-    // benign path to this state.  What produces it is a broken supply: an
-    // unpowered I2C slave keeps acknowledging on parasitic current through the
-    // bus pull-ups, so the lighter-draw part goes on answering while the other
-    // dies.  Reported loudly because the readings that DO still arrive come from
-    // a part running on stolen power and are not trustworthy either.
-    const bool imuDegradedNow = (imuDev.accelReady != imuDev.magReady);
-    if (imuDegradedNow != prevIMUDegraded) {
-        prevIMUDegraded = imuDegradedNow;
-        if (imuDegradedNow) {
-            Serial.println("IMU: *** WARNING - only one of two devices answering ***");
-            Serial.println("     Both share one VIN/GND on the breakout, so suspect POWER or");
-            Serial.println("     WIRING, not a failed chip. An unpowered part still ACKs via");
-            Serial.println("     parasitic power on the bus - do not trust the half that replies.");
+    // The old two-chip breakout could report exactly one device answering, which
+    // was a POWER fault rather than partial data — an unpowered I2C slave keeps
+    // acknowledging on parasitic current through the bus pull-ups, so the
+    // lighter-draw part went on replying while the other died. One chip cannot
+    // produce that state, so the warning is gone with it.
+    //
+    // What takes its place is the fused output not yet being trustworthy: the
+    // part is up and publishing linear acceleration whose calibration has not
+    // converged. Those values are not wrong-looking, merely not yet right, and
+    // nothing downstream could otherwise tell.
+    const bool imuFusionUnready =
+        imuIsReady(imuDev) && (imuData.calibGyro < IMU_CALIB_MIN_GYRO);
+    if (imuFusionUnready != prevIMUDegraded) {
+        prevIMUDegraded = imuFusionUnready;
+        if (imuFusionUnready) {
+            Serial.println("IMU: fusion output not yet trustworthy - gyro calibration converging");
+            Serial.println("     Reaches 3 within seconds of standing still. The accelerometer");
+            Serial.println("     figure is reported but does NOT gate this: on the bench it sat");
+            Serial.println("     at 0 for 9000 polls while gravity held 9.79-9.81, so it was not");
+            Serial.println("     measuring trustworthiness. The gravity gate in the driver is.");
         } else {
-            Serial.println("IMU: both devices answering again");
+            Serial.println("IMU: fusion calibrated");
         }
     }
 #ifdef USE_GPS
@@ -1142,8 +1394,12 @@ void loop()
 
         // Held indicator state, so this reads steadily while indicating rather
         // than flickering with the lamp. Both arrows at once is hazards.
+        // "<>" is now driven by the hazard SIGNAL, not by both turn bits being
+        // set. On this vehicle the hazards leave both turn bits clear, so the
+        // old test could never fire — which is exactly how it was found.
         Serial.print(" turn=");
-        if      (vehSignals.turnLeft && vehSignals.turnRight) Serial.print("<>");
+        if      (vehSignals.hazard)                           Serial.print("<>");
+        else if (vehSignals.turnLeft && vehSignals.turnRight) Serial.print("<>");
         else if (vehSignals.turnLeft)                         Serial.print("<-");
         else if (vehSignals.turnRight)                        Serial.print("->");
         else if (vehSignals.turnSrc == VehSource::NONE)       Serial.print("--");
@@ -1203,14 +1459,15 @@ void loop()
         if (isnan(gpsData.velocityKmh)) Serial.print("--");
         else                            Serial.print(gpsData.velocityKmh, 1);
 #endif
-        // Three states, not two: "partial" is the case a boolean cannot express
-        // and the one that actually happened — half the breakout alive on
-        // parasitic bus power while the other half was unpowered.
+        // Four states. "configuring" is new and load-bearing: bring-up now takes
+        // about 700 ms of wall clock, and without it the first console lines of
+        // every boot would report a healthy IMU as "down".
         Serial.print("  imu=");
-        if (isIMUQuarantined(imuDev))                  Serial.print("QUARANTINED");
-        else if (imuDev.accelReady && imuDev.magReady) Serial.print("up");
-        else if (imuDev.accelReady || imuDev.magReady) Serial.print("PARTIAL");
-        else                                           Serial.print("down");
+        if (isIMUQuarantined(imuDev))       Serial.print("QUARANTINED");
+        else if (imuIsReady(imuDev))        Serial.print("up");
+        else if (imuDev.init.stage != BNO055InitStage::Failed)
+                                            Serial.print("configuring");
+        else                                Serial.print("down");
         Serial.print(" |a|=");
         if (imuData.accelValid) {
             Serial.print(sqrtf(imuData.accelX * imuData.accelX +
@@ -1229,8 +1486,26 @@ void loop()
         Serial.print("/");
         if (isnan(imuData.gyroPeakDps)) Serial.print("--");
         else                            Serial.print(imuData.gyroPeakDps, 1);
+        // The peak that actually drives incident detection, and the one the
+        // previous hardware could not produce: gravity already removed, so a
+        // stationary vehicle reads ~0 here while |a| beside it reads 9.81.
+        Serial.print(" lin=");
+        if (isnan(imuData.linAccelPeakMs2)) Serial.print("--");
+        else                                Serial.print(imuData.linAccelPeakMs2, 2);
+        // SAT is not a detail. Fusion locks the accelerometer at ±4 g, so a
+        // clipped peak understates a real collision fivefold, and a saturated
+        // number printed plainly is indistinguishable from a measured one.
+        if (imuData.accelSaturated) Serial.print(" SAT");
+        // The hardware latch. Distinct from a high peak, and the distinction is
+        // the point: a peak is only ever as good as the polls that produced it,
+        // while this survived whatever the loop was doing at the time.
+        if (imuData.highGEvent) Serial.print(" HIGH-G");
+        else if (!imuData.highGArmed && imuIsReady(imuDev)) Serial.print(" nohg");
         Serial.print(" mode=");
-        Serial.print(imuData.lowPower ? "LP" : "fifo");
+        Serial.print(imuData.fusionMode ? "fus" : "amg");
+        Serial.print(" cal=");
+        Serial.print(imuData.calibGyro);
+        Serial.print(imuData.calibAccel);
         if (imuData.dataGap) Serial.print(" GAP");
         // The state that DECIDES the mode above, so the two can be compared.  A
         // mode that looks wrong is almost always a power state that is not what
@@ -1248,18 +1523,26 @@ void loop()
         // degrading looks identical to a healthy one in every other field on
         // this line.  Slowly climbing numbers here are the only warning.
         Serial.print(" ioerr=");
-        Serial.print(imuDev.accelIOErrors);
+        Serial.print(imuDev.ioErrors);
+        // Bursts that arrived intact and failed a plausibility gate, counted
+        // apart from bus errors because they mean the opposite thing: the part
+        // answered perfectly and the CONTENTS were impossible. That is how the
+        // previous IMU failed — 40 % of its samples corrupt, every transaction a
+        // success — and no bus-level counter can see it.
         Serial.print("/");
-        Serial.print(imuDev.magIOErrors);
+        Serial.print(imuDev.implausible);
         // CUMULATIVE gap counts, hardware overrun / freshness discard.  The
         // GAP flag above lasts only IMU_PEAK_WINDOW_MS, so a soak watching the
         // console can miss every one of them and still look clean — which is
         // exactly what a 150 s run showing no GAP proved, and did not prove.
         // These only ever climb, so one glance answers "were there any?".
         Serial.print(" gaps=");
-        Serial.print(imuDev.fifoOverruns);
-        Serial.print("/");
-        Serial.print(imuDev.fifoGapFlushes);
+        Serial.print(imuDev.missedPolls);
+        // Cumulative High-G latches. The published flag lasts IMU_HIGHG_HOLD_MS,
+        // so a soak watching the console can miss every one of them and still
+        // look clean. This only climbs, so one glance answers "were there any?".
+        Serial.print(" hg=");
+        Serial.print(imuDev.highGCount);
         // c3= is the LINK, stream= is the session on top of it.  They are
         // different failures: a bridge that is attached but not asking for
         // telemetry is healthy, one that has been unplugged is not, and

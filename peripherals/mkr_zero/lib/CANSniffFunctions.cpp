@@ -122,6 +122,26 @@ static uint32_t gMatches = 0;
  */
 static uint32_t gTurnLeftLitMs  = 0;
 static uint32_t gTurnRightLitMs = 0;
+/// Same treatment for hazards, which flash on the same cadence.
+static uint32_t gHazardLitMs    = 0;
+
+/**
+ * The two indicator lamps as seen in the CURRENT frame: -1 absent, 0 dark, 1 lit.
+ *
+ * The hold has to be cancellable, not just decaying. A driver moving the stalk
+ * from left to right lights the right lamp while the left hold is still running,
+ * so both read active for up to CAN_TURN_HOLD_MS and the payload says HAZARDS —
+ * observed on the vehicle at every single direction change.
+ *
+ * One frame settles it. A frame that lights right while left is DARK proves left
+ * has stopped now, so its hold is dropped immediately. A frame that lights BOTH
+ * is a genuine simultaneous flash and leaves both holds alone, which is what
+ * keeps this from breaking a vehicle that really does drive hazards through
+ * these bits. The dark half of an ordinary blink lights neither, so it cancels
+ * nothing and the hold survives the gap — which is the whole point of it.
+ */
+static int8_t gFrameTurnL = -1;
+static int8_t gFrameTurnR = -1;
 
 /**
  * How long an indicator stays "active" after its last flash.
@@ -202,7 +222,29 @@ const CanSignalMap *canSniffGetMap()
 
 uint32_t canSniffFrameCount() { return gFrames; }
 uint32_t canSniffMatchCount() { return gMatches; }
-void     canSniffResetCounters() { gFrames = 0; gMatches = 0; }
+
+/// One bit per directory entry, set the first time that ID is decoded. This is
+/// what turns "twenty frames arrived" into "twenty frames arrived from the IDs
+/// this map actually names".
+static uint16_t gIdsSeenMask = 0;
+
+uint8_t canSniffIdsSeen()
+{
+    uint8_t n = 0;
+    for (uint16_t m = gIdsSeenMask; m; m >>= 1) n = (uint8_t)(n + (m & 1u));
+    return n;
+}
+
+uint8_t canProbeIdsNeeded()
+{
+    const CanSignalMap &m = *canSniffGetMap();
+    // A strict majority, rounded up, and never more than the map defines.
+    // One ID is one ID: a single-signal map cannot be cross-checked, and
+    // demanding two would make it permanently unprovable.
+    return (m.idCount <= 1u) ? m.idCount : (uint8_t)((m.idCount + 1u) / 2u);
+}
+
+void canSniffResetCounters() { gFrames = 0; gMatches = 0; gIdsSeenMask = 0; }
 
 // ─── boot-time source decision ────────────────────────────────────────────────
 
@@ -232,7 +274,22 @@ CanProbeStage canProbeTick(CanProbeState &p, uint32_t nowMs)
         p.startMs      = nowMs;
     }
 
-    if (canSniffMatchCount() >= CAN_PROBE_MIN_MATCHES) {
+    // Two conditions, not one. A raw match count can be reached entirely by a
+    // single ID, and popular identifiers are shared across a manufacturer's
+    // whole range — a Civic map plugged into this Brio would see 0x17C at 100 Hz
+    // and clear twenty matches in 200 ms while every other row it defines never
+    // appeared. That is the exact failure the probe exists to catch, and a
+    // count alone cannot see it.
+    //
+    // Requiring most of the map's IDs to show up is what makes the test about
+    // THIS map rather than about the bus being busy. Not all of them: a row may
+    // legitimately stay silent early on — 0x158 reads zero until the shifter
+    // leaves Park — so the bar is a majority, and the window still has to elapse
+    // before a shortfall is called a mismatch.
+    const uint8_t seen   = canSniffIdsSeen();
+    const uint8_t needed = canProbeIdsNeeded();
+
+    if (canSniffMatchCount() >= CAN_PROBE_MIN_MATCHES && seen >= needed) {
         p.stage = CanProbeStage::Sniffing;
     } else if ((nowMs - p.startMs) > CAN_PROBE_WINDOW_MS) {
         p.stage = CanProbeStage::FellBack;
@@ -311,6 +368,71 @@ int16_t yawRateFromWheels(const YawEstimator &y, uint16_t rawRL, uint16_t rawRR)
 
 CanMode canGetMode() { return gMode; }
 
+/// Whether the filters currently programmed came from the loaded map, as
+/// opposed to a host command. Reported on the wire, because "filtered" and
+/// "filtered the way the map intended" are different statements about a capture.
+static bool     gFiltersFromMap = false;
+/// Filter IDs currently programmed, and how many are meaningful.
+static uint16_t gFilterIds[CAN_MAP_FILTER_SLOTS] = { 0, 0, 0, 0, 0, 0 };
+static uint8_t  gFilterCount = 0;
+
+/**
+ * @brief Writes a filter set to the controller. NO MODE GUARD — internal.
+ *
+ * Separate from @c canSniffSetFilters() because the bring-up path calls it
+ * DURING the transition into sniff mode, when @c gMode does not yet say Sniff.
+ * A single guarded function would either refuse its own bring-up or have to
+ * exempt it with a flag, and both were tried before this split.
+ */
+static bool applyFilterSet(const uint16_t *ids, uint8_t count)
+{
+    uint16_t f[CAN_MAP_FILTER_SLOTS] = { 0, 0, 0, 0, 0, 0 };
+    uint16_t mask = 0x7FFu;
+
+    if (count == 0u) {
+        // ACCEPT ALL, which is what an empty filter set means on an MCP2515 —
+        // a zero mask compares no bits, so every ID matches whatever the filter
+        // registers hold. Worth stating because it is the opposite of what "no
+        // filters" sounds like, and because leaving the mask exact with filters
+        // at 0 would accept ID 0 alone: a real, and very high priority,
+        // identifier rather than a harmless default.
+        mask = 0x000u;
+    } else {
+        if (count > CAN_MAP_FILTER_SLOTS) count = CAN_MAP_FILTER_SLOTS;
+        // Fewer IDs than slots: repeat the last. An unused slot left at 0 would
+        // accept ID 0 for the same reason as above.
+        for (uint8_t i = 0; i < CAN_MAP_FILTER_SLOTS; ++i) {
+            f[i] = (i < count) ? ids[i] : ids[count - 1u];
+        }
+    }
+
+    if (!CAN.setFilterRegisters(
+            /* mask0   */ mask, f[0], f[1],
+            /* mask1   */ mask, f[2], f[3], f[4], f[5],
+            /* allowRollover */ true,
+            /* targetMode    */ MODE_LISTEN_ONLY)) {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < CAN_MAP_FILTER_SLOTS; ++i) gFilterIds[i] = f[i];
+    gFilterCount    = count;
+    gFiltersFromMap = false;
+    return true;
+}
+
+bool canSniffSetFilters(const uint16_t *ids, uint8_t count)
+{
+    if (ids == nullptr && count != 0u) return false;
+    // Only in sniff mode. The filter registers belong to the receive path, and
+    // in OBD2 mode they are programmed for the 0x7E8 response and must not be
+    // overwritten by a host that is thinking about a different bus role.
+    if (gMode != CanMode::SNIFF) return false;
+    return applyFilterSet(ids, count);
+}
+
+uint8_t canSniffFilterCount()   { return gFilterCount; }
+bool    canSniffFiltersFromMap(){ return gFiltersFromMap; }
+
 /**
  * Programs the Honda filters. Six filters across two masks, which is the whole
  * reason this project vendored a fork that can express them: the stock library
@@ -321,15 +443,11 @@ static bool programSniffFilters()
 {
     const CanSignalMap &m = *canSniffGetMap();
 
-    // Six slots across two masks, taken from the map's priority-chosen set.
-    // Fewer IDs than slots: repeat the last, as the hardcoded version already
-    // did — an unused slot left at 0 would accept ID 0, which is a real (and
-    // very high priority) identifier.
-    uint16_t f[CAN_MAP_FILTER_SLOTS];
-    const uint8_t n = m.filterCount;
-    for (uint8_t i = 0; i < CAN_MAP_FILTER_SLOTS; ++i) {
-        f[i] = (i < n) ? m.filterId[i] : m.filterId[n ? n - 1u : 0u];
-    }
+    // Slot filling — six slots across two masks, repeating the last when the map
+    // supplies fewer — lives in applyFilterSet() now that a host command needs
+    // exactly the same treatment. It was duplicated here until the two could
+    // disagree, which is one copy too many for a rule that decides what a
+    // capture contains.
 
     // More IDs than slots: the surplus are DROPPED, and the mask stays exact.
     //
@@ -359,11 +477,9 @@ static bool programSniffFilters()
         }
     }
 
-    return CAN.setFilterRegisters(
-        /* mask0   */ 0x7FFu, f[0], f[1],
-        /* mask1   */ 0x7FFu, f[2], f[3], f[4], f[5],
-        /* allowRollover */ true,
-        /* targetMode    */ MODE_LISTEN_ONLY);
+    if (!applyFilterSet(m.filterId, m.filterCount)) return false;
+    gFiltersFromMap = true;
+    return true;
 }
 
 /**
@@ -383,10 +499,27 @@ static bool programSniffFilters()
  */
 static CanModeStatus failToConfig(CanModeStatus why)
 {
-    (void)rawSetMode(MODE_CONFIG);   // best effort; we are already failing
-    gMode       = CanMode::OFF;
-    gLastModeMs = millis();
-    return why;
+    // Verified, not best-effort. If the controller will not even reach
+    // Configuration then we do not know what it is doing, and reporting a
+    // definite state we have not confirmed is the failure this function exists
+    // to prevent. gMode is OFF either way — it means "no usable mode", which is
+    // true whether the chip parked or stopped answering — but the caller is told
+    // which, so a chip stuck in Normal on a live bus is a reported fault rather
+    // than a silent one.
+    const bool parked = rawSetMode(MODE_CONFIG);
+    gMode = CanMode::OFF;
+
+    // gLastModeMs is deliberately NOT stamped.
+    //
+    // It did, and that made the documented immediate fallback unreachable: a
+    // failed SNIFF stamped the clock, and the applyCanMode(OBD2) on the very
+    // next line was then rejected by the 500 ms rate limit, leaving the node in
+    // NO mode at all. The rate limit exists to stop a command storm thrashing
+    // successful transitions; a transition that failed changed nothing worth
+    // protecting, and recovery must not be throttled by the fault it recovers
+    // from.
+
+    return parked ? why : CanModeStatus::NOK_CONFIG;
 }
 
 CanModeStatus canSetMode(CanMode mode, int csPin)
@@ -491,14 +624,6 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
  */
 static bool readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
 {
-    // RXBnCTRL first, because the READ RX BUFFER below clears RXnIF on its CS
-    // rising edge and we want the control byte that belongs to THIS frame.
-    // RXRTR (bit 3) is the only place a STANDARD remote frame is flagged: the
-    // RTR bit in RXBnDLC is defined for extended frames only, so the bytes the
-    // buffer read returns cannot answer the question on their own.
-    const uint8_t ctrl = rawRead((instr == INSTR_READ_RXB0) ? REG_RXB0CTRL
-                                                            : (uint8_t)(REG_RXB0CTRL + 0x10));
-
     uint8_t b[13];
     SPI.beginTransaction(kSniffSPI);
     digitalWrite(gCsPin, LOW);
@@ -517,7 +642,12 @@ static bool readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
     // merely wrong but plausible. An extended frame is rejected for the mirror
     // reason: only its low 11 bits are compared here, so a 29-bit ID could
     // masquerade as a mapped standard one.
-    if (ctrl & 0x08u) return false;             // RXRTR: remote request
+    // Both answers are already in the bytes just read, so this costs nothing.
+    // An earlier version read RXBnCTRL.RXRTR in a separate SPI transaction on
+    // the belief that a STANDARD remote frame was flagged nowhere else. It is:
+    // RXBnSIDL.SRR (bit 4) carries exactly that, and the extra register read was
+    // pure overhead on the hottest path in the firmware.
+    if (b[1] & 0x10u) return false;             // SRR: standard remote request
     if (b[1] & 0x08u) return false;             // IDE: extended identifier
 
     id  = (uint16_t)(((uint16_t)b[0] << 3) | (b[1] >> 5));
@@ -582,13 +712,20 @@ static void applyRow(VehicleSignals &v, const CanSignalMap &m,
     // taken on every frame either way, because the MESSAGE is what went stale.
     case CAN_SIG_TURN_LEFT:
         if (raw != 0u) gTurnLeftLitMs = now;
+        gFrameTurnL = (raw != 0u) ? 1 : 0;
         v.turnMs  = now;
         v.turnSrc = VehSource::CAN_SNIFF;
         break;
     case CAN_SIG_TURN_RIGHT:
         if (raw != 0u) gTurnRightLitMs = now;
+        gFrameTurnR = (raw != 0u) ? 1 : 0;
         v.turnMs  = now;
         v.turnSrc = VehSource::CAN_SNIFF;
+        break;
+    case CAN_SIG_HAZARD:
+        if (raw != 0u) gHazardLitMs = now;
+        v.hazardMs  = now;
+        v.hazardSrc = VehSource::CAN_SNIFF;
         break;
     case CAN_SIG_WHEEL_FL: case CAN_SIG_WHEEL_FR:
     case CAN_SIG_WHEEL_RL: case CAN_SIG_WHEEL_RR:
@@ -636,7 +773,7 @@ uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
         // software compare, so there is no second one to write.
         const CanIdEntry *e = nullptr;
         for (uint8_t i = 0; i < m.idCount; ++i) {
-            if (m.id[i].canId == id) { e = &m.id[i]; break; }
+            if (m.id[i].canId == id) { e = &m.id[i]; gIdsSeenMask |= (uint16_t)(1u << i); break; }
             if (m.id[i].canId >  id) break;
         }
         if (e == nullptr) continue;
@@ -659,6 +796,17 @@ uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
             // have silently counted every slot added after them as a wheel.
             if (r.slot >= CAN_SIG_WHEEL_FL && r.slot <= CAN_SIG_WHEEL_RR) sawWheel = true;
         }
+
+        // Indicator exclusivity, decided on this frame alone. Both lamps present
+        // and only one lit means the other is off NOW, whatever its hold says —
+        // so drop it, or a stalk moved from left to right reads as hazards for
+        // most of a second. Both lit leaves both holds standing.
+        if (gFrameTurnL >= 0 && gFrameTurnR >= 0) {
+            if (gFrameTurnL == 1 && gFrameTurnR == 0) gTurnRightLitMs = 0;
+            if (gFrameTurnR == 1 && gFrameTurnL == 0) gTurnLeftLitMs  = 0;
+        }
+        gFrameTurnL = -1;
+        gFrameTurnR = -1;
 
         // Yaw once per wheel frame, after every wheel row in it has landed.
         if (sawWheel && (m.statusFlags & CAN_MAP_F_YAW_OK)) {
@@ -688,6 +836,10 @@ uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
         const uint32_t t = millis();
         v.turnLeft  = (gTurnLeftLitMs  != 0u) && ((t - gTurnLeftLitMs)  <= CAN_TURN_HOLD_MS);
         v.turnRight = (gTurnRightLitMs != 0u) && ((t - gTurnRightLitMs) <= CAN_TURN_HOLD_MS);
+    }
+    if (v.hazardSrc == VehSource::CAN_SNIFF) {
+        const uint32_t t = millis();
+        v.hazard = (gHazardLitMs != 0u) && ((t - gHazardLitMs) <= CAN_TURN_HOLD_MS);
     }
 
     // Overruns are cleared but not reported here: this is the production path,

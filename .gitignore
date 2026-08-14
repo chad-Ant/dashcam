@@ -5,3 +5,4 @@ archive/*
 # mount), so keep stray recordings out of git.
 *.mkv
 models/*
+docs/*

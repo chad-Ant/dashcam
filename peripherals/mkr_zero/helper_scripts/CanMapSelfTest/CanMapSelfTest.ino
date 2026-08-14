@@ -180,6 +180,18 @@ static void testParser()
           ((t.row[t.slotRow[CAN_SIG_TURN_LEFT]].flags  & CAN_ROW_SINGLEBIT) &&
            (t.row[t.slotRow[CAN_SIG_TURN_RIGHT]].flags & CAN_ROW_SINGLEBIT)) ? 1 : 0, 1);
     check("turn minDlc", t.row[t.slotRow[CAN_SIG_TURN_LEFT]].minDlc, 1);
+    // Hazards are their OWN slot, not "both turn bits": measured on the vehicle,
+    // switching them on leaves both turn bits clear. The row must parse so the
+    // bit can be filled in on the card once found, with no reflash.
+    {
+        CanSignalMap h;
+        canMapInitDefaults(h);
+        (void)feed(h, "speed,0x158,7,16,u,0.01");
+        check("hazard row accepted", feed(h, "hazard,0x294,4,1,u,1") ? 1 : 0, 1);
+        check("finalise", (long)canMapFinalise(h), (long)CanMapStatus::OK);
+        check("hazard is single-bit",
+              (h.row[h.slotRow[CAN_SIG_HAZARD]].flags & CAN_ROW_SINGLEBIT) ? 1 : 0, 1);
+    }
     // The bit assignment itself: byte 0 of a frame with only bit 5 set must read
     // left-on/right-off, and vice versa. This is the census result (bit 5 = left,
     // from the rear-wheel yaw sign) pinned down so a future edit cannot swap it.

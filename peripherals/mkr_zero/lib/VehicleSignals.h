@@ -117,10 +117,9 @@ struct VehicleSignals {
      * Indicator ACTIVE, not indicator lamp lit.  See below - the difference is
      * the whole reason these are computed here.
      *
-     * Two independent bools rather than one three-state direction, because
-     * both set at once is hazard lights: a real, distinct state that a
-     * single-direction enum would have to drop or encode as a fourth value
-     * needing a special case at every consumer.
+     * Two independent bools rather than one three-state direction, so a vehicle
+     * that does drive both lamps from this message can say so. This one does
+     * NOT — see @c hazard, which had to become its own signal.
      *
      * These are what separate a deliberate lane change from a lane departure,
      * which is why lane keeping wants them.  Two honest limits on that: the
@@ -141,6 +140,22 @@ struct VehicleSignals {
     bool     turnLeft;
     bool     turnRight;
 
+    /**
+     * Hazard lights. A SEPARATE signal, not "turnLeft && turnRight".
+     *
+     * That derivation was assumed and the vehicle disproved it: with the hazards
+     * on, both turn bits of 0x294 stay clear. The indicator message reports the
+     * STALK, and the hazard switch bypasses the stalk, so the two are genuinely
+     * independent here. Deriving one from the other would publish hazards as
+     * "not indicating" — the most reassuring possible reading for a car stopped
+     * in a live lane, which is exactly when it must not be wrong.
+     *
+     * Its own timestamp because the map may put it on a different ID entirely;
+     * on this platform it has not been located yet. Held like the indicators,
+     * since it flashes on the same cadence.
+     */
+    bool     hazard;
+
     // ---- per-signal freshness (millis(), 0 = never) ----
     //
     // @c wheelMs and @c brakeMs exist because the couplings they replace stopped
@@ -159,6 +174,7 @@ struct VehicleSignals {
     uint32_t wheelMs;
     uint32_t brakeMs;
     uint32_t turnMs;
+    uint32_t hazardMs;
 
     // ---- per-signal provenance ----
     VehSource speedSrc;
@@ -170,6 +186,7 @@ struct VehicleSignals {
     VehSource wheelSrc;
     VehSource brakeSrc;
     VehSource turnSrc;
+    VehSource hazardSrc;
 };
 
 /** @brief Resets every field to its "unavailable" value. */
@@ -186,13 +203,14 @@ inline void initVehicleSignals(VehicleSignals &v)
     v.brakeSwitch      = false;
     v.turnLeft         = false;
     v.turnRight        = false;
+    v.hazard           = false;
 
     v.speedMs = v.rpmMs = v.gearMs = v.steerMs =
-    v.yawMs   = v.pedalMs = v.wheelMs = v.brakeMs = v.turnMs = 0;
+    v.yawMs   = v.pedalMs = v.wheelMs = v.brakeMs = v.turnMs = v.hazardMs = 0;
 
     v.speedSrc = v.rpmSrc = v.gearSrc = v.steerSrc =
     v.yawSrc   = v.pedalSrc = v.wheelSrc = v.brakeSrc =
-    v.turnSrc  = VehSource::NONE;
+    v.turnSrc  = v.hazardSrc = VehSource::NONE;
 }
 
 /**

@@ -73,6 +73,55 @@ void watchdogFeed(void);
 bool watchdogCausedReset(void);
 
 /**
+ * @brief Why the board last reset, as text. Never null.
+ *
+ * Printed at every boot, not only when it was the watchdog. Reporting only the
+ * watchdog case forces every OTHER cause to be read out of a MISSING line, and
+ * a rig that browns out on a vehicle supply then looks exactly like one that
+ * was cleanly power-cycled. Those need opposite investigations.
+ */
+const char *resetCauseName(void);
+
+/** @brief Raw PM->RCAUSE, for logging the bits when the name is not enough. */
+uint8_t resetCauseRaw(void);
+
+// ─── which line wedged the bus ────────────────────────────────────────────────
+//
+// @c I2CBusState::Stuck says only that recovery failed. These say WHERE, which
+// is the difference between "a slave is mid-byte" and "the pull-up is gone".
+#define I2C_STUCK_SDA_LOW      0x01u ///< SDA still low after nine clocks + STOP.
+#define I2C_STUCK_SCL_LOW      0x02u ///< SCL still low at the end.
+#define I2C_STUCK_SCL_NO_RISE  0x04u ///< SCL never rose, so no STOP was emitted.
+/**
+ * SDA was never once observed high while being clocked.
+ *
+ * The measurement that separates the last two candidates when supply has been
+ * verified at every module. A slave stuck mid-byte lets go as soon as it is
+ * clocked past the bit it was holding, so SDA MOVES even if it settles low
+ * again. A short to ground or a clamping damaged pad never moves at all. A
+ * pass/fail verdict cannot tell those apart, and they need different repairs.
+ */
+#define I2C_STUCK_SDA_NEVER_MOVED 0x08u
+
+/// Clocks issued to free a mid-byte slave. Nine covers a byte plus its ACK;
+/// eighteen also covers a slave with more than one byte queued, and costs
+/// 180 us on a bus that is broken anyway.
+#define I2C_RECOVER_CLOCKS     18u
+
+/** @brief Bitmask of @c I2C_STUCK_* from the last @c i2cBusRecover(). */
+uint8_t i2cStuckLines(void);
+
+/**
+ * @brief The same thing as text, naming the likely hardware fault.
+ *
+ * A retry loop that prints @c NOK_BUS_STUCK twenty times says nothing about
+ * where to put the probe. Both lines low is a supply collapse; SDA alone is a
+ * slave stuck mid-byte or running on parasitic current; SCL that will not rise
+ * is a dead pull-up or a slave stretching forever. Different investigations.
+ */
+const char *i2cStuckReason(void);
+
+/**
  * @brief True for the WHOLE of a boot that follows a watchdog reset.
  *
  * The watchdog turns a hang into a reboot, which is containment — but on its own

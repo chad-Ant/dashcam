@@ -136,6 +136,192 @@
 #define IMU_ACCEL_I2C_ADDRESS_ALT                    107U
 #define IMU_MAG_I2C_ADDRESS_ALT                      30U
 
+// ─── IMU: Bosch BNO055 9-DoF with on-chip fusion (I2C) ───────────────────────
+// Replaces the LSM6DSOX + LIS3MDL breakout above, which latched up after a run
+// of successful-but-corrupt readings.  The addresses above are still referenced
+// by the bus-conflict scan and are removed with the rest of that driver.
+
+/// BNO055 at 0x29, the DATASHEET DEFAULT (COM3 floating, as GY breakouts leave
+/// it).  0x28 is the alternative — and is what the Bosch driver hardcodes, so
+/// the two disagree and neither may be assumed.  Bring-up scans both by CHIP_ID.
+#define BNO055_I2C_ADDRESS_DEFAULT                   41U
+#define BNO055_I2C_ADDRESS_ALT                       40U
+
+/// Power-on to the part answering in CONFIG mode (ms).  Datasheet rev 1.4.
+#define BNO055_POR_TO_CONFIG_MS                      400UL
+
+/// Reset command to the part answering again (ms).  Longer than power-on, and
+/// the two are genuinely different numbers — using 400 here reads CHIP_ID into
+/// a device that is still rebooting and calls a healthy part missing.
+#define BNO055_RESET_TO_CONFIG_MS                    650UL
+
+/// Settling time allowed after ANY operating-mode write (ms).
+///
+/// The datasheet gives two: 7 ms CONFIG->operation and 19 ms operation->CONFIG.
+/// One constant covering the worse of the two removes the need for the caller to
+/// know which direction it is going, which is the kind of bookkeeping that gets
+/// it wrong once and then produces a mode change that silently did not happen.
+///
+/// 30 rather than 19, matching the drivers observed to work on this part. The
+/// extra 11 ms is spent once per bring-up and buys margin on a figure the
+/// datasheet gives as typical rather than maximum.
+///
+/// This wait is entirely the caller's job.  bno055_set_operation_mode() does NOT
+/// wait — the vendored driver never calls its own delay hook, not once — so from
+/// an operating mode it writes CONFIG and then immediately writes the target
+/// mode from inside the 19 ms window.  See vendor/BNO055/PATCHES.md.
+#define BNO055_MODE_SWITCH_MS                        30UL
+
+/// Settling time after selecting the clock source (ms).
+#define BNO055_CLOCK_SETTLE_MS                       20UL
+
+/// Prefer the external 32.768 kHz crystal over the internal oscillator.
+///
+/// Bosch recommends it for fusion, and the reference design fits one — but this
+/// is a generic GY breakout, and clones do omit it.  Selecting a crystal that is
+/// not there leaves the part unable to run, so bring-up does not simply trust
+/// this flag: it selects the crystal, then reads SYS_ERR, and falls back to the
+/// internal oscillator if the part complains.  @c BNO055InitState::clockFallback
+/// records which one is actually in use, because "configured" must not mean two
+/// different things depending on hardware nobody checked.
+///
+/// OFF at present, and that is a diagnostic decision rather than a conclusion.
+/// The base sequence does not yet configure this part at all, and selecting a
+/// clock source is an unproven improvement layered on an unproven foundation —
+/// it adds a variable to every failure while the failure is still being read.
+/// Bench evidence so far says the crystal is NOT implicated: an attempt on the
+/// internal oscillator failed identically. Turn this back on, and confirm the
+/// fallback path still works, once bring-up reaches Configured.
+#define BNO055_USE_EXTERNAL_CRYSTAL                  0
+
+/// Bring-up attempts at the fast rate before backing off to @c IMU_RETRY_MS.
+/// Fewer than the GNSS gets: that receiver is measurably flaky on first contact,
+/// whereas a BNO055 that does not answer twice in a row is usually not fitted.
+#define BNO055_INIT_FAST_RETRIES                     4U
+
+/// Delay between fast bring-up retries (ms).
+#define BNO055_INIT_FAST_RETRY_MS                    250UL
+
+/// Die-temperature band a reading must fall in to be believed (degC).
+///
+/// The part's own rated operating range, so anything outside cannot be a
+/// measurement whatever the vehicle is doing. Carried over from the LSM6DSOX
+/// driver, where on a captured failure it flagged 100 % of the corrupt bursts —
+/// 341 of 861 samples, all reporting 104 or 116 C on a 25 C bench — with zero
+/// false positives across 520 good ones. The burst is one transaction, so a bad
+/// temperature condemns the inertial bytes beside it.
+#define IMU_TEMP_MIN_VALID_C                         (-40.0f)
+#define IMU_TEMP_MAX_VALID_C                         (85.0f)
+
+/// Band the fused GRAVITY VECTOR's magnitude must fall in to be believed (m/s2).
+///
+/// A check the previous hardware could not offer, and a stronger one than
+/// temperature: the fusion algorithm constructs this vector, so its length is
+/// near-constant at 9.81 whatever the vehicle is doing — cornering, braking and
+/// potholes move its DIRECTION, not its size. A departure means the fusion
+/// output is not to be trusted, however healthy the transaction looked.
+///
+/// Wide enough not to fire while the algorithm is still converging after
+/// bring-up, which is a real state and not a fault.
+#define IMU_GRAVITY_MIN_VALID_MS2                    (7.0f)
+#define IMU_GRAVITY_MAX_VALID_MS2                    (12.0f)
+
+/// Acceleration at which the part is at its range limit (m/s2).
+///
+/// Fusion modes lock the accelerometer at +/-4 g = 39.24 m/s2 (datasheet 3.5),
+/// and this sits just under it. A peak at or above this is a FLOOR rather than
+/// a measurement: a genuine 20 g collision reads as 4 g, understating the impact
+/// fivefold, so @c IMUData::accelSaturated must accompany it.
+#define IMU_ACCEL_SATURATION_MS2                     (39.0f)
+
+// ─── High-G interrupt: the hardware impact backstop ──────────────────────────
+//
+// The reason this exists is that the BNO055 has no FIFO. The previous part
+// buffered 2.3 seconds of samples, so an impact survived a stalled loop for as
+// long as the FIFO was deep enough. Polling cannot do that: a poll that does not
+// happen is data that no longer exists.
+//
+// The High-G interrupt is strictly better than what it replaces. The part
+// latches a threshold crossing IN HARDWARE and holds it until it is explicitly
+// cleared, so an impact survives a stall of any length — not merely one shorter
+// than the buffer.
+
+/// GPIO the BNO055 INT pin is wired to.
+///
+/// D6, chosen because it is genuinely free: 3, 4, 7, 19 and 20 are allocated,
+/// 8/9/10 are SPI, 11/12 are the I2C this part sits on, and 13/14 are Serial1.
+///
+/// THE WIRE IS OPTIONAL, and the design deliberately keeps it so. The latch
+/// lives in the part's INT_STA register, which this driver reads over I2C in
+/// the same burst as everything else — so High-G works with no wire at all,
+/// just with poll latency instead of pin latency. The pin only makes the
+/// detection immediate. An unconnected input is pulled down and reads low
+/// forever, so an absent wire produces no false events.
+#define IMU_HIGHG_INT_PIN                            6U
+
+/// High-G threshold, as the register wants it.
+///
+/// At the ±4 g the fusion modes lock the accelerometer to, 1 LSB is 15.63 mg,
+/// so 128 is very close to 2.0 g.
+///
+/// 2 g rather than something smaller because GRAVITY COUNTS. The interrupt
+/// watches the raw accelerometer, in which the vertical axis reads a steady 1 g
+/// while the vehicle does nothing at all — and this project's standing rule is
+/// not to guess a mounting orientation, so the axis that carries gravity is
+/// unknown and none can be excluded. A threshold below 1 g would therefore fire
+/// continuously on a parked car. 2 g leaves a full 1 g of headroom above
+/// gravity, which ordinary driving does not reach: hard braking is around
+/// 0.8 g and a sharp pothole strike is well past 2 g.
+#define IMU_HIGHG_THRESHOLD_LSB                      128U
+
+/// High-G duration, as the register wants it: the event must persist for
+/// (value + 1) × 2 ms.
+///
+/// 1 gives 4 ms, long enough to reject a single noisy conversion and far shorter
+/// than the 10-50 ms a real impact pulse lasts.
+#define IMU_HIGHG_DURATION_LSB                       1U
+
+/// How long a latched High-G event is republished on the wire (ms).
+///
+/// The same reasoning as the data-gap flag: telemetry publishes at 10 Hz, so an
+/// event flag lasting a single 10 ms poll would be missed by nine frames out of
+/// ten — and the frames missing it are precisely the ones an incident detector
+/// most needs to see.
+#define IMU_HIGHG_HOLD_MS                            500UL
+
+/// Missing inertial time that makes a peak window untrustworthy (ms).
+///
+/// Was "twice the poll interval", which at the old 20 Hz poll meant 100 ms and
+/// was reasonable. At 100 Hz the same rule means 20 ms — and a single console
+/// status line at 115200 baud takes about 30 ms of blocking Serial writes, so
+/// the flag fired on every debug print. Caught on the bench: a poll counter
+/// advancing 196 times in two seconds instead of 200, alongside a status line
+/// with a character dropped out of the middle of it.
+///
+/// A flag that fires whenever the firmware talks about itself is worse than no
+/// flag: it trains a reader to ignore the one field that says a peak is not a
+/// peak over the window it claims.
+///
+/// 50 ms as an ABSOLUTE, not a multiple of the poll rate, so changing the poll
+/// no longer silently changes what counts as a hole. Below this the hardware
+/// High-G latch covers an impact that lands in the gap — which is exactly why
+/// that interrupt exists — and above it the window genuinely under-reports.
+#define IMU_GAP_MIN_MS                               50UL
+
+/// Shortest interval between calibration saves to the card (ms).
+///
+/// Ten minutes. The save is cheap in bytes but not free in time — capturing the
+/// offsets means dropping the sensor to CONFIG and back, roughly 60 ms with no
+/// samples produced — and the card is flash with a finite erase budget. A
+/// calibration that has genuinely improved is still there ten minutes later;
+/// one that is oscillating between two states is not worth recording twice.
+#define IMU_CALIB_SAVE_INTERVAL_MS                   600000UL
+
+/// @c SYS_STATUS values this project acts on.  Datasheet section 4.3.58.
+#define BNO055_SYS_STATUS_ERROR                      1U   ///< System error; read SYS_ERR.
+#define BNO055_SYS_STATUS_FUSION_RUNNING             5U   ///< Fusion mode, running.
+#define BNO055_SYS_STATUS_NO_FUSION_RUNNING          6U   ///< Non-fusion mode (AMG), running.
+
 /// Watchdog period (ms), rounded up to the next supported WDT period.
 ///
 /// Generous on purpose. It exists to end a hang inside the SAMD core's unbounded
@@ -190,17 +376,36 @@
 /// back to 100000UL — nothing else needs to change.
 #define IMU_I2C_CLOCK_HZ                             400000UL
 
-/// IMU FIFO drain cadence (50 ms = 20 Hz).
+/// IMU poll cadence (10 ms = 100 Hz).
 ///
-/// This is the rate the HOST empties the LSM6DSOX FIFO, not the rate the sensor
-/// samples at.  Those were the same thing before the FIFO existed, and that was
-/// the defect: reading the output registers at 20 Hz against a 104 Hz ODR threw
-/// away four samples in five, so a pothole or kerb strike — a 10-50 ms impulse,
-/// the exact event the +/-8 g range was chosen to capture — was usually gone
-/// before the next poll looked.  Now every converted sample is buffered in the
-/// part and collected here, and the peak across the whole window survives even
-/// though telemetry still publishes at 10 Hz.
-#define IMU_POLL_MS                                  50UL
+/// With the BNO055 the poll rate IS the sample rate. The LSM6DSOX this replaced
+/// batched 220 samples/s into a 512-word FIFO for a 20 Hz drain to collect in
+/// full, so every sample reached the peak ring however slowly the host polled.
+/// The BNO055 has no FIFO at all, so a 20 Hz poll simply discards four of every
+/// five samples the part produced — and the discarded ones are exactly where a
+/// pothole or kerb strike lives, since those are 10-50 ms impulses.
+///
+/// 100 Hz matches the part's fusion output rate, so nothing is thrown away.
+///
+/// THE BUS COST WAS THE OPEN QUESTION, and it is answered rather than assumed.
+/// One poll is a single 48-byte burst; at IMU_I2C_CLOCK_HZ that is about 1.2 ms
+/// including addressing, so 100 Hz occupies roughly 12 % of the bus. The GNSS,
+/// measured at the same clock, needs about 6.2 ms four times a second — another
+/// 2.5 %. At the 100 kHz this driver was believed to be using, the same burst
+/// would have taken 4.5 ms and 100 Hz would have wanted 45 % of a shared bus,
+/// which is why the figure was worth checking before changing this constant.
+#define IMU_POLL_MS                                  10UL
+
+// The superseded 50 ms FIFO drain cadence stood here. It is DELETED rather than
+// left as history, because a second #define of IMU_POLL_MS below the new one is
+// not a comment — the last definition wins, so the 100 Hz poll above would have
+// silently reverted to 20 Hz while every comment claimed otherwise. GCC said so
+// ("IMU_POLL_MS redefined") and a cached build had been swallowing it.
+//
+// The reasoning it carried is preserved above, where it still applies: polling
+// slower than the sensor samples throws away the 10-50 ms impulses that a
+// pothole or kerb strike consists of. The LSM6DSOX solved that with a FIFO; the
+// BNO055 has none, so the poll rate has to solve it directly.
 
 /// Largest number of FIFO words read in one poll.
 ///
@@ -268,6 +473,39 @@
 /// poll, so a single drain lands in one or two buckets and expiry granularity is
 /// well below the window it is protecting.  The cost is 6 floats per channel.
 #define IMU_PEAK_BUCKETS                             6U
+
+/// Span of one peak bucket (ms).  Derived, never set independently — the two
+/// constants above are the ones with reasons behind them.
+#define IMU_PEAK_BUCKET_MS                           (IMU_PEAK_WINDOW_MS / IMU_PEAK_BUCKETS)
+
+/// Gyroscope calibration (0-3) required before the FUSED output is reported as
+/// trustworthy rather than @c PARTIAL.
+///
+/// Cheap and load-bearing: it arrives within seconds of the vehicle standing
+/// still, and relative yaw is worthless without it.
+///
+/// THE ACCELEROMETER FIGURE IS DELIBERATELY NOT A CRITERION, and that is a
+/// correction made on measurement. It was one, set at 1 on the argument that a
+/// board bolted into a bracket might never exceed that. The argument was right
+/// about the ceiling and wrong about the floor: on the bench the figure fell to
+/// 0 after 1400 polls and stayed there for 9000 more, so the IMU reported
+/// PARTIAL continuously — a quality flag that never clears tells a consumer
+/// exactly as little as one that is never set.
+///
+/// What settled it is that the gravity magnitude held 9.79-9.81 across every one
+/// of those 9000 polls. That is a DIRECT physical test of whether the fusion
+/// output is sane, it already gates every sample in getIMUData(), and it passed
+/// while the calibration bits said not to trust anything. Bosch's figures are
+/// the part's self-assessment; the gravity gate is a measurement.
+///
+/// All four figures still go to the consumer, so anything downstream that wants
+/// to be stricter can be. And Phase 6's calibration persistence is the real fix
+/// for an accelerometer figure sitting at 0 — restoring the stored offsets at
+/// key-on is precisely what the datasheet says it is for.
+///
+/// System calibration is not a criterion either: it cannot rise above 0 without
+/// the magnetometer, which fusion mode switches off on purpose.
+#define IMU_CALIB_MIN_GYRO                           3U
 
 /// FIFO fill above which the OLDEST buffered words are older than the freshness
 /// contract, so draining them would publish stale samples stamped as current.

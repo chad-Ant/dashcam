@@ -35,7 +35,7 @@
  *
  * ── Frame layout ─────────────────────────────────────────────────────────────
  *   SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
- *   VER is hostproto::VERSION, currently 0x05; Telemetry is 148 bytes.
+ *   VER is hostproto::VERSION, currently 0x06; Telemetry is 160 bytes.
  *
  * CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over VER..last payload byte,
  * transmitted low byte first.  Both ends are little-endian IEEE-754, so a
@@ -69,8 +69,29 @@ constexpr uint8_t  SOF            = 0x7E; ///< Start-of-frame delimiter.
  * 0x04 added the windowed inertial peaks (123 -> 131 bytes) once the LSM6DSOX
  * FIFO started being drained in full, together with the IMU_DATA_GAP and
  * IMU_LOWPOWER flags that say when a peak may not be trusted.
+ *
+ * 0x05 added the vehicle-bus block decoded from CAN sniffing (131 -> 148 bytes):
+ * gear, brake and turn bits, pedal, EPS torque, yaw rate and per-wheel speeds.
+ *
+ * 0x06 (148 -> 160 bytes) is the largest single change since the IMU block, and
+ * it is two changes that had to travel together because either alone would have
+ * cost a version bump of its own:
+ *
+ *   - THE INERTIAL SENSOR CHANGED. The LSM6DSOX + LIS3MDL breakout was retired
+ *     after it spent 40 % of its samples returning corrupt-but-plausible values
+ *     through transactions that all succeeded, then latched up. Its replacement,
+ *     a BNO055, fuses on-chip — so @c imuLinAccelPeak (gravity already removed),
+ *     @c imuYawRelDeg and @c imuCalib exist for the first time, the magnetometer
+ *     fields are NAN by design, and IMU_HIGH_G and IMU_SATURATED say things the
+ *     previous part could not.
+ *   - THE CAN DECODE TABLE BECAME IDENTIFIABLE. @c canMapChecksum and
+ *     @c canMapFlags name the map that produced the vehicle fields, which a
+ *     recording needs in order to be re-interpretable later.
+ *
+ * @c flags widened from uint8 to uint16 to carry the three new bits, and
+ * IMU_DEGRADED changed meaning — read it against VERSION, not on its own.
  */
-constexpr uint8_t  VERSION        = 0x05;
+constexpr uint8_t  VERSION        = 0x06;
 constexpr uint16_t MAX_PAYLOAD    = 255;  ///< Largest payload (LEN is one byte).
 constexpr uint16_t FRAME_OVERHEAD = 6;    ///< SOF+VER+TYPE+LEN + CRC16(2).
 constexpr uint16_t MAX_FRAME      = FRAME_OVERHEAD + MAX_PAYLOAD;
@@ -128,6 +149,23 @@ enum MsgType : uint8_t {
      * outranks the boot decision and skips the probe entirely.
      */
     CMD_SET_CAN_MODE = 0x13,
+    /**
+     * Replace the master's hardware receive filters. 13-byte payload, relayed.
+     *
+     * Layout: uint8 count, then 6 x uint16 little-endian CAN IDs; entries past
+     * @c count are ignored but must still be transmitted, so the expected length
+     * stays a pure function of TYPE.
+     *
+     * A count of 0 clears every filter, which on the master's MCP2515 means
+     * ACCEPT ALL rather than accept none — the opposite of what "no filters"
+     * sounds like, and the correct behaviour for discovery. The map's filter set
+     * is an optimisation for a known vehicle, not a security boundary.
+     *
+     * Exists so a host can widen the capture without editing the SD card and
+     * rebooting the vehicle: @c canMapFlags tells it what is currently being
+     * excluded, and this changes it.
+     */
+    CMD_SET_CAN_FILTER = 0x14,
     CMD_PING         = 0x20, ///< Link check.
 
     // ── C3 -> Jetson ──
@@ -190,15 +228,18 @@ constexpr uint8_t VEH_FLAG_BRAKE_SWITCH  = 0x02;
 constexpr uint8_t VEH_FLAG_TURN_LEFT     = 0x04;
 constexpr uint8_t VEH_FLAG_TURN_RIGHT    = 0x08;
 /**
- * Both indicator bits. NOT a "hazards" predicate.
+ * Both indicator bits. NOT a hazards predicate — see VEH_FLAG_HAZARD.
  *
- * Named for what it is because the obvious use of a constant called HAZARDS is
- * `flags & VEH_FLAG_HAZARDS`, and that is true for a single indicator too - a
- * left turn would read as hazard lights. Hazards are the EQUALITY case:
- *
- *     const bool hazards = (t.vehFlags & VEH_FLAG_TURN_MASK) == VEH_FLAG_TURN_MASK;
+ * Do not test hazards as `flags & TURN_MASK`: that is true for a single
+ * indicator too. And do not test them as `== TURN_MASK` either, which is what
+ * this comment used to recommend. Measured on the vehicle: switching the hazards
+ * on leaves BOTH turn bits clear, because the indicator message reports the
+ * stalk and the hazard switch bypasses it. Hazards have their own bit.
  */
 constexpr uint8_t VEH_FLAG_TURN_MASK     = VEH_FLAG_TURN_LEFT | VEH_FLAG_TURN_RIGHT;
+
+/// Hazard lights, an independent signal — NOT both indicators at once.
+constexpr uint8_t VEH_FLAG_HAZARD        = 0x80;
 
 /**
  * Validity bits. Zero means "no data", NOT "released / not indicating".
@@ -235,16 +276,21 @@ constexpr uint8_t TLM_FLAG_IMU_PRESENT = 0x08;
  */
 constexpr uint8_t TLM_FLAG_GPS_PRESENT = 0x10;
 /**
- * The IMU is answering on only ONE of its two devices — suspected power/wiring
- * fault for the whole module.
+ * The IMU is running, but NOT in the configuration that was asked for.
  *
- * Both parts share one PCB, one VIN and one ground, so exactly one responding
- * has no benign cause. An unpowered I2C slave keeps acknowledging via parasitic
- * power through the bus pull-ups, which is why the module can look present while
- * actually being unpowered. Readings still arriving in this state come from a
- * parasitically powered part and should not be trusted.
+ * v0x06 REDEFINED THIS FLAG. Through v0x05 the master carried a two-chip
+ * breakout and this meant "only one of the two devices is answering" — a power
+ * fault, since an unpowered I2C slave keeps acknowledging on parasitic current
+ * through the bus pull-ups while its neighbour dies.
+ *
+ * The single-chip BNO055 that replaced it cannot produce that state. The flag
+ * now means the sensor came up on a fallback — the internal oscillator after the
+ * external crystal was refused, or a mode other than the one requested. The data
+ * is good; it is not the data that was configured.
+ *
+ * Interpret against @c VERSION, not on its own.
  */
-constexpr uint8_t TLM_FLAG_IMU_DEGRADED = 0x20;
+constexpr uint16_t TLM_FLAG_IMU_DEGRADED = 0x20;
 /**
  * There is a HOLE in the inertial record for this window.
  *
@@ -256,20 +302,50 @@ constexpr uint8_t TLM_FLAG_IMU_DEGRADED = 0x20;
  */
 constexpr uint8_t TLM_FLAG_IMU_DATA_GAP = 0x40;
 /**
- * The IMU is in low-power sampling because the vehicle is powered off.
+ * The IMU is in a coarser sampling regime than normal.
  *
- * Driven by IGNITION state — sustained OBD-II silence after the link has been up
- * — not by apparent stillness, so a vehicle waiting at a light stays in full
- * capture.  Readings are honest but coarse: reduced output rate, FIFO bypassed,
- * so @c imuAccelPeak is a peak over sampled points rather than over every sample.
- * Enough to show the vehicle is still, not enough to characterise an impact on a
- * parked car.
+ * RESERVED AND ALWAYS CLEAR as of v0x06. It described the previous sensor's
+ * low-power mode, selected from ignition state. The BNO055 has an equivalent and
+ * it is not enabled: the datasheet withdraws the High-G interrupt in low power,
+ * which would remove the hardware impact backstop exactly when a car-park bump is
+ * what is being watched for. The bit is kept so nothing below it shifts.
  */
-constexpr uint8_t TLM_FLAG_IMU_LOWPOWER = 0x80;
+constexpr uint16_t TLM_FLAG_IMU_LOWPOWER = 0x80;
 /**
- * NOTE: @c Telemetry::flags is one byte and 0x80 is its last bit.  A further
- * flag requires widening the field, which changes the payload size and so
- * requires a VERSION bump on both hops.
+ * The IMU latched a High-G threshold crossing during this window.
+ *
+ * THE ONLY FIELD HERE THAT SURVIVES A STALLED MASTER. Every other inertial value
+ * is the product of a poll, and the sensor has no FIFO — so a poll the master
+ * fails to make is data that no longer exists. This is latched in the sensor's
+ * own hardware and held until read, so an impact during a stalled loop is still
+ * reported afterwards, where the peak that would have described it is gone.
+ *
+ * For incident detection this is a STRONGER trigger than @c imuAccelPeak, not a
+ * weaker one: the peak is only ever as good as the polls behind it.
+ */
+constexpr uint16_t TLM_FLAG_IMU_HIGH_G = 0x0100;
+/**
+ * The accelerometer hit its range limit, so the peaks are FLOORS.
+ *
+ * The sensor locks the accelerometer at ±4 g in fusion mode, so anything past
+ * 39.2 m/s² is clipped and a genuine 20 g collision reads as 4 g. Both
+ * @c imuAccelPeak and @c imuLinAccelPeak are affected — linear acceleration is
+ * derived from the same clipped measurement. Grading severity from a saturated
+ * peak understates an impact several-fold.
+ */
+constexpr uint16_t TLM_FLAG_IMU_SATURATED = 0x0200;
+/**
+ * A CAN signal map is loaded and in use; @c canMapChecksum identifies which.
+ *
+ * Without this a consumer cannot tell a vehicle whose map decoded nothing from
+ * one running with no map at all — both publish the same sentinels.
+ */
+constexpr uint16_t TLM_FLAG_CANMAP_LOADED = 0x0400;
+/**
+ * NOTE: @c Telemetry::flags became @c uint16_t in v0x06 and 0x0400 is in use.
+ * Nine bits remain. A further widening is another payload size change and so
+ * another VERSION bump on both hops — the v0x05 note said exactly this about the
+ * change that has just happened.
  */
 
 /** @c LogHeader::level values (mirrors dashcam::log::LogLevel). */
@@ -346,29 +422,120 @@ struct __attribute__((packed)) Telemetry {
     float imuGyroX;        ///< Angular rate about sensor X (deg/s).
     float imuGyroY;        ///< Angular rate about sensor Y (deg/s).
     float imuGyroZ;        ///< Angular rate about sensor Z (deg/s).
-    float imuMagX;         ///< Magnetic flux density along sensor X (µT), uncalibrated.
-    float imuMagY;         ///< Magnetic flux density along sensor Y (µT), uncalibrated.
-    float imuMagZ;         ///< Magnetic flux density along sensor Z (µT), uncalibrated.
-    float imuTempC;        ///< LSM6DSOX die temperature (°C) — board, not cabin.
+    /**
+     * Magnetic flux density per sensor axis (µT), uncalibrated.
+     *
+     * NAN IN NORMAL OPERATION as of v0x06, deliberately rather than for want of
+     * a sensor. The master runs the BNO055 in its magnetometer-free fusion mode
+     * on purpose: the magnetometer feeds the orientation quaternion that linear
+     * acceleration is derived from, so magnetic disturbance would contaminate
+     * the one channel incident detection depends on — and a car, with its steel
+     * shell and load-dependent currents, is close to a worst case. Populated
+     * only in the raw (AMG) mode.
+     */
+    float imuMagX;
+    float imuMagY;
+    float imuMagZ;
+    float imuTempC;        ///< Sensor die temperature (°C) — board, not cabin.
     /**
      * Peak |a| and |ω| over the master's trailing window, not at this instant.
      *
      * The axes above are one sample; at 10 Hz that is one of roughly ten the
      * sensor produced since the last frame, so the sample that caught a 10-50 ms
      * impact is usually not the one transmitted.  These are folded on the master
-     * from every sample the sensor converted.
+     * from every sample it polled.
+     *
+     * WHAT BACKS THEM CHANGED IN v0x06. Through v0x05 the sensor batched into a
+     * 512-word FIFO that the master drained in full, so every converted sample
+     * reached the peak however slowly the host polled. The BNO055 has no FIFO,
+     * so the master polls at the sensor's own 100 Hz output rate — which catches
+     * the same impulses, but means a poll the master fails to make is data that
+     * no longer exists anywhere. @c TLM_FLAG_IMU_DATA_GAP therefore carries more
+     * weight than it did, and @c TLM_FLAG_IMU_HIGH_G is the hardware backstop
+     * for exactly that case.
      *
      * Magnitudes, so mounting orientation does not matter.  Gravity is included
      * in @c imuAccelPeak — a stationary vehicle reads about 9.81.
      *
      * NAN when the channel is stale or absent.  Check
      * @c TLM_FLAG_IMU_DATA_GAP before trusting a window, and
-     * @c TLM_FLAG_IMU_LOWPOWER before trusting its resolution.
+     * @c TLM_FLAG_IMU_SATURATED before grading severity from one.
      */
     float imuAccelPeak;    ///< Peak |a| over the window (m/s², gravity included).
     float imuGyroPeak;     ///< Peak |ω| over the window (deg/s).
+    /**
+     * ---- IMU fusion (v0x06) ----
+     *
+     * Computed by the sensor, not derived here. They did not exist before v0x06
+     * because the previous part could not produce them at all.
+     */
+    /**
+     * Peak |linear a| over the window (m/s²), GRAVITY REMOVED.
+     *
+     * The field incident detection actually wants. @c imuAccelPeak includes
+     * gravity, so a stationary vehicle reads 9.81 and every threshold has to
+     * carry that offset; this reads ~0 at rest, so 1 g here means the vehicle
+     * accelerated at 1 g. NAN in the raw (AMG) mode, which produces no fusion.
+     */
+    float imuLinAccelPeak;
+    /**
+     * Rotation about the vertical (deg), RELATIVE AND DRIFTING.
+     *
+     * NOT a heading, and named so it cannot be mistaken for one — the sensor
+     * runs with its magnetometer off, so this has no north reference. What it is
+     * good for is short-window rotation at 100 Hz: how far the vehicle turned
+     * during a two-second event, where drift is negligible and neither the 1 Hz
+     * GNSS course nor the wheel-speed pair (dead below ~3 km/h) can answer. For
+     * an absolute bearing use @c heading.
+     */
+    float imuYawRelDeg;
+    /**
+     * Sensor self-assessed calibration, 2 bits each:
+     * bits 1:0 mag, 3:2 accel, 5:4 gyro, 7:6 system. 0 = uncalibrated, 3 = full.
+     *
+     * MAG AND SYSTEM ARE PERMANENTLY 0 in fusion mode and that is correct — the
+     * magnetometer is off and the system figure cannot rise without it. Judge
+     * readiness on the gyroscope field.
+     *
+     * The ACCELEROMETER field is reported but is a poor quality gate: on the
+     * bench it fell to 0 and stayed there for 9000 polls while the sensor's own
+     * gravity vector held 9.79-9.81 m/s². The master gates on that gravity
+     * magnitude instead — a direct physical test rather than the part's opinion
+     * of itself.
+     */
+    uint8_t imuCalib;
+    /**
+     * ---- CAN signal map identity (v0x06) ----
+     *
+     * Which decode table produced the vehicle fields below.
+     *
+     * The master loads a per-vehicle map from SD, so the MEANING of @c gearPos,
+     * @c vehFlags and the rest depends on a file editable between drives without
+     * a firmware flash. A recording that does not say which map decoded it
+     * cannot be re-interpreted later — and a wrong map does not fail loudly, it
+     * produces plausible values from the wrong bytes.
+     *
+     * Zero when no map is loaded; check @c TLM_FLAG_CANMAP_LOADED, since zero is
+     * also a legitimate checksum.
+     */
+    uint8_t canMapChecksum;
+    /**
+     * bit 0 hardware filters active, bit 1 filter set came from the map,
+     * bits 2-7 reserved and zero.
+     *
+     * Filters decide what CANNOT appear: an ID absent from a filtered capture
+     * may be absent from the bus or merely excluded by the controller, and only
+     * this says which.
+     */
+    uint8_t canMapFlags;
     // ---- status ----
-    uint8_t flags;         ///< TLM_FLAG_* bitfield.
+    /**
+     * TLM_FLAG_* bitfield.
+     *
+     * WIDENED FROM uint8 IN v0x06. The v0x05 header noted 0x80 was the last bit
+     * and that the next flag would force this; three arrived at once.
+     */
+    uint16_t flags;
     /**
      * ---- vehicle bus (v0x05) ----
      *
@@ -389,7 +556,7 @@ struct __attribute__((packed)) Telemetry {
     /**
      * bit 0 brakePressed, bit 1 brakeSwitch,
      * bit 2 turnLeft, bit 3 turnRight,
-     * bit 4 brakeValid, bit 5 turnValid, bit 6 pedalValid, bit 7 reserved.
+     * bit 4 brakeValid, bit 5 turnValid, bit 6 pedalValid, bit 7 hazard.
      *
      * The turn bits are indicator ACTIVE, not indicator lamp lit: the lamp
      * blinks at ~1.5 Hz and telemetry arrives at ~4 Hz, so the sender holds
@@ -498,7 +665,7 @@ constexpr size_t MAX_LOG_TEXT = MAX_PAYLOAD - sizeof(LogHeader);
 // The wire contract depends on these exact sizes on both ends.  Telemetry must
 // also equal sizeof(TelemetryPayload) in CommProtocol.h — the bridge asserts
 // that separately, where both headers are visible.
-static_assert(sizeof(Telemetry)    == 148, "hostproto::Telemetry must be tightly packed to 148 bytes");
+static_assert(sizeof(Telemetry)    == 160, "hostproto::Telemetry must be tightly packed to 160 bytes");
 /**
  * Must fit the frame's one-byte LEN field and @c Hello::telemetryBytes, which is
  * also one byte.  Stated explicitly now the struct has grown 79 -> 83 -> 123 -> 131:
@@ -710,6 +877,7 @@ inline const char *typeName(uint8_t type)
     case CMD_STOP_STREAM:  return "CMD_STOP_STREAM";
     case CMD_SET_DECIM:    return "CMD_SET_DECIM";
     case CMD_SET_CAN_MODE: return "CMD_SET_CAN_MODE";
+    case CMD_SET_CAN_FILTER: return "CMD_SET_CAN_FILTER";
     case CMD_PING:         return "CMD_PING";
     case MSG_TELEMETRY:    return "MSG_TELEMETRY";
     case MSG_STATUS:       return "MSG_STATUS";
@@ -739,6 +907,7 @@ inline bool isCommand(uint8_t type)
     case CMD_STOP_STREAM:
     case CMD_SET_DECIM:
     case CMD_SET_CAN_MODE:
+    case CMD_SET_CAN_FILTER:
     case CMD_PING:
         return true;
     default:
@@ -746,10 +915,20 @@ inline bool isCommand(uint8_t type)
     }
 }
 
+/// Filter slots @c CMD_SET_CAN_FILTER carries. Matches the master's MCP2515.
+constexpr uint8_t CAN_FILTER_SLOTS   = 6;
+/// uint8 count + 6 x uint16.
+constexpr uint8_t SET_CAN_FILTER_LEN = 13;
+
 /** @brief Expected payload length for a command TYPE; 0 for the zero-payload commands. */
 inline uint8_t commandPayloadLen(uint8_t type)
 {
-    return (type == CMD_SET_DECIM || type == CMD_SET_CAN_MODE) ? 1 : 0;
+    switch (type) {
+    case CMD_SET_DECIM:
+    case CMD_SET_CAN_MODE:   return 1;
+    case CMD_SET_CAN_FILTER: return SET_CAN_FILTER_LEN;
+    default:                 return 0;
+    }
 }
 
 } // namespace hostproto

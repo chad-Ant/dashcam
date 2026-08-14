@@ -9,7 +9,7 @@
 static const char *const kSlotNames[CAN_SIG_COUNT] = {
     "speed", "rpm", "gear", "pedal",
     "brake_pressed", "brake_switch", "steer_torque",
-    "turn_left", "turn_right",
+    "turn_left", "turn_right", "hazard",
     "wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"
 };
 
@@ -23,6 +23,7 @@ static const CanSlotKind kSlotKinds[CAN_SIG_COUNT] = {
     CanSlotKind::RAW16,  // steer_torque
     CanSlotKind::BIT,    // turn_left
     CanSlotKind::BIT,    // turn_right
+    CanSlotKind::BIT,    // hazard
     CanSlotKind::RAW16,  // wheel_fl
     CanSlotKind::RAW16,  // wheel_fr
     CanSlotKind::RAW16,  // wheel_rl
@@ -51,6 +52,7 @@ static const uint8_t kSlotFilterPriority[CAN_SIG_COUNT] = {
     1,  // steer_torque
     4,  // turn_left
     4,  // turn_right
+    3,  // hazard
     4, 4, 4, 4  // wheel_fl, _fr, _rl, _rr
 };
 
@@ -398,6 +400,16 @@ CanMapStatus canMapFinalise(CanSignalMap &m)
         const uint32_t q = (uint32_t)(r.scale * 1000000.0f + 0.5f);
         sum = (uint8_t)(sum + (uint8_t)q + (uint8_t)(q >> 8) +
                         (uint8_t)(q >> 16) + (uint8_t)(q >> 24));
+    }
+    // gearmap and yawscale too. Both change what the SAME bits are published as
+    // — a gearmap swap relabels every selector position, and yawscale is a
+    // straight multiplier on the yaw rate — so a checksum blind to them would
+    // give two maps that disagree about the vehicle one identity on the wire.
+    for (uint8_t g = 0; g < 7u; ++g) sum = (uint8_t)(sum + m.gearRaw[g]);
+    {
+        const uint32_t y = (uint32_t)(m.yawCdpsPerCount * 1000.0f + 0.5f);
+        sum = (uint8_t)(sum + (uint8_t)y + (uint8_t)(y >> 8) +
+                        (uint8_t)(y >> 16) + (uint8_t)(y >> 24));
     }
     m.checksum = (sum == 0u) ? 1u : sum;   // 0 is reserved for "no map"
 

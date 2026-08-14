@@ -230,6 +230,27 @@ CANReturnStatus receiveS1Command(OBD2Config &config, uint8_t *outputBuffer, byte
 #define OBD2_NO_REPLY_MS        8000UL
 
 /**
+ * Consecutive sessions that never got a single reply before OBD-II is given up
+ * on entirely and the controller is taken OFF the bus.
+ *
+ * Without a bound the fallback is not a fallback, it is a permanent loop: on a
+ * vehicle whose ECUs do not answer Mode 01 at this tap, the node re-initialises,
+ * goes bus-active, transmits 0x7DF into silence for OBD2_NO_REPLY_MS, declares
+ * the link lost, waits OBD2_RETRY_MS and does it again - forever, unattended,
+ * producing nothing. Measured on this vehicle: 17 such sessions in one 4-minute
+ * drive.
+ *
+ * Three, not one: an ECU can legitimately be slow to wake right after ignition,
+ * and giving up on the first miss would break a link that was about to work.
+ * Three failures spanning ~40 s is no longer a slow start.
+ *
+ * Retries resume the moment any reply is decoded, and a host CMD_SET_CAN_MODE
+ * always overrides - this bounds an autonomous behaviour, it does not veto a
+ * human one.
+ */
+#define OBD2_DEAD_SESSIONS      3u
+
+/**
  * Floor on the gap between consecutive requests.
  *
  * Previously the next request went out the instant a reply was decoded, which

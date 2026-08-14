@@ -20,6 +20,13 @@ if errorlevel 1 (
 for %%I in ("%~dp0.") do set "SKETCH_DIR=%%~fI"
 for %%I in ("%~dp0..\..\lib") do set "LIB_DIR=%%~fI"
 for %%I in ("%~dp0..\..\vendor\Wire") do set "WIRE_DIR=%%~fI"
+rem Pinned Bosch BNO055 driver - see ..\..\vendor\BNO055\PATCHES.md.
+for %%I in ("%~dp0..\..\vendor\BNO055") do set "BNO_DIR=%%~fI"
+rem Not used by this sketch. Needed because --library lib\ compiles EVERY source
+rem in lib\, including SDFunctions.cpp and the CAN files, and each fails its own
+rem vendoring marker without these.
+for %%I in ("%~dp0..\..\vendor\CANBus") do set "CAN_DIR=%%~fI"
+for %%I in ("%~dp0..\..\vendor\SdFat") do set "SDFAT_DIR=%%~fI"
 
 set "FQBN=arduino:samd:mkrzero"
 set "CORE_REQUIRED=1.8.14"
@@ -33,9 +40,9 @@ if not "%CORE_FOUND%"=="%CORE_REQUIRED%" (
 )
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

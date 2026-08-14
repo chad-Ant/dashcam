@@ -85,6 +85,19 @@ static_assert(offsetof(TelemetryPayload, imuTempC) == offsetof(hostproto::Teleme
               "TelemetryPayload/hostproto::Telemetry field order diverged (imuTempC)");
 static_assert(offsetof(TelemetryPayload, imuAccelPeak) == offsetof(hostproto::Telemetry, imuAccelPeak),
               "TelemetryPayload/hostproto::Telemetry field order diverged (imuAccelPeak)");
+// The v0x06 fusion and CAN-map block, anchored at both ends on the same
+// principle as the blocks around it. Without these, twelve bytes could be
+// inserted in a different ORDER in the two headers and every assertion here
+// would still pass — the sizes would match, and flags below would land at the
+// same offset, while imuYawRelDeg and canMapChecksum quietly swapped places.
+static_assert(offsetof(TelemetryPayload, imuLinAccelPeak) == offsetof(hostproto::Telemetry, imuLinAccelPeak),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuLinAccelPeak)");
+static_assert(offsetof(TelemetryPayload, imuCalib) == offsetof(hostproto::Telemetry, imuCalib),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuCalib)");
+static_assert(offsetof(TelemetryPayload, canMapChecksum) == offsetof(hostproto::Telemetry, canMapChecksum),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (canMapChecksum)");
+static_assert(offsetof(TelemetryPayload, canMapFlags) == offsetof(hostproto::Telemetry, canMapFlags),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (canMapFlags)");
 // The vehicle-bus tail. Checked at BOTH ends of the block, not just the start:
 // the fields between are mixed 1/2-byte and the array is last, so a single
 // anchor would pass while an interior field had drifted.
@@ -360,6 +373,20 @@ void loop()
     if (const uint8_t m = gHost.takeCanModeRequest()) {
         if (!gLink.setCanMode(m)) {
             bridgeLog(hostproto::LOG_WARN, "CMD_SET_CAN_MODE dropped: master TX busy");
+        }
+    }
+
+    // 2c) CAN filter set, relayed on the same terms as the mode above: not
+    //     latched, not retried. There is no reply to strand a host on, and a
+    //     stale filter change applied seconds later would narrow a capture the
+    //     host has long since moved past.
+    {
+        uint16_t ids[hostproto::CAN_FILTER_SLOTS];
+        uint8_t  count = 0;
+        if (gHost.takeCanFilterRequest(ids, count)) {
+            if (!gLink.setCanFilter(ids, count)) {
+                bridgeLog(hostproto::LOG_WARN, "CMD_SET_CAN_FILTER dropped: master TX busy");
+            }
         }
     }
 

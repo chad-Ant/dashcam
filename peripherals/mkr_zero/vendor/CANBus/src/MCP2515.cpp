@@ -263,6 +263,7 @@ int MCP2515Class::endPacket()
   // failure, which the caller can act on; a hang is not.
   bool aborted = false;
   bool timedOut = true;
+  bool txreqCleared = false;   // DASHCAM PATCH: gates the ABAT release below.
   for (uint16_t tries = 0; tries < DASHCAM_WAIT_TRIES; tries++) {
     if (!(readRegister(REG_TXBnCTRL(n)) & 0x08)) {
       timedOut = false;
@@ -289,6 +290,7 @@ int MCP2515Class::endPacket()
     aborted = true;
     for (uint16_t tries = 0; tries < DASHCAM_WAIT_TRIES; tries++) {
       if (!(readRegister(REG_TXBnCTRL(n)) & 0x08)) {
+        txreqCleared = true;
         break;
       }
       delayMicroseconds(DASHCAM_WAIT_STEP_US);
@@ -296,7 +298,18 @@ int MCP2515Class::endPacket()
     }
   }
 
-  if (aborted) {
+  // DASHCAM PATCH: ABAT is released only once TXREQ is CONFIRMED clear.
+  //
+  // It used to be cleared unconditionally after the wait loop above, with the
+  // loop's result discarded. If TXREQ had not dropped - the case the abort
+  // exists for - releasing ABAT re-arms the buffer, and a stale request fires
+  // the instant the bus recovers: a diagnostic frame the caller was already
+  // told had failed, transmitted seconds later, unattended, on a live vehicle.
+  //
+  // Leaving ABAT asserted is the safe direction. It blocks further transmission
+  // rather than permitting an unintended one, and the next initializeOBD2()
+  // resets the controller, which clears it.
+  if (aborted && txreqCleared) {
     // Reset the ABAT bit.
     modifyRegister(REG_CANCTRL, 0x10, 0x00);
   }

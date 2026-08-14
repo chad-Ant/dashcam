@@ -40,9 +40,12 @@ SFE_UBLOX_GNSS myGNSS;
 
 static constexpr unsigned long SERIAL_READY_TIMEOUT_MS = 2000;
 
-static constexpr uint8_t SOX_ADDR   = IMU_ACCEL_I2C_ADDRESS;
-static constexpr uint8_t SOX_WHOAMI = 0x0Fu;
-static constexpr uint8_t SOX_ID     = 0x6Cu;   ///< 0b01101100 — bit 7 is 0.
+/// The IMU, used here only as something to hold the bus down with.
+/// Names kept from the LSM6DSOX this replaced so the bit-banged wedge below
+/// reads unchanged; only the part behind them is different.
+static constexpr uint8_t SOX_ADDR   = BNO055_I2C_ADDRESS_DEFAULT;  ///< 0x29.
+static constexpr uint8_t SOX_WHOAMI = 0x00u;                       ///< CHIP_ID.
+static constexpr uint8_t SOX_ID     = 0xA0u;
 
 /// Half-bit period for the bit-banged transaction (~100 kHz).
 static constexpr uint32_t HALF_BIT_US = 5u;
@@ -177,18 +180,16 @@ static void runFullTest(void)
         Serial.println("FATAL: bus not Ready before the test even starts");
         return;
     }
-    const bool baselineAccel = i2cProbeAddress(IMU_ACCEL_I2C_ADDRESS);
-    const bool baselineMag   = i2cProbeAddress(IMU_MAG_I2C_ADDRESS);
-    const bool baselineGps   = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
+    const bool baselineImu = i2cProbeAddress(SOX_ADDR);
+    const bool baselineGps = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
     {
         char detail[64];
-        snprintf(detail, sizeof(detail), "accel=%d mag=%d gnss=%d",
-                 (int)baselineAccel, (int)baselineMag, (int)baselineGps);
-        report("T0 baseline: all three devices ACK",
-               baselineAccel && baselineMag && baselineGps, detail);
+        snprintf(detail, sizeof(detail), "imu=%d gnss=%d",
+                 (int)baselineImu, (int)baselineGps);
+        report("T0 baseline: both devices ACK", baselineImu && baselineGps, detail);
     }
-    if (!baselineAccel) {
-        Serial.println("ABORT: no LSM6DSOX, nothing to wedge the bus with");
+    if (!baselineImu) {
+        Serial.println("ABORT: no BNO055, nothing to wedge the bus with");
         return;
     }
 
@@ -228,15 +229,13 @@ static void runFullTest(void)
     Wire.begin();
     Wire.setClock(IMU_I2C_CLOCK_HZ);
 
-    const bool afterAccel = i2cProbeAddress(IMU_ACCEL_I2C_ADDRESS);
-    const bool afterMag   = i2cProbeAddress(IMU_MAG_I2C_ADDRESS);
-    const bool afterGps   = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
+    const bool afterImu = i2cProbeAddress(SOX_ADDR);
+    const bool afterGps = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
     {
         char detail[64];
-        snprintf(detail, sizeof(detail), "accel=%d mag=%d gnss=%d",
-                 (int)afterAccel, (int)afterMag, (int)afterGps);
-        report("T3 all three devices ACK after recovery",
-               afterAccel && afterMag && afterGps, detail);
+        snprintf(detail, sizeof(detail), "imu=%d gnss=%d",
+                 (int)afterImu, (int)afterGps);
+        report("T3 both devices ACK after recovery", afterImu && afterGps, detail);
     }
 
     // ---- 4: a real sensor still reads correctly -----------------------------
@@ -249,14 +248,26 @@ static void runFullTest(void)
     float mag = NAN;
     uint16_t samples = 0;
     if (ist == IMUReturnStatus::OK) {
-        // Keep sampling for a fixed window and judge the LAST reading, not the
-        // first. configureAccel() software-resets the part, and the first
-        // conversions out of a reset come from a digital filter that has not
-        // settled yet — grabbing sample number one and calling it the answer
-        // measures the settling transient, not the sensor.
+        // initializeIMU() no longer configures the part — it ARMS a staged
+        // bring-up that takes about 700 ms of wall clock, most of it the
+        // BNO055's own reset delay. So this window has to drive imuInitTick()
+        // and be long enough to contain that, where the previous part was
+        // configured by the time the call returned.
+        //
+        // Judge the LAST reading, not the first: the fusion algorithm needs a
+        // moment after a reset, and grabbing sample number one measures the
+        // settling transient rather than the sensor.
         const unsigned long start = millis();
-        while (!isTimeout(400UL, start)) {
-            if (getIMUData(dev, data) == IMUReturnStatus::OK && data.accelValid) samples++;
+        while (!isTimeout(2000UL, start)) {
+            watchdogFeed();
+            (void)imuInitTick(dev);
+            if (!imuIsReady(dev)) continue;
+            const IMUReturnStatus rst = getIMUData(dev, data);
+            // PARTIAL counts here. It means the fused output has not earned
+            // belief yet — calibration takes longer than this window — and the
+            // raw accelerometer this test judges is unaffected by that.
+            if ((rst == IMUReturnStatus::OK || rst == IMUReturnStatus::PARTIAL) &&
+                data.accelValid) samples++;
         }
         if (data.accelValid) {
             mag = sqrtf(data.accelX * data.accelX +
@@ -377,14 +388,23 @@ static void testStuckPhase1(void)
 
     IMUDevice dev{};   // value-initialised: initializeIMU() reads dev.lifecycle
     const uint32_t t1 = micros();
-    const IMUReturnStatus ist = initializeIMU(dev);
+    // The bus check moved. initializeIMU() no longer transacts at all — it arms
+    // the staged bring-up — so asking IT for NOK_BUS_STUCK now tests nothing.
+    // imuInitTick() is what touches the bus, and it checks per STEP rather than
+    // once, which is the stronger property: a slave can wedge the lines between
+    // two steps as easily as before the first one.
+    //
+    // Three ticks because the first only arms the machine and the second is the
+    // power-on hold; the third is the first that would transact.
+    (void)initializeIMU(dev);
+    for (uint8_t i = 0u; i < 3u; i++) (void)imuInitTick(dev);
     const uint32_t imuUs = micros() - t1;
     {
-        char detail[64];
-        snprintf(detail, sizeof(detail), "status=%d (want -5) in %lu us",
-                 (int)ist, (unsigned long)imuUs);
-        report("S3 initializeIMU returns NOK_BUS_STUCK",
-               ist == IMUReturnStatus::NOK_BUS_STUCK, detail);
+        char detail[80];
+        snprintf(detail, sizeof(detail), "why=%s (want bus-stuck) in %lu us",
+                 bno055InitStatusName(dev.init.lastStatus), (unsigned long)imuUs);
+        report("S3 IMU bring-up refuses on a stuck bus",
+               dev.init.lastStatus == BNO055InitStatus::NOK_BUS_STUCK, detail);
     }
 
     const uint32_t t2 = micros();

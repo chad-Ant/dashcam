@@ -323,6 +323,7 @@ void resetOBD2Poll()
     lastTxAttempt = 0;
     lastReplyMs   = 0;
     silenceArmed  = false;
+    firstTxMs     = 0;
 }
 
 bool obd2EverReplied()
@@ -369,8 +370,16 @@ static CANReturnStatus fireRequest(OBD2Config &config, uint8_t idx)
     // bus proves only that the bus is alive - not that the ECU we addressed is.
     // That is why clearing txFailures is no longer sufficient evidence of a
     // healthy link; see isOBD2LinkLost().
-    if (st == CANReturnStatus::OK) txFailures = 0;
-    else if (txFailures < 0xFFFFu) ++txFailures;
+    if (st == CANReturnStatus::OK) {
+        txFailures = 0;
+        // Starts the no-reply deadline in isOBD2LinkLost(). Stamped on the first
+        // request that actually reached the wire, not on init: a request that
+        // failed to transmit is already covered by txFailures, and starting the
+        // clock on it would blame the ECU for a fault below it.
+        if (firstTxMs == 0u) firstTxMs = lastTxAttempt;
+    } else if (txFailures < 0xFFFFu) {
+        ++txFailures;
+    }
     return st;
 }
 

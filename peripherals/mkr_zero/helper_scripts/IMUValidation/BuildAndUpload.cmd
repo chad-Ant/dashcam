@@ -28,6 +28,16 @@ if errorlevel 1 (
 for %%I in ("%~dp0.") do set "SKETCH_DIR=%%~fI"
 for %%I in ("%~dp0..\..\lib") do set "LIB_DIR=%%~fI"
 for %%I in ("%~dp0..\..\vendor\Wire") do set "WIRE_DIR=%%~fI"
+rem Pinned Bosch BNO055 driver. Without it arduino-cli resolves <BNO055.h> from
+rem the global Arduino libraries folder, whose bno055_init() overwrites the
+rem device address with 0x28 - the ALTERNATIVE address, not the default - so on a
+rem GY breakout every read goes nowhere. See ..\..\vendor\BNO055\PATCHES.md.
+for %%I in ("%~dp0..\..\vendor\BNO055") do set "BNO_DIR=%%~fI"
+rem Not used by this sketch. Needed because --library lib\ compiles EVERY source
+rem in lib\, including SDFunctions.cpp and the CAN files, and each fails its own
+rem vendoring marker without these.
+for %%I in ("%~dp0..\..\vendor\CANBus") do set "CAN_DIR=%%~fI"
+for %%I in ("%~dp0..\..\vendor\SdFat") do set "SDFAT_DIR=%%~fI"
 
 set "FQBN=arduino:samd:mkrzero"
 set "CORE_REQUIRED=1.8.14"
@@ -46,7 +56,7 @@ rem build MUST fail on the missing DASHCAM_SAMD_WIRE_REQUESTFROM1_FIX marker. A
 rem guard nobody has watched fail is a guard nobody knows works.
 if /i "%~1"=="/nowire" (
     echo Negative test: building WITHOUT vendor\Wire, expecting the marker guard to fail...
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%LIB_DIR%" "%SKETCH_DIR%" >nul 2>&1
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%" >nul 2>&1
     if errorlevel 1 (
         echo PASS - build correctly refused without the patched Wire.
         exit /b 0
@@ -57,9 +67,9 @@ if /i "%~1"=="/nowire" (
 )
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

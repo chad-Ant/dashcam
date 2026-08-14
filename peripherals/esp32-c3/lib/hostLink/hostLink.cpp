@@ -40,6 +40,10 @@ void HostLink::resetSessionState()
     // this node transmits on a live vehicle bus. That is not a decision any
     // client should inherit from its predecessor.
     canModeReq_ = 0;
+    // And the pending filter set, for the same reason: it decides what a capture
+    // can contain, and inheriting one from a process that has gone away would
+    // silently narrow the next session's data.
+    canFilterPending_ = false;
 }
 
 bool HostLink::sendFrame(uint8_t type, const uint8_t *payload, uint8_t len)
@@ -166,6 +170,41 @@ void HostLink::handleCommand(uint8_t type, const uint8_t *payload, uint8_t len)
         }
         canModeReq_ = payload[0];
         break;
+
+    case hostproto::CMD_SET_CAN_FILTER: {
+        // Validated at this hop as well as at the MKR, for the same reason as
+        // the mode above: a bad argument should die where the host can still be
+        // told which argument it was.
+        //
+        // A count of 0 is VALID and means accept-all, so it is not rejected the
+        // way CMD_SET_DECIM rejects 0. That asymmetry is deliberate — there,
+        // zero would mean "forward nothing", which another command already says;
+        // here it is the only way to clear the filters.
+        const uint8_t count = payload[0];
+        if (count > hostproto::CAN_FILTER_SLOTS) {
+            (void)sendNack(type, hostproto::NACK_BAD_VALUE);
+            break;
+        }
+        bool ok = true;
+        for (uint8_t i = 0; i < count; ++i) {
+            const uint16_t id = (uint16_t)(payload[1 + i * 2] |
+                                           ((uint16_t)payload[2 + i * 2] << 8));
+            // Standard 11-bit only. An extended ID would be truncated into the
+            // filter register and silently exclude traffic the host asked for.
+            if (id > 0x7FF) { ok = false; break; }
+        }
+        if (!ok) {
+            (void)sendNack(type, hostproto::NACK_BAD_VALUE);
+            break;
+        }
+        for (uint8_t i = 0; i < hostproto::CAN_FILTER_SLOTS; ++i) {
+            canFilterIds_[i] = (uint16_t)(payload[1 + i * 2] |
+                                          ((uint16_t)payload[2 + i * 2] << 8));
+        }
+        canFilterCount_   = count;
+        canFilterPending_ = true;
+        break;
+    }
 
     default:
         break; // unreachable: isCommand() already filtered unknown types

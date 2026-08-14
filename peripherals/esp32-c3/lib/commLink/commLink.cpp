@@ -43,6 +43,27 @@ bool CommLink::setCanMode(uint8_t mode)
     return sendCmd(CMD_SET_CAN_MODE, &mode, 1);
 }
 
+bool CommLink::setCanFilter(const uint16_t *ids, uint8_t count)
+{
+    if (count > COMM_CAN_FILTER_SLOTS) return false;
+    if (ids == nullptr && count != 0u)  return false;
+
+    // Fixed length regardless of count: unused slots are transmitted as zeros so
+    // the receiver can check the frame size before trusting any of its contents.
+    // A variable-length command would have to be parsed to know how long it
+    // should have been.
+    uint8_t p[COMM_SET_CAN_FILTER_LEN] = { 0 };
+    p[0] = count;
+    for (uint8_t i = 0; i < count; ++i) {
+        // Little-endian on the wire, matching every other multi-byte field on
+        // this link — both ends are little-endian, but writing it out by hand
+        // keeps the framing independent of that happening to be true.
+        p[1 + i * 2] = (uint8_t)(ids[i] & 0xFFu);
+        p[2 + i * 2] = (uint8_t)(ids[i] >> 8);
+    }
+    return sendCmd(CMD_SET_CAN_FILTER, p, sizeof(p));
+}
+
 bool CommLink::poll()
 {
     if (!uart_) return false;

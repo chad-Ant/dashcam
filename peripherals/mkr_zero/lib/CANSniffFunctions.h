@@ -172,6 +172,45 @@ void canSniffSetMap(const CanSignalMap *m);
 /** @brief The map currently installed. Never nullptr after canSniffSetMap(). */
 const CanSignalMap *canSniffGetMap();
 
+/**
+ * @brief Reprograms the hardware receive filters at runtime.
+ *
+ * For @c CMD_SET_CAN_FILTER, so a host can widen or narrow a capture without
+ * editing the SD card and rebooting the vehicle.
+ *
+ * @p count of 0 means ACCEPT ALL, not accept none — an MCP2515 with a zero mask
+ * compares no bits. That is the correct reading of "clear the filters" and the
+ * opposite of how it sounds, so it is worth knowing before sending it on a busy
+ * bus: the drain has roughly 267 frames/s of capacity against ~1100 arriving,
+ * and an unfiltered capture will lose frames at random rather than by priority.
+ *
+ * COSTS A RECEIVE GAP. The controller must re-enter Configuration mode to have
+ * its filter registers written, so frames in flight are lost. Only valid in
+ * sniff mode; OBD2 mode programs these registers for the 0x7E8 response and
+ * refuses to have them overwritten.
+ *
+ * @param ids    Up to @c CAN_MAP_FILTER_SLOTS standard 11-bit IDs. Fewer than
+ *               the hardware's six repeats the last, because a slot left at 0
+ *               would accept ID 0 — a real and very high priority identifier.
+ * @param count  How many of @p ids are meaningful. Surplus entries are dropped.
+ * @return false when not sniffing, or when the controller refused.
+ */
+bool canSniffSetFilters(const uint16_t *ids, uint8_t count);
+
+/** @brief Filter IDs currently programmed; 0 means accept-all. */
+uint8_t canSniffFilterCount();
+
+/**
+ * @brief True when the live filters came from the loaded map.
+ *
+ * Distinct from "filters are active", and the difference belongs on the wire: a
+ * capture filtered by the map excludes what the map's author chose to exclude,
+ * while one filtered by a host command excludes whatever that host asked for —
+ * and a consumer reading a recording months later can tell them apart only if
+ * this was recorded at the time.
+ */
+bool canSniffFiltersFromMap();
+
 // ─── boot-time source decision ────────────────────────────────────────────────
 
 /// Matching frames that end the probe EARLY. A live 50-100 Hz signal reaches
@@ -228,6 +267,19 @@ CanProbeStage canProbeTick(CanProbeState &p, uint32_t nowMs);
 uint32_t canSniffFrameCount();
 /** @brief Of those, the ones whose ID was in the map. */
 uint32_t canSniffMatchCount();
+
+/**
+ * @brief How many DISTINCT map IDs have been seen since the counters were reset.
+ *
+ * The probe's second condition. A match count alone can be satisfied entirely by
+ * one popular identifier — a map for a different model of the same make would
+ * clear twenty matches on a shared 100 Hz message while every other row it
+ * defines never appeared once.
+ */
+uint8_t canSniffIdsSeen();
+
+/** @brief Distinct IDs the probe requires before it will lock in: a majority. */
+uint8_t canProbeIdsNeeded();
 /** @brief Restarts both counters. */
 void canSniffResetCounters();
 

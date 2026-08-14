@@ -8,6 +8,9 @@
 // public header above stays decoupled via forward declarations.
 #include "OBD2Functions.h"
 #include "GPSFunctions.h"
+// The map's identity and the controller's live filter state both go on the wire
+// as of v0x06, so the builder needs the sniffer's accessors.
+#include "CANSniffFunctions.h"
 
 bool splitByte(const char* input, char* outputBuffer, const size_t outputBufferLength, size_t byteLength, size_t byteOffset){
     if (!input || !outputBuffer){
@@ -105,7 +108,30 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     out.imuAccelPeak = imu.accelPeakMs2;
     out.imuGyroPeak  = imu.gyroPeakDps;
 
-    uint8_t flags = 0;
+    // Fusion output (v0x06). The sensor computes these; nothing is derived here.
+    out.imuLinAccelPeak = imu.linAccelPeakMs2;
+    out.imuYawRelDeg    = imu.yawRelDeg;
+    // Packed in the sensor's own CALIB_STAT order — mag, accel, gyro, system —
+    // so a consumer holding the datasheet reads it without a translation table.
+    out.imuCalib = (uint8_t)(( imu.calibMag         & 0x03u)        |
+                             ((imu.calibAccel & 0x03u) << 2) |
+                             ((imu.calibGyro  & 0x03u) << 4) |
+                             ((imu.calibSys   & 0x03u) << 6));
+
+    // ---- CAN map identity (v0x06) ----
+    // Taken from the sniffer rather than passed in: it already owns the pointer,
+    // and threading a seventh parameter through four call sites to reach a value
+    // one module already holds is how signatures rot.
+    const CanSignalMap *map = canSniffGetMap();
+    out.canMapChecksum = (map != nullptr && map->loaded) ? map->checksum : 0u;
+    out.canMapFlags    = 0u;
+    // Read from the CONTROLLER's live state, not from the map's intentions. The
+    // two diverge the moment a host sends CMD_SET_CAN_FILTER, and the field
+    // exists to describe what a capture actually excluded.
+    if (canSniffFilterCount() > 0u)  out.canMapFlags |= 0x01u;
+    if (canSniffFiltersFromMap())    out.canMapFlags |= 0x02u;
+
+    uint16_t flags = 0;
     // OBD2 is "live" only if tickOBD2() stored a reading within the freshness window,
     // so the flag clears within OBD2_FRESH_WINDOW_MS of the ECU going quiet.
     if (obd.lastUpdateMs != 0 && (millis() - obd.lastUpdateMs) < OBD2_FRESH_WINDOW_MS) flags |= COMM_FLAG_OBD2_VALID;
@@ -129,6 +155,13 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     // and a consumer weighing an incident needs to know which it is holding.
     if (imu.dataGap) flags |= COMM_FLAG_IMU_DATA_GAP;
     if (imu.lowPower) flags |= COMM_FLAG_IMU_LOWPOWER;
+    // The hardware latch, and the only inertial evidence that survives a stalled
+    // master — so it is raised independently of whether the peaks look eventful.
+    if (imu.highGEvent) flags |= COMM_FLAG_IMU_HIGH_G;
+    // Qualifies BOTH peaks: linear acceleration is derived from the same clipped
+    // accelerometer, so a rail the raw channel hit propagates straight into it.
+    if (imu.accelSaturated) flags |= COMM_FLAG_IMU_SATURATED;
+    if (map != nullptr && map->loaded) flags |= COMM_FLAG_CANMAP_LOADED;
     out.flags = flags;
 
     // ---- vehicle bus ----
@@ -157,7 +190,8 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
                                      (veh.turnRight    ? COMM_VEH_FLAG_TURN_RIGHT    : 0x00u) |
                                      (veh.brakeSrc != VehSource::NONE ? COMM_VEH_FLAG_BRAKE_VALID : 0x00u) |
                                      (veh.turnSrc  != VehSource::NONE ? COMM_VEH_FLAG_TURN_VALID  : 0x00u) |
-                                     (veh.pedalSrc != VehSource::NONE ? COMM_VEH_FLAG_PEDAL_VALID : 0x00u));
+                                     (veh.pedalSrc != VehSource::NONE ? COMM_VEH_FLAG_PEDAL_VALID : 0x00u) |
+                                     (veh.hazard       ? COMM_VEH_FLAG_HAZARD      : 0x00u));
     out.pedalGas         = veh.pedalGas;
     out.steerMotorTorque = veh.steerMotorTorque;
     out.yawRateCdps      = veh.yawRateCdps;
@@ -190,9 +224,14 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
         if (veh.rpmSrc == VehSource::NONE && !isnan(obd.rpm)) {
             out.sigSource = (uint8_t)((out.sigSource & ~0x0Cu) | ((uint8_t)VehSource::OBD2 << 2));
         }
-        if (veh.gearSrc == VehSource::NONE && !isnan(obd.gear)) {
-            out.sigSource = (uint8_t)((out.sigSource & ~0x30u) | ((uint8_t)VehSource::OBD2 << 4));
-        }
+        // Gear provenance is deliberately NOT stamped for OBD-II.
+        //
+        // sigSource's gear field qualifies `gearPos`, the VehGear SELECTOR
+        // position, which only sniffing fills. OBD-II's PID 0xA4 gives a numeric
+        // ratio-derived gear that lives in the separate `gear` float — a
+        // different quantity in a different field. Marking the source OBD2 here
+        // certified a gearPos of "unknown" as an OBD-II reading, which is worse
+        // than leaving it NONE: NONE is true.
     }
 }
 
@@ -273,6 +312,37 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
                     sendFrame(MSG_NACK, nullptr, 0);
                 }
                 break;
+            case CMD_SET_CAN_FILTER: {
+                // Latched, not applied — see CommMaster::canFilterPending.
+                //
+                // Validated at the wire boundary: a count past the hardware's
+                // six slots, or an ID outside the 11-bit standard range, is
+                // rejected here rather than reaching the CAN driver. This
+                // vehicle uses standard IDs throughout, and an extended ID
+                // silently truncated into a filter register would produce a
+                // capture that quietly excludes traffic the host asked for.
+                const uint8_t count = payload[0];
+                bool ok = (count <= COMM_CAN_FILTER_SLOTS);
+                for (uint8_t i = 0; ok && i < COMM_CAN_FILTER_SLOTS; ++i){
+                    const uint16_t id = (uint16_t)(payload[1 + i * 2] |
+                                                   ((uint16_t)payload[2 + i * 2] << 8));
+                    // Entries past count are ignored but must still decode: the
+                    // payload is fixed-length so the receiver can check its size
+                    // before trusting any of it.
+                    if (i < count && id > 0x7FFu) ok = false;
+                }
+                if (!ok){
+                    sendFrame(MSG_NACK, nullptr, 0);
+                    break;
+                }
+                for (uint8_t i = 0; i < COMM_CAN_FILTER_SLOTS; ++i){
+                    m.canFilterIds[i] = (uint16_t)(payload[1 + i * 2] |
+                                                   ((uint16_t)payload[2 + i * 2] << 8));
+                }
+                m.canFilterCount   = count;
+                m.canFilterPending = true;
+                break;
+            }
             case CMD_PING:
                 sendFrame(MSG_PONG, nullptr, 0);
                 break;

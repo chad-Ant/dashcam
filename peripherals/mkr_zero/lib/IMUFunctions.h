@@ -3,142 +3,146 @@
 
 #include <Arduino.h>
 
+#include "BNO055Init.h"
 #include "I2CBus.h"
 
 /**
  * @file IMUFunctions.h
- * @brief Adafruit LSM6DSOX + LIS3MDL 9-DoF breakout (PID 4517) on the MKR Zero.
+ * @brief Bosch BNO055 9-DoF with on-chip sensor fusion, on the MKR Zero.
  *
- * The breakout carries two independent I2C devices on ONE bus segment:
- *   - LSM6DSOX  @c 0x6A  accelerometer + gyroscope + die temperature
- *   - LIS3MDL   @c 0x1C  three-axis magnetometer
+ * ONE device at @c 0x29 (or @c 0x28), sharing @c Wire (D11/SDA, D12/SCL) with
+ * the u-blox GNSS receiver at @c 0x42 and, when fitted, the segment LED at
+ * @c 0x70.
  *
- * Both share @c Wire (D11/SDA, D12/SCL) with the u-blox GNSS receiver at
- * @c 0x42 and, when fitted, the segment LED at @c 0x70.  No address collides —
- * see @c checkI2CBusConflict(), which verifies that at RUN time rather than
- * trusting the datasheet defaults.
+ * WHAT REPLACED WHAT, AND WHY
+ * ---------------------------
+ * This replaces a register-level driver for an Adafruit LSM6DSOX + LIS3MDL
+ * breakout.  That part was retired after it spent a recorded 40 % of its samples
+ * returning corrupt-but-plausible data — a fixed 27.8 m/s2 and 104 C on a 25 C
+ * bench — from I2C transactions that SUCCEEDED, and then latched up with SDA
+ * clamped at 0.6 V on a good rail.  For a dashcam whose acceleration peak
+ * triggers incident capture, a steady fabricated 2.85 g is worse than a dead
+ * sensor, and that shaped most of what follows.
  *
- * WHY THIS IS A REGISTER-LEVEL DRIVER AND NOT A WRAPPER
- * ----------------------------------------------------
- * The obvious implementation delegates to Adafruit_LSM6DSOX / Adafruit_LIS3MDL.
- * Three properties this project needs rule that out:
+ * THREE THINGS ARE ARCHITECTURALLY DIFFERENT, not just renamed:
  *
- *   1. HONEST FAILURE.  @c Adafruit_LSM6DS::getEvent() always returns @c true,
- *      and the @c _read() behind it ignores the return of its 14-byte I2C burst
- *      into an UNINITIALISED stack buffer.  A sensor that has lost power does
- *      not report an error — it publishes accelerations decoded from stack
- *      garbage, which silently poisons incident detection.
- *   2. NO ALLOCATION AFTER INIT.  @c begin_I2C() runs @c delete / @c new, and so
- *      does the @c _init() behind it (three unified-sensor helpers).  A retry
- *      path that re-runs those churns a 32 KB heap from @c loop().
- *   3. BOUNDED WAITS.  @c Adafruit_LSM6DS::reset() spins on
- *      @c while (sw_reset.read()) with no timeout, so a sensor that fails
- *      mid-reset hangs the node forever.
+ *   1. THERE IS NO FIFO.  Zero occurrences of the word in the datasheet, and
+ *      zero in the Bosch driver.  The old peak capture leaned on a 512-word FIFO
+ *      that batched 220 samples/s for a 20 Hz drain to collect in full, so every
+ *      sample reached the peak ring.  Here the poll rate IS the sample rate: a
+ *      20 Hz poll sees 20 of the 100 samples the part produced.  Phase 4 raises
+ *      the poll to 100 Hz and adds the High-G interrupt, which latches an impact
+ *      in hardware and so survives a loop stall the FIFO could only have covered
+ *      for as long as its depth allowed.
  *
- * This library therefore talks to both parts over @c Wire directly: every
- * transaction's return is checked, nothing is allocated at any point, and every
- * wait has a deadline.  An absent sensor yields @c NAN and a cleared valid flag.
+ *   2. THERE ARE NO PER-CHANNEL DATA-READY BITS.  The LSM6DSOX published one per
+ *      channel, and this driver's predecessor validated each channel from its
+ *      own bit — so a gyro that stopped converting could be caught while the
+ *      accelerometer beside it kept working.  The BNO055 offers nothing
+ *      equivalent, so @c fresh here means "a plausible burst was read", not "the
+ *      part produced a new sample".  What replaces the stall check is
+ *      @c IMUDevice::lastChangeMs: real inertial data is never bit-identical
+ *      twice in a row, because gyro noise alone guarantees the low bits move.
+ *      Frozen bytes are therefore a positive signal, and one that would have
+ *      caught the previous sensor's failure directly.
  *
- * AXES
- * ----
- * Readings are in the SENSOR frame as silkscreened on the breakout.  Mapping
- * to the vehicle frame (which depends on how the board is bolted in) is left
- * to the caller — this library does not guess a mounting orientation.
+ *   3. FUSION IS ON-CHIP.  @c linAccelX/Y/Z is gravity-compensated acceleration
+ *      computed by the part, which is the signal incident detection actually
+ *      wants; @c gravityX/Y/Z is its estimate of the gravity vector, and its
+ *      MAGNITUDE is a free, physics-backed integrity check — it must be about
+ *      9.81 whatever the vehicle is doing, so a departure means the output is
+ *      not to be trusted.  Nothing the old part offered could do that.
  *
- * HARDWARE
- * --------
- * Power the breakout from the MKR Zero's @b VCC (3.3 V) pin, never 5 V.  The
- * STEMMA QT level shifters reference the board's input rail, so a 5 V supply
- * puts 5 V on SDA/SCL — and no MKR Zero I/O pin is 5 V tolerant.
+ * BUS OWNERSHIP is unchanged: this library never opens or recovers the bus
+ * itself.  That belongs to @c I2CBus.h, which every client enters through so the
+ * first to arrive is the one that unwedges it.
  *
- * BUS OWNERSHIP
- * -------------
- * This library does not open, configure or recover the I2C bus itself — that
- * belongs to @c I2CBus.h, which every client on the bus enters through so the
- * first one to arrive is the one that unwedges it.  See that header for why a
- * shared "already initialised" boolean cannot express that ordering.
- *
- * KNOWN PLATFORM HAZARD
- * ---------------------
- * The Arduino SAMD core's I2C driver waits on its bus flags in UNBOUNDED loops
- * (@c SERCOM::startTransmissionWIRE, @c SERCOM::readDataWIRE).  Nothing in
- * userland can bound them — the vendored Wire patch fixes the one-byte
- * @c requestFrom() defect only.  @c i2cBusBegin() clears the common power-on
- * case, but a wedge that happens mid-drive still needs a watchdog to turn a
- * hang into a reboot.
+ * AXES are in the SENSOR frame as silkscreened.  Mapping to the vehicle frame
+ * depends on how the board is bolted in, and this library does not guess a
+ * mounting orientation — the same rule the previous driver followed.
  */
 
 /**
- * How the LSM6DSOX is sampled.  Selected at runtime, per driving state.
+ * What the part is configured to produce.  Chosen per session, NOT per event.
  *
- * The two modes exist because the right answer genuinely changes with the
- * vehicle.  Moving, the sensor must not miss a 10-50 ms impulse, which costs
- * 104 Hz batching and roughly 21% of the shared 100 kHz bus.  Parked, that same
- * configuration burns bus time and sensor current to record a stationary car —
- * and this system is designed to stay powered while the vehicle is off.
+ * Switching costs a full re-configuration — the datasheet's 19 ms out of an
+ * operating mode plus 7 ms back in, and in practice a reset — so it cannot be
+ * done on a trigger: a crash pulse is over in 10-50 ms.  It is also not a
+ * volume knob. The two modes produce DIFFERENT MEASUREMENTS, and the difference
+ * is recorded on every sample rather than left for a consumer to infer.
  */
 enum class IMUSampleMode : uint8_t{
     /**
-     * 104 Hz into the FIFO, drained in full every poll.
+     * IMUPLUS: accelerometer + gyroscope fused on-chip, magnetometer OFF.
      *
-     * Every converted sample is examined, so @c IMUData::accelPeakMs2 is a true
-     * peak over the window.  Use whenever the vehicle may be moving.
+     * The primary mode.  Yields linear acceleration, gravity and relative yaw,
+     * none of which the raw mode can produce.
+     *
+     * The accelerometer is LOCKED AT +/-4 g in every fusion mode (datasheet
+     * 3.5), so acceleration saturates at 39.2 m/s2 and a real collision pulse of
+     * 15-40 g clips hard.  @c IMUData::accelSaturated says when that has
+     * happened, because a clipped 4 g reported as a plain number is the same
+     * class of lie as the corrupt 2.85 g that retired the last sensor.
+     *
+     * The magnetometer stays off deliberately.  It is not additive: it feeds the
+     * orientation quaternion, and linear acceleration is derived FROM that
+     * quaternion, so magnetic disturbance would contaminate the one channel
+     * incident detection depends on.  A car is close to a worst case — steel
+     * shell, dash speakers, a harness carrying tens of amps — and the distortion
+     * moves with electrical load, so calibration cannot converge.  GNSS course
+     * and the CAN rear-wheel differential already provide heading, drift-free.
      */
-    Fifo = 0,
+    Fusion = 0,
     /**
-     * Reduced ODR, FIFO bypassed, output registers polled directly.
+     * AMG: raw accelerometer, magnetometer and gyroscope. No fusion.
      *
-     * The pre-FIFO scheme, kept deliberately.  Draws roughly a tenth of the
-     * sensor current and a fifth of the bus time, at the cost of seeing only the
-     * samples a 20 Hz poll happens to land on — enough to show a parked vehicle
-     * is still, NOT enough to characterise an impact.
-     *
-     * Selected from VEHICLE POWER STATE, never from apparent stillness.  A
-     * vehicle waiting at a light is powered on and stays in @c Fifo.  See
-     * @c setIMUSampleMode().
+     * Not a mere fallback — it is the only mode that can select an accelerometer
+     * range, up to +/-16 g, so it is the only one that can CHARACTERISE a severe
+     * impact rather than clip it.  In exchange there is no linear acceleration,
+     * no gravity vector and no orientation, so @c accelPeakMs2 includes gravity
+     * and the fused fields are @c NAN.
      */
-    LowPower = 1,
+    Raw = 1,
 };
 
-/// @c IMUDevice::lifecycle sentinels.
-///
-/// @c UNINIT is the member initialiser, so the field is NEVER read before it is
-/// written — see @c IMUDevice::lifecycle for why that initialiser is required
-/// rather than merely tidy.  The other two are arbitrary distinct values; being
-/// improbable as stack garbage is a convenience when reading a memory dump, not
-/// a safety argument.
+/// @c IMUDevice::lifecycle sentinels.  @c UNINIT is the member initialiser, so
+/// the field is never read before it is written — see @c IMUDevice::lifecycle.
 #define IMU_LIFECYCLE_UNINIT      0u
 #define IMU_LIFECYCLE_ACTIVE      0x9A1C0DE1u
 #define IMU_LIFECYCLE_QUARANTINED 0x9A1CDEADu
 
 /** Return codes used by IMU functions. */
 enum class IMUReturnStatus{
-    OK = 0,                     ///< Requested operation succeeded.
-    DATA_STALE = 1,             ///< No new sample since the last call; cached values retained.
-    PARTIAL = 2,                ///< Only one of the two devices is live.
-    NOK_INIT_FAILED = -1,       ///< Neither device answered.
-    NOK_ACCEL_MISSING = -2,     ///< LSM6DSOX absent or wrong WHO_AM_I.
-    NOK_MAG_MISSING = -3,       ///< LIS3MDL absent or wrong WHO_AM_I.
-    NOK_ADDRESS_CONFLICT = -4,  ///< A foreign device occupies an IMU address.
+    OK = 0,                     ///< A fresh, plausible sample was read.
+    DATA_STALE = 1,             ///< No new sample; cached values still inside the window.
+    /**
+     * The part is running, and its FUSED output is not yet trustworthy.
+     *
+     * Raised while gyroscope or accelerometer calibration is below usable, or
+     * when the part came up in a fallback configuration.  Kept distinct from
+     * @c OK because IMUPLUS publishes linear acceleration from the moment it
+     * starts, and those first values are not wrong-looking — they are simply
+     * not yet right, and nothing downstream could otherwise tell.
+     */
+    PARTIAL = 2,
+    NOK_INIT_FAILED = -1,       ///< Bring-up failed; see @c IMUDevice::init.
+    NOK_NOT_READY = -2,         ///< Bring-up still in progress. Not an error.
+    NOK_ADDRESS_CONFLICT = -4,  ///< A foreign device occupies the IMU address.
     NOK_BUS_STUCK = -5,         ///< SDA held low; recovery clocking did not free it.
-    NOK_LINK_LOST = -6,         ///< Both devices stopped answering after a good init.
+    NOK_LINK_LOST = -6,         ///< The part stopped answering after a good init.
     NOK_CONFIG_FAILED = -7,     ///< Device answered but rejected its configuration.
 };
 
 /**
- * @brief One coherent 9-DoF snapshot.
+ * @brief One coherent snapshot.
  *
  * Every reading is @c NAN unless its matching valid flag is true, so a consumer
  * can never mistake "sensor gone" for "sitting still at 0 m/s2" — zero is a
- * perfectly plausible gyro reading, which is exactly why it must not double as
- * the missing-data sentinel.
- *
- * Accelerometer and gyroscope carry SEPARATE timestamps and validity even
- * though they live in one chip: the LSM6DSOX has an independent data-ready flag
- * per channel, and a gyro that has stopped converting while the accelerometer
- * keeps going must be reported as exactly that.
+ * perfectly plausible reading, which is exactly why it must not double as the
+ * missing-data sentinel.
  */
 struct IMUData{
+    // ── raw channels, present in both modes ──────────────────────────────────
     float accelX;         ///< Acceleration along sensor X (m/s2, gravity included).
     float accelY;         ///< Acceleration along sensor Y (m/s2, gravity included).
     float accelZ;         ///< Acceleration along sensor Z (m/s2, gravity included).
@@ -147,273 +151,356 @@ struct IMUData{
     float gyroY;          ///< Angular rate about sensor Y (deg/s).
     float gyroZ;          ///< Angular rate about sensor Z (deg/s).
 
-    float magX;           ///< Magnetic flux density along sensor X (uT).
-    float magY;           ///< Magnetic flux density along sensor Y (uT).
-    float magZ;           ///< Magnetic flux density along sensor Z (uT).
+    float magX;           ///< Magnetic flux density along sensor X (uT). @c Raw mode only.
+    float magY;           ///< Magnetic flux density along sensor Y (uT). @c Raw mode only.
+    float magZ;           ///< Magnetic flux density along sensor Z (uT). @c Raw mode only.
 
-    float temperatureC;   ///< LSM6DSOX die temperature (degC) — board, not cabin.
+    float temperatureC;   ///< Die temperature (degC) — board, not cabin.
+
+    // ── fused channels, @c Fusion mode only ──────────────────────────────────
+    /**
+     * Gravity-compensated acceleration (m/s2).
+     *
+     * What incident detection actually wants, and what the previous hardware
+     * could not supply: a 1 g reading here means the vehicle accelerated at 1 g,
+     * not that it is sitting still on a planet.
+     */
+    float linAccelX;
+    float linAccelY;
+    float linAccelZ;
 
     /**
-     * Largest |a| and |w| seen over the trailing @c IMU_PEAK_WINDOW_MS.
+     * The part's estimate of the gravity vector (m/s2).
      *
-     * The reason the FIFO exists.  @c accelX/Y/Z above are the most recent
-     * sample, and at a 10 Hz publication rate that sample is one of the ten the
-     * sensor produced since the last frame — a pothole hit by the other nine is
-     * simply not in the data.  These are computed from EVERY sample drained from
-     * the FIFO, so a transient is reported even though the vector that caused it
-     * is not.
-     *
-     * Magnitudes, so they do not depend on how the breakout is bolted in — the
-     * master does not guess a mounting orientation anywhere else either.
-     * Gravity is included, so a stationary vehicle reads about 9.81 rather than
-     * zero; subtract it if what is wanted is the excursion.
-     *
-     * NAN whenever the matching channel is invalid, exactly like the axes.
+     * Published because its MAGNITUDE is an integrity check available no other
+     * way.  It must be about 9.81 whatever the vehicle is doing — the fusion
+     * constructs it that way — so a departure means the output is not to be
+     * trusted, whatever the transaction status said.  See
+     * @c IMU_GRAVITY_MIN_VALID_MS2.
      */
-    float accelPeakMs2;   ///< Peak |a| over the window (m/s2, gravity included).
-    float gyroPeakDps;    ///< Peak |w| over the window (deg/s).
+    float gravityX;
+    float gravityY;
+    float gravityZ;
+
+    /**
+     * Rotation about the vertical, in degrees, RELATIVE and drifting.
+     *
+     * Named for what it is.  In @c Fusion the magnetometer is off, so this has
+     * no north reference and no absolute meaning; calling it "heading" invites
+     * precisely the misreading that would put a drifting number where a bearing
+     * belongs.  GNSS course-over-ground and the CAN rear-wheel differential are
+     * the heading sources.
+     *
+     * What it IS good for is short-window rotation at the fusion rate: how far
+     * the car turned during a two-second event, where drift is negligible and
+     * neither the 1 Hz GNSS nor the wheel pair — dead below about 3 km/h — can
+     * answer.
+     */
+    float yawRelDeg;
+    float pitchDeg;       ///< Pitch (deg). Sign convention follows @c IMUDevice::eulerAndroid.
+    float rollDeg;        ///< Roll (deg).
+
+    // ── windowed peaks ───────────────────────────────────────────────────────
+    /**
+     * Largest magnitudes seen over the trailing @c IMU_PEAK_WINDOW_MS.
+     *
+     * These exist because the axes above are the MOST RECENT sample, and at a
+     * 10 Hz publication rate that sample is one of the ten the part produced
+     * since the last frame — a pothole hit by the other nine is simply not in
+     * the data.  Peaks are folded from every polled sample, so a transient is
+     * reported even though the vector that caused it is not.
+     *
+     * Magnitudes, so they do not depend on how the board is bolted in.
+     */
+    float accelPeakMs2;   ///< Peak |a| (m/s2, gravity included).
+    float linAccelPeakMs2;///< Peak |linear a| (m/s2). @c Fusion mode only.
+    float gyroPeakDps;    ///< Peak |w| (deg/s).
+
+    /**
+     * The accelerometer hit its range limit during this window.
+     *
+     * @c accelPeakMs2 is then a FLOOR, not a measurement.  Fusion modes lock the
+     * range at +/-4 g, so anything past 39.2 m/s2 is clipped and a genuine
+     * 20 g collision reads as 4 g.  A saturated peak published as a plain number
+     * would understate an impact by a factor of five.
+     *
+     * @c linAccelPeakMs2 IS EQUALLY SUSPECT while this is set, and there is no
+     * separate flag for it: linear acceleration is derived from the same clipped
+     * accelerometer, so a rail the raw channel hit propagates straight into it.
+     * Bench measurement during clipping showed the linear peak reaching
+     * 56.97 m/s2 — above the raw rail itself, because subtracting an estimated
+     * gravity vector from a clipped measurement is not a physical quantity.
+     * Treat both peaks as lower bounds whenever this is true.
+     */
+    bool accelSaturated;
+
+    /**
+     * The part latched a High-G threshold crossing.
+     *
+     * THIS IS THE ONE FIELD THAT SURVIVES A STALLED LOOP. Everything else here
+     * is the product of a poll, and a poll that does not happen produces
+     * nothing — there is no FIFO to cover the gap. The BNO055 latches a
+     * threshold crossing in hardware and holds it until cleared, so an impact
+     * during a half-second stall is still reported afterwards, where the peak
+     * that would have described it is simply gone.
+     *
+     * Held for @c IMU_HIGHG_HOLD_MS so it cannot fall between two published
+     * frames.
+     */
+    bool highGEvent;
+
+    /// @c millis() the High-G latch was first seen. Meaningless unless
+    /// @c highGEvent. Read from the INT pin when one is wired and from the poll
+    /// that noticed the latch otherwise — the second is later, but it is the
+    /// event's own timestamp either way, not the frame's.
+    uint32_t highGMs;
+
+    /// The hardware backstop is armed. When false, an impact inside a loop
+    /// stall goes unrecorded, and nothing else on the frame would say so.
+    bool highGArmed;
 
     /**
      * There is a HOLE in the inertial record for this window.
      *
-     * Raised for either cause, because the consequence is identical: a peak
-     * computed across a gap is not a peak over the window it claims, and an
-     * incident detector has to know that.
-     *   - the part overwrote unread words (a true FIFO overrun), or
-     *   - the host discarded a backlog that was already older than
-     *     IMU_MAX_DATA_AGE_MS, so draining it would have stamped stale samples
-     *     as current.
-     *
-     * Named for the CONSEQUENCE rather than one of the causes: an earlier name
-     * of "fifoOverrun" described only the first, while the flag was in fact
-     * raised by both, so a reader chasing an overrun found a counter that had
-     * never incremented.  @c IMUDevice keeps the two causes apart.
+     * Named for the consequence rather than the cause: a peak computed across a
+     * gap is not a peak over the window it claims, and an incident detector has
+     * to know that.  Raised when polls were missed — with no FIFO, a poll that
+     * does not happen is data that does not exist, which is why this flag is
+     * far more load-bearing here than it was on the previous part.
      */
     bool dataGap;
 
-    /**
-     * The samples in this snapshot were taken in low-power mode.
-     *
-     * Device state rather than sample state, and here for the same reason
-     * @c devicePresent is: a consumer holding only an @c IMUData must be able to
-     * tell a coarse reading from a fine one.  Without it, a peak recorded at
-     * 26 Hz with no buffering is indistinguishable from one folded across every
-     * sample at 104 Hz — and those two numbers support very different
-     * conclusions about an impact.
-     */
+    /// Sampling regime was coarser than normal.  Reserved for the parked
+    /// low-power mode, which is not enabled yet: the datasheet withdraws the
+    /// High-G interrupt in low power, leaving no hardware impact backstop
+    /// exactly when a car-park bump is the thing being watched for.
     bool lowPower;
 
-    uint32_t accelSampleMs; ///< @c millis() of the newest accepted accelerometer sample.
-    uint32_t gyroSampleMs;  ///< @c millis() of the newest accepted gyroscope sample.
-    uint32_t tempSampleMs;  ///< @c millis() of the newest accepted temperature sample.
-    uint32_t magSampleMs;   ///< @c millis() of the newest accepted magnetometer sample.
+    /// True when the part is in @c IMUSampleMode::Fusion.  Carried on the sample
+    /// because the peak means something different in each mode — one includes
+    /// gravity and saturates at 4 g, the other does not.
+    bool fusionMode;
+
+    // ── calibration, 0..3 each ───────────────────────────────────────────────
+    /// System calibration.  STAYS 0 in @c Fusion mode and that is correct, not a
+    /// fault: the system figure cannot rise without the magnetometer, which is
+    /// deliberately off.  Judge fusion readiness by @c calibGyro and
+    /// @c calibAccel.
+    uint8_t calibSys;
+    uint8_t calibGyro;    ///< Reaches 3 within seconds of sitting still.
+    uint8_t calibAccel;   ///< Needs the board held in several orientations.
+    uint8_t calibMag;     ///< Always 0 in @c Fusion mode; the magnetometer is off.
+
+    // ── freshness ────────────────────────────────────────────────────────────
+    uint32_t accelSampleMs; ///< @c millis() of the newest accepted sample.
+    uint32_t gyroSampleMs;
+    uint32_t tempSampleMs;
+    uint32_t magSampleMs;
+    uint32_t fusionSampleMs;
 
     bool accelValid;      ///< Accelerometer readings are fresh and trustworthy.
     bool gyroValid;       ///< Gyroscope readings are fresh and trustworthy.
     bool magValid;        ///< Magnetometer readings are fresh and trustworthy.
     bool tempValid;       ///< Die temperature is fresh and trustworthy.
+    bool fusionValid;     ///< Linear accel, gravity and Euler are fresh and trustworthy.
 
     /**
-     * At least one device is configured and has not been declared lost.
+     * The part is configured and has not been declared lost.
      *
-     * Deliberately NOT derived from the valid flags above.  Those describe this
+     * Deliberately NOT derived from the valid flags.  Those describe this
      * SAMPLE; this describes the HARDWARE, and the two differ in exactly the
-     * case that matters: an IMU that is fitted and simply quiet right now has
-     * every valid flag clear but is emphatically still present.  Collapsing the
-     * two would make "sensor absent" and "sensor briefly silent" indis-
-     * tinguishable to a consumer, which is the misdiagnosis this whole struct
-     * is arranged to prevent.
+     * case that matters — an IMU that is fitted and briefly quiet has every
+     * valid flag clear and is emphatically still present.
      */
     bool devicePresent;
 
     /**
-     * BOTH devices are answering.
+     * The part is running EXACTLY as configured.
      *
-     * Kept separate from @c devicePresent because the difference is a fault
-     * signature, not a detail: the LSM6DSOX and LIS3MDL share one PCB, one VIN
-     * and one ground, so exactly one responding cannot happen benignly. An
-     * unpowered I2C slave keeps acknowledging through the bus pull-ups, so the
-     * lighter-draw part survives a power loss the other does not — which is what
-     * pulling VIN on the bench produced.
+     * Retained under its old name because the telemetry flag built on it has not
+     * been re-cut yet; the protocol bump owns that.  Its meaning has necessarily
+     * changed: with one chip instead of two there is no "both answered" to
+     * report, so it now means present AND in the requested mode AND on the
+     * requested clock.  False therefore means running in a fallback — still
+     * useful data, not the data that was asked for.
      */
     bool allDevicesPresent;
 };
 
 /**
- * @brief Device addresses plus the health state needed to fail honestly.
+ * @brief The device: bring-up state, health counters and the peak ring.
  *
- * Declare ONE of these at file scope.  It is a plain aggregate holding no
- * pointers and owning no memory, so neither @c initializeIMU() nor
- * @c recoverIMU() allocates — they may be called from @c loop() on a retry
- * timer without touching the heap.
+ * Plain aggregate holding no pointers of its own and owning no memory, so
+ * neither @c initializeIMU() nor @c recoverIMU() allocates.
+ *
+ * MUST have static storage duration — @c BNO055InitState::dev is handed to the
+ * Bosch driver, which keeps a file-static pointer to it.
  */
 struct IMUDevice{
-    uint8_t accelAddress;     ///< 7-bit address the LSM6DSOX answers on.
-    uint8_t magAddress;       ///< 7-bit address the LIS3MDL answers on.
+    BNO055InitState init;     ///< Address, mode, clock and driver context.
 
-    bool accelReady;          ///< LSM6DSOX configured and not yet declared lost.
-    bool magReady;            ///< LIS3MDL configured and not yet declared lost.
+    bool     ready;           ///< Configured and not yet declared lost.
+    uint8_t  faults;          ///< Consecutive failed or implausible reads.
 
-    uint8_t accelFaults;      ///< Consecutive failed/implausible LSM6DSOX bus reads.
-    uint8_t magFaults;        ///< Consecutive failed/implausible LIS3MDL bus reads.
-
-    /// Cumulative failed bus transactions since @c initializeIMU(), saturating.
+    /// Cumulative failed transactions since @c initializeIMU(), saturating.
     ///
-    /// The consecutive counters above cannot answer "did any read fail?", and
-    /// that is by design — they reset on every success, because a lone NACK is a
-    /// glitch to ride out rather than a fault to act on.  The consequence is that
-    /// transient failures are invisible from outside: @c getIMUData() still
-    /// returns @c OK when the other device supplied fresh data, so a caller
-    /// counting non-OK returns measures nothing and can report a clean run over a
-    /// bus that was NACKing steadily.
-    ///
-    /// These are the diagnostic the consecutive counters deliberately are not:
-    /// monotonic, independent of whether a sample happened to be available, and
-    /// carried across @c recoverIMU() so a device that keeps dropping out is
+    /// The consecutive counter above cannot answer "did any read fail?", by
+    /// design — it resets on every success, because a lone NACK is a glitch to
+    /// ride out.  The consequence is that transients are invisible from outside,
+    /// so this is the diagnostic that counter deliberately is not: monotonic,
+    /// and carried across @c recoverIMU() so a part that keeps dropping out is
     /// distinguishable from one that failed once.
-    uint16_t accelIOErrors;
-    uint16_t magIOErrors;
+    uint16_t ioErrors;
 
-    /// @c millis() when each channel last asserted its data-ready bit.  These
-    /// detect a channel that has gone silent while its device still answers the
-    /// bus — a fault no data-age check can act on, because the device never
-    /// looks lost and so is never retried.  See @c IMU_MAX_CHANNEL_STALL_MS.
-    uint32_t lastAccelReadyMs;
-    uint32_t lastGyroReadyMs;
-    uint32_t lastMagReadyMs;
+    /// Reads discarded for failing a plausibility gate rather than the bus.
+    /// Counted separately from @c ioErrors because they mean something entirely
+    /// different: the transaction SUCCEEDED and the data was wrong, which is the
+    /// failure that retired the previous sensor and the one no transport-level
+    /// counter can see.
+    uint16_t implausible;
 
-    float accelScaleMs2;      ///< m/s2 per LSB for the configured accelerometer range.
-    float gyroScaleDps;       ///< deg/s per LSB for the configured gyroscope range.
-    float magScaleUt;         ///< uT per LSB for the configured magnetometer range.
+    /// @c millis() at which the raw bytes last CHANGED.
+    ///
+    /// This replaces the per-channel data-ready stall check, which the BNO055
+    /// gives no way to perform.  Real inertial data is never bit-identical twice
+    /// running — gyro noise alone moves the low bits — so bytes that stop
+    /// changing are a frozen data path, on a part that is still answering every
+    /// transaction perfectly.  See @c IMU_MAX_CHANNEL_STALL_MS.
+    uint32_t lastChangeMs;
+    uint8_t  lastRaw[12];     ///< Accel + gyro bytes from the previous poll.
+    bool     lastRawValid;
 
     /// Windowed peak tracking, held as SQUARED magnitudes in a bucket ring.
     ///
-    /// Squares keep the hot path free of square roots: the drain compares every
-    /// sample, and one sqrtf per channel per poll at the end replaces ten inside
-    /// the loop.  On a Cortex-M0+ with no FPU that is not a micro-optimisation —
-    /// every sqrtf is a software routine.
+    /// Squares keep the hot path free of square roots: one sqrtf per channel per
+    /// poll replaces one per sample.  On a Cortex-M0+ with no FPU that is not a
+    /// micro-optimisation — every sqrtf is a software routine.
     ///
     /// The RING is what makes the window honest.  A single max plus a timestamp
     /// cannot represent one: when the stored maximum aged out it was replaced by
-    /// whatever sample happened to be current, so a large hit at t=0 followed by
-    /// a medium hit at t=200 ms reported the medium one only until t=250 ms, and
-    /// then dropped straight to the idle level — discarding an impact that was
-    /// still well inside the window.  Bucketing by arrival time means expiry
-    /// removes only what is genuinely too old, and the published peak is the max
-    /// of what remains.
-    float    accelPeakSq[IMU_PEAK_BUCKETS];  ///< Max |a|^2 seen in each bucket.
-    float    gyroPeakSq[IMU_PEAK_BUCKETS];   ///< Max |w|^2 seen in each bucket.
-    uint32_t peakBucketMs[IMU_PEAK_BUCKETS]; ///< Start @c millis() of each bucket.
-    uint8_t  peakBucketHead;                 ///< Bucket currently being filled.
+    /// whatever sample was current, so a large hit followed by a medium one
+    /// reported the medium value and then dropped to the idle level, discarding
+    /// an impact still well inside the window.
+    float    accelPeakSq[IMU_PEAK_BUCKETS];
+    float    linAccelPeakSq[IMU_PEAK_BUCKETS];
+    float    gyroPeakSq[IMU_PEAK_BUCKETS];
+    uint32_t peakBucketMs[IMU_PEAK_BUCKETS];
+    uint8_t  peakBucketHead;
 
-    /// Cumulative HARDWARE overruns since @c initializeIMU(), saturating.
-    /// The part overwrote unread words: samples are gone and nothing could have
-    /// prevented it once the drain fell that far behind.
-    uint16_t fifoOverruns;
-    /// Cumulative FRESHNESS discards: the host flushed a backlog that had not
-    /// overflowed but was already older than IMU_MAX_DATA_AGE_MS.
+    /// Saturation, tracked PER BUCKET for the same reason the peaks are.
     ///
-    /// Counted separately from a true overrun because the two have different
-    /// causes and different fixes.  An overrun means the FIFO is too small or
-    /// the drain too slow; a freshness discard means something blocked the loop.
-    /// One number covering both cannot tell a technician which.
-    uint16_t fifoGapFlushes;
-    /// Abandoned for this boot after a watchdog reset — no recovery attempted.
-    /// See @c imuQuarantine().
-    bool quarantined;
+    /// It began as a single latch and that was wrong: nothing cleared it, so one
+    /// clipped sample marked every subsequent frame as saturated for the rest of
+    /// the run. On the bench it stuck on at poll 12 000 and was still asserted
+    /// 4 000 polls later with the sensor sitting still reading 9.83.
+    ///
+    /// That is worse than a cosmetic bug. The flag's meaning is "the peak beside
+    /// me is a floor, not a measurement", so a stuck one devalues every honest
+    /// reading that follows — and this is the field an incident detector would
+    /// consult before deciding an impact was under-reported.
+    bool     satBucket[IMU_PEAK_BUCKETS];
+
+    /// Polls that should have happened and did not, saturating.  With no FIFO a
+    /// missed poll is data that no longer exists anywhere, so this is the only
+    /// record that the window has a hole in it.
+    uint16_t missedPolls;
+    uint32_t lastPollMs;
+
+    /// Cumulative High-G latches since bring-up, saturating. The published flag
+    /// lasts IMU_HIGHG_HOLD_MS, so a soak watching the console can miss every
+    /// one and still look clean — this only ever climbs, so one glance answers
+    /// "were there any?".
+    uint16_t highGCount;
+    bool     highGActive;      ///< Currently inside the republication hold.
+    uint32_t highGUntilMs;     ///< Deadline for that hold.
+    uint32_t highGAtMs;        ///< When the latch was first seen.
+    /// Deadline form, not elapsed-time form: the gap notice is HELD until
+    /// @c gapFlagUntilMs and then latched off.  Deriving it from "counter
+    /// nonzero and the timestamp looks recent" republished a long-finished gap
+    /// for one window every time @c millis() rolled over at 49.7 days.
+    bool     gapFlagActive;
+    uint32_t gapFlagUntilMs;
+
+    /// Euler angles use the Android sign convention.  Read from the part rather
+    /// than assumed, because it decides the sign of pitch and getting it wrong
+    /// inverts a channel silently.
+    bool     eulerAndroid;
+
+    bool     quarantined;
 
     /**
      * Lifecycle latch, so quarantine survives a later @c initializeIMU().
      *
-     * A separate field is needed because @c initializeIMU() begins by resetting
-     * every other one — it has to, it is the initialiser — so @c quarantined
-     * alone would be cleared and the device re-polled by any caller that simply
-     * calls it again.  The sketch happens not to, but the LIBRARY must not
-     * depend on one caller's discipline for a safety property.
+     * A separate field is needed because @c initializeIMU() resets every other
+     * one — it has to, it is the initialiser — so @c quarantined alone would be
+     * cleared by any caller that simply called it again.
      *
-     * THE MEMBER INITIALISER IS LOAD-BEARING, not tidiness.  @c initializeIMU()
-     * and @c imuMarkAbsent() both READ this field before anything has written
-     * it, and the helper sketches declare @c IMUDevice as an automatic.  Without
-     * an initialiser that read is of an indeterminate value, which is undefined
-     * behaviour outright — not a small probability of a wrong answer.  An
-     * earlier version of this comment argued the 32-bit sentinel made a bad read
-     * unlikely enough to accept; that reasoning was wrong, because UB is not a
-     * probability. The sentinel's only remaining job is legibility in a dump.
+     * THE MEMBER INITIALISER IS LOAD-BEARING.  @c initializeIMU() and
+     * @c imuMarkAbsent() both READ this before anything has written it, and the
+     * helper sketches declare @c IMUDevice as an automatic.  Without an
+     * initialiser that read is of an indeterminate value, which is undefined
+     * behaviour outright — not a small chance of a wrong answer.
      */
     uint32_t lifecycle = IMU_LIFECYCLE_UNINIT;
-    /// Deadline form, not elapsed-time form: the gap notice is HELD until
-    /// @c gapFlagUntilMs and then latched off.  Deriving it from "counter
-    /// nonzero and lastOverrunMs looks recent" republished a long-finished gap
-    /// for 250 ms every time @c millis() rolled over at 49.7 days.
-    bool     gapFlagActive;
-    uint32_t gapFlagUntilMs;
-
-    /// Current sampling scheme.  Change it through @c setIMUSampleMode(), never
-    /// by assignment — the field only describes what the DEVICE was configured
-    /// to do, and writing it without touching the registers makes the driver
-    /// decode the FIFO on a part that is no longer filling one.
-    IMUSampleMode mode;
 };
 
 /** What answered on the bus, and whether it is what we expected. */
 struct I2CBusReport{
     uint8_t deviceCount;                        ///< Number of responders found.
     uint8_t addresses[I2C_SCAN_MAX_DEVICES];    ///< 7-bit addresses that ACKed.
-    bool accelPresent;    ///< Something ACKed at @c IMU_ACCEL_I2C_ADDRESS.
-    bool magPresent;      ///< Something ACKed at @c IMU_MAG_I2C_ADDRESS.
+    bool imuPresent;      ///< Something ACKed at a BNO055 address.
+    bool imuIdentified;   ///< That responder returned CHIP_ID 0xA0.
+    uint8_t imuAddress;   ///< Where it was identified. 0 when it was not.
     bool gpsPresent;      ///< Something ACKed at @c GPS_DEFAULT_I2C_ADDRESS.
-    bool accelIdentified; ///< That responder returned the LSM6DSOX WHO_AM_I.
-    bool magIdentified;   ///< That responder returned the LIS3MDL WHO_AM_I.
-    bool conflict;        ///< An IMU address is occupied by a device that is not the IMU.
+    bool conflict;        ///< An IMU address is occupied by something that is not the IMU.
 };
 
 /**
- * @brief Brings up both sensors at their default addresses.
+ * @brief Starts the staged bring-up. Returns IMMEDIATELY — it does not block.
  *
- * Enters through @c i2cBusBegin(), which opens the bus once per session and
- * recovers it FIRST, before any transaction: a slave wedged onto SDA would
- * otherwise hang the very first probe inside the SAMD core's unbounded wait,
- * and recovery placed after that probe could never run.
+ * The previous implementation configured the part inline and returned a verdict.
+ * That cannot be done here without holding the CPU for the 650 ms the part needs
+ * after a reset, and doing so is the specific mistake @c gpsInitTick() exists to
+ * correct: nothing else runs, so the CAN drain stops and the telemetry push
+ * jitters, and a hang lands at the same point on every boot under the same armed
+ * watchdog — a reboot loop rather than a fault.
  *
- * Resets, configures and verifies each device independently, so one missing
- * sensor never prevents the other from coming up.
+ * So the caller must drive @c imuInitTick() from @c loop() until
+ * @c imuIsReady(). Bring-up takes about 700 ms of WALL CLOCK while the loop
+ * keeps turning over throughout.
  *
- * @param[in,out] dev  Device bundle to initialise.
- * @return @c OK when both devices came up, @c PARTIAL when exactly one did,
- *         @c NOK_INIT_FAILED when neither answered, @c NOK_ADDRESS_CONFLICT
- *         when an address is held by a foreign device, or @c NOK_BUS_STUCK
- *         when SDA could not be freed.
+ * @param[in,out] dev   Device to bring up.
+ * @param[in]     mode  @c Fusion (recommended) or @c Raw.
+ * @return @c OK when the machine was armed, @c NOK_INIT_FAILED when the device
+ *         is quarantined or the mode was rejected.
  */
+IMUReturnStatus initializeIMU(IMUDevice &dev, IMUSampleMode mode);
+
+/** @brief As above, in @c IMUSampleMode::Fusion. */
 IMUReturnStatus initializeIMU(IMUDevice &dev);
 
 /**
- * @brief Brings up both sensors at caller-chosen addresses.
+ * @brief Advances the bring-up by one step. Call from @c loop(), every pass.
  *
- * Use when the breakout's address jumpers are closed (LSM6DSOX 0x6B,
- * LIS3MDL 0x1E) or when two breakouts share the bus.
+ * Cheap — at most a few single-byte transfers, a few hundred microseconds. Call
+ * it unconditionally rather than on the poll timer: the sequence has about a
+ * dozen steps, and running them at 20 Hz would add half a second to a bring-up
+ * whose real cost is the part's own reset delay.
  *
- * @param[in,out] dev           Device bundle to initialise.
- * @param[in]     accelAddress  7-bit LSM6DSOX address, 0x6A or 0x6B.
- * @param[in]     magAddress    7-bit LIS3MDL address, 0x1C or 0x1E.
- * @return As @c initializeIMU(IMUDevice&).  Returns @c NOK_ADDRESS_CONFLICT if
- *         either address is one this project has already allocated to another
- *         device (the GNSS receiver or the segment LED).
+ * A no-op once configured, so an unconditional call costs one comparison.
+ *
+ * @return The bring-up stage after this step.
  */
-IMUReturnStatus initializeIMU(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress);
+BNO055InitStage imuInitTick(IMUDevice &dev);
+
+/** @brief True once the part is configured and running in the requested mode. */
+bool imuIsReady(const IMUDevice &dev);
 
 /**
- * @brief Re-configures ONLY the devices currently marked not-ready.
+ * @brief Restarts bring-up after the part was declared lost.
  *
- * This is the retry path, and it is deliberately not @c initializeIMU(): a
- * magnetometer that dropped off the bus must not cost a reset of a perfectly
- * healthy accelerometer, which would blank a working signal for the ~30 ms the
- * part takes to reset and refill its filters.
- *
- * Allocation-free and safe to call from @c loop() on a bounded retry timer.
- * Calling it when nothing is down is a no-op that returns @c OK.
- *
- * @param[in,out] dev  Device bundle previously passed to @c initializeIMU().
- * @return As @c initializeIMU(IMUDevice&).
+ * Non-blocking, like @c initializeIMU(). Allocation-free and safe to call from
+ * @c loop() on a rate limiter. A no-op returning @c OK when nothing is wrong.
  */
 IMUReturnStatus recoverIMU(IMUDevice &dev);
 
@@ -421,78 +508,59 @@ IMUReturnStatus recoverIMU(IMUDevice &dev);
 void initIMUData(IMUData &data);
 
 /**
- * @brief Reads whatever new data the sensors have (non-blocking).
+ * @brief Reads one sample (non-blocking).
  *
- * Checks each device's STATUS register first and only bursts the output
- * registers when a fresh conversion is waiting, so polling faster than the
- * output data rate costs one short transaction instead of a wasted 14-byte
- * read.  Block Data Update is enabled on both parts, so a burst can never
- * splice the MSB of one sample onto the LSB of the next.
+ * ONE 46-byte burst covers accelerometer, magnetometer, gyroscope, Euler
+ * angles, quaternion, linear acceleration, gravity, temperature and calibration
+ * — registers 0x08 to 0x35 are contiguous.  Reading them separately would cost
+ * five transactions and their addressing overhead for the same bytes; the
+ * quaternion and, in fusion mode, the magnetometer come along unused and are
+ * cheaper to discard than to avoid.
  *
- * Accelerometer, gyroscope and temperature are validated independently from
- * their own data-ready bits — a burst triggered by the accelerometer does not
- * certify the gyro half of the same 14 bytes.
+ * TWO PLAUSIBILITY GATES stand between a successful transaction and a published
+ * reading, because on this project a successful transaction has already proved
+ * not to mean a valid one:
  *
- * Readings older than @c IMU_MAX_DATA_AGE_MS are replaced with @c NAN and
- * their valid flag cleared: a value that stopped updating is not a measurement,
- * however plausible it still looks.
+ *   - TEMPERATURE against the part's own -40..+85 C rating.  Carried forward
+ *     from the previous driver, where it caught 100 % of a failing sensor's
+ *     corrupt bursts with no false positives over 520 good ones.
+ *   - GRAVITY MAGNITUDE against about 9.81, in fusion mode.  New, and stronger:
+ *     the fusion constructs that vector, so its length is near-constant whatever
+ *     the vehicle does.  A burst that fails it is discarded whole.
  *
- * Refuses to transact at all when the shared bus is not idle, returning
- * @c NOK_BUS_STUCK without charging the failure to either device.  That check
- * belongs on every poll, not only on bring-up: the SAMD core's I2C waits have no
- * deadline, so one slave holding SDA mid-drive would otherwise hang the CPU until
- * the watchdog reset it.
+ * A failed gate discards the ENTIRE burst — it arrived in one transaction, so a
+ * reading that cannot be trusted condemns the bytes beside it.
  *
- * A caller that needs to know whether reads have been FAILING, as opposed to
- * whether a sample was available, must read @c IMUDevice::accelIOErrors and
- * @c magIOErrors — this return code cannot express it, and returns @c OK for a
- * poll in which one device NACKed and the other supplied fresh data.
- *
- * @param[in,out] dev   Initialised device bundle.
- * @param[in,out] data  Snapshot to update in place.
- * @return @c OK when at least one device supplied a fresh sample,
- *         @c DATA_STALE when neither had new data but the cached values are
- *         still inside the freshness window, @c PARTIAL when one device has
- *         been declared lost, @c NOK_LINK_LOST when both have, or
- *         @c NOK_BUS_STUCK when the bus was not safe to use.
+ * @return @c OK on a fresh plausible sample, @c PARTIAL when the fused output is
+ *         not yet trustworthy, @c DATA_STALE when nothing new arrived,
+ *         @c NOK_NOT_READY during bring-up, @c NOK_BUS_STUCK when the bus was
+ *         unsafe, or @c NOK_LINK_LOST once the part has been declared lost.
  */
 IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data);
 
-/**
- * @brief True once every configured device has been declared lost.
- *
- * Mirrors @c isOBD2LinkLost().  Note this is the BOTH-gone case — schedule
- * recovery on @c isIMUDegraded() instead, or a single failed sensor never gets
- * retried.
- */
+/** @brief True once the part has been declared lost. */
 bool isIMULinkLost(const IMUDevice &dev);
 
+/** @brief True when the part is not delivering usable data and should be retried. */
+bool isIMUDegraded(const IMUDevice &dev);
+
 /**
- * @brief Puts the bundle into a valid "nothing fitted" state WITHOUT touching the bus.
+ * @brief Puts the device into a valid "nothing fitted" state WITHOUT touching the bus.
  *
- * Every field is set exactly as @c initializeIMU() sets it before probing, so
- * the struct is safe to read and to publish; only the hardware access is
- * skipped.  Use when the bus must not be touched at all.
- *
- * ONE EXCEPTION, and it is deliberate: a quarantine is CARRIED ACROSS the reset
- * rather than cleared.  Without that this function was a public way around
- * @c imuQuarantine() — resetting the struct put a device that hung the board
- * back into the polling and recovery paths.  Everything else here is scratch
- * state a re-initialisation may discard; the quarantine is a decision about the
- * hardware, which resetting software state does not change.
+ * ONE EXCEPTION, deliberate: a quarantine is CARRIED ACROSS rather than cleared.
+ * Without that this would be a public way around @c imuQuarantine() — resetting
+ * the struct would put a device that hung the board back into the polling and
+ * recovery paths.
  */
-void imuMarkAbsent(IMUDevice &dev, uint8_t accelAddress, uint8_t magAddress);
+void imuMarkAbsent(IMUDevice &dev);
 
 /**
  * @brief Abandons the IMU for this boot, without any bus access. TERMINAL.
  *
- * For use after a watchdog reset.  @c initializeIMU() transacts, and so does the
- * @c recoverIMU() path that @c isIMUDegraded() schedules — so on a boot that
- * follows a hang BOTH have to be suppressed, not just the first.  Suppressing
- * only initialisation leaves the retry timer to re-enter the hang a few seconds
- * later, which merely lengthens the reboot loop.
- *
- * Cleared only by a non-watchdog reset.
+ * For use after a watchdog reset.  Both bring-up and the recovery path that
+ * @c isIMUDegraded() schedules transact, so on a boot following a hang BOTH have
+ * to be suppressed — suppressing only initialisation leaves the retry timer to
+ * re-enter the hang seconds later, which merely lengthens the reboot loop.
  */
 void imuQuarantine(IMUDevice &dev);
 
@@ -500,66 +568,45 @@ void imuQuarantine(IMUDevice &dev);
 bool isIMUQuarantined(const IMUDevice &dev);
 
 /**
- * @brief Switches the LSM6DSOX between full-rate FIFO capture and low power.
+ * @brief Records a High-G edge seen on the INT pin. SAFE TO CALL FROM AN ISR.
  *
- * Rewrites the output data rates, the high-performance-mode bits and the FIFO
- * mode, then flushes: samples already buffered were taken at the OLD rate and in
- * the old power mode, and decoding them afterwards would attribute them to the
- * new configuration.
+ * Optional. The latch is read over I2C on every poll regardless, so the wire
+ * only removes poll latency — up to @c IMU_POLL_MS of it. What the pin buys is
+ * the event's true timestamp, which matters for a dashcam deciding which frames
+ * belong to an incident.
  *
- * Cheap enough to call on a state change but not on every loop — it is six
- * verified register writes.  Returns immediately when already in @p mode, so an
- * unconditional call from a state machine costs nothing.
+ * Touches no bus and takes no lock: it stores a timestamp and sets a flag, both
+ * volatile. Calling I2C from an interrupt would deadlock against the poll that
+ * is very likely already inside Wire.
+ */
+void imuNoteHighGPin(uint32_t whenMs);
+
+/** @brief The mode the part is currently configured for. */
+IMUSampleMode imuSampleMode(const IMUDevice &dev);
+
+/**
+ * @brief Reconfigures the part into another mode. NON-BLOCKING, and expensive.
  *
- * FAILURE-ATOMIC.  The first write puts the FIFO into Bypass, so mid-sequence
- * the hardware matches neither mode.  If any write fails the device is left
- * marked NOT ready, so the caller's recovery path performs one rate-limited full
- * reconfiguration rather than decoding against a configuration the part no
- * longer has.  @c dev.mode and readiness are committed together, only once every
- * register has read back.
+ * Restarts the whole bring-up, so the IMU is unavailable for about 700 ms and
+ * the peak window is discarded.  Call it on a session-level decision, never on a
+ * trigger: a crash pulse lasts 10-50 ms and would be over before the part
+ * finished switching.
  *
- * DRIVEN BY VEHICLE POWER STATE, not by motion.  The caller decides from
- * ignition — sustained OBD-II silence after the link has been up — because a
- * noise floor has a tail and no amplitude threshold separates a parked car from
- * a moving one reliably.  An earlier revision tried and produced repeated false
- * wakes on a motionless bench.
- *
- * The consequence to accept: a parked vehicle is sampled coarsely, so an impact
- * while parked is not characterised well.  Fixing that properly needs the
- * LSM6DSOX wake-up interrupt on a wired INT pin, which this build lacks.
- *
- * @param[in,out] dev   Initialised device bundle.
- * @param[in]     mode  Desired sampling scheme.
- * @return @c OK on success, @c NOK_BUS_STUCK when the bus was unusable,
- *         @c NOK_CONFIG_FAILED when a register did not read back as written, or
- *         @c NOK_ACCEL_MISSING when the LSM6DSOX is not currently live.
+ * A no-op returning @c OK when already in @p mode.
  */
 IMUReturnStatus setIMUSampleMode(IMUDevice &dev, IMUSampleMode mode);
 
-/** @brief The sampling scheme the LSM6DSOX is currently configured for. */
-IMUSampleMode imuSampleMode(const IMUDevice &dev);
-
-/** @brief True when any device that should be running has gone silent. */
-bool isIMUDegraded(const IMUDevice &dev);
-
 /**
- * @brief Checks that the IMU addresses hold the IMU and nothing else.
+ * @brief Checks that the IMU address holds the IMU and nothing else.
  *
- * Answers the question a datasheet cannot: an address being free "by default"
- * is worthless if the GNSS receiver on the same bus was reconfigured, or a
- * second breakout was added with its jumper closed.  Scans the bus, then reads
- * WHO_AM_I at each IMU address and compares it against the expected part ID.
+ * Answers what a datasheet cannot: an address being free "by default" is
+ * worthless if the GNSS receiver was reconfigured or a second board was added.
+ * Scans the bus, then identifies the IMU by CHIP_ID rather than by a bare
+ * address ACK — something else can answer at 0x28 or 0x29, and a device that
+ * answers but is not a BNO055 must read as a conflict, not as the IMU.
  *
- * Call it BEFORE @c initializeIMU() during bring-up.  Does not require the
- * sensors to be initialised; it opens the bus itself via @c i2cBusBegin().
- *
- * @param[out] report  Filled with what was found.
- * @return @c OK when both IMU addresses hold the expected parts,
- *         @c NOK_ADDRESS_CONFLICT when one holds something else,
- *         @c NOK_ACCEL_MISSING / @c NOK_MAG_MISSING when an address is silent,
- *         @c NOK_INIT_FAILED when the bus is genuinely empty, or
- *         @c NOK_BUS_STUCK when a held line made the scan impossible — which is
- *         a different fault from an empty bus and must not be reported as one.
+ * Does not require the sensor to be initialised; opens the bus via
+ * @c i2cBusBegin() itself.
  */
 IMUReturnStatus checkI2CBusConflict(I2CBusReport &report);
 

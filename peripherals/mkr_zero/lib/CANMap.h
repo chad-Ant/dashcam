@@ -104,6 +104,17 @@ enum CanSigSlot : uint8_t {
     CAN_SIG_STEER_TORQUE,
     CAN_SIG_TURN_LEFT,
     CAN_SIG_TURN_RIGHT,
+    /**
+     * Hazard lights, as their OWN signal — not "both indicators at once".
+     *
+     * That inference was tested on the vehicle and is wrong here: switching the
+     * hazards on left both turn bits of 0x294 clear. The indicator message
+     * reports the STALK, and the hazard switch bypasses the stalk entirely, so
+     * on this platform the two are genuinely separate signals. Deriving one from
+     * the other would report hazards as "not indicating" — the safest-looking
+     * possible answer for a car stopped in a live lane.
+     */
+    CAN_SIG_HAZARD,
     CAN_SIG_WHEEL_FL,
     CAN_SIG_WHEEL_FR,
     CAN_SIG_WHEEL_RL,

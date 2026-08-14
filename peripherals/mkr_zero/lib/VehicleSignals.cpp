@@ -35,6 +35,8 @@ void expireVehicleSignals(VehicleSignals &v, uint32_t nowMs,
     // expires when the ID goes away, which is what staleness means here. The
     // blink itself is handled by the hold in the decoder.
     VEH_EXPIRE(v.turnMs,  v.turnSrc,  v.turnLeft = false; v.turnRight = false);
+    // Its own clock: the map may put hazards on a different ID from the stalk.
+    VEH_EXPIRE(v.hazardMs, v.hazardSrc, v.hazard = false);
     VEH_EXPIRE(v.wheelMs, v.wheelSrc,
                for (uint8_t i = 0; i < VEH_WHEEL_COUNT; ++i) v.wheelRaw[i] = VEH_WHEEL_INVALID);
 

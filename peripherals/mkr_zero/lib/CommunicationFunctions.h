@@ -123,6 +123,23 @@ struct CommMaster {
      * The sketch applies it at a point of its own choosing.
      */
     uint8_t       canModeRequest;
+    /**
+     * A CMD_SET_CAN_FILTER the sketch has not acted on yet.
+     *
+     * Latched for the same reason as @c canModeRequest, and more strongly: the
+     * MCP2515 cannot have its filter registers written while receiving, so
+     * applying this means dropping into Configuration mode and back. Doing that
+     * inside the frame decoder would put a receive gap in the middle of command
+     * servicing, where nothing is watching for one.
+     *
+     * @c canFilterPending is a separate flag rather than "count != 0" because
+     * ZERO IS A MEANINGFUL REQUEST: on an MCP2515 no filters means accept all,
+     * so a host clearing the filter set to widen a capture sends count 0, and
+     * treating that as "nothing pending" would silently discard the command.
+     */
+    bool          canFilterPending;
+    uint8_t       canFilterCount;
+    uint16_t      canFilterIds[COMM_CAN_FILTER_SLOTS];
 };
 
 /**

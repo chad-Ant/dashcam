@@ -64,6 +64,56 @@ bool watchdogCausedReset(void){
     return (resetCause & PM_RCAUSE_WDT) != 0u;
 }
 
+uint8_t resetCauseRaw(void){
+    return resetCause;
+}
+
+/// Which lines were still low at the end of the last recovery attempt.
+static uint8_t lastStuckMask = 0u;
+
+uint8_t i2cStuckLines(void){
+    return lastStuckMask;
+}
+
+const char *i2cStuckReason(void){
+    // Ordered by what each one implicates. Both lines low is checked first
+    // because it is the supply case, and a supply fault explains the other two
+    // rather than sitting alongside them.
+    const uint8_t m = lastStuckMask;
+    if (m == 0u) return "bus free";
+    if ((m & I2C_STUCK_SDA_LOW) && (m & I2C_STUCK_SCL_LOW)) {
+        return "BOTH lines low - supply collapse or a short, not a bus hang";
+    }
+    if (m & I2C_STUCK_SDA_LOW) {
+        // The distinction that survives once both modules measure 3.3 V at VIN.
+        if (m & I2C_STUCK_SDA_NEVER_MOVED) {
+            return "SDA NEVER moved through 18 clocks - shorted/clamped, not a stuck slave";
+        }
+        return "SDA moved while clocked but settled low - a slave is re-asserting it";
+    }
+    if (m & (I2C_STUCK_SCL_LOW | I2C_STUCK_SCL_NO_RISE)) {
+        return "SCL will not rise - check the pull-up, or a slave stretching forever";
+    }
+    return "released late";
+}
+
+const char *resetCauseName(void){
+    // Order matters: WDT and the brownout detectors are the two that say
+    // something WENT WRONG, so they are tested before the benign causes.
+    // Reported unconditionally by the caller rather than only when it was the
+    // watchdog — an earlier version printed a line only for WDT, so every other
+    // cause had to be inferred from the ABSENCE of that line. A supply brownout
+    // and a clean power-cycle then looked identical, which on a vehicle rig is
+    // the single most useful distinction there is.
+    if (resetCause & PM_RCAUSE_WDT)   return "watchdog (previous run hung)";
+    if (resetCause & PM_RCAUSE_BOD33) return "BROWNOUT on VDDANA (3.3V rail sagged)";
+    if (resetCause & PM_RCAUSE_BOD12) return "BROWNOUT on the core 1.2V regulator";
+    if (resetCause & PM_RCAUSE_EXT)   return "external reset pin";
+    if (resetCause & PM_RCAUSE_SYST)  return "software request";
+    if (resetCause & PM_RCAUSE_POR)   return "power-on (cold start)";
+    return "unknown";
+}
+
 // ─── hang quarantine ──────────────────────────────────────────────────────────
 
 bool bootAfterHang(void){
@@ -155,13 +205,26 @@ static inline void releaseLine(uint8_t pin){
  * @brief Releases SCL and waits, bounded, for it to actually read high.
  * @return @c true when SCL rose within the timeout.
  */
-static bool releaseSclAndWait(void){
-    releaseLine(PIN_WIRE_SCL);
+/**
+ * @brief Releases @p pin and waits, bounded, for it to actually reach a high.
+ *
+ * Both lines need this, not just SCL. A released line does not rise instantly:
+ * it is an RC edge against the pull-ups, and this bus carries an ESLOV cable to
+ * the GNSS, so the capacitance is whatever the cable and a second module happen
+ * to add. Sampling once, immediately, measures the rise time rather than the
+ * state of the bus.
+ */
+static bool releaseAndWait(uint8_t pin){
+    releaseLine(pin);
     const uint32_t start = micros();
     while ((micros() - start) < SCL_RELEASE_TIMEOUT_US){
-        if (digitalRead(PIN_WIRE_SCL) == HIGH) return true;
+        if (digitalRead(pin) == HIGH) return true;
     }
-    return false;   // slave is stretching, or SCL is shorted low
+    return false;   // held low by a slave, or shorted
+}
+
+static bool releaseSclAndWait(void){
+    return releaseAndWait(PIN_WIRE_SCL);   // stretching, or SCL shorted low
 }
 
 I2CBusState i2cBusRecover(void){
@@ -172,11 +235,22 @@ I2CBusState i2cBusRecover(void){
     releaseLine(PIN_WIRE_SDA);
     delayMicroseconds(10);
 
-    // Up to nine clocks: enough for a slave to finish the byte plus the ACK it
-    // believes it is in the middle of.  Fixed bound, so this terminates however
-    // badly the slave behaves.
-    for (uint8_t i = 0u; i < 9u; i++){
-        if (digitalRead(PIN_WIRE_SDA) == HIGH) break;   // already released
+    // Whether SDA EVER let go during clocking, at any point.
+    //
+    // This is the measurement that separates the two faults still standing once
+    // supply has been ruled out at both modules. A slave stuck mid-byte releases
+    // SDA the moment it is clocked past the bit it was holding — so SDA moves,
+    // even if it ends up low again. A line shorted to ground, or a damaged pad
+    // clamping it, NEVER moves, no matter how many clocks it is given. Both look
+    // identical in a pass/fail verdict and need completely different repairs.
+    bool sdaEverHigh = false;
+
+    // 18 clocks, not 9. Nine covers a byte plus its ACK, which is the textbook
+    // case; doubling it costs 180 us on a bus that is already broken and covers
+    // a slave that has more than one byte queued. The bound still guarantees
+    // termination however badly the slave behaves.
+    for (uint8_t i = 0u; i < I2C_RECOVER_CLOCKS; i++){
+        if (digitalRead(PIN_WIRE_SDA) == HIGH) { sdaEverHigh = true; break; }
 
         driveLow(PIN_WIRE_SCL);
         delayMicroseconds(5);
@@ -209,12 +283,39 @@ I2CBusState i2cBusRecover(void){
 
     // Released unconditionally: even on failure the MCU must not walk away still
     // driving SDA low, which would wedge the bus on our own account.
-    releaseLine(PIN_WIRE_SDA);
-    delayMicroseconds(5);
+    //
+    // SDA is then given the SAME bounded settle SCL already gets. It used to be
+    // released, given a flat 5 us, and sampled ONCE - so the verdict on half the
+    // bus rested on a single reading taken before a slow line could possibly
+    // have risen.
+    //
+    // 5 us is not a margin, it is roughly the RC rise time itself. The GNSS
+    // hangs off an ESLOV cable, and cable plus connector plus a second module's
+    // pin capacitance easily reaches a few hundred pF; against the board
+    // pull-ups that is microseconds to reach a valid high. A perfectly healthy
+    // bus therefore reads LOW at 5 us and is declared Stuck - permanently, since
+    // every later retry repeats the same too-early sample and reaches the same
+    // verdict. That is the shape of these logs exactly: never a recovery, on a
+    // rail measured steady at 3.3 V with no short.
+    const bool sdaHigh = releaseAndWait(PIN_WIRE_SDA);
+    const bool sclHigh = (digitalRead(PIN_WIRE_SCL) == HIGH);
+    const bool released = sclHighForStop && sdaHigh && sclHigh;
 
-    const bool released = sclHighForStop &&
-                          (digitalRead(PIN_WIRE_SDA) == HIGH) &&
-                          (digitalRead(PIN_WIRE_SCL) == HIGH);
+    // WHICH line failed, recorded before the pins go back to the SERCOM.
+    //
+    // "Stuck" alone collapses three unrelated hardware faults into one code,
+    // and a run that retries twenty times reports the same -5 every time while
+    // saying nothing about where to put the probe. SDA held low is a slave stuck
+    // mid-byte or running on parasitic power; SCL that will not rise is a dead
+    // pull-up, a short, or a slave clock-stretching forever; both low is a
+    // supply collapse. Different investigations entirely.
+    lastStuckMask = 0u;
+    if (!sdaHigh)        lastStuckMask |= I2C_STUCK_SDA_LOW;
+    if (!sclHigh)        lastStuckMask |= I2C_STUCK_SCL_LOW;
+    if (!sclHighForStop) lastStuckMask |= I2C_STUCK_SCL_NO_RISE;
+    // Only meaningful when SDA ended low: it says whether the line was ever
+    // observed to move while being clocked.
+    if (!sdaHigh && !sdaEverHigh) lastStuckMask |= I2C_STUCK_SDA_NEVER_MOVED;
 
     // Hand the pins back to the SERCOM.  Wire.begin() re-runs pinPeripheral() on
     // both, which is what actually undoes the pinMode() calls above.
