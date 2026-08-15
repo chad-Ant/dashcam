@@ -411,6 +411,10 @@ struct IMUDevice{
     /// one and still look clean — this only ever climbs, so one glance answers
     /// "were there any?".
     uint16_t highGCount;
+    /// Times the latch could not be cleared. Each one disarms the backstop, so
+    /// this should be 0; a non-zero value with highGArmed false is the record of
+    /// why the hardware impact detector stopped working.
+    uint8_t  highGClearFails;
     bool     highGActive;      ///< Currently inside the republication hold.
     uint32_t highGUntilMs;     ///< Deadline for that hold.
     uint32_t highGAtMs;        ///< When the latch was first seen.

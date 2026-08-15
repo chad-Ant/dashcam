@@ -19,12 +19,11 @@
  */
 
 #include <Wire.h>
-#include <BNO055.h>
 
 #include "BNO055Transport.h"
 #include "I2CBus.h"
 
-static struct bno055_t gDev;
+static BNO055Device gDev;
 static uint8_t  gAddr    = 0;
 
 static uint32_t gReads   = 0;
@@ -75,22 +74,25 @@ void setup()
     Serial.println(gAddr == 0x29u ? F("  (datasheet default)")
                                   : F("  (alternative strapping)"));
 
-    bno055TransportBind(gDev, gAddr);
-    const int rc = bno055_init(&gDev);
+    const bool identified = bno055Identify(gDev, gAddr);
 
-    Serial.print(F("bno055_init() -> "));
-    Serial.print(rc);
+    Serial.print(F("bno055Identify() -> "));
+    Serial.print(identified ? F("true") : F("FALSE"));
     Serial.print(F("   chip_id 0x"));
-    Serial.print(gDev.chip_id, HEX);
-    // Said explicitly because the return value does NOT mean what it looks like:
-    // bno055_init() reassigns comres from each of its reads in turn, so it
-    // reports only the last one. chip_id is the honest check.
-    Serial.println(gDev.chip_id == BNO055_EXPECTED_CHIP_ID ? F("  OK") : F("  *** WRONG ***"));
+    Serial.print(gDev.chipId, HEX);
+    // The return now means what it looks like. Its predecessor, bno055_init(),
+    // reassigned its status from each of its reads in turn and so reported only
+    // the last one — a success that said nothing about whether the part had
+    // answered, which is why this line used to check chip_id separately.
+    Serial.println(identified ? F("  OK") : F("  *** WRONG or UNREADABLE ***"));
 
-    Serial.print(F("sw rev 0x"));   Serial.print(gDev.sw_revision_id, HEX);
-    Serial.print(F("  accel 0x"));  Serial.print(gDev.accel_revision_id, HEX);
-    Serial.print(F("  mag 0x"));    Serial.print(gDev.mag_revision_id, HEX);
-    Serial.print(F("  gyro 0x"));   Serial.println(gDev.gyro_revision_id, HEX);
+    // Full 16 bits. The vendored driver stored this in a uint8 and dropped the
+    // major version, so a part running 3.08 printed as 0x8 and looked exactly
+    // like a failed second byte of a two-byte read.
+    Serial.print(F("sw rev 0x"));   Serial.print(gDev.swRevId, HEX);
+    Serial.print(F("  accel 0x"));  Serial.print(gDev.accelRevId, HEX);
+    Serial.print(F("  mag 0x"));    Serial.print(gDev.magRevId, HEX);
+    Serial.print(F("  gyro 0x"));   Serial.println(gDev.gyroRevId, HEX);
 
     Serial.println(F("\nHammering CHIP_ID. Any non-zero fault or wrong id is a FAIL.\n"));
 }

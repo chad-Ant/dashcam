@@ -46,20 +46,13 @@
 /// consistent observations of a stuck bit, and the bit was never being read.
 #define BNO055_UNIT_SEL_MASK         0x97u
 
-/// PAGE_ID, spelled to match the driver header's mixed-case macro.
-#define BNO055_PAGE_ID_ADDR          BNO055_Page_ID_ADDR
+// The page-0 and page-1 register addresses used below live in BNO055Regs.h.
+// They were split across this file and a vendored header — page 0 there, page 1
+// here, because that header never named the interrupt registers — which is one
+// map in two places and exactly the arrangement that lets them drift.
 
-// ─── page 1 registers ─────────────────────────────────────────────────────────
-//
-// Spelled out here because the vendored driver's header does not name them: it
-// defines the page-0 map and the bit positions for INT_STA, but not the page-1
-// addresses that arm the interrupts. Datasheet rev 1.4, table 4-3.
-
-#define BNO055_P1_INT_MSK_ADDR        0x0Fu   ///< Which interrupts drive the INT PIN.
-#define BNO055_P1_INT_EN_ADDR         0x10u   ///< Which interrupts are evaluated at all.
-#define BNO055_P1_ACC_INT_SET_ADDR    0x12u   ///< Per-axis enables and sample count.
-#define BNO055_P1_ACC_HG_DUR_ADDR     0x13u   ///< High-G duration.
-#define BNO055_P1_ACC_HG_THRES_ADDR   0x14u   ///< High-G threshold.
+/// ACC_CONFIG bits 1:0 select the range. Only settable in non-fusion modes.
+#define BNO055_ACC_RANGE_MASK         0x03u
 
 /// INT_EN / INT_MSK bit 5 — accelerometer High-G.
 #define BNO055_INT_BIT_ACC_HIGH_G     0x20u
@@ -96,11 +89,13 @@
 
 // ─── register helpers ─────────────────────────────────────────────────────────
 //
-// Straight through the transport hooks, NOT through the driver's register
-// helpers.  bno055_write_register() would work, but it reaches the device
-// through the driver's file-static context pointer, and routing bring-up
-// through global state that bno055_init() must already have installed makes the
-// ordering a matter of trust.  These take the address explicitly.
+// Straight through the transport, taking the address explicitly.
+//
+// The vendored driver offered bno055_write_register(), which reached the device
+// through a file-static context pointer that bno055_init() had to have installed
+// first — so the ordering was a matter of trust rather than of signature. That
+// was the reason for these helpers, and it outlived the driver: an address in
+// the argument list cannot be unset.
 
 static bool regRead8(uint8_t addr, uint8_t reg, uint8_t &value)
 {
@@ -376,17 +371,15 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
                 break;
             }
             state.address = addr;
-            bno055TransportBind(state.dev, addr);
 
-            // Return deliberately discarded: it reports only the LAST of the
-            // several reads this makes, so it cannot distinguish a part that
-            // answered everything from one that answered nothing but the final
-            // register.  chip_id is the honest check, and it is checked below.
-            // The call is still needed — it installs the driver's context
-            // pointer, which every driver call after this dereferences.
-            (void)bno055_init(&state.dev);
-
-            if (state.dev.chip_id != BNO055_EXPECTED_CHIP_ID){
+            // One call, one honest verdict. This was a bind() to install
+            // function pointers followed by a bno055_init() whose return had to
+            // be discarded — it reported only the last of its several reads, so
+            // a success said nothing about whether the part had answered, and
+            // the chip ID had to be re-checked separately afterwards. Both are
+            // now inside bno055Identify(), which is false if ANY read failed or
+            // the ID is wrong.
+            if (!bno055Identify(state.dev, addr)){
                 bno055InitFail(state, BNO055InitStatus::NOK_NOT_FOUND);
                 break;
             }
@@ -495,12 +488,31 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             state.calibOffered  = (state.calibProfile != nullptr);
             state.calibRestored = false;
             if (state.calibOffered) {
-                // NOT a failure when it does not take. The sensor is entirely
-                // usable with default offsets — it simply has to earn its
-                // calibration again over the drive — so refusing to bring up an
-                // IMU because a stored profile would not write would trade a
-                // working sensor for a warm-up. The flag records it instead.
                 state.calibRestored = bno055CalibWrite(state, state.calibProfile);
+                if (!state.calibRestored) {
+                    // A FAILED RESTORE IS NOT SURVIVABLE IN PLACE, and treating
+                    // it as merely disappointing was wrong.
+                    //
+                    // bno055CalibWrite() writes 22 registers and stops at the
+                    // first refusal, so a failure leaves the part holding some
+                    // registers from the stored profile and the rest at their
+                    // power-on defaults. That mixture is not "uncalibrated" — it
+                    // is a set of offsets no calibration ever produced, applied
+                    // to every reading afterwards. Worse than either endpoint,
+                    // and invisible: the fused output stays plausible and the
+                    // gravity gate still passes, because a bias is exactly the
+                    // kind of error a magnitude check cannot see.
+                    //
+                    // So restart, which reaches a known state the only way that
+                    // is guaranteed to work — the reset at the top of the
+                    // sequence. And DROP the profile first: retrying it would
+                    // reproduce the same partial write on every attempt, turning
+                    // one bad file into a permanent bring-up loop.
+                    state.calibProfile = nullptr;
+                    captureDiagnostics(state);
+                    bno055InitFail(state, BNO055InitStatus::NOK_CONFIG_FAILED);
+                    break;
+                }
             }
             state.stage = BNO055InitStage::SetHighG;
             break;
@@ -512,6 +524,29 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             // returning plausible constants — the exact fault that made thirty
             // bring-ups look like counterfeit silicon.
             bool ok = configWrite(state, BNO055_PAGE_ID_ADDR, 0x01u, 0xFFu);
+
+            // The accelerometer RANGE, and only in AMG.
+            //
+            // This was missing, and its absence made a documented claim false:
+            // the whole justification for keeping a raw mode is that it is the
+            // only one able to CHARACTERISE a severe impact rather than clip it,
+            // because non-fusion modes can select up to +/-16 g. Never
+            // programming ACC_CONFIG left it at the +/-4 g power-on default, so
+            // AMG saturated at exactly the same 39.2 m/s2 as fusion and bought
+            // nothing at all.
+            //
+            // Skipped in fusion modes because the part overrides the range there
+            // — writing it would be a no-op that reads back wrong and fails the
+            // verification below for no reason.
+            if (ok && state.opMode == OPERATION_MODE_AMG){
+                uint8_t cfg = 0u;
+                ok = regRead8(state.address, BNO055_P1_ACC_CONFIG_ADDR, cfg);
+                if (ok){
+                    cfg = (uint8_t)((cfg & ~BNO055_ACC_RANGE_MASK) | ACCEL_RANGE_16G);
+                    ok  = configWrite(state, BNO055_P1_ACC_CONFIG_ADDR, cfg,
+                                      BNO055_ACC_RANGE_MASK);
+                }
+            }
 
             if (ok) ok = configWrite(state, BNO055_P1_ACC_HG_THRES_ADDR,
                                      IMU_HIGHG_THRESHOLD_LSB, 0xFFu);

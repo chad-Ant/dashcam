@@ -478,13 +478,12 @@ static void testStuckPhase2(void)
         report("S7 i2cBusBegin recovers by itself", st == I2CBusState::Ready, detail);
     }
 
-    const bool a = i2cProbeAddress(IMU_ACCEL_I2C_ADDRESS);
-    const bool m = i2cProbeAddress(IMU_MAG_I2C_ADDRESS);
+    const bool a = i2cProbeAddress(SOX_ADDR);
     const bool g = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
     {
         char detail[48];
-        snprintf(detail, sizeof(detail), "accel=%d mag=%d gnss=%d", (int)a, (int)m, (int)g);
-        report("S8 all three devices ACK again", a && m && g, detail);
+        snprintf(detail, sizeof(detail), "imu=%d gnss=%d", (int)a, (int)g);
+        report("S8 both devices ACK again", a && g, detail);
     }
 
     IMUDevice dev{};   // value-initialised: initializeIMU() reads dev.lifecycle
@@ -495,8 +494,21 @@ static void testStuckPhase2(void)
     bool sane = false;
     float mag = NAN;
     if (ist == IMUReturnStatus::OK) {
+        // Ticked, and given room for the part's own 650 ms reset.
+        //
+        // This block still polled a device that was never configured:
+        // initializeIMU() only ARMS the staged bring-up now, and without
+        // imuInitTick() the machine never leaves its first stage — so
+        // getIMUData() returned NOK_NOT_READY for the whole window and the test
+        // reported a dead sensor as a failure of bus recovery. A test that
+        // cannot pass is worse than a missing one, because it accuses the wrong
+        // subsystem.
         const unsigned long start = millis();
-        while (!isTimeout(400UL, start)) (void)getIMUData(dev, data);
+        while (!isTimeout(2000UL, start)) {
+            watchdogFeed();
+            (void)imuInitTick(dev);
+            if (imuIsReady(dev)) (void)getIMUData(dev, data);
+        }
         if (data.accelValid) {
             mag = sqrtf(data.accelX * data.accelX +
                         data.accelY * data.accelY +

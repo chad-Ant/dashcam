@@ -211,12 +211,12 @@ void setup(){
 
     if (initializeSD() == SDReturnStatus::OK) {
         Serial.println(F("SD: mounted"));
-        uint8_t chip = 0;
-        if (bno055CalibLoad(gCalibProfile, &chip)) {
-            if (chip != BNO055_EXPECTED_CHIP_ID) {
-                Serial.print(F("calibration on card is from chip 0x"));
-                Serial.print(chip, HEX);
-                Serial.println(F(" - IGNORED"));
+        uint16_t install = 0;
+        if (bno055CalibLoad(gCalibProfile, &install)) {
+            if (install != BNO055_CALIB_INSTALL_ID) {
+                Serial.print(F("calibration on card is for install 0x"));
+                Serial.print(install, HEX);
+                Serial.println(F(" - IGNORED (sensor replaced? delete bno055.cal)"));
             } else {
                 gCalibValid = true;
                 char desc[80];
@@ -411,13 +411,13 @@ void loop(){
         else if (c == 'i') restart(IMUSampleMode::Fusion);
         else if (c == 'b') busSurvey();
         else if (c == 'l'){
-            uint8_t chip = 0;
+            uint16_t install = 0;
             uint8_t p[BNO055_CALIB_BYTES];
-            if (bno055CalibLoad(p, &chip)){
+            if (bno055CalibLoad(p, &install)){
                 char desc[80];
                 bno055CalibDescribe(p, desc, sizeof(desc));
-                Serial.print(F("stored profile (chip 0x"));
-                Serial.print(chip, HEX);
+                Serial.print(F("stored profile (install 0x"));
+                Serial.print(install, HEX);
                 Serial.print(F("): "));
                 Serial.println(desc);
             } else {
@@ -449,7 +449,7 @@ void loop(){
                 // a High-G event for exactly this reason.
                 if (!bno055CalibCapture(gDev.init, fresh)){
                     Serial.println(F("capture FAILED - sensor returned to its operating mode"));
-                } else if (!bno055CalibStore(fresh, gDev.init.dev.chip_id)){
+                } else if (!bno055CalibStore(fresh, BNO055_CALIB_INSTALL_ID)){
                     Serial.println(F("save FAILED - is a card fitted? previous profile intact"));
                 } else {
                     memcpy(gCalibProfile, fresh, sizeof(fresh));

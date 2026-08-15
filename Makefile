@@ -62,7 +62,7 @@ LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
 
 LIBCAN_SRCS    := lib/libcan/libcan.cpp
 LIBCOMM_SRCS   := lib/libcommlink/libcommlink.cpp
-LIBGPIO_SRCS   := lib/libgpio/libgpio.cpp
+LIBGPIO_SRCS   := lib/libgpio/libgpio.cpp lib/libgpio/libgpio_pwm.cpp
 LIBI2C_SRCS    := lib/libi2c/libi2c.cpp
 LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
 LIBNET_SRCS    := lib/libnetwork/libnetwork.cpp lib/libnetwork/libnetwork_ntp.cpp \

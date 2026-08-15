@@ -28,15 +28,15 @@
  */
 
 #include <Wire.h>
-#include <BNO055.h>
 
 #include "BNO055Init.h"
 #include "BNO055Transport.h"
 #include "I2CBus.h"
 
-/// Static storage duration is REQUIRED, not stylistic: bno055_init() keeps a
-/// pointer to dev inside the driver, and every driver call afterwards
-/// dereferences it.
+/// File scope so the state outlives every tick of loop(). It used to be a hard
+/// requirement — the vendored driver kept a pointer to it and dereferenced that
+/// on every later call — but that driver is gone and nothing holds a pointer to
+/// this any more.
 static BNO055InitState gInit;
 
 static BNO055InitStage gLastStage = BNO055InitStage::Idle;

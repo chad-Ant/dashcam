@@ -701,16 +701,20 @@ void setup()
     // for 9000 polls: a board bolted into a bracket does not see the
     // orientations Bosch's algorithm wants, so it may never recover on its own.
     {
-        uint8_t storedChip = 0;
-        if (bno055CalibLoad(imuCalibProfile, &storedChip)) {
-            // Refused if it came from a different part. These offsets are
-            // properties of the silicon, so a profile survives the board being
-            // unbolted and remounted — but not the sensor being replaced, and a
-            // stale one would bias every reading with nothing to show for it.
-            if (storedChip != BNO055_EXPECTED_CHIP_ID) {
-                Serial.print("IMU: stored calibration is from chip 0x");
-                Serial.print(storedChip, HEX);
-                Serial.println(" - IGNORED, offsets belong to the silicon");
+        uint16_t storedInstall = 0;
+        if (bno055CalibLoad(imuCalibProfile, &storedInstall)) {
+            // Refused if it was captured under a different install ID. These
+            // offsets are properties of the silicon, so a profile survives the
+            // board being unbolted and remounted — but not the sensor being
+            // replaced, and a stale one would bias every reading with nothing to
+            // show for it. The part has no serial number, so this is an operator
+            // -managed ID rather than an automatic check; see the constant.
+            if (storedInstall != BNO055_CALIB_INSTALL_ID) {
+                Serial.print("IMU: stored calibration is for install 0x");
+                Serial.print(storedInstall, HEX);
+                Serial.print(", this firmware is 0x");
+                Serial.println(BNO055_CALIB_INSTALL_ID, HEX);
+                Serial.println("     IGNORED. Delete bno055.cal, or recalibrate and re-save.");
             } else {
                 imuCalibProfileValid = true;
                 bno055InitSetCalibProfile(imuDev.init, imuCalibProfile);
@@ -1217,13 +1221,33 @@ void loop()
     // CONFIG producing nothing, and the one moment that must never have a hole
     // in it is an impact — which is precisely when this would otherwise fire, as
     // a hard jolt is also what finally moves the accelerometer figure to 3.
-    if (imuIsReady(imuDev) && sdReady() && !imuData.highGEvent &&
+    //
+    // AND ONLY WHILE THE SENSOR IS QUIET. The capture spends ~60 ms in CONFIG
+    // producing nothing AND with the High-G comparator inactive, so it is a true
+    // blind window — the one interval where neither the poll nor the hardware
+    // backstop is watching. Excluding an active High-G event is not enough,
+    // because that only covers an impact already detected. Requiring the peak
+    // over the last window to be near gravity means nothing is happening at all,
+    // which is a stronger and entirely self-contained test — no vehicle speed,
+    // no ignition state, nothing that can be wrong about the car.
+    const bool imuQuiet = !isnan(imuData.linAccelPeakMs2) &&
+                          imuData.linAccelPeakMs2 < IMU_CALIB_SAVE_QUIET_MS2;
+
+    if (imuIsReady(imuDev) && sdReady() && !imuData.highGEvent && imuQuiet &&
         imuData.calibGyro >= 3u && imuData.calibAccel >= 3u &&
         (lastCalibSaveMs == 0 || isTimeout(IMU_CALIB_SAVE_INTERVAL_MS, lastCalibSaveMs))) {
 
         uint8_t fresh[BNO055_CALIB_BYTES];
         if (!bno055CalibCapture(imuDev.init, fresh)) {
-            Serial.println("IMU: calibration capture FAILED - sensor left in its operating mode");
+            // The capture verifies both mode transitions, so a failure means the
+            // part may be STRANDED IN CONFIG: answering every transaction,
+            // devicePresent true, and producing no data at all. Nothing else
+            // detects that — the frozen-data check would eventually fire, a
+            // second at a time, on a sensor we already know is wrong.
+            Serial.println("IMU: calibration capture FAILED - mode may not have been restored.");
+            Serial.println("     Re-running bring-up: a part left in CONFIG answers normally");
+            Serial.println("     and reports nothing, which no other check catches quickly.");
+            (void)initializeIMU(imuDev, imuSampleMode(imuDev));
             lastCalibSaveMs = millis();   // do not retry every pass
         } else if (imuCalibProfileValid && bno055CalibEqual(fresh, imuCalibProfile)) {
             // Identical to what is already stored. Skipped silently and the
@@ -1231,7 +1255,7 @@ void loop()
             // bytes every ten minutes for the life of the vehicle.
             lastCalibSaveMs = millis();
         } else {
-            const bool ok = bno055CalibStore(fresh, imuDev.init.dev.chip_id);
+            const bool ok = bno055CalibStore(fresh, BNO055_CALIB_INSTALL_ID);
             if (ok) {
                 memcpy(imuCalibProfile, fresh, sizeof(fresh));
                 imuCalibProfileValid = true;

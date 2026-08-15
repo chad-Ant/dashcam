@@ -31,6 +31,12 @@ if errorlevel 1 (
 for %%I in ("%~dp0.") do set "SKETCH_DIR=%%~fI"
 for %%I in ("%~dp0..\..\lib") do set "LIB_DIR=%%~fI"
 for %%I in ("%~dp0..\..\vendor\Wire") do set "WIRE_DIR=%%~fI"
+rem Not used by this sketch's tests, but --library lib\ compiles EVERY source in
+rem lib\ - including the BNO055 transport, SDFunctions and the CAN files - and
+rem each fails its own vendoring marker without these.
+for %%I in ("%~dp0..\..\vendor\CANBus") do set "CAN_DIR=%%~fI"
+for %%I in ("%~dp0..\..\vendor\SdFat") do set "SDFAT_DIR=%%~fI"
+set "VENDOR_LIBS=--library "%CAN_DIR%" --library "%SDFAT_DIR%""
 
 set "FQBN=arduino:samd:mkrzero"
 set "CORE_REQUIRED=1.8.14"
@@ -52,9 +58,9 @@ if /i "%~1"=="/stock" (
     rem Clean build so nothing from a vendored build can be reused, and verbose
     rem so the resolved Wire path is captured in the log below.
     if "%~2"=="" (
-        arduino-cli compile %WARN% --clean --verbose --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=-DDASHCAM_WIRE_STOCK_CONTROL=1" --library "%LIB_DIR%" "%SKETCH_DIR%" > "%TEMP%\wireregression_stock.log" 2>&1
+        arduino-cli compile %WARN% --clean --verbose --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=-DDASHCAM_WIRE_STOCK_CONTROL=1" %VENDOR_LIBS% --library "%LIB_DIR%" "%SKETCH_DIR%" > "%TEMP%\wireregression_stock.log" 2>&1
     ) else (
-        arduino-cli compile %WARN% --clean --verbose --upload --port "%~2" --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=-DDASHCAM_WIRE_STOCK_CONTROL=1" --library "%LIB_DIR%" "%SKETCH_DIR%" > "%TEMP%\wireregression_stock.log" 2>&1
+        arduino-cli compile %WARN% --clean --verbose --upload --port "%~2" --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=-DDASHCAM_WIRE_STOCK_CONTROL=1" %VENDOR_LIBS% --library "%LIB_DIR%" "%SKETCH_DIR%" > "%TEMP%\wireregression_stock.log" 2>&1
     )
     set "RC=%ERRORLEVEL%"
     rem NOTE: no parentheses in echo text inside an if-block - an unescaped ")"
@@ -73,9 +79,9 @@ if /i "%~1"=="/stock" (
 )
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=%INSTRUMENT%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=%INSTRUMENT%" --library "%WIRE_DIR%" %VENDOR_LIBS% --library "%LIB_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=%INSTRUMENT%" --library "%WIRE_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --build-property "compiler.cpp.extra_flags=%INSTRUMENT%" --library "%WIRE_DIR%" %VENDOR_LIBS% --library "%LIB_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

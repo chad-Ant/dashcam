@@ -35,12 +35,16 @@
  * none of the driver's mode-changing setters.  @c vendor/BNO055/PATCHES.md has
  * the details and the line numbers.
  *
- * WHAT THE DRIVER IS STILL FOR
- * ----------------------------
- * @c bno055_init() is called once, to install the driver's internal context
- * pointer and populate the revision IDs.  Phase 3's @c getIMUData() then uses
- * the driver's conversion functions (@c bno055_read_linear_accel_xyz() and
- * friends), which is where a 16 000-line register map earns its place.
+ * THERE IS NO DRIVER
+ * ------------------
+ * A vendored Bosch reference driver used to sit under this, and this comment
+ * used to say @c getIMUData() would eventually use its conversion functions.
+ * It never did — the poll reads one 48-byte burst and decodes it directly — so
+ * the whole 16 000-line library ended up being called for exactly one function,
+ * @c bno055_init(), which is seven single-byte reads. It has been replaced by
+ * @c bno055Identify() and the register map in @c BNO055Regs.h, which also
+ * settles a GPLv3-against-MIT licence conflict that was being deferred rather
+ * than resolved.
  *
  * @see peripherals/mkr_zero/lib/BNO055Transport.h  — the I2C hooks under this
  * @see peripherals/mkr_zero/vendor/BNO055/PATCHES.md
@@ -174,16 +178,19 @@ enum class BNO055InitStage : uint8_t{
 /**
  * @brief Progress of one BNO055 bring-up.
  *
- * MUST have static storage duration.  @c bno055_init() stores @c &dev in a
- * file-static pointer inside the driver, and every driver call afterwards
- * dereferences it — so a state on the stack leaves the driver holding a
- * dangling pointer the moment the caller returns.  Plain aggregate otherwise:
- * owns no memory, allocates nothing, safe to drive from @c loop().
+ * Plain aggregate: owns no memory, allocates nothing, safe to drive from
+ * @c loop().
+ *
+ * It used to carry a static-storage-duration requirement, because the vendored
+ * driver stored @c &dev in a file-static pointer and dereferenced it on every
+ * later call — so a state on the stack left the driver holding a dangling
+ * pointer the moment the caller returned. That driver is gone and nothing keeps
+ * a pointer to this any more, so the requirement is gone with it. The production
+ * instance is still at file scope for its own reasons.
  */
 struct BNO055InitState{
-    /// Driver context.  Holds the transport hooks, the address and the IDs read
-    /// by @c bno055_init().
-    struct bno055_t dev = {};
+    /// What the part reported at identification: address, chip and revision IDs.
+    BNO055Device dev = {};
 
     BNO055InitStage  stage      = BNO055InitStage::Idle;
     BNO055InitStage  failedAt   = BNO055InitStage::Idle;  ///< Which step refused, for logs.

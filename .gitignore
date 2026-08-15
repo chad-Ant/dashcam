@@ -6,3 +6,4 @@ archive/*
 *.mkv
 models/*
 docs/*
+testlogs/*

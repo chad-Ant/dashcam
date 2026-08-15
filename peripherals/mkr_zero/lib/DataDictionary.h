@@ -234,6 +234,21 @@
 /// fivefold, so @c IMUData::accelSaturated must accompany it.
 #define IMU_ACCEL_SATURATION_MS2                     (39.0f)
 
+/// Acceleration beyond which a reading is IMPOSSIBLE, not merely clipped (m/s2).
+///
+/// The part cannot report past its configured rail, so anything beyond it did
+/// not come from the accelerometer. Distinct from @c IMU_ACCEL_SATURATION_MS2,
+/// and the distinction matters: saturation says "this reading is a floor",
+/// while this says "this reading is not a reading". Conflating them let a value
+/// of 196 m/s2 be published as a genuine 20 g impact carrying a may-be-clipped
+/// note — a fabricated crash on the field that triggers incident capture, which
+/// is the exact failure mode that retired the previous sensor.
+///
+/// The rail plus roughly 10 %, so genuine clipping at the limit still reports as
+/// saturated instead of being discarded.
+#define IMU_ACCEL_MAX_VALID_MS2_FUSION               (43.0f)   ///< +/-4 g rail = 39.24.
+#define IMU_ACCEL_MAX_VALID_MS2_RAW                  (173.0f)  ///< +/-16 g rail = 156.9.
+
 // ─── High-G interrupt: the hardware impact backstop ──────────────────────────
 //
 // The reason this exists is that the BNO055 has no FIFO. The previous part
@@ -307,6 +322,32 @@
 /// High-G latch covers an impact that lands in the gap — which is exactly why
 /// that interrupt exists — and above it the window genuinely under-reports.
 #define IMU_GAP_MIN_MS                               50UL
+
+/// Identifies WHICH physical sensor a stored calibration belongs to.
+///
+/// BUMP THIS WHENEVER THE BNO055 IS REPLACED, or delete bno055.cal from the
+/// card. Either invalidates the stored profile.
+///
+/// It exists because the automatic check that used to be here did not work. The
+/// file recorded CHIP_ID and refused a profile whose chip did not match — but
+/// every BNO055 answers 0xA0, so the test passed for any BNO055 at all and a
+/// replacement sensor silently inherited the previous unit's biases. The part
+/// has no serial number to do better with, so the guard is handed to the only
+/// participant who actually knows the sensor changed: the person who changed it.
+///
+/// Remounting the SAME sensor does not need a bump — these offsets are
+/// properties of the silicon, not of the bracket.
+#define BNO055_CALIB_INSTALL_ID                      0x0001u
+
+/// Peak linear acceleration below which the vehicle counts as quiet enough to
+/// spend 60 ms not watching (m/s2).
+///
+/// Gravity is already removed from that peak, so this is a direct statement that
+/// nothing is happening: well under the ~1 m/s2 of ordinary acceleration and far
+/// under a pothole. Used to gate the calibration capture, which is the only
+/// operation that blinds BOTH the poll and the hardware High-G comparator at
+/// once.
+#define IMU_CALIB_SAVE_QUIET_MS2                     (0.5f)
 
 /// Shortest interval between calibration saves to the card (ms).
 ///

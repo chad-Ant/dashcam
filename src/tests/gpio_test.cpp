@@ -1,10 +1,11 @@
-// GPIO / UART / I2C / SPI integration test
+// GPIO / PWM / UART / I2C / SPI integration test
 // Runs on the Jetson Orin Nano 40-pin header without requiring specific external hardware.
 // Tests that succeed unconditionally: I2C bus scan, SPI open.
 // Tests that require wiring:           GPIO read/write, UART loopback.
 
 #include "libgpio.h"
 #include "libgpio_dashcam.h"
+#include "libgpio_pwm.h"
 #include "libi2c.h"
 #include "liblog.h"
 #include "libspi.h"
@@ -42,9 +43,9 @@ int main(int argc, char* argv[]) {
     auto log = dashcam::log::getCallback();
 
     log(LvL::INFO, "=== GPIO / UART / I2C / SPI test ===");
-    constexpr int N = 4;
+    constexpr int N = 5;
 
-    // ── [1/4] libgpio ─────────────────────────────────────────────────────────
+    // ── [1/5] libgpio ─────────────────────────────────────────────────────────
     section(log, 1, N, "libgpio");
 
     // Output pin: header pin 29 (GPIO05 = PAA.00)
@@ -90,7 +91,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ── [2/4] libuart ─────────────────────────────────────────────────────────
+    // ── [2/5] libuart ─────────────────────────────────────────────────────────
     section(log, 2, N, "libuart");
 
     {
@@ -119,8 +120,53 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ── [3/4] libi2c ──────────────────────────────────────────────────────────
-    section(log, 3, N, "libi2c");
+    // ── [3/5] PWM (status-LED brightness / 74HCT595 OE) ───────────────────────
+    section(log, 3, N, "PWM");
+
+    {
+        // Header pin 32 (PAA.01) = PWM0. Requires the pin to be muxed to its PWM
+        // function via jetson-io and a REBOOT; PwmPin::open() says so explicitly
+        // if the chip is missing, because an unmuxed pin is the usual reason and
+        // the bare ENOENT gives no hint that a reboot is involved.
+        //
+        // A SKIP here is not a failure of this test — it means the pinmux step
+        // has not been done, which is a setup task rather than a defect.
+        dashcam::gpio::PwmPin pwm;
+        const bool ok = pwm.open(/*chip*/ 0, /*channel*/ 0,
+                                 dashcam::gpio::pins::LED595_PWM_HZ, log);
+        log(ok ? LvL::INFO : LvL::WARN,
+            std::string("  PwmPin::open(pwmchip0/pwm0, ")
+                + std::to_string(dashcam::gpio::pins::LED595_PWM_HZ) + " Hz)  "
+                + (ok ? "OK" : "SKIP — pin not muxed to PWM? run jetson-io + reboot"));
+
+        if (ok) {
+            pwm.enable(true);
+
+            // Ramp, then back down. On a scope this is a duty sweep; with an LED
+            // on pin 32 it is a visible fade. Both ends are exercised because 0
+            // and 1 are the two the kernel is most likely to reject — a duty
+            // equal to the period, and a duty of zero, are the edge cases.
+            for (int pct = 0; pct <= 100 && !g_stop.load(); pct += 10) {
+                const bool set = pwm.setDuty(static_cast<float>(pct) / 100.0f);
+                std::ostringstream o;
+                o << "    duty " << std::setw(3) << pct << " %  " << (set ? "OK" : "FAIL");
+                log(set ? LvL::INFO : LvL::ERROR, o.str());
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            }
+            pwm.setDuty(0.0f);
+            pwm.enable(false);
+
+            // The panel drives OE, which is ACTIVE LOW: duty here is the fraction
+            // of the period the pin is HIGH, so brightness is 1 - duty. The
+            // inversion lives with the LED driver, not in PwmPin — see the note
+            // in libgpio_pwm.h.
+            log(LvL::INFO, "  note: on the LED panel this pin is OE (active low) — brightness = 1 - duty");
+        }
+        // Destructor disables and unexports.
+    }
+
+    // ── [4/5] libi2c ──────────────────────────────────────────────────────────
+    section(log, 4, N, "libi2c");
 
     {
         dashcam::i2c::I2cBus i2c;
@@ -145,8 +191,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ── [4/4] libspi ──────────────────────────────────────────────────────────
-    section(log, 4, N, "libspi");
+    // ── [5/5] libspi ──────────────────────────────────────────────────────────
+    section(log, 5, N, "libspi");
 
     {
         dashcam::spi::SpiConfig scfg;

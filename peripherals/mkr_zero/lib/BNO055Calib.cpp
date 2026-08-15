@@ -46,28 +46,50 @@ bool bno055CalibWrite(const BNO055InitState &state, const uint8_t *in)
     return memcmp(back, in, BNO055_CALIB_BYTES) == 0;
 }
 
+/**
+ * @brief Writes OPR_MODE, waits the switching time, and CONFIRMS it took.
+ *
+ * The confirmation is the point. A mode write can be acknowledged on the bus and
+ * still not take — that is not hypothetical on this part, it is what thirty
+ * bring-ups did while it sat on the wrong register page. Without the read-back,
+ * a capture that failed to leave CONFIG returns success, the caller goes on
+ * believing the sensor is running, and the part produces nothing for the rest of
+ * the drive while every health flag says it is fine.
+ */
+static bool setModeVerified(const BNO055InitState &state, uint8_t mode)
+{
+    unsigned char v = mode;
+    if (bno055BusWrite(state.address, BNO055_OPR_MODE_ADDR, &v, 1u) != 0) return false;
+    // The datasheet's switching time, which the vendored driver does not honour
+    // on its own. See vendor/BNO055/PATCHES.md.
+    delay(BNO055_MODE_SWITCH_MS);
+
+    unsigned char back = 0u;
+    if (bno055BusRead(state.address, BNO055_OPR_MODE_ADDR, &back, 1u) != 0) return false;
+    return (uint8_t)(back & 0x0Fu) == mode;
+}
+
 bool bno055CalibCapture(BNO055InitState &state, uint8_t *out)
 {
     if (out == nullptr || state.address == 0u) return false;
 
     const uint8_t opMode = state.opMode;
-    unsigned char cfg    = OPERATION_MODE_CONFIG;
 
-    if (bno055BusWrite(state.address, BNO055_OPR_MODE_ADDR, &cfg, 1u) != 0) return false;
-    // The datasheet's operation->CONFIG figure, which the driver does not honour
-    // on its own. See vendor/BNO055/PATCHES.md.
-    delay(BNO055_MODE_SWITCH_MS);
+    if (!setModeVerified(state, OPERATION_MODE_CONFIG)) {
+        // Never entered CONFIG, so the offsets were never readable and the part
+        // is still in its operating mode. Nothing to undo.
+        return false;
+    }
 
-    const bool ok = bno055CalibRead(state, out);
+    const bool readOk = bno055CalibRead(state, out);
 
-    // Restored whether or not the read worked. Leaving the part in CONFIG after
-    // a failed capture would stop it producing data entirely — turning a failed
-    // save into a dead sensor, which is a far worse outcome than not saving.
-    unsigned char back = opMode;
-    if (bno055BusWrite(state.address, BNO055_OPR_MODE_ADDR, &back, 1u) != 0) return false;
-    delay(BNO055_MODE_SWITCH_MS);
+    // Restoration is attempted whether or not the read worked, because leaving
+    // the part in CONFIG turns a failed save into a dead sensor — a far worse
+    // outcome than not saving. Its result outranks the read's: a captured
+    // profile is worthless if the sensor is no longer running.
+    if (!setModeVerified(state, opMode)) return false;
 
-    return ok;
+    return readOk;
 }
 
 // ─── the file ─────────────────────────────────────────────────────────────────
@@ -77,12 +99,61 @@ bool bno055CalibCapture(BNO055InitState &state, uint8_t *out)
 // endings, and it is read by the same sdReadLine() every other parser here is
 // built on. The whole profile is 22 bytes; the cost of hex is 22 bytes.
 
-/** @brief Sum-based checksum, matching the CAN map's. */
-static uint8_t profileChecksum(const uint8_t *p, uint8_t chipId)
+/**
+ * @brief CRC-16/CCITT-FALSE over the profile and its install ID.
+ *
+ * An 8-bit additive sum stood here, copied from the CAN map's. It was the wrong
+ * borrowing: the map is re-read and re-checked constantly and a bad row shows up
+ * as a signal that never updates, whereas this is written straight into the
+ * offset registers and then believed for the whole drive. A 1-in-256 chance of
+ * accepting corruption buys a silently biased sensor, and an additive sum does
+ * not notice transposed bytes at all — which is precisely what a partially
+ * written file looks like.
+ *
+ * Same polynomial as the wire protocol, so there is one CRC in this codebase
+ * rather than two.
+ */
+static uint16_t profileCrc(const uint8_t *p, uint16_t installId)
 {
-    uint16_t sum = chipId;
-    for (uint8_t i = 0; i < BNO055_CALIB_BYTES; ++i) sum += p[i];
-    return (uint8_t)(sum & 0xFFu);
+    uint16_t crc = 0xFFFFu;
+    const uint8_t hdr[2] = { (uint8_t)(installId & 0xFFu), (uint8_t)(installId >> 8) };
+
+    for (uint8_t i = 0; i < 2u + BNO055_CALIB_BYTES; ++i) {
+        crc ^= (uint16_t)((i < 2u ? hdr[i] : p[i - 2u])) << 8;
+        for (uint8_t b = 0; b < 8u; ++b) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/**
+ * @brief Rejects offsets that no calibration could have produced.
+ *
+ * A CRC proves the file is intact, not that its contents are sane — a profile
+ * captured from a sensor mid-failure is perfectly well-formed. The datasheet
+ * bounds each field, so anything outside is refused rather than written into the
+ * registers that every later reading is measured against.
+ */
+static bool profilePlausible(const uint8_t *p)
+{
+    // Accelerometer and gyroscope offsets are +/-2000 in their raw units;
+    // magnetometer +/-6400. Bounds from the datasheet's offset register tables,
+    // taken generously — the aim is to catch garbage, not to second-guess Bosch.
+    for (uint8_t i = 0; i < 6u; i += 2u) {
+        const int16_t a = (int16_t)(p[i]      | (p[i + 1]      << 8));   // accel
+        const int16_t m = (int16_t)(p[6 + i]  | (p[7 + i]      << 8));   // mag
+        const int16_t g = (int16_t)(p[12 + i] | (p[13 + i]     << 8));   // gyro
+        if (a < -2100 || a > 2100) return false;
+        if (m < -6600 || m > 6600) return false;
+        if (g < -2100 || g > 2100) return false;
+    }
+    // Radii are unsigned and bounded well below their encoding's range; a value
+    // near int16 max is the signature of a garbage block that happened to CRC.
+    const uint16_t accRadius = (uint16_t)(p[18] | (p[19] << 8));
+    const uint16_t magRadius = (uint16_t)(p[20] | (p[21] << 8));
+    if (accRadius > 2000u || magRadius > 2000u) return false;
+    return true;
 }
 
 static int hexNibble(char c)
@@ -93,18 +164,17 @@ static int hexNibble(char c)
     return -1;
 }
 
-bool bno055CalibStore(const uint8_t *profile, uint8_t chipId)
+bool bno055CalibStore(const uint8_t *profile, uint16_t installId)
 {
     if (profile == nullptr) return false;
 
-    // Three short lines and the hex. Sized for the longest: 44 hex characters
-    // plus its key and terminator.
-    char text[160];
+    char text[224];
     int n = snprintf(text, sizeof(text),
                      "# BNO055 calibration offsets - regs 0x55..0x6A\n"
+                     "# DELETE THIS FILE after replacing or remounting the sensor.\n"
                      "ver %u\n"
-                     "chip %02X\n"
-                     "data ", (unsigned)BNO055_CALIB_FILE_VER, (unsigned)chipId);
+                     "install %04X\n"
+                     "data ", (unsigned)BNO055_CALIB_FILE_VER, (unsigned)installId);
     if (n < 0 || (size_t)n >= sizeof(text)) return false;
 
     for (uint8_t i = 0; i < BNO055_CALIB_BYTES; ++i) {
@@ -113,13 +183,13 @@ bool bno055CalibStore(const uint8_t *profile, uint8_t chipId)
         n += m;
     }
     const int m = snprintf(text + n, sizeof(text) - (size_t)n,
-                           "\nsum %02X\n", (unsigned)profileChecksum(profile, chipId));
+                           "\ncrc %04X\n", (unsigned)profileCrc(profile, installId));
     if (m < 0 || (size_t)(n + m) >= sizeof(text)) return false;
 
     return sdWriteTextAtomic(BNO055_CALIB_PATH, text) == SDReturnStatus::OK;
 }
 
-bool bno055CalibLoad(uint8_t *out, uint8_t *chipId)
+bool bno055CalibLoad(uint8_t *out, uint16_t *installId)
 {
     if (out == nullptr) return false;
 
@@ -131,10 +201,10 @@ bool bno055CalibLoad(uint8_t *out, uint8_t *chipId)
 
     uint8_t  profile[BNO055_CALIB_BYTES];
     bool     haveData = false;
-    bool     haveSum  = false;
+    bool     haveCrc  = false;
     unsigned ver      = 0;
-    unsigned chip     = 0;
-    unsigned sum      = 0;
+    unsigned install  = 0;
+    unsigned crc      = 0;
 
     char line[SD_MAX_LINE];
     while (sdReadLine(f, line, sizeof(line))) {
@@ -142,11 +212,11 @@ bool bno055CalibLoad(uint8_t *out, uint8_t *chipId)
 
         if (strncmp(line, "ver ", 4) == 0) {
             ver = (unsigned)strtoul(line + 4, nullptr, 10);
-        } else if (strncmp(line, "chip ", 5) == 0) {
-            chip = (unsigned)strtoul(line + 5, nullptr, 16);
-        } else if (strncmp(line, "sum ", 4) == 0) {
-            sum = (unsigned)strtoul(line + 4, nullptr, 16);
-            haveSum = true;
+        } else if (strncmp(line, "install ", 8) == 0) {
+            install = (unsigned)strtoul(line + 8, nullptr, 16);
+        } else if (strncmp(line, "crc ", 4) == 0) {
+            crc = (unsigned)strtoul(line + 4, nullptr, 16);
+            haveCrc = true;
         } else if (strncmp(line, "data ", 5) == 0) {
             const char *p = line + 5;
             // Length checked BEFORE parsing, so a truncated line is rejected
@@ -165,12 +235,15 @@ bool bno055CalibLoad(uint8_t *out, uint8_t *chipId)
     }
     f.close();
 
-    if (!haveData || !haveSum)              return false;
-    if (ver != BNO055_CALIB_FILE_VER)       return false;
-    if (profileChecksum(profile, (uint8_t)chip) != (uint8_t)sum) return false;
+    if (!haveData || !haveCrc)        return false;
+    if (ver != BNO055_CALIB_FILE_VER) return false;
+    if (profileCrc(profile, (uint16_t)install) != (uint16_t)crc) return false;
+    // Intact is not the same as sane. A profile captured from a sensor that was
+    // already misbehaving CRCs perfectly.
+    if (!profilePlausible(profile))   return false;
 
     memcpy(out, profile, BNO055_CALIB_BYTES);
-    if (chipId != nullptr) *chipId = (uint8_t)chip;
+    if (installId != nullptr) *installId = (uint16_t)install;
     return true;
 }
 

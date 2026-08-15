@@ -68,12 +68,18 @@ static constexpr unsigned long SERIAL_READY_TIMEOUT_MS = 2000;
 /// Enough repeats that an intermittent UB outcome cannot hide in the noise.
 static constexpr uint16_t REPEATS = 500;
 
-/// LSM6DSOX WHO_AM_I, used as a known-answer target for the read tests.
-static constexpr uint8_t SOX_ADDR    = IMU_ACCEL_I2C_ADDRESS;
-static constexpr uint8_t SOX_WHOAMI  = 0x0Fu;
-static constexpr uint8_t SOX_ID      = 0x6Cu;
-/// 32 contiguous readable output/config registers starting here.
-static constexpr uint8_t SOX_OUT_TEMP_L = 0x20u;
+/// Known-answer target for the read tests: the BNO055's CHIP_ID.
+///
+/// Was the LSM6DSOX at 0x6A, which this rig no longer has — so the sketch
+/// aborted with "no device at the LSM6DSOX address" and the Wire regression
+/// stopped running at all. The names are kept because the tests below are about
+/// WIRE, not about which sensor answers; only the target moved.
+static constexpr uint8_t SOX_ADDR    = BNO055_I2C_ADDRESS_DEFAULT;  ///< 0x29.
+static constexpr uint8_t SOX_WHOAMI  = 0x00u;                       ///< CHIP_ID.
+static constexpr uint8_t SOX_ID      = 0xA0u;
+/// 32 contiguous readable registers starting here: the BNO055 data block from
+/// ACC_DATA_X_LSB, which is exactly what the multi-byte tests want.
+static constexpr uint8_t SOX_OUT_TEMP_L = 0x08u;
 
 /// SERCOM2 I2CM BUSSTATE encoding (SAMD21 datasheet 28.10.3).
 static constexpr uint8_t BUSSTATE_UNKNOWN = 0;
@@ -306,10 +312,10 @@ static void runAllTests(void)
         return;
     }
 
-    // Everything below assumes the LSM6DSOX answers; without it the read tests
-    // would "pass" by failing uniformly, which is worse than not running.
+    // Everything below assumes the IMU answers; without it the read tests would
+    // "pass" by failing uniformly, which is worse than not running.
     if (!i2cProbeAddress(SOX_ADDR)) {
-        Serial.println("FATAL: no device at the LSM6DSOX address - cannot test");
+        Serial.println("FATAL: no device at the BNO055 address - cannot test");
         return;
     }
 

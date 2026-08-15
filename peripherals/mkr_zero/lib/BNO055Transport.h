@@ -20,13 +20,24 @@
  */
 
 #include <Arduino.h>
-#include <BNO055.h>
 
+#include "BNO055Regs.h"       // register map and BNO055Device
 #include "DataDictionary.h"   // IMU_I2C_CLOCK_HZ
 
-#ifndef DASHCAM_BNO055_VENDORED
-#error "Stock BNO055 detected. Build with --library peripherals/mkr_zero/vendor/BNO055 (see vendor/BNO055/PATCHES.md); the global copy resolves an unpinned driver whose bno055_init() overwrites the device address with 0x28, which is the WRONG one for a GY breakout."
-#endif
+/*
+ * THE VENDORING MARKER GUARD THAT STOOD HERE IS GONE, and its absence is not an
+ * oversight.
+ *
+ * It existed because this file included <BNO055.h>, resolved BY NAME — so a
+ * build missing `--library vendor/BNO055` would silently link whatever copy sat
+ * in the user's global Arduino folder, and that copy's bno055_init() overwrites
+ * the device address with 0x28. The guard turned that silent mis-link into a
+ * build failure, which was the right response to a real hazard.
+ *
+ * Nothing includes <BNO055.h> any more. There is no library to resolve by name,
+ * so there is no wrong copy to catch, and a guard for a hazard that cannot occur
+ * is a line that only ever fails for the wrong reason. See BNO055Regs.h.
+ */
 
 /// I2C clock the BNO055 actually runs at — an ALIAS, not an independent setting.
 ///
@@ -50,43 +61,31 @@
 #define BNO055_I2C_CLOCK_HZ   IMU_I2C_CLOCK_HZ
 
 /// Value @c BNO055_CHIP_ID_ADDR must return. Anything else means the address is
-/// wrong or the read is corrupt — the driver's own init return cannot tell you.
+/// wrong or the read is corrupt.
 #define BNO055_EXPECTED_CHIP_ID  0xA0u
-
-/**
- * @brief Installs the transport hooks and the address into @p dev.
- *
- * Does NOT talk to the part; it only wires the struct up. Bring-up is staged
- * elsewhere because the BNO055 needs 400 ms from power-on and 650 ms from a
- * reset before it answers, and blocking that long is the mistake
- * @c gpsInitTick() exists to avoid.
- *
- * @param[out] dev      Driver context to populate.
- * @param[in]  address  7-bit address, normally from a scan. NOT defaulted:
- *                      the datasheet default is 0x29 and the driver's built-in
- *                      constant is 0x28, so guessing has a 50 % failure rate on
- *                      a board whose strapping you have not checked.
- */
-void bno055TransportBind(struct bno055_t &dev, uint8_t address);
 
 /** @brief Scans for a BNO055 at either strapping. 0 when neither answers. */
 uint8_t bno055FindAddress();
 
-// ─── the hooks themselves ─────────────────────────────────────────────────────
+// ─── the transfers themselves ─────────────────────────────────────────────────
 //
-// Exposed as well as installed, because register-level access is exactly what a
-// validation sketch needs: reading CHIP_ID ten thousand times through the SAME
-// path production uses is the only way to prove that path, and going around it
-// with bare Wire calls would prove something else.
+// Public because register-level access is exactly what a validation sketch
+// needs: reading CHIP_ID ten thousand times through the SAME path production
+// uses is the only way to prove that path, and going around it with bare Wire
+// calls would prove something else.
 //
-// extern "C" and these exact signatures are fixed by BNO055_RD_FUNC_PTR /
-// BNO055_WR_FUNC_PTR in the driver. Zero is success, non-zero failure.
+// The signatures were dictated by the vendored driver's BNO055_RD_FUNC_PTR /
+// BNO055_WR_FUNC_PTR typedefs and are KEPT unchanged now that the driver is
+// gone — every caller in this project already speaks them, and churning a
+// working interface to make it prettier is how a licence cleanup turns into a
+// behavioural change nobody asked for. Zero is success, non-zero failure.
+//
+// extern "C" is likewise retained: it costs nothing and the symbols are stable.
 
 extern "C" int  bno055BusRead (unsigned char dev_addr, unsigned char reg_addr,
                                unsigned char *reg_data, unsigned char cnt);
 extern "C" int  bno055BusWrite(unsigned char dev_addr, unsigned char reg_addr,
                                unsigned char *reg_data, unsigned char cnt);
-extern "C" void bno055Delay   (BNO055_MDELAY_DATA_TYPE ms);
 
 /**
  * @brief Consecutive failed transfers since the last success.

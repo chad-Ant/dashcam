@@ -23,8 +23,20 @@
  * WHAT IS AND IS NOT PORTABLE. These offsets are properties of the SILICON —
  * zero-rate bias, accelerometer offset, the fusion's radii — not of how the
  * board is mounted, so a profile survives the sensor being unbolted and moved.
- * It does NOT survive the sensor being replaced, which is why the file records
- * the chip and the profile is refused if it does not match.
+ * It does NOT survive the sensor being replaced.
+ *
+ * THAT LAST CASE CANNOT BE DETECTED AUTOMATICALLY, and an earlier version of
+ * this file claimed it could. It stored CHIP_ID and refused a profile whose chip
+ * did not match — but every BNO055 reports 0xA0, so the check passed for any
+ * BNO055 including a brand new one, and a replacement sensor silently inherited
+ * the old unit's biases. The part exposes no serial number to do better with.
+ *
+ * So the guard is honest instead of automatic: the file carries an INSTALL ID
+ * that the firmware supplies, and a profile whose ID does not match the running
+ * firmware's is refused. Replacing the sensor means bumping
+ * @c BNO055_CALIB_INSTALL_ID or deleting the file — which the file says on its
+ * own first line, because the person holding a screwdriver is the only one who
+ * knows the sensor changed.
  *
  * @see peripherals/mkr_zero/lib/BNO055Init.h — the bring-up this hooks into
  */
@@ -92,12 +104,16 @@ bool bno055CalibCapture(BNO055InitState &state, uint8_t *out);
  * ordinary state of a rig that has never been calibrated, and of one that lost
  * power inside the write window. Distinguished from a corrupt file, which is.
  *
- * @param[out] out      @c BNO055_CALIB_BYTES bytes, untouched unless @c true.
- * @param[out] chipId   Chip ID the profile was captured from, for the caller's
- *                      own check; may be nullptr.
- * @return true only when a well-formed, checksum-valid profile was read.
+ * Rejects a profile that is malformed, fails CRC, or contains offsets outside
+ * the ranges the datasheet allows — a file can be perfectly intact and still
+ * hold values captured from a sensor that was already misbehaving.
+ *
+ * @param[out] out        @c BNO055_CALIB_BYTES bytes, untouched unless @c true.
+ * @param[out] installId  Install ID the profile was written under, for the
+ *                        caller's own check; may be nullptr.
+ * @return true only when a well-formed, CRC-valid, plausible profile was read.
  */
-bool bno055CalibLoad(uint8_t *out, uint8_t *chipId);
+bool bno055CalibLoad(uint8_t *out, uint16_t *installId);
 
 /**
  * @brief Stores a profile on the card, replacing any previous one.
@@ -105,7 +121,7 @@ bool bno055CalibLoad(uint8_t *out, uint8_t *chipId);
  * @return false when the card is absent or the write failed. The previous
  *         profile is left intact on failure.
  */
-bool bno055CalibStore(const uint8_t *profile, uint8_t chipId);
+bool bno055CalibStore(const uint8_t *profile, uint16_t installId);
 
 /** @brief True when the two profiles are byte-identical. */
 bool bno055CalibEqual(const uint8_t *a, const uint8_t *b);

@@ -14,14 +14,6 @@ rem you rule the transport out when they misbehave.
 rem
 rem The --library flags are REQUIRED, not a convenience:
 rem
-rem   vendor\BNO055  Pinned Bosch driver. WITHOUT this flag arduino-cli resolves
-rem                  <BNO055.h> from the global Arduino libraries folder, whose
-rem                  bno055_init() overwrites the device address with 0x28 - the
-rem                  ALTERNATIVE address, not the default - so on a GY breakout
-rem                  every read goes nowhere and chip_id is whatever the failed
-rem                  read left behind. lib\BNO055Transport.h fails the build on a
-rem                  missing marker rather than link the unpinned copy.
-rem                  See vendor\BNO055\PATCHES.md.
 rem
 rem   vendor\Wire    Patched SAMD Wire. Stock TwoWire::requestFrom() reads an
 rem                  uninitialised busOwner on 1-byte transfers, and single-byte
@@ -48,7 +40,6 @@ if errorlevel 1 (
 for %%I in ("%~dp0.") do set "SKETCH_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\..\..\lib") do set "LIB_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\..\..\vendor\Wire") do set "WIRE_DIR=%%~fI"
-for %%I in ("%SKETCH_DIR%\..\..\vendor\BNO055") do set "BNO_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\..\..\vendor\CANBus") do set "CAN_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\..\..\vendor\SdFat") do set "SDFAT_DIR=%%~fI"
 
@@ -65,9 +56,9 @@ if not "%CORE_FOUND%"=="%CORE_REQUIRED%" (
 )
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%BNO_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

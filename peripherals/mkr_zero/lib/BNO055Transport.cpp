@@ -110,38 +110,55 @@ extern "C" int bno055BusWrite(unsigned char dev_addr, unsigned char reg_addr,
     return BNO_OK;
 }
 
-/**
- * @brief The driver's @c delay_msec hook.
+/*
+ * bno055Delay() and bno055TransportBind() stood here and are both gone.
  *
- * Bounded and watchdog-fed. The driver asks for short waits around register
- * writes, which are fine; the long ones the part needs (400 ms from power-on,
- * 650 ms from reset, 19 ms leaving an operating mode) are handled by the staged
- * bring-up instead, so they never arrive here.
+ * They existed to satisfy the vendored driver's function-pointer interface:
+ * bind() installed bus_read, bus_write and delay_msec into its context struct so
+ * it could reach a bus, and the delay hook was a bounded, watchdog-fed wrapper
+ * so a driver path asking to block for a second could not take the watchdog with
+ * it. That clamp guarded an assumption the driver turned out never to test — it
+ * does not call delay_msec at all, not once in 16 000 lines.
  *
- * The clamp is a guard against that assumption quietly becoming false: a driver
- * path that asks to block for a second would otherwise take the watchdog with
- * it, and this is precisely the failure the GNSS bring-up was restructured to
- * eliminate. Feeding the watchdog while waiting keeps a legitimate long wait
- * survivable; clamping keeps it from being silent.
+ * With the driver gone there is no indirection to install: this file's functions
+ * are called directly. One fewer way for the hooks to be unset.
  */
-extern "C" void bno055Delay(BNO055_MDELAY_DATA_TYPE ms)
-{
-    uint32_t remaining = (uint32_t)ms;
-    if (remaining > 50u) remaining = 50u;
-    while (remaining > 0u) {
-        const uint32_t slice = (remaining > 5u) ? 5u : remaining;
-        delay(slice);
-        watchdogFeed();
-        remaining -= slice;
-    }
-}
 
-void bno055TransportBind(struct bno055_t &dev, uint8_t address)
+bool bno055Identify(BNO055Device &dev, uint8_t address)
 {
-    dev.dev_addr   = address;   // honoured thanks to the vendored init patch
-    dev.bus_read   = bno055BusRead;
-    dev.bus_write  = bno055BusWrite;
-    dev.delay_msec = bno055Delay;
+    dev = BNO055Device{};
+    dev.address = address;
+    if (address == 0u) return false;
+
+    uint8_t id = 0u, acc = 0u, mag = 0u, gyr = 0u, bl = 0u, page = 0u;
+    uint8_t sw[2] = { 0u, 0u };
+
+    // EVERY read checked, and the verdict is the AND of all of them. The
+    // function this replaces assigned its status from each read in turn and so
+    // returned only the last one's — a success that said nothing about whether
+    // the part had answered. That trap needed a note in the vendored copy
+    // telling callers to check chip_id themselves; here there is nothing left
+    // for a caller to remember.
+    bool ok = true;
+    ok = ok && (bno055BusRead(address, BNO055_CHIP_ID_ADDR,       &id,   1u) == 0);
+    ok = ok && (bno055BusRead(address, BNO055_ACC_REV_ID_ADDR,     &acc,  1u) == 0);
+    ok = ok && (bno055BusRead(address, BNO055_MAG_REV_ID_ADDR,     &mag,  1u) == 0);
+    ok = ok && (bno055BusRead(address, BNO055_GYR_REV_ID_ADDR,     &gyr,  1u) == 0);
+    ok = ok && (bno055BusRead(address, BNO055_BL_REV_ID_ADDR,      &bl,   1u) == 0);
+    ok = ok && (bno055BusRead(address, BNO055_SW_REV_ID_LSB_ADDR,  sw,    2u) == 0);
+    ok = ok && (bno055BusRead(address, BNO055_PAGE_ID_ADDR,        &page, 1u) == 0);
+    if (!ok) return false;
+
+    dev.chipId          = id;
+    dev.accelRevId      = acc;
+    dev.magRevId        = mag;
+    dev.gyroRevId       = gyr;
+    dev.bootloaderRevId = bl;
+    // Both bytes. See BNO055Device::swRevId for the one that used to be dropped.
+    dev.swRevId         = (uint16_t)(sw[0] | ((uint16_t)sw[1] << 8));
+    dev.pageId          = page;
+
+    return id == BNO055_EXPECTED_CHIP_ID;
 }
 
 uint8_t bno055FindAddress()
@@ -157,9 +174,8 @@ uint8_t bno055FindAddress()
         uint8_t id = 0u;
         // Probe, so a silent candidate address is not charged to the counters.
         if (busReadInto(kCandidates[i], BNO055_CHIP_ID_ADDR, &id, 1u, false) != BNO_OK) continue;
-        // Identified by CHIP_ID, not by a bare address ACK. Something else could
-        // sit at either address, and bno055_init() cannot tell you - it returns
-        // only the status of its LAST read, so a wrong device passes it.
+        // Identified by CHIP_ID, not by a bare address ACK. Something else can
+        // sit at either address, and an ACK only proves that something is there.
         if (id == BNO055_EXPECTED_CHIP_ID) return kCandidates[i];
     }
     return 0u;
