@@ -340,6 +340,21 @@ bool CommLink::setCanMode(uint8_t mode) {
     return sendFrame(hostproto::CMD_SET_CAN_MODE, &mode, 1);
 }
 
+bool CommLink::setImuMode(uint8_t mode) {
+    if (mode != hostproto::IMU_MODE_FUSION && mode != hostproto::IMU_MODE_RAW) {
+        doLog(m_log, dashcam::log::LogLevel::ERROR,
+              "CommLink::setImuMode: expected 1 (IMUPLUS fusion) or 2 (AMG raw)");
+        return false;
+    }
+    // NOT cached and re-applied on reconnect, for the same reason as the CAN
+    // mode above and one of its own: applying it blinds the sensor for ~700 ms
+    // and discards its trailing peak window, so silently repeating it after a
+    // cable glitch would cost a window of inertial data nobody asked to lose.
+    // Read TLM_FLAG_IMU_FUSION_MODE on the next frame to learn the current mode
+    // rather than assuming the last request survived.
+    return sendFrame(hostproto::CMD_SET_IMU_MODE, &mode, 1);
+}
+
 // ─── state ────────────────────────────────────────────────────────────────────
 
 bool CommLink::isOpen() const {

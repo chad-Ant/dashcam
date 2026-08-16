@@ -40,6 +40,11 @@ void HostLink::resetSessionState()
     // this node transmits on a live vehicle bus. That is not a decision any
     // client should inherit from its predecessor.
     canModeReq_ = 0;
+    // And the pending IMU mode, on the same grounds. It selects which
+    // MEASUREMENT the sensor produces, so inheriting one would hand the next
+    // client a frame whose fields mean something other than what it expects —
+    // and cost it a 700 ms blind window it never asked for.
+    imuModeReq_ = 0;
     // And the pending filter set, for the same reason: it decides what a capture
     // can contain, and inheriting one from a process that has gone away would
     // silently narrow the next session's data.
@@ -169,6 +174,21 @@ void HostLink::handleCommand(uint8_t type, const uint8_t *payload, uint8_t len)
             break;
         }
         canModeReq_ = payload[0];
+        break;
+
+    case hostproto::CMD_SET_IMU_MODE:
+        // Range-checked at this hop as well as at the MKR, on the same grounds
+        // as the CAN mode above: a bad argument should die where the host can
+        // still be told which argument it was. 0 is not mapped to a default —
+        // it is reserved as the "nothing pending" sentinel in the latch below,
+        // and silently treating it as fusion would make a typo look like a
+        // deliberate mode change.
+        if (payload[0] != hostproto::IMU_MODE_FUSION &&
+            payload[0] != hostproto::IMU_MODE_RAW) {
+            (void)sendNack(type, hostproto::NACK_BAD_VALUE);
+            break;
+        }
+        imuModeReq_ = payload[0];
         break;
 
     case hostproto::CMD_SET_CAN_FILTER: {

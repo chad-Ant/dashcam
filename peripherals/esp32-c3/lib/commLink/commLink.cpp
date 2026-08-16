@@ -43,6 +43,15 @@ bool CommLink::setCanMode(uint8_t mode)
     return sendCmd(CMD_SET_CAN_MODE, &mode, 1);
 }
 
+bool CommLink::setImuMode(uint8_t mode)
+{
+    // Validated at this boundary as well as at the MKR, for the same reason
+    // setCanMode() is: relaying an out-of-range value spends a UART frame to
+    // earn a NACK the host has no way to attribute to its own argument.
+    if (mode != COMM_IMU_MODE_FUSION && mode != COMM_IMU_MODE_RAW) return false;
+    return sendCmd(CMD_SET_IMU_MODE, &mode, 1);
+}
+
 bool CommLink::setCanFilter(const uint16_t *ids, uint8_t count)
 {
     if (count > COMM_CAN_FILTER_SLOTS) return false;
@@ -62,6 +71,50 @@ bool CommLink::setCanFilter(const uint16_t *ids, uint8_t count)
         p[2 + i * 2] = (uint8_t)(ids[i] >> 8);
     }
     return sendCmd(CMD_SET_CAN_FILTER, p, sizeof(p));
+}
+
+/**
+ * @brief The larger of two peaks, treating NAN as "no measurement".
+ *
+ * NAN is the payload's own "not supplied", so it must lose to any real value and
+ * must not survive one. A plain `>` gets both wrong: every comparison against NAN
+ * is false, so the accumulator would latch NAN forever the first time a channel
+ * went stale.
+ *
+ * BY VALUE, not through a reference parameter. TelemetryPayload is packed, so its
+ * members may be unaligned and a `float&` to one of them does not compile — which
+ * is the compiler stopping an unaligned access rather than a nuisance to work
+ * around.
+ */
+static inline float maxOf(float acc, float sample)
+{
+    if (isnan(sample)) return acc;
+    if (isnan(acc) || (sample > acc)) return sample;
+    return acc;
+}
+
+void CommLink::accumulate(const TelemetryPayload &src)
+{
+    coalescedFlags_        |= (uint16_t)(src.flags & kStickyFlags);
+    coalescedAccelPeak_     = maxOf(coalescedAccelPeak_,    src.imuAccelPeak);
+    coalescedGyroPeak_      = maxOf(coalescedGyroPeak_,     src.imuGyroPeak);
+    coalescedLinAccelPeak_  = maxOf(coalescedLinAccelPeak_, src.imuLinAccelPeak);
+}
+
+void CommLink::mergeCoalesced(TelemetryPayload &out) const
+{
+    out.flags           = (uint16_t)(out.flags | coalescedFlags_);
+    out.imuAccelPeak    = maxOf(out.imuAccelPeak,    coalescedAccelPeak_);
+    out.imuGyroPeak     = maxOf(out.imuGyroPeak,     coalescedGyroPeak_);
+    out.imuLinAccelPeak = maxOf(out.imuLinAccelPeak, coalescedLinAccelPeak_);
+}
+
+void CommLink::clearCoalesced()
+{
+    coalescedFlags_        = 0;
+    coalescedAccelPeak_    = NAN;
+    coalescedGyroPeak_     = NAN;
+    coalescedLinAccelPeak_ = NAN;
 }
 
 bool CommLink::poll()
@@ -87,6 +140,12 @@ bool CommLink::poll()
         case MSG_TELEMETRY:
             if (len == sizeof(TelemetryPayload)) {
                 memcpy(&latest_, payload, sizeof(TelemetryPayload));
+                // BEFORE the overwrite is allowed to matter. This loop can accept
+                // eight frames and the forwarder sends one, so without this the
+                // other seven are simply gone — including a High-G latch the
+                // master held for 500 ms specifically so it could not fall
+                // between two frames. It fell between two frames here instead.
+                accumulate(latest_);
                 hasData_  = true;
                 lastRxMs_ = millis();
                 fresh     = true;

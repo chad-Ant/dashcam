@@ -106,13 +106,23 @@ bool sdReadLine(File32 &f, char *buf, size_t bufLen);
  * loads plausible-looking garbage into the offsets and biases every reading
  * afterwards. So the write goes to a temporary file, is flushed, and only then
  * replaces the target — a cut at any point leaves either the old profile or no
- * new one, never a partial.
+ * new one, NEVER A PARTIAL. That is the guarantee, and it is the one that
+ * matters: the failure being defended against is a corrupt file, not a missing
+ * one.
+ *
+ * ⚠️ ATOMIC IS NOT THE SAME AS TRANSACTIONAL, and this contract used to promise
+ * the stronger thing. FAT has no atomic replace, so the swap is remove-then-
+ * rename and there is a window in which neither name exists. A failure inside
+ * that window — or a power cut inside it — LOSES THE PREVIOUS CONTENTS. Callers
+ * must treat a missing profile as an ordinary state rather than as corruption,
+ * which is exactly what @c bno055CalibLoad() does.
  *
  * @param path  Destination. A sibling temporary is created alongside it.
  * @param text  NUL-terminated content, written verbatim.
  * @return @c OK, @c NOK_INIT_FAILED when no card is mounted, or
- *         @c NOK_WRITE_FAILED if any step failed — in which case the previous
- *         contents of @p path are left untouched.
+ *         @c NOK_WRITE_FAILED if any step failed. On failure @p path holds
+ *         either its previous contents or nothing at all — never a partial
+ *         write, and never the new contents.
  */
 SDReturnStatus sdWriteTextAtomic(const char *path, const char *text);
 

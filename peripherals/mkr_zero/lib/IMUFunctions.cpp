@@ -51,9 +51,9 @@ static_assert(BNO055_I2C_ADDRESS_ALT != SEGLED_ADDRESS,
 #define IMU_SCALE_EULER_DEG   0.0625f   ///< 16 LSB = 1 degree.
 #define IMU_SCALE_MAG_UT      0.0625f   ///< 16 LSB = 1 microtesla.
 
-/// Bytes of the burst compared poll-to-poll to detect a frozen data path:
-/// accelerometer at 0 and gyroscope at 12, six each.
-#define IMU_FREEZE_CHECK_LEN  12u
+/// Bytes of the burst compared poll-to-poll to detect a frozen data path, per
+/// channel: accelerometer at burst offset 0 and gyroscope at 12, six each.
+#define IMU_FREEZE_BYTES_PER_CHANNEL  6u
 
 /// INT_STA bit 5 — accelerometer High-G.
 #define IMU_INT_STA_HIGH_G    0x20u
@@ -136,7 +136,32 @@ static void noteImplausible(IMUDevice &dev){
  */
 static void noteHighG(IMUDevice &dev, uint8_t intSta, uint32_t now)
 {
-    bool     fired  = (intSta & IMU_INT_STA_HIGH_G) != 0u;
+    const bool latched = (intSta & IMU_INT_STA_HIGH_G) != 0u;
+
+    // ── is the latch actually clearing? ──────────────────────────────────────
+    //
+    // Checked BEFORE anything else uses the bit, and checked against the bus
+    // rather than against the write's acknowledgement. A clear that is ACKed and
+    // discarded — by a part on the wrong register page, the failure this project
+    // has already had once — used to leave INT asserted forever while
+    // highGArmed went on advertising a working backstop. The next burst answers
+    // the question at no extra transaction: this one is that burst.
+    if (!latched){
+        dev.highGStuckTracking = false;
+    } else if (!dev.highGStuckTracking){
+        dev.highGStuckTracking = true;
+        dev.highGStuckSinceMs  = now;
+    } else if (dev.init.highGArmed &&
+               ((now - dev.highGStuckSinceMs) > IMU_HIGHG_STUCK_MS)){
+        // Degraded, not fatal, and for the same reason a failed clear write is:
+        // the sample data is unaffected and the peaks still work. What is gone
+        // is the backstop, and a consumer weighing an incident has to be told
+        // that the latch it would have relied on has stopped arming.
+        dev.init.highGArmed = false;
+        if (dev.highGClearFails < 0xFFu) dev.highGClearFails++;
+    }
+
+    bool     fired  = latched;
     uint32_t whenMs = now;
 
     // Snapshot the ISR flags with interrupts masked. Reading a flag and its
@@ -193,6 +218,23 @@ static void noteHighG(IMUDevice &dev, uint8_t intSta, uint32_t now)
 }
 
 // ─── peak ring ────────────────────────────────────────────────────────────────
+//
+// The two properties the ring's sizing exists to deliver, asserted rather than
+// reasoned about in a comment. Both were violated by the previous constants and
+// neither failure was visible: a peak simply came out lower than it should have,
+// on the field incident severity is graded from, and nothing anywhere said so.
+
+/// A bucket must stop being eligible BEFORE the head wraps round and clears it.
+/// Otherwise a bucket contributes to a published peak and is then wiped while
+/// still inside the window, which is the under-report arriving early.
+static_assert(IMU_PEAK_ELIGIBLE_MS < ((uint32_t)IMU_PEAK_BUCKETS * IMU_PEAK_BUCKET_MS),
+              "peak ring is too short: buckets are cleared while still eligible");
+
+/// Every sample must live at least the window it is published as covering,
+/// whatever its phase within its bucket. A sample landing at the very end of a
+/// bucket is the worst case, and it is the one the old sizing failed.
+static_assert((IMU_PEAK_ELIGIBLE_MS - IMU_PEAK_BUCKET_MS) >= IMU_PEAK_WINDOW_MS,
+              "peak retention is shorter than the window it advertises");
 
 static void resetPeakRing(IMUDevice &dev, uint32_t now){
     for (uint8_t i = 0u; i < IMU_PEAK_BUCKETS; i++){
@@ -233,6 +275,11 @@ static void notePeakSq(float valueSq, float *ring, uint8_t head){
 /**
  * @brief Largest value across the buckets still inside the window.
  *
+ * Eligibility is measured to the bucket's END, not its start — see
+ * @c IMU_PEAK_ELIGIBLE_MS. Comparing against the start retired a bucket whose
+ * newest sample was still well inside the window, which under-reported a peak by
+ * up to a whole bucket on the field incident severity is graded from.
+ *
  * @return @c NAN when every bucket is empty, which is honest: no sample has
  *         arrived recently enough to support a peak.
  */
@@ -240,7 +287,7 @@ static float ringMaxSq(const IMUDevice &dev, const float *ring, uint32_t now){
     float best = NAN;
     for (uint8_t i = 0u; i < IMU_PEAK_BUCKETS; i++){
         if (isnan(ring[i])) continue;
-        if ((now - dev.peakBucketMs[i]) > IMU_PEAK_WINDOW_MS) continue;
+        if ((now - dev.peakBucketMs[i]) > IMU_PEAK_ELIGIBLE_MS) continue;
         if (isnan(best) || (ring[i] > best)) best = ring[i];
     }
     return best;
@@ -267,7 +314,7 @@ static void publishPeaks(const IMUDevice &dev, IMUData &data, uint32_t now){
     bool sat = false;
     for (uint8_t i = 0u; i < IMU_PEAK_BUCKETS; i++){
         if (!dev.satBucket[i]) continue;
-        if ((now - dev.peakBucketMs[i]) > IMU_PEAK_WINDOW_MS) continue;
+        if ((now - dev.peakBucketMs[i]) > IMU_PEAK_ELIGIBLE_MS) continue;
         sat = true;
     }
     data.accelSaturated = sat;
@@ -356,8 +403,39 @@ static inline bool isExpired(uint32_t sampleMs, uint32_t nowMs){
     return (nowMs - sampleMs) > IMU_MAX_DATA_AGE_MS;
 }
 
+/**
+ * @brief Raises the gap notice when the record has been without a sample too long.
+ *
+ * MEASURED FROM THE LAST ACCEPTED BURST, not from the last poll ATTEMPT, and the
+ * difference is a whole class of hole that was going unreported. A poll that runs
+ * exactly on time and then has its burst rejected — by the temperature gate, the
+ * gravity gate or the accel-limit gate — leaves precisely the same absence in the
+ * inertial record as a poll that never happened. There is no FIFO to fill it in
+ * either case.
+ *
+ * The old test compared against the attempt and reset its timer before the
+ * transaction, so a sensor failing every gate for 200 ms restarted the clock
+ * every 10 ms and reported a continuous, healthy record over a window in which
+ * nothing at all had been accepted. That is the exact shape of the failure this
+ * driver exists to catch: the part answering perfectly and the contents being
+ * unusable.
+ *
+ * One threshold serves both causes because the consequence is identical, and it
+ * is the same @c IMU_GAP_MIN_MS with the same reasoning behind it — below that
+ * the hardware High-G latch covers an impact landing in the hole.
+ */
+static void noteGapIfStarved(IMUDevice &dev, uint32_t now){
+    if (!dev.ready) return;   // absent hardware is reported as absent, not as a gap
+    if ((now - dev.lastGoodMs) <= IMU_GAP_MIN_MS) return;
+
+    dev.gapFlagActive  = true;
+    dev.gapFlagUntilMs = now + IMU_PEAK_WINDOW_MS;
+}
+
 /** @brief Ages out any channel past its freshness window, without touching the bus. */
 static void expireChannels(IMUDevice &dev, IMUData &data, uint32_t now){
+    noteGapIfStarved(dev, now);
+
     if (!dev.ready || isExpired(data.accelSampleMs,  now)) invalidateAccel(data);
     if (!dev.ready || isExpired(data.gyroSampleMs,   now)) invalidateGyro(data);
     if (!dev.ready || isExpired(data.tempSampleMs,   now)) invalidateTemp(data);
@@ -388,13 +466,22 @@ static void expireChannels(IMUDevice &dev, IMUData &data, uint32_t now){
 }
 
 /**
- * @brief True when the fused output has earned the right to be believed.
+ * @brief The MINIMUM LOCAL USABILITY GATE on the fused output.
+ *
+ * Named for what it is rather than for what it sounds like. It is not a verdict
+ * on quality and cannot be one: it consults a single field.
  *
  * Gyroscope only. The accelerometer figure was a criterion until a bench run
- * showed it falling to 0 and staying there for 9000 consecutive polls while the
- * gravity magnitude held 9.79-9.81 throughout — so it was reporting PARTIAL
- * forever on output that a direct physical test says is fine. See
- * @c IMU_CALIB_MIN_GYRO for the full reasoning.
+ * showed it decaying to 0 within about 19 seconds of a successful profile
+ * restore and staying there for thousands of polls, while the gravity magnitude
+ * held 9.79-9.81 throughout — so it was reporting PARTIAL indefinitely on output
+ * that a gross physical check says is fine. See @c IMU_CALIB_MIN_GYRO.
+ *
+ * That gravity magnitude is a fusion OUTPUT, so its steadiness is a
+ * self-consistency test rather than an independent physical bound on
+ * accelerometer bias — which is the other reason this is a floor and not a
+ * judgement. A consumer wanting an accelerometer-calibration policy has the raw
+ * figure on the wire in @c imuCalib and should enforce it there.
  */
 static bool fusionTrustworthy(const IMUData &data){
     return data.calibGyro >= IMU_CALIB_MIN_GYRO;
@@ -424,10 +511,14 @@ void imuMarkAbsent(IMUDevice &dev){
     dev.ioErrors    = 0u;
     dev.implausible = 0u;
 
-    dev.lastChangeMs  = millis();
+    dev.accelChangeMs = millis();
+    dev.gyroChangeMs  = millis();
     dev.lastRawValid  = false;
     dev.missedPolls   = 0u;
     dev.lastPollMs    = millis();
+    // Seeded to now, not to zero. The gap flag is an elapsed-time test against
+    // this, so a zero would read as a 49-day hole on the very first poll.
+    dev.lastGoodMs    = millis();
     dev.gapFlagActive = false;
     dev.gapFlagUntilMs = millis();
     dev.eulerAndroid  = false;
@@ -437,6 +528,8 @@ void imuMarkAbsent(IMUDevice &dev){
     dev.highGActive  = false;
     dev.highGUntilMs = millis();
     dev.highGAtMs    = 0u;
+    dev.highGStuckTracking = false;
+    dev.highGStuckSinceMs  = millis();
     // Any pin edge from before this reset describes a device that is being
     // re-initialised, so it belongs to nothing.
     noInterrupts();
@@ -490,12 +583,16 @@ BNO055InitStage imuInitTick(IMUDevice &dev){
     // publish a reading from a part that has not finished being told what to do.
     if ((stage == BNO055InitStage::Configured) && !dev.ready){
         const uint32_t now = millis();
-        dev.ready        = true;
-        dev.faults       = 0u;
-        dev.lastChangeMs = now;
-        dev.lastRawValid = false;
-        dev.lastPollMs   = now;
-        dev.eulerAndroid = (dev.init.unitSelSeen & 0x80u) != 0u;
+        dev.ready         = true;
+        dev.faults        = 0u;
+        dev.accelChangeMs = now;
+        dev.gyroChangeMs  = now;
+        dev.lastRawValid  = false;
+        dev.lastPollMs    = now;
+        // The record starts here, so the first poll is not charged for the
+        // bring-up that preceded it.
+        dev.lastGoodMs    = now;
+        dev.eulerAndroid  = (dev.init.unitSelSeen & 0x80u) != 0u;
         resetPeakRing(dev, now);
         dev.lifecycle    = IMU_LIFECYCLE_ACTIVE;
     }
@@ -573,10 +670,13 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // part's FIFO covered a stalled loop up to its 2.3 s depth; this one has no
     // buffer at all, so the gap flag is the only record that the window has a
     // hole in it — which makes it far more load-bearing here than it was there.
+    //
+    // This counts the LOOP's failures to arrive on time, which is a diagnostic
+    // about the firmware. The gap FLAG is raised elsewhere, from the last burst
+    // actually accepted, because a poll arriving punctually and being thrown out
+    // by a plausibility gate leaves the identical hole — see noteGapIfStarved().
     if ((now - dev.lastPollMs) > IMU_GAP_MIN_MS){
         if (dev.missedPolls < 0xFFFFu) dev.missedPolls++;
-        dev.gapFlagActive  = true;
-        dev.gapFlagUntilMs = now + IMU_PEAK_WINDOW_MS;
     }
     dev.lastPollMs = now;
 
@@ -685,17 +785,43 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // stop changing are a frozen data path on a device that is still answering
     // every transaction perfectly — which is precisely how the previous sensor
     // failed, and a fault no bus-level counter could ever see.
+    //
+    // PER CHANNEL, with a timer each. One flag over all twelve bytes is set by
+    // ANY of them moving, and gyro noise never stops — so the combined form could
+    // not detect a frozen accelerometer at all, however long it stayed frozen.
+    // The sensor this driver replaced failed by returning a FIXED 27.8 m/s2
+    // accelerometer, which is to say the check documented as catching that exact
+    // failure would have been held open by the noise beside it. The masking runs
+    // both ways: driving over a rough surface would equally have hidden a frozen
+    // gyroscope.
     {
-        bool changed = !dev.lastRawValid;
-        for (uint8_t i = 0u; i < IMU_FREEZE_CHECK_LEN; i++){
-            const uint8_t src = (i < 6u) ? buf[IMU_OFF_ACCEL + i]
-                                         : buf[IMU_OFF_GYRO + (i - 6u)];
-            if (dev.lastRaw[i] != src) changed = true;
+        const bool first = !dev.lastRawValid;
+
+        bool accelChanged = first;
+        for (uint8_t i = 0u; i < IMU_FREEZE_BYTES_PER_CHANNEL; i++){
+            const uint8_t src = buf[IMU_OFF_ACCEL + i];
+            if (dev.lastRaw[i] != src) accelChanged = true;
             dev.lastRaw[i] = src;
         }
+
+        bool gyroChanged = first;
+        for (uint8_t i = 0u; i < IMU_FREEZE_BYTES_PER_CHANNEL; i++){
+            const uint8_t src = buf[IMU_OFF_GYRO + i];
+            if (dev.lastRaw[IMU_FREEZE_BYTES_PER_CHANNEL + i] != src) gyroChanged = true;
+            dev.lastRaw[IMU_FREEZE_BYTES_PER_CHANNEL + i] = src;
+        }
+
         dev.lastRawValid = true;
-        if (changed) dev.lastChangeMs = now;
-        else if ((now - dev.lastChangeMs) > IMU_MAX_CHANNEL_STALL_MS){
+        if (accelChanged) dev.accelChangeMs = now;
+        if (gyroChanged)  dev.gyroChangeMs  = now;
+
+        // EITHER channel stalling retires the part. They share one die, one
+        // regulator and one bus, so a channel that has stopped converting is
+        // evidence about the device rather than about that channel — and there
+        // is no per-channel repair available in any case: the recovery path is
+        // a full reconfiguration either way.
+        if (((now - dev.accelChangeMs) > IMU_MAX_CHANNEL_STALL_MS) ||
+            ((now - dev.gyroChangeMs)  > IMU_MAX_CHANNEL_STALL_MS)){
             // Retired rather than merely expired. Expiry blanks the signal and
             // leaves it blank; retiring is what makes isIMUDegraded() true and
             // gets the part reconfigured, which is the only thing that might
@@ -742,6 +868,11 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // there is no room for an impossible value to exist in the encoding. A test
     // that cannot fail is not a test.
 
+    // The burst has passed every gate, so this is the moment the inertial record
+    // gained a sample. The gap flag is measured from here — see
+    // noteGapIfStarved() for why the poll's own timestamp will not do.
+    dev.lastGoodMs = now;
+
     data.accelX = ax; data.accelY = ay; data.accelZ = az;
     data.accelSampleMs = now;
     data.accelValid    = true;
@@ -760,9 +891,14 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // Saturation is judged per AXIS, not on the magnitude. The rail is per-axis,
     // so a single clipped component makes the vector wrong even while its length
     // is nowhere near the limit — and a magnitude test would miss exactly that.
-    if (fabsf(ax) >= IMU_ACCEL_SATURATION_MS2 ||
-        fabsf(ay) >= IMU_ACCEL_SATURATION_MS2 ||
-        fabsf(az) >= IMU_ACCEL_SATURATION_MS2){
+    //
+    // AGAINST THE RAIL OF THE MODE IN USE. A single 4 g threshold was applied to
+    // both, so AMG — selected at +/-16 g precisely so a severe impact can be
+    // characterised instead of clipped — marked every honest reading above 4 g as
+    // clipped, on the one mode that exists to measure past it.
+    const float satLimit = fusion ? IMU_ACCEL_SATURATION_MS2_FUSION
+                                  : IMU_ACCEL_SATURATION_MS2_RAW;
+    if (fabsf(ax) >= satLimit || fabsf(ay) >= satLimit || fabsf(az) >= satLimit){
         dev.satBucket[dev.peakBucketHead] = true;
     }
 

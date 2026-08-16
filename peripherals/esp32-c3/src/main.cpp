@@ -259,13 +259,34 @@ static void forwardTelemetry()
         if (!gHost.streaming()) return;
         // Decimation gate: forward every Nth master frame.  decimation() is
         // guaranteed >= 1 by hostLink (CMD_SET_DECIM rejects 0).
-        if (++gDecimCount < gHost.decimation()) return;
+        //
+        // AN EVENT OVERRIDES IT. Decimation is a bandwidth preference about
+        // routine sampling, and it was being applied to a High-G latch as though
+        // an impact were routine — so at a decimation of 5 the frame carrying an
+        // impact had a 4-in-5 chance of being dropped for arriving on the wrong
+        // count. The flags are sticky, so the event would eventually ride out on
+        // a later frame; sending it now removes up to half a second of delay from
+        // the one signal that exists because delay loses data.
+        if (!gLink.hasUrgent() && (++gDecimCount < gHost.decimation())) return;
     }
     gDecimCount = 0;
 
+    // The snapshot is the newest master frame; the merge restores what the frames
+    // coalesced behind it carried. Done on a COPY, before the hand-off, so a
+    // failed send leaves both gLink's snapshot and its accumulator untouched.
+    TelemetryPayload snap = gLink.latest();
+    gLink.mergeCoalesced(snap);
+
     hostproto::Telemetry t;
-    toHostTelemetry(gLink.latest(), t);
+    toHostTelemetry(snap, t);
     const bool sent = gHost.sendTelemetry(t); // a drop is counted in BridgeStatus::hostTxDropped
+
+    // ONLY ON A CONFIRMED SEND. A full host TX ring, a disconnected Jetson or an
+    // app that has stalled all end here, and clearing the accumulator on the
+    // attempt discarded the event along with the frame that failed to carry it —
+    // after which the next frame reported a quiet window over an interval that
+    // contained an impact. Held instead until something actually leaves.
+    if (sent) gLink.clearCoalesced();
 
     // Only retire the one-shot once it has actually gone out.  Clearing it on
     // the attempt would answer a full TX ring with silence, leaving the host
@@ -373,6 +394,20 @@ void loop()
     if (const uint8_t m = gHost.takeCanModeRequest()) {
         if (!gLink.setCanMode(m)) {
             bridgeLog(hostproto::LOG_WARN, "CMD_SET_CAN_MODE dropped: master TX busy");
+        }
+    }
+
+    // 2b-ii) IMU mode request, relayed on the same terms as the CAN mode: not
+    //        latched, not retried.
+    //
+    // The reasoning is stronger here. Applying one costs the master a ~700 ms
+    // blind window, so a request re-sent because the first was dropped would
+    // blind the sensor twice for a change the host asked for once — and a stale
+    // one delivered seconds later would switch the MEASUREMENT under a host that
+    // has moved on, which is worse than not switching at all.
+    if (const uint8_t m = gHost.takeImuModeRequest()) {
+        if (!gLink.setImuMode(m)) {
+            bridgeLog(hostproto::LOG_WARN, "CMD_SET_IMU_MODE dropped: master TX busy");
         }
     }
 

@@ -124,6 +124,30 @@ struct CommMaster {
      */
     uint8_t       canModeRequest;
     /**
+     * A CMD_SET_IMU_MODE the sketch has not acted on yet. 0 = none pending.
+     *
+     * Latched for the same reason as @c canModeRequest and more urgently:
+     * applying it calls setIMUSampleMode(), which restarts the sensor's entire
+     * bring-up. That is roughly 700 ms during which the IMU publishes nothing
+     * and the trailing peak window is discarded — far too much work to do from
+     * inside the frame decoder, which is servicing a bounded command budget and
+     * must return promptly to the loop.
+     *
+     * Values are @c COMM_IMU_MODE_FUSION and @c COMM_IMU_MODE_RAW, validated at
+     * the wire boundary so an out-of-range byte is NACKed rather than reaching
+     * the driver.
+     */
+    uint8_t       imuModeRequest;
+    /**
+     * @c millis() the last IMU mode change was applied. 0 = none this boot.
+     *
+     * The rate limiter's state. Without one, a host looping on the command
+     * would hold the sensor in permanent re-initialisation and it would never
+     * produce a sample again — every request individually reasonable, the
+     * aggregate a denial of the sensor.
+     */
+    unsigned long imuModeAppliedMs;
+    /**
      * A CMD_SET_CAN_FILTER the sketch has not acted on yet.
      *
      * Latched for the same reason as @c canModeRequest, and more strongly: the

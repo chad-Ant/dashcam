@@ -182,11 +182,57 @@
  */
 #define COMM_FLAG_CANMAP_LOADED 0x0400u
 /**
- * NOTE: @c TelemetryPayload::flags became @c uint16_t in v0x06 and 0x0400 is in
- * use. Nine bits remain. The next widening is another payload size change and
+ * The hardware High-G backstop is ARMED.
+ *
+ * The counterpart of @c COMM_FLAG_IMU_HIGH_G, and useless without it. That flag
+ * says an impact was latched; this says the latch was capable of latching one.
+ * Clear means an impact landing inside a stalled master goes unrecorded — the
+ * single case the backstop exists for — and NOTHING ELSE ON THIS FRAME WOULD SAY
+ * SO. The peaks look normal, every valid flag stays set, and the absence is
+ * indistinguishable from a quiet drive.
+ *
+ * It goes clear when the interrupt could not be configured at bring-up, or when
+ * the master found the latch no longer clearing. Both leave the sample data
+ * fully usable, which is why neither is reported as a fault: the sensor is fine
+ * and the safety net is not.
+ *
+ * Added in v0x06 without a version bump — a flag bit inside an existing
+ * @c uint16_t changes no offset and no payload size, so a consumer built against
+ * the earlier v0x06 header ignores it exactly as it ignores any bit it does not
+ * know. A host that WANTS it should test it, not assume it.
+ */
+#define COMM_FLAG_IMU_HIGHG_ARMED 0x0800u
+/**
+ * The IMU is in a FUSION mode (IMUPLUS); clear means the raw mode (AMG).
+ *
+ * The two publish different fields and mean different things by the same ones,
+ * so a consumer that does not know which it is holding cannot read the frame
+ * correctly. In fusion the magnetometer is off and @c imuMagX/Y/Z are NAN while
+ * @c imuLinAccelPeak and @c imuYawRelDeg are live; in raw there is no fusion, so
+ * those two are NAN and the magnetometer is populated. @c imuAccelPeak saturates
+ * at 4 g in fusion and 16 g in raw — the same number, two different rails.
+ *
+ * Inferring the mode from which fields happen to be NAN was the only option
+ * before this bit existed, and it is not the same thing: a stale channel and a
+ * mode that does not produce that channel look identical.
+ *
+ * It also closes the loop on @c CMD_SET_IMU_MODE, which otherwise asks for a
+ * change the host has no way to observe.
+ */
+#define COMM_FLAG_IMU_FUSION_MODE 0x1000u
+/**
+ * NOTE: @c TelemetryPayload::flags became @c uint16_t in v0x06 and 0x1000 is in
+ * use. Seven bits remain. The next widening is another payload size change and
  * therefore another COMM_VERSION bump — the v0x05 note said the same thing about
  * this one, and it was accurate.
  */
+
+/// @c CMD_SET_IMU_MODE payload values.
+///
+/// 1-based, so 0 stays available as "nothing pending" in the master's latch —
+/// the same convention @c CMD_SET_CAN_MODE uses, and for the same reason.
+#define COMM_IMU_MODE_FUSION 1u  ///< IMUPLUS: on-chip fusion, magnetometer off.
+#define COMM_IMU_MODE_RAW    2u  ///< AMG: raw accel/mag/gyro, no fusion, +/-16 g.
 
 /** Message / command identifiers. High bit set = master (MKR) -> slave (C3). */
 enum CommMsgType : uint8_t {
@@ -223,6 +269,27 @@ enum CommMsgType : uint8_t {
      * reports it as a gap rather than hiding it.
      */
     CMD_SET_CAN_FILTER = 0x14,
+    /**
+     * C3 -> MKR: select the IMU's operating mode. 1-byte payload.
+     *
+     * @c COMM_IMU_MODE_FUSION or @c COMM_IMU_MODE_RAW. The two are DIFFERENT
+     * MEASUREMENTS, not a quality setting — see the mode constants — so this is
+     * a deliberate session-level choice, never a per-event one.
+     *
+     * ⚠️ EXPENSIVE AND BLINDING. Applying it restarts the sensor's whole
+     * bring-up: the IMU publishes nothing for about 700 ms and the trailing peak
+     * window is discarded. A crash pulse lasts 10-50 ms, so a mode switch
+     * triggered ON an impact would be over long after the event it was reacting
+     * to, having thrown away the only record of it. The master rate-limits this
+     * for that reason, and a request arriving too soon after the last one is
+     * NACKed rather than queued.
+     *
+     * Not restored automatically after a master reset: the MKR comes back in its
+     * compiled-in default, and a host that needs the other mode must ask again.
+     * The mode is reported on every frame in @c COMM_FLAG_IMU_FUSION_MODE, so a
+     * host can tell without keeping its own state.
+     */
+    CMD_SET_IMU_MODE = 0x15,
     MSG_TELEMETRY    = 0x81, ///< MKR -> C3: telemetry payload.
     MSG_PONG         = 0xA0, ///< MKR -> C3: ping acknowledgement.
     MSG_NACK         = 0xEE, ///< MKR -> C3: malformed or unknown command.
@@ -253,6 +320,7 @@ inline bool isCommand(uint8_t type)
     case CMD_STOP_STREAM:
     case CMD_SET_CAN_MODE:
     case CMD_SET_CAN_FILTER:
+    case CMD_SET_IMU_MODE:
     case CMD_PING:
         return true;
     default:
@@ -265,6 +333,7 @@ inline uint8_t commandPayloadLen(uint8_t type)
 {
     switch (type) {
     case CMD_SET_CAN_MODE:   return 1;
+    case CMD_SET_IMU_MODE:   return 1;
     case CMD_SET_CAN_FILTER: return COMM_SET_CAN_FILTER_LEN;
     default:                 return 0;
     }

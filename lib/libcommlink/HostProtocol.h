@@ -166,6 +166,30 @@ enum MsgType : uint8_t {
      * excluded, and this changes it.
      */
     CMD_SET_CAN_FILTER = 0x14,
+    /**
+     * Select the IMU's operating mode; relayed to the MKR. 1-byte payload.
+     *
+     * @c IMU_MODE_FUSION or @c IMU_MODE_RAW. The two are DIFFERENT MEASUREMENTS,
+     * not a quality setting — fusion yields gravity-compensated linear
+     * acceleration and relative yaw but clips at 4 g, while raw reaches 16 g and
+     * produces no fusion at all. Which one is right depends on what the host is
+     * trying to record, so it is a session-level decision.
+     *
+     * ⚠️ EXPENSIVE AND BLINDING. Applying it restarts the sensor's bring-up: the
+     * IMU publishes nothing for about 700 ms and the trailing peak window is
+     * discarded. A crash pulse lasts 10-50 ms, so switching mode ON an impact
+     * would complete long after the event and would throw away the only record
+     * of it. Choose the mode before the drive, not during an incident.
+     *
+     * Not restored automatically after a master or bridge reset — the MKR comes
+     * back in its compiled-in default. @c TLM_FLAG_IMU_FUSION_MODE reports the
+     * mode on every frame, so a host re-establishing a link should read it
+     * rather than assume its last request survived.
+     *
+     * The bridge NACKs an out-of-range value; a request the master's TX cannot
+     * accept is reported as a bridge log line, not retried.
+     */
+    CMD_SET_IMU_MODE = 0x15,
     CMD_PING         = 0x20, ///< Link check.
 
     // ── C3 -> Jetson ──
@@ -342,11 +366,61 @@ constexpr uint16_t TLM_FLAG_IMU_SATURATED = 0x0200;
  */
 constexpr uint16_t TLM_FLAG_CANMAP_LOADED = 0x0400;
 /**
- * NOTE: @c Telemetry::flags became @c uint16_t in v0x06 and 0x0400 is in use.
- * Nine bits remain. A further widening is another payload size change and so
+ * The hardware High-G backstop is ARMED.
+ *
+ * The counterpart of @c TLM_FLAG_IMU_HIGH_G, and useless without it. That flag
+ * says an impact was latched; this says the latch was capable of latching one.
+ * Clear means an impact landing inside a stalled master goes unrecorded — the
+ * single case the backstop exists for — and NOTHING ELSE ON THIS FRAME WOULD SAY
+ * SO. The peaks look normal, every valid flag stays set, and the absence is
+ * indistinguishable from a quiet drive.
+ *
+ * It goes clear when the interrupt could not be configured at bring-up, or when
+ * the master found the latch no longer clearing. Both leave the sample data
+ * fully usable, which is why neither is reported as a fault: the sensor is fine
+ * and the safety net is not.
+ *
+ * A consumer treating @c TLM_FLAG_IMU_HIGH_G as its incident trigger should read
+ * this alongside it. Absence of the event flag means "no impact detected" only
+ * while this is set; with it clear the honest reading is "not watched for".
+ *
+ * Added within v0x06 — a flag bit inside an existing @c uint16_t changes no
+ * offset and no payload size, so a consumer built against the earlier v0x06
+ * header ignores it exactly as it ignores any bit it does not know.
+ */
+constexpr uint16_t TLM_FLAG_IMU_HIGHG_ARMED = 0x0800;
+/**
+ * The IMU is in a FUSION mode (IMUPLUS); clear means the raw mode (AMG).
+ *
+ * The two publish different fields and mean different things by the same ones,
+ * so a consumer that does not know which it is holding cannot read the frame
+ * correctly. In fusion the magnetometer is off and @c imuMagX/Y/Z are NAN while
+ * @c imuLinAccelPeak and @c imuYawRelDeg are live; in raw there is no fusion, so
+ * those two are NAN and the magnetometer is populated. @c imuAccelPeak saturates
+ * at 4 g in fusion and 16 g in raw — the same number, two different rails, which
+ * is why grading an impact from it requires knowing this bit.
+ *
+ * Inferring the mode from which fields happen to be NAN was the only option
+ * before this bit existed, and it is not the same thing: a stale channel and a
+ * mode that does not produce that channel look identical.
+ *
+ * It also closes the loop on @c CMD_SET_IMU_MODE, which otherwise asks for a
+ * change the host has no way to observe.
+ */
+constexpr uint16_t TLM_FLAG_IMU_FUSION_MODE = 0x1000;
+/**
+ * NOTE: @c Telemetry::flags became @c uint16_t in v0x06 and 0x1000 is in use.
+ * Seven bits remain. A further widening is another payload size change and so
  * another VERSION bump on both hops — the v0x05 note said exactly this about the
  * change that has just happened.
  */
+
+/// @c CMD_SET_IMU_MODE payload values.
+///
+/// 1-based, so 0 stays available as "nothing pending" in the bridge's latch —
+/// the same convention @c CMD_SET_CAN_MODE uses, and for the same reason.
+constexpr uint8_t IMU_MODE_FUSION = 1;  ///< IMUPLUS: on-chip fusion, magnetometer off.
+constexpr uint8_t IMU_MODE_RAW    = 2;  ///< AMG: raw accel/mag/gyro, no fusion, +/-16 g.
 
 /** @c LogHeader::level values (mirrors dashcam::log::LogLevel). */
 enum LogLevel : uint8_t { LOG_DEBUG = 0, LOG_INFO = 1, LOG_WARN = 2, LOG_ERROR = 3 };
@@ -403,7 +477,7 @@ struct __attribute__((packed)) Telemetry {
     uint8_t minute;        ///< 0–59.
     uint8_t second;        ///< 0–60.
     /**
-     * ---- IMU (LSM6DSOX + LIS3MDL, sensor frame) ----
+     * ---- IMU (BNO055, sensor frame) ----
      *
      * NOT to be confused with @c accel above. That is a scalar LONGITUDINAL
      * acceleration derived from the ECU speed signal; these are the raw
@@ -908,6 +982,7 @@ inline bool isCommand(uint8_t type)
     case CMD_SET_DECIM:
     case CMD_SET_CAN_MODE:
     case CMD_SET_CAN_FILTER:
+    case CMD_SET_IMU_MODE:
     case CMD_PING:
         return true;
     default:
@@ -925,7 +1000,8 @@ inline uint8_t commandPayloadLen(uint8_t type)
 {
     switch (type) {
     case CMD_SET_DECIM:
-    case CMD_SET_CAN_MODE:   return 1;
+    case CMD_SET_CAN_MODE:
+    case CMD_SET_IMU_MODE:   return 1;
     case CMD_SET_CAN_FILTER: return SET_CAN_FILTER_LEN;
     default:                 return 0;
     }

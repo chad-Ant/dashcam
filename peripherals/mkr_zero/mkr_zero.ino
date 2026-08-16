@@ -591,10 +591,28 @@ void setup()
         // the CPU through the part's own 650 ms reset — with the C3 link, the
         // CAN drain and the watchdog feed all stopped, and a hang landing at the
         // same point on every boot under the same armed watchdog.
-        const IMUReturnStatus st = initializeIMU(imuDev, IMUSampleMode::Fusion);
+        // DASHCAM_IMU_MODE_AMG selects the raw mode instead, and is UNSET in
+        // production — the default below is the shipped configuration and this
+        // block compiles to exactly what it did before.
+        //
+        // It exists because the mode is chosen once, here, and there is no
+        // command to change it at runtime: the raw path therefore has no way of
+        // being exercised end to end without a rebuild. Selecting it at compile
+        // time keeps the alternative honest — what gets flashed is the
+        // production firmware in its other documented mode, not a test harness
+        // wearing its name.
+        //
+        //   arduino-cli compile --build-property "build.extra_flags=-DDASHCAM_IMU_MODE_AMG" ...
+#ifdef DASHCAM_IMU_MODE_AMG
+        const IMUSampleMode bootMode = IMUSampleMode::Raw;
+#else
+        const IMUSampleMode bootMode = IMUSampleMode::Fusion;
+#endif
+        const IMUReturnStatus st = initializeIMU(imuDev, bootMode);
         Serial.print("IMU: ");
-        if (st == IMUReturnStatus::OK) Serial.println("bring-up started (IMUPLUS)");
-        else                           Serial.println("bring-up REFUSED");
+        if (st != IMUReturnStatus::OK)                 Serial.println("bring-up REFUSED");
+        else if (bootMode == IMUSampleMode::Raw)       Serial.println("bring-up started (AMG)");
+        else                                           Serial.println("bring-up started (IMUPLUS)");
 
         // The bus is still worth naming at BOOT, before anything has run. A bus
         // already down on a cold start is the single most diagnostic line in the
@@ -898,6 +916,55 @@ void loop()
         // request above: a refused command retried every pass forever produces a
         // stream of failures for something the host asked once.
         commMaster.canFilterPending = false;
+    }
+
+    // ── 0a-ii) Host-requested IMU mode change ────────────────────────────────
+    //
+    // Applied HERE and not in the frame decoder, because setIMUSampleMode()
+    // restarts the whole bring-up: about 700 ms in which the sensor publishes
+    // nothing and the trailing peak window is thrown away.
+    if (commMaster.imuModeRequest != 0) {
+        const IMUSampleMode want = (commMaster.imuModeRequest == COMM_IMU_MODE_RAW)
+                                       ? IMUSampleMode::Raw
+                                       : IMUSampleMode::Fusion;
+
+        Serial.print("IMU: host requested ");
+        Serial.print(want == IMUSampleMode::Raw ? "AMG" : "IMUPLUS");
+        Serial.print(" -> ");
+
+        // RATE LIMITED, and this is the whole reason the timestamp exists. Each
+        // switch blinds the sensor for ~700 ms, so a host looping on the command
+        // would hold it in permanent re-initialisation and it would never
+        // produce another sample — every request individually reasonable, the
+        // aggregate a denial of the sensor.
+        const unsigned long sinceLast = millis() - commMaster.imuModeAppliedMs;
+        if (isIMUQuarantined(imuDev)) {
+            // Not a refusal to be fixed by asking again: the quarantine is
+            // terminal for the boot, and honouring this would re-enter the bus
+            // hang it exists to prevent.
+            Serial.println("REFUSED (IMU quarantined for this boot)");
+        } else if (imuSampleMode(imuDev) == want) {
+            // Not an error, and worth saying: a host re-asserting the mode it
+            // already has should not be charged a 700 ms blind window for it.
+            Serial.println("already in that mode, no change");
+        } else if (commMaster.imuModeAppliedMs != 0 && sinceLast < IMU_MODE_MIN_INTERVAL_MS) {
+            Serial.print("REFUSED (last change ");
+            Serial.print(sinceLast);
+            Serial.println(" ms ago)");
+        } else if (setIMUSampleMode(imuDev, want) == IMUReturnStatus::OK) {
+            commMaster.imuModeAppliedMs = millis();
+            // The snapshot describes a sensor that no longer exists in that
+            // configuration, so it is cleared rather than left to age out. Its
+            // peaks were folded against the OTHER mode's rail.
+            initIMUData(imuData);
+            Serial.println("bring-up restarted (~700 ms blind)");
+        } else {
+            Serial.println("REFUSED (driver declined)");
+        }
+
+        // Cleared whether or not it was applied, on the same principle as the
+        // CAN requests above.
+        commMaster.imuModeRequest = 0;
     }
 
     // ── 0b) Passive decode, whenever a listen-only mode is active ────────────

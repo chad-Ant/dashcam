@@ -225,6 +225,29 @@ public:
      */
     bool setCanMode(uint8_t mode);
 
+    /**
+     * @brief Selects the IMU's operating mode on the master.
+     *
+     * @param mode @c hostproto::IMU_MODE_FUSION (1) for IMUPLUS — on-chip
+     *             fusion giving gravity-compensated linear acceleration and
+     *             relative yaw, clipping at 4 g — or @c IMU_MODE_RAW (2) for
+     *             AMG, which reaches 16 g and produces no fusion at all.
+     *
+     * The two are DIFFERENT MEASUREMENTS, not a quality setting, so this is a
+     * session-level decision.
+     *
+     * ⚠️ Applying it restarts the sensor's bring-up: no IMU data for about
+     * 700 ms and the trailing peak window is discarded. Never send it in
+     * response to an impact — a crash pulse lasts 10-50 ms and would be long
+     * over, with the only record of it thrown away. The master rate-limits
+     * this and refuses one that arrives too soon after the last.
+     *
+     * Not restored automatically after a reconnect - see the implementation.
+     * Read @c TLM_FLAG_IMU_FUSION_MODE to learn the mode actually in force.
+     * @return false on an out-of-range mode or a failed write.
+     */
+    bool setImuMode(uint8_t mode);
+
     // ── state ─────────────────────────────────────────────────────────────────
     bool isOpen()      const; ///< The device node is currently open.
     bool isRunning()   const; ///< The RX thread is running.

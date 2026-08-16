@@ -161,6 +161,62 @@ bool bno055Identify(BNO055Device &dev, uint8_t address)
     return id == BNO055_EXPECTED_CHIP_ID;
 }
 
+/**
+ * @brief Recovers a part left on register page 1, without disturbing a stranger.
+ *
+ * CHIP_ID lives at 0x00 on page 0. On page 1 that address is RESERVED, so a part
+ * left on page 1 by whatever ran last does not answer 0xA0 and is declared
+ * absent — before ever reaching @c SetPageId, which is the step written to
+ * repair exactly this. That ordering made the repair unreachable.
+ *
+ * It is not hypothetical. @c SetHighG deliberately works on page 1 and puts the
+ * page back before it returns; if that final write fails, the stage fails the
+ * bring-up and the retry restarts at FindDevice, against a part it has just left
+ * on page 1. One bus glitch inside one stage produced an IMU that read as absent
+ * until someone pulled the power.
+ *
+ * PAGE_ID at 0x07 is the one register mapped identically on both pages, so it is
+ * the only thing that can be asked of a part whose page is unknown.
+ *
+ * THE FOREIGN-DEVICE PROBLEM is why this is not simply "write 0 to 0x07 and see
+ * what happens". Something that is not a BNO055 can sit at 0x28 or 0x29, and
+ * writing to a stranger's registers is not a diagnostic, it is damage. So the
+ * write happens only when the responder ACKs, does NOT answer 0xA0 at 0x00, and
+ * reports exactly 0x01 at PAGE_ID — and if the part still fails to identify
+ * afterwards, the original value is put back and the address is abandoned. A
+ * device that was not ours is left exactly as it was found.
+ *
+ * @return true when @p address holds a BNO055 that is now on page 0.
+ */
+static bool identifyWithPageRecovery(uint8_t address)
+{
+    uint8_t id = 0u;
+    // Probe, so a silent candidate address is not charged to the counters.
+    if (busReadInto(address, BNO055_CHIP_ID_ADDR, &id, 1u, false) != BNO_OK) return false;
+    // Identified by CHIP_ID, not by a bare address ACK. Something else can sit
+    // at either address, and an ACK only proves that something is there.
+    if (id == BNO055_EXPECTED_CHIP_ID) return true;
+
+    // Something answered and it is not a BNO055 on page 0. Ask the only question
+    // that is meaningful without knowing the page.
+    uint8_t page = 0u;
+    if (busReadInto(address, BNO055_PAGE_ID_ADDR, &page, 1u, false) != BNO_OK) return false;
+    if (page != 0x01u) return false;   // page 0 and not ours, or a value neither page uses
+
+    unsigned char toPage0 = 0x00u;
+    if (bno055BusWrite(address, BNO055_PAGE_ID_ADDR, &toPage0, 1u) != BNO_OK) return false;
+
+    if (busReadInto(address, BNO055_CHIP_ID_ADDR, &id, 1u, false) == BNO_OK &&
+        id == BNO055_EXPECTED_CHIP_ID) {
+        return true;
+    }
+
+    // Not ours after all. Put its register back the way it was.
+    unsigned char restore = 0x01u;
+    (void)bno055BusWrite(address, BNO055_PAGE_ID_ADDR, &restore, 1u);
+    return false;
+}
+
 uint8_t bno055FindAddress()
 {
     // Both strappings, low first. The datasheet default is 0x29 and the driver's
@@ -171,12 +227,7 @@ uint8_t bno055FindAddress()
     if (!busUsable()) return 0u;
 
     for (uint8_t i = 0; i < 2u; ++i) {
-        uint8_t id = 0u;
-        // Probe, so a silent candidate address is not charged to the counters.
-        if (busReadInto(kCandidates[i], BNO055_CHIP_ID_ADDR, &id, 1u, false) != BNO_OK) continue;
-        // Identified by CHIP_ID, not by a bare address ACK. Something else can
-        // sit at either address, and an ACK only proves that something is there.
-        if (id == BNO055_EXPECTED_CHIP_ID) return kCandidates[i];
+        if (identifyWithPageRecovery(kCandidates[i])) return kCandidates[i];
     }
     return 0u;
 }

@@ -158,6 +158,18 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     // The hardware latch, and the only inertial evidence that survives a stalled
     // master — so it is raised independently of whether the peaks look eventful.
     if (imu.highGEvent) flags |= COMM_FLAG_IMU_HIGH_G;
+    // And whether that latch was armed to begin with. Without this the flag above
+    // is unfalsifiable: its absence reads as "no impact" whether the backstop was
+    // watching or had been disarmed at bring-up, and IMUData::highGArmed —
+    // documented as the thing nothing else on the frame would say — did not reach
+    // the frame at all.
+    if (imu.highGArmed) flags |= COMM_FLAG_IMU_HIGHG_ARMED;
+    // Which MEASUREMENT this frame carries, not how good it is. The two modes
+    // populate different fields and put the same peak against different rails,
+    // so a consumer that cannot tell them apart is reading the frame wrong —
+    // and until this bit existed the only way to guess was which fields happened
+    // to be NAN, which is indistinguishable from a stale channel.
+    if (imu.fusionMode) flags |= COMM_FLAG_IMU_FUSION_MODE;
     // Qualifies BOTH peaks: linear acceleration is derived from the same clipped
     // accelerometer, so a rail the raw channel hit propagates straight into it.
     if (imu.accelSaturated) flags |= COMM_FLAG_IMU_SATURATED;
@@ -248,6 +260,8 @@ void initCommMaster(CommMaster &m){
     m.oncePending   = false;
     m.onceRequestMs = 0;
     m.canModeRequest = 0;
+    m.imuModeRequest = 0;
+    m.imuModeAppliedMs = 0;
     commRxInit(m.rx);
 }
 
@@ -308,6 +322,18 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
                 // wire boundary rather than reaching the CAN driver.
                 if (payload[0] >= 1u && payload[0] <= 3u){
                     m.canModeRequest = payload[0];
+                } else {
+                    sendFrame(MSG_NACK, nullptr, 0);
+                }
+                break;
+            case CMD_SET_IMU_MODE:
+                // Latched, not applied, and for a stronger reason than the CAN
+                // mode above: applying it restarts the sensor's bring-up, which
+                // is ~700 ms of the IMU publishing nothing. Doing that from
+                // inside the frame decoder would stall the command budget and
+                // the telemetry push behind it.
+                if (payload[0] == COMM_IMU_MODE_FUSION || payload[0] == COMM_IMU_MODE_RAW){
+                    m.imuModeRequest = payload[0];
                 } else {
                     sendFrame(MSG_NACK, nullptr, 0);
                 }

@@ -156,6 +156,16 @@ public:
     uint8_t takeCanModeRequest() { const uint8_t m = canModeReq_; canModeReq_ = 0; return m; }
 
     /**
+     * @brief Consumes a pending @c CMD_SET_IMU_MODE; 0 when none is pending.
+     *
+     * Consume-on-read like the CAN mode above, and it matters more here: each
+     * relayed request costs the sensor a ~700 ms bring-up, so a latched value
+     * that survived reading would be re-sent every loop and hold the IMU in
+     * permanent re-initialisation.
+     */
+    uint8_t takeImuModeRequest() { const uint8_t m = imuModeReq_; imuModeReq_ = 0; return m; }
+
+    /**
      * @brief Consumes a pending @c CMD_SET_CAN_FILTER.
      *
      * Consume-on-read like the others, so each host request is relayed once.
@@ -214,6 +224,7 @@ private:
     bool     connectSeen_  = false;
     bool     onceReq_      = false;
     uint8_t canModeReq_ = 0;   ///< Pending CMD_SET_CAN_MODE arg; 0 = none.
+    uint8_t imuModeReq_ = 0;   ///< Pending CMD_SET_IMU_MODE arg; 0 = none.
     /// Pending CMD_SET_CAN_FILTER. A separate flag, not "count != 0" — see
     /// takeCanFilterRequest() for why zero is a request rather than an absence.
     bool     canFilterPending_ = false;

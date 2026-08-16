@@ -62,6 +62,19 @@
 /// SENSOR, and the same sensor in a different car has the same biases.
 #define BNO055_CALIB_PATH   "bno055.cal"
 
+/// Largest file @c bno055CalibLoad() will parse, in bytes.
+///
+/// A REFUSAL BOUND, not a format limit. The load runs with the watchdog armed
+/// and reads to EOF, so the parse time is a function of the file's size — which
+/// is an attribute of the CARD, not of this firmware. A large file at this path
+/// takes the watchdog with it, and the next boot reads the same file: a reboot
+/// loop that no amount of retry logic escapes.
+///
+/// @c bno055CalibStore() emits under 224 bytes. 512 leaves room for comments and
+/// hand-editing while staying far below anything that could outlast a watchdog
+/// period.
+#define BNO055_CALIB_MAX_FILE_BYTES  512u
+
 /**
  * @brief Reads the offset registers. REQUIRES CONFIG MODE.
  *

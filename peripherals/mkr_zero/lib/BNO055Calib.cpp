@@ -148,11 +148,21 @@ static bool profilePlausible(const uint8_t *p)
         if (m < -6600 || m > 6600) return false;
         if (g < -2100 || g > 2100) return false;
     }
-    // Radii are unsigned and bounded well below their encoding's range; a value
-    // near int16 max is the signature of a garbage block that happened to CRC.
-    const uint16_t accRadius = (uint16_t)(p[18] | (p[19] << 8));
-    const uint16_t magRadius = (uint16_t)(p[20] | (p[21] << 8));
-    if (accRadius > 2000u || magRadius > 2000u) return false;
+    // SIGNED, like every other field in the block. Read as uint16 they were
+    // being compared against a positive bound, so a negative radius became a
+    // number above 32000 and the profile was refused — a valid file rejected by
+    // a type error rather than by anything about its contents. The magnitude is
+    // what the bound is about, so take it explicitly.
+    //
+    // Bounded well below the encoding's range: a value near int16 max is the
+    // signature of a garbage block that happened to CRC. Deliberately generous —
+    // the aim is to catch garbage, not to second-guess Bosch — and worth
+    // tightening to the datasheet's exact radius limits once they have been
+    // confirmed against the part on the bench rather than from memory.
+    const int16_t accRadius = (int16_t)(p[18] | (p[19] << 8));
+    const int16_t magRadius = (int16_t)(p[20] | (p[21] << 8));
+    if (accRadius < -2048 || accRadius > 2048) return false;
+    if (magRadius < -2048 || magRadius > 2048) return false;
     return true;
 }
 
@@ -198,6 +208,21 @@ bool bno055CalibLoad(uint8_t *out, uint16_t *installId)
     // calibrated. Reported as a plain false, not as an error, so the caller has
     // nothing to distinguish and nothing to log loudly.
     if (!sdOpenRead(BNO055_CALIB_PATH, f)) return false;
+
+    // SIZE FIRST, BEFORE PARSING A BYTE OF IT.
+    //
+    // This runs with the watchdog already armed and does not feed it. The parse
+    // below reads to EOF, and sdReadLine() drains an over-long line to its
+    // newline rather than truncating — correct for its own job, and unbounded
+    // in file size. A multi-megabyte file at this path, from a corrupted card or
+    // simply dropped there, therefore spends longer inside this function than
+    // the watchdog period, and the next boot parses exactly the same file: a
+    // reboot loop with no way out but a card reader.
+    //
+    // bno055CalibStore() writes well under 224 bytes, so anything past a
+    // generous multiple of that is not a profile this firmware produced,
+    // whatever its contents turn out to be.
+    if (f.fileSize() > BNO055_CALIB_MAX_FILE_BYTES) { f.close(); return false; }
 
     uint8_t  profile[BNO055_CALIB_BYTES];
     bool     haveData = false;

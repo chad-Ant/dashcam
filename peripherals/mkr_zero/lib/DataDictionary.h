@@ -232,7 +232,15 @@
 /// and this sits just under it. A peak at or above this is a FLOOR rather than
 /// a measurement: a genuine 20 g collision reads as 4 g, understating the impact
 /// fivefold, so @c IMUData::accelSaturated must accompany it.
-#define IMU_ACCEL_SATURATION_MS2                     (39.0f)
+///
+/// PER MODE, because the rail is per mode. One constant was applied to both, so
+/// AMG — which this project selects +/-16 g for, precisely so a severe impact can
+/// be characterised rather than clipped — flagged every honest reading above 4 g
+/// as saturated. That inverts the flag's meaning on the one mode that exists to
+/// measure past 4 g: it says "this peak is a floor" about the only readings that
+/// are not.
+#define IMU_ACCEL_SATURATION_MS2_FUSION              (39.0f)   ///< +/-4 g rail = 39.24.
+#define IMU_ACCEL_SATURATION_MS2_RAW                 (155.0f)  ///< +/-16 g rail = 156.9.
 
 /// Acceleration beyond which a reading is IMPOSSIBLE, not merely clipped (m/s2).
 ///
@@ -279,6 +287,12 @@
 /// At the ±4 g the fusion modes lock the accelerometer to, 1 LSB is 15.63 mg,
 /// so 128 is very close to 2.0 g.
 ///
+/// ⚠️ THE LSB SCALES WITH THE SELECTED RANGE, so this byte does NOT mean 2 g in
+/// every mode. AMG selects ±16 g, where 1 LSB is 62.5 mg and 128 is 8 g — a
+/// threshold that ignores the pothole strikes the 2 g figure was chosen to
+/// catch. Production is fixed to IMUPLUS so the 2 g reading is the operative
+/// one, but anything presenting AMG as supported has to program this per mode.
+///
 /// 2 g rather than something smaller because GRAVITY COUNTS. The interrupt
 /// watches the raw accelerometer, in which the vertical axis reads a steady 1 g
 /// while the vehicle does nothing at all — and this project's standing rule is
@@ -295,6 +309,33 @@
 /// 1 gives 4 ms, long enough to reject a single noisy conversion and far shorter
 /// than the 10-50 ms a real impact pulse lasts.
 #define IMU_HIGHG_DURATION_LSB                       1U
+
+/// Shortest interval between two host-commanded IMU mode changes (ms).
+///
+/// Each change restarts the sensor's bring-up, so it costs about 700 ms in which
+/// the IMU publishes nothing and the trailing peak window is discarded. Without
+/// a floor, a host polling this command holds the part in permanent
+/// re-initialisation and it never produces another sample — every request
+/// individually reasonable, the aggregate a denial of the sensor.
+///
+/// 5 s is several times the cost of one switch, so a legitimate session-level
+/// decision is never refused, while a loop is.
+#define IMU_MODE_MIN_INTERVAL_MS                     5000UL
+
+/// How long INT_STA may read High-G continuously before the latch is called
+/// stuck and the backstop disarmed (ms).
+///
+/// A DURATION, NOT A RETRY COUNT, and that is the whole design of the test. The
+/// clear write is retried and each attempt is checked, but an ACK only proves the
+/// part accepted the byte — a device on the wrong register page accepts it and
+/// discards it. The next burst carries INT_STA anyway, so a latch that never goes
+/// low is free to observe; what is NOT free is telling it apart from a genuine
+/// re-latch on the poll straight after an impact. A few consecutive polls cannot:
+/// a real crash pulse lasts 10-50 ms and re-arms the comparator repeatedly.
+///
+/// 500 ms is past any real pulse by an order of magnitude, so a latch still
+/// asserted after it is a latch that is not clearing.
+#define IMU_HIGHG_STUCK_MS                           500UL
 
 /// How long a latched High-G event is republished on the wire (ms).
 ///
@@ -508,16 +549,42 @@
 /// claimed.  Expiry now removes only buckets that are genuinely too old.
 #define IMU_PEAK_WINDOW_MS                           250UL
 
-/// Buckets in the peak ring.  Each covers IMU_PEAK_WINDOW_MS / IMU_PEAK_BUCKETS.
+/// Buckets in the peak ring.
 ///
-/// Six at a 250 ms window is ~42 ms per bucket, comfortably finer than the 50 ms
-/// poll, so a single drain lands in one or two buckets and expiry granularity is
-/// well below the window it is protecting.  The cost is 6 floats per channel.
-#define IMU_PEAK_BUCKETS                             6U
+/// SEVEN, NOT SIX, AND THE EXTRA ONE IS NOT SPARE CAPACITY.  A bucket is cleared
+/// when the ring head wraps back onto it, which is BUCKETS x BUCKET_MS after that
+/// bucket STARTED — so a sample arriving near the end of its bucket is erased
+/// almost one whole bucket earlier than one arriving at the start.  With six
+/// buckets of 250/6 = 41 ms (integer division, so 246 ms of ring against a 250 ms
+/// window) the worst case retained a peak for 205 ms and published it as a 250 ms
+/// figure.  Under-reporting an impact, on the field incident detection grades
+/// severity from.
+///
+/// The guarantee wanted is (BUCKETS - 1) x BUCKET_MS >= IMU_PEAK_WINDOW_MS, which
+/// is what makes the ADVERTISED window the WORST case rather than the best.
+#define IMU_PEAK_BUCKETS                             7U
 
-/// Span of one peak bucket (ms).  Derived, never set independently — the two
-/// constants above are the ones with reasons behind them.
-#define IMU_PEAK_BUCKET_MS                           (IMU_PEAK_WINDOW_MS / IMU_PEAK_BUCKETS)
+/// Span of one peak bucket (ms).  Derived, never set independently.
+///
+/// Ceiling division over BUCKETS-1, for the reason above: truncation here is what
+/// silently shortened the window, and (250 + 5) / 6 = 42 ms gives 6 x 42 = 252 ms
+/// of guaranteed coverage for every sample whatever its phase within a bucket.
+/// Still comfortably finer than the poll, so expiry granularity stays well below
+/// the window it protects.  The cost is one extra float per channel.
+#define IMU_PEAK_BUCKET_MS                           ((IMU_PEAK_WINDOW_MS + (IMU_PEAK_BUCKETS - 2U)) / (IMU_PEAK_BUCKETS - 1U))
+
+/// How long a bucket stays eligible, measured from the bucket's START (ms).
+///
+/// The window filter used to compare @c now against the bucket start, which
+/// retired a bucket whose NEWEST sample was still well inside the window — the
+/// same under-reporting as above, arriving by a second route.  Comparing against
+/// the bucket's END instead makes every sample live at least
+/// @c IMU_PEAK_WINDOW_MS and at most one bucket longer.
+///
+/// That asymmetry is deliberate.  Over-retaining a peak reports a real impact for
+/// 42 ms longer than it lasted; under-retaining discards one.  For a dashcam
+/// those are not comparable errors.
+#define IMU_PEAK_ELIGIBLE_MS                         (IMU_PEAK_WINDOW_MS + IMU_PEAK_BUCKET_MS)
 
 /// Gyroscope calibration (0-3) required before the FUSED output is reported as
 /// trustworthy rather than @c PARTIAL.

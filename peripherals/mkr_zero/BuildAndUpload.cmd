@@ -5,6 +5,17 @@ rem MKR Zero telemetry master - build / flash with arduino-cli.
 rem
 rem   BuildAndUpload.cmd            compile only
 rem   BuildAndUpload.cmd COM5       compile and upload to COM5
+rem   BuildAndUpload.cmd COM5 amg   ...with the IMU in its raw (AMG) mode
+rem
+rem The optional "amg" argument defines DASHCAM_IMU_MODE_AMG, which selects
+rem IMUSampleMode::Raw at bring-up instead of the production IMUPLUS. The mode is
+rem chosen once in setup() and no command changes it at runtime, so this is the
+rem only way to exercise the raw path end to end. WITHOUT the argument the build
+rem is bit-for-bit the production one.
+rem
+rem It sets compiler.cpp.extra_flags rather than build.extra_flags: the latter is
+rem where the SAMD platform keeps {build.usb_flags}, and overriding it would drop
+rem the USB VID/PID defines and produce a board that does not enumerate.
 rem
 rem The --library flags are REQUIRED, not a convenience.
 rem
@@ -73,10 +84,22 @@ if not "%CORE_FOUND%"=="%CORE_REQUIRED%" (
     exit /b 1
 )
 
-if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+rem "amg" is accepted in EITHER position, so a compile-only AMG build does not
+rem need an empty first argument - a shell that collapses "" would otherwise pass
+rem "amg" as the PORT and try to upload to a device of that name.
+rem Each set is its own line: grouping them inside parentheses needs delayed
+rem expansion to read back, which is a well-known way to get an empty variable.
+set "EXTRA="
+set "PORT=%~1"
+if /i "%~1"=="amg" set "PORT="
+if /i "%~1"=="amg" set "EXTRA=--build-property compiler.cpp.extra_flags=-DDASHCAM_IMU_MODE_AMG"
+if /i "%~2"=="amg" set "EXTRA=--build-property compiler.cpp.extra_flags=-DDASHCAM_IMU_MODE_AMG"
+if not "%EXTRA%"=="" echo Building with the IMU in AMG ^(raw^) mode.
+
+if "%PORT%"=="" (
+    arduino-cli compile %WARN% %EXTRA% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% %EXTRA% --upload --port "%PORT%" --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

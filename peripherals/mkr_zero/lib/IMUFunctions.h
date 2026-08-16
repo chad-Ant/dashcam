@@ -41,10 +41,13 @@
  *      accelerometer beside it kept working.  The BNO055 offers nothing
  *      equivalent, so @c fresh here means "a plausible burst was read", not "the
  *      part produced a new sample".  What replaces the stall check is
- *      @c IMUDevice::lastChangeMs: real inertial data is never bit-identical
- *      twice in a row, because gyro noise alone guarantees the low bits move.
- *      Frozen bytes are therefore a positive signal, and one that would have
- *      caught the previous sensor's failure directly.
+ *      @c IMUDevice::accelChangeMs and @c IMUDevice::gyroChangeMs: real inertial
+ *      data is never bit-identical twice in a row, because gyro noise alone
+ *      guarantees the low bits move.  Frozen bytes are therefore a positive
+ *      signal, and one that would have caught the previous sensor's failure
+ *      directly — but ONLY because the two channels are timed separately.  With
+ *      one timer over both, the gyro noise that makes the check work at all is
+ *      also what hides a frozen accelerometer beside it.
  *
  *   3. FUSION IS ON-CHIP.  @c linAccelX/Y/Z is gravity-compensated acceleration
  *      computed by the part, which is the signal incident detection actually
@@ -116,13 +119,19 @@ enum class IMUReturnStatus{
     OK = 0,                     ///< A fresh, plausible sample was read.
     DATA_STALE = 1,             ///< No new sample; cached values still inside the window.
     /**
-     * The part is running, and its FUSED output is not yet trustworthy.
+     * The part is running, and its FUSED output has not passed the local gate.
      *
-     * Raised while gyroscope or accelerometer calibration is below usable, or
-     * when the part came up in a fallback configuration.  Kept distinct from
-     * @c OK because IMUPLUS publishes linear acceleration from the moment it
-     * starts, and those first values are not wrong-looking — they are simply
-     * not yet right, and nothing downstream could otherwise tell.
+     * Raised while the fusion has produced no estimate yet, or while GYROSCOPE
+     * calibration is below usable.  The accelerometer figure is deliberately NOT
+     * a criterion — see @c IMU_CALIB_MIN_GYRO — so this is a MINIMUM LOCAL
+     * USABILITY GATE rather than a verdict on quality, and a consumer wanting an
+     * accelerometer-calibration policy must apply its own: the figure is on the
+     * wire in @c imuCalib for exactly that purpose.
+     *
+     * Kept distinct from @c OK because IMUPLUS publishes linear acceleration
+     * from the moment it starts, and those first values are not wrong-looking —
+     * they are simply not yet right, and nothing downstream could otherwise
+     * tell.
      */
     PARTIAL = 2,
     NOK_INIT_FAILED = -1,       ///< Bring-up failed; see @c IMUDevice::init.
@@ -359,16 +368,47 @@ struct IMUDevice{
     /// counter can see.
     uint16_t implausible;
 
-    /// @c millis() at which the raw bytes last CHANGED.
+    /// @c millis() at which each channel's raw bytes last CHANGED.
     ///
     /// This replaces the per-channel data-ready stall check, which the BNO055
     /// gives no way to perform.  Real inertial data is never bit-identical twice
     /// running — gyro noise alone moves the low bits — so bytes that stop
     /// changing are a frozen data path, on a part that is still answering every
     /// transaction perfectly.  See @c IMU_MAX_CHANNEL_STALL_MS.
-    uint32_t lastChangeMs;
-    uint8_t  lastRaw[12];     ///< Accel + gyro bytes from the previous poll.
+    ///
+    /// TWO TIMERS, NOT ONE, and the split is the whole point of the check.  A
+    /// single flag over all twelve bytes is satisfied by ANY of them moving, so
+    /// ordinary gyro noise — which never stops — held the timer open forever and
+    /// a completely frozen accelerometer could never trip it.  That is not a
+    /// hypothetical: the sensor this driver replaced failed by returning a fixed
+    /// 27.8 m/s2 accelerometer, and the combined check this file documented as
+    /// catching that failure "directly" would have masked it.
+    uint32_t accelChangeMs;
+    uint32_t gyroChangeMs;
+    uint8_t  lastRaw[12];     ///< Accel (0..5) + gyro (6..11) bytes from the previous poll.
     bool     lastRawValid;
+
+    /// @c millis() of the last burst that passed EVERY plausibility gate.
+    ///
+    /// The gap flag is measured from this rather than from the last poll
+    /// ATTEMPT, because the two differ in the case that was being missed: a poll
+    /// that runs on time and has its burst rejected by the temperature, gravity
+    /// or accel-limit gate leaves exactly the same hole in the record as a poll
+    /// that never happened.  Keying on the attempt reset the timer every 10 ms
+    /// while every sample was being discarded, so a 200 ms hole reported none.
+    uint32_t lastGoodMs;
+
+    /// @c millis() from which INT_STA has read High-G continuously.
+    ///
+    /// The clear is a write, and a write can be ACKed and ignored — by a part on
+    /// the wrong register page, most obviously, which is a failure this project
+    /// has already had.  An ACK is therefore not proof the latch cleared, and
+    /// treating it as proof left @c highGArmed claiming a backstop that had
+    /// stopped arming.  What settles it is the NEXT burst: INT_STA is in it
+    /// anyway, so a latch that never goes low is visible at no extra cost.  See
+    /// @c IMU_HIGHG_STUCK_MS for why the test is a duration and not a count.
+    uint32_t highGStuckSinceMs;
+    bool     highGStuckTracking;
 
     /// Windowed peak tracking, held as SQUARED magnitudes in a bucket ring.
     ///
