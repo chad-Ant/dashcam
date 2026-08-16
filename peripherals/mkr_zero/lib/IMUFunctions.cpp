@@ -136,32 +136,32 @@ static void noteImplausible(IMUDevice &dev){
  */
 static void noteHighG(IMUDevice &dev, uint8_t intSta, uint32_t now)
 {
-    const bool latched = (intSta & IMU_INT_STA_HIGH_G) != 0u;
-
-    // ── is the latch actually clearing? ──────────────────────────────────────
+    // ── INT_STA IS CLEARED ON READ ───────────────────────────────────────────
     //
-    // Checked BEFORE anything else uses the bit, and checked against the bus
-    // rather than against the write's acknowledgement. A clear that is ACKed and
-    // discarded — by a part on the wrong register page, the failure this project
-    // has already had once — used to leave INT asserted forever while
-    // highGArmed went on advertising a working backstop. The next burst answers
-    // the question at no extra transaction: this one is that burst.
-    if (!latched){
-        dev.highGStuckTracking = false;
-    } else if (!dev.highGStuckTracking){
-        dev.highGStuckTracking = true;
-        dev.highGStuckSinceMs  = now;
-    } else if (dev.init.highGArmed &&
-               ((now - dev.highGStuckSinceMs) > IMU_HIGHG_STUCK_MS)){
-        // Degraded, not fatal, and for the same reason a failed clear write is:
-        // the sample data is unaffected and the peaks still work. What is gone
-        // is the backstop, and a consumer weighing an incident has to be told
-        // that the latch it would have relied on has stopped arming.
-        dev.init.highGArmed = false;
-        if (dev.highGClearFails < 0xFFu) dev.highGClearFails++;
-    }
-
-    bool     fired  = latched;
+    // Datasheet 3.8.1, settled from docs/BST_BNO055_DS000-1509603.pdf: "All bits
+    // in this register are cleared on read." The burst that produced @p intSta
+    // has therefore ALREADY consumed the event, and this function is the only
+    // place it still exists. That is exactly why the call site handles it before
+    // any validation gate — the ordering was written on the suspicion that this
+    // might be true, and it is.
+    //
+    // A DURATION-BASED "STUCK LATCH" DETECTOR STOOD HERE AND HAS BEEN REMOVED.
+    // It disarmed the backstop when INT_STA read set continuously for longer
+    // than a real impact could last. On a clear-on-read register that condition
+    // cannot arise from a stuck latch, because every poll clears it — so the
+    // check could never detect the fault it was written for, and bench
+    // measurement confirmed it: the flag was observed set for exactly one poll
+    // interval and never longer. What it COULD still do is fire during a
+    // genuinely sustained impact that re-triggers on every poll for half a
+    // second, disarming the backstop in the middle of the event it exists to
+    // catch. A test that cannot pass and can only misfire is worse than no test.
+    //
+    // The write below still matters, and only for the INT PIN: the pin latches
+    // high and is released by RST_INT, so a failed write leaves it asserted and
+    // no further rising edge can occur. The register path is unaffected, which
+    // is why a failed clear degrades the OPTIONAL pin shortcut rather than
+    // losing events.
+    bool     fired  = (intSta & IMU_INT_STA_HIGH_G) != 0u;
     uint32_t whenMs = now;
 
     // Snapshot the ISR flags with interrupts masked. Reading a flag and its
@@ -528,8 +528,6 @@ void imuMarkAbsent(IMUDevice &dev){
     dev.highGActive  = false;
     dev.highGUntilMs = millis();
     dev.highGAtMs    = 0u;
-    dev.highGStuckTracking = false;
-    dev.highGStuckSinceMs  = millis();
     // Any pin edge from before this reset describes a device that is being
     // re-initialised, so it belongs to nothing.
     noInterrupts();

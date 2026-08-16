@@ -11,14 +11,14 @@
  *   A  nothing            pure logic and constants
  *   B  microSD card       calibration file parsing
  *   C  a live BNO055      page recovery, gap accounting, armed reporting
- *   D  a live BNO055      fault injection: frozen channel, stuck latch, AMG rail
+ *   D  a live BNO055      fault injection: frozen channel, High-G event, AMG rail
  *
  * Groups whose hardware is absent report SKIP rather than FAIL, so this is
  * useful on a bare board and more useful on a complete one.
  *
- * GROUP D MAKES THE SENSOR MISBEHAVE ON PURPOSE, using its own power modes and
- * threshold register rather than stubbing the driver out — so the code under
- * test is production code meeting a genuinely faulty part. It reconfigures the
+ * GROUP D MAKES THE SENSOR MISBEHAVE ON PURPOSE, using its own power modes
+ * rather than stubbing the driver out — so the code under test is production
+ * code meeting a genuinely faulty part. It reconfigures the
  * sensor as it goes and restores the production configuration at the end. An
  * injection that does not take is reported as SKIP, never as a FAIL: a part that
  * ignored the fault has tested nothing, and saying otherwise would be a lie
@@ -56,6 +56,14 @@
 // ─── tiny harness ─────────────────────────────────────────────────────────────
 
 static uint16_t gPass = 0, gFail = 0, gSkip = 0;
+
+/// True once the sensor half of the suite has actually been reached.
+///
+/// Tracked because "no failures" and "the tests ran" are different claims, and
+/// the summary used to conflate them — a wedged I2C bus skipped every hardware
+/// group and the report still said OK, which is the shape of a regression
+/// hiding behind a green result.
+static bool gSensorBusOk = false;
 
 static void check(bool ok, const char *name)
 {
@@ -306,17 +314,41 @@ static void groupCalibFile()
           bno055CalibEqual(profile, loaded),
           "a profile with a negative accel radius is ACCEPTED");
 
-    // ...and the bound still bites at the other end, so the check is not simply
-    // gone. A test that cannot fail is not a test.
+    // ── the bounds, probed AT the datasheet limits ───────────────────────────
+    //
+    // Just-over rather than absurd. A profile with a radius of 30000 is rejected
+    // by any bound anyone might pick, so it proves only that SOME check exists;
+    // 1001 against a documented +/-1000 proves the check is where Bosch put it.
+    // These numbers come from docs/BST_BNO055_DS000-1509603.pdf Table 3-24 and
+    // section 3.6.4, not from memory — the previous bounds were guessed and were
+    // TIGHTER than the part can legitimately produce.
     makeSaneProfile(profile);
-    putRadii(profile, 30000, 700);
-    check(bno055CalibStore(profile, 0x0002u) && !bno055CalibLoad(loaded, nullptr),
-          "an absurd accel radius is still REJECTED");
+    putRadii(profile, 1000, 960);           // exactly the documented maxima
+    check(bno055CalibStore(profile, 0x0002u) && bno055CalibLoad(loaded, nullptr),
+          "radii AT the datasheet maxima are accepted");
 
     makeSaneProfile(profile);
-    profile[0] = 0xFF; profile[1] = 0x7F;   // accel X offset = 32767
+    putRadii(profile, 1001, 700);
     check(bno055CalibStore(profile, 0x0003u) && !bno055CalibLoad(loaded, nullptr),
-          "an out-of-range accel offset is still REJECTED");
+          "an accel radius one past +/-1000 is REJECTED");
+
+    makeSaneProfile(profile);
+    putRadii(profile, 700, 961);
+    check(bno055CalibStore(profile, 0x0004u) && !bno055CalibLoad(loaded, nullptr),
+          "a mag radius one past +/-960 is REJECTED");
+
+    // Accelerometer offsets scale with the G-range: +/-16000 at the 16 g this
+    // project selects in AMG (Table 3-16). The old +/-2100 bound would have
+    // refused this legitimate profile outright.
+    makeSaneProfile(profile);
+    profile[0] = (uint8_t)(16000 & 0xFF); profile[1] = (uint8_t)(16000 >> 8);
+    check(bno055CalibStore(profile, 0x0005u) && bno055CalibLoad(loaded, nullptr),
+          "an accel offset at the 16 g maximum is ACCEPTED");
+
+    makeSaneProfile(profile);
+    profile[0] = (uint8_t)(16001 & 0xFF); profile[1] = (uint8_t)(16001 >> 8);
+    check(bno055CalibStore(profile, 0x0006u) && !bno055CalibLoad(loaded, nullptr),
+          "and one past it is REJECTED");
 
     // B3 the fix for finding 7: an oversized file is refused, and refused FAST.
     //
@@ -528,6 +560,10 @@ static void testGapAccounting()
     check(cleared, "and clears once accepted samples resume");
 }
 
+/// Defined with the fault-injection helpers below; used here to inspect the
+/// production configuration without disturbing it.
+static bool page1Read(uint8_t addr, uint8_t reg, uint8_t &value);
+
 // C3 — finding 2, sensor side. The armed state has to survive the trip from the
 // device into the published sample and on into the payload.
 static void testArmedReporting()
@@ -538,6 +574,24 @@ static void testArmedReporting()
     note("init.highGArmed",  gDev.init.highGArmed ? 1 : 0);
     note("data.highGArmed",  gData.highGArmed ? 1 : 0);
     note("highGClearFails",  gDev.highGClearFails);
+
+    // DOES THE THRESHOLD SURVIVE ENTRY INTO THE FUSION MODE?
+    //
+    // A pure read, and a question about PRODUCTION rather than about this test.
+    // The bring-up writes ACC_HG_THRES while in CONFIG and only afterwards
+    // selects IMUPLUS — and the fusion modes are documented to take the
+    // accelerometer configuration over, which is why the same stage skips
+    // programming ACC_CONFIG's range there. If the override reaches the
+    // threshold too, then the backstop production is running is armed at
+    // whatever the part chose rather than at the 2 g this project asked for, and
+    // highGArmed would say nothing about it: that flag only reports that the
+    // configuration writes read back correctly DURING bring-up.
+    uint8_t liveThres = 0xFFu;
+    const bool thresRead = page1Read(gDev.init.address, BNO055_P1_ACC_HG_THRES_ADDR, liveThres);
+    note("ACC_HG_THRES_in_fusion", thresRead ? (long)liveThres : -1L);
+    note("ACC_HG_THRES_configured", (long)IMU_HIGHG_THRESHOLD_LSB);
+    check(thresRead && liveThres == IMU_HIGHG_THRESHOLD_LSB,
+          "the High-G threshold survived entry into IMUPLUS");
 
     check(gData.highGArmed == (gDev.ready && gDev.init.highGArmed),
           "published armed state matches the device");
@@ -836,93 +890,84 @@ static void testFreezeSplit(uint8_t address)
     }
 }
 
-// D2 — finding 8. The High-G threshold is dropped below gravity, so the
-// comparator re-latches the instant every clear write lands. The write is ACKed
-// each time, which is exactly the evidence the old code trusted.
-static void testStuckLatch(uint8_t address)
+// D2 — the High-G path, tested for what it actually does.
+//
+// A DURATION-BASED STUCK-LATCH TEST STOOD HERE AND HAS BEEN DELETED. It lowered
+// the threshold below gravity expecting the latch to stay asserted, and measured
+// exactly one poll interval every time. The datasheet says why: INT_STA is
+// "cleared on read" (3.8.1), and the driver reads it in the burst on every poll —
+// so no stuck condition can ever be observed across two polls, and the detector
+// it was testing has been removed from the driver for the same reason.
+//
+// What is left is worth testing and was not covered before: a REAL impact must
+// be latched, counted, held, and published. That is the whole backstop, and it
+// runs on the production configuration rather than an injected one.
+static void testHighGEvent()
 {
-    group("D2  a High-G latch that never clears (finding 8)");
+    group("D2  a real High-G event is captured (finding 2 / 8)");
 
     if (setIMUSampleMode(gDev, IMUSampleMode::Fusion) != IMUReturnStatus::OK ||
         !tickUntilReady(5000UL)) {
-        skip("stuck latch", "could not return to fusion");
+        skip("High-G event", "could not return to fusion");
         return;
     }
-    pollFor(200UL, 10UL);
-    (void)getIMUData(gDev, gData);
+    pollFor(300UL, 10UL);
     if (!gDev.init.highGArmed) {
-        skip("stuck latch", "backstop was not armed to begin with");
+        skip("High-G event", "backstop was not armed to begin with");
         return;
     }
 
-    // ── negative control FIRST ───────────────────────────────────────────────
-    // A threshold of 1 LSB is ~15.6 mg against a constant 1 g, so the latch is
-    // permanently satisfied. Held for well under IMU_HIGHG_STUCK_MS, it must NOT
-    // disarm anything: a real crash pulse lasts 10-50 ms and re-arms the
-    // comparator repeatedly, and a detector that tripped on that would disarm the
-    // backstop during the very impact it exists to catch.
-    if (!writePage1InConfig(address, BNO055_P1_ACC_HG_THRES_ADDR, 1u)) {
-        skip("stuck latch", "could not lower the threshold");
-        return;
-    }
-    pollFor(IMU_HIGHG_STUCK_MS / 2u, 10UL);
-    const bool armedAfterShort = gDev.init.highGArmed;
+    const uint16_t countBefore = gDev.highGCount;
+    const uint8_t  failsBefore = gDev.highGClearFails;
 
-    // Put the threshold back and let the latch actually clear.
-    (void)writePage1InConfig(address, BNO055_P1_ACC_HG_THRES_ADDR, IMU_HIGHG_THRESHOLD_LSB);
-    pollFor(150UL, 10UL);
+    Serial.println(F("        knock the board HARD within 8 s (needs > 2 g)..."));
 
-    check(armedAfterShort, "a short continuous latch does NOT disarm the backstop");
-    check(gDev.init.highGArmed, "and the backstop is still armed afterwards");
-
-    // ── the fault itself ─────────────────────────────────────────────────────
-    const uint8_t failsBefore = gDev.highGClearFails;
-    if (!writePage1InConfig(address, BNO055_P1_ACC_HG_THRES_ADDR, 1u)) {
-        skip("stuck latch (sustained)", "could not lower the threshold");
-        return;
-    }
-
-    uint32_t disarmedMs = 0;
-    bool     latchSeen  = false;
-    const uint32_t t0     = millis();
-    const uint32_t giveUp = t0 + (IMU_HIGHG_STUCK_MS * 3u);
+    uint32_t firedMs = 0;
+    const uint32_t giveUp = millis() + 8000UL;
     while ((int32_t)(millis() - giveUp) < 0) {
         (void)getIMUData(gDev, gData);
-        if (gData.highGEvent) latchSeen = true;
-        if (!gDev.init.highGArmed) { disarmedMs = millis(); break; }
-        delay(10);
+        if (gData.highGEvent) { firedMs = millis(); break; }
+        delay(5);
     }
 
-    note("disarm_latency_ms", disarmedMs ? (long)(disarmedMs - t0) : -1L);
-    note("highGClearFails",   gDev.highGClearFails);
-
-    // If the comparator never fired there was no stuck latch to detect, so
-    // nothing here has been exercised. That is an injection failure, not a
-    // driver failure, and must not be reported as one.
-    if (!latchSeen) {
-        (void)writePage1InConfig(address, BNO055_P1_ACC_HG_THRES_ADDR, IMU_HIGHG_THRESHOLD_LSB);
-        (void)bringUpSensor();
-        skip("stuck latch (sustained)", "threshold write did not make the latch fire");
+    if (firedMs == 0u) {
+        skip("High-G event", "no impact above the 2 g threshold seen");
         return;
     }
 
-    check(disarmedMs != 0u, "a latch that never clears DOES disarm the backstop");
-    check((disarmedMs == 0u) || ((disarmedMs - t0) >= IMU_HIGHG_STUCK_MS),
-          "and not before the configured stuck window has elapsed");
-    check(gDev.highGClearFails > failsBefore, "and the failure is counted");
+    note("highGCount_delta", (long)(gDev.highGCount - countBefore));
+    note("highGAtMs_set",    gData.highGMs != 0u ? 1 : 0);
 
-    // The whole reason the flag exists: the host has to be told.
+    check(gDev.highGCount > countBefore, "the latch was counted");
+    check(gData.highGMs != 0u,           "and carries the instant it happened");
+
+    // The hold is what stops the event falling between two published frames, so
+    // it has to outlast a telemetry interval rather than one poll.
+    (void)getIMUData(gDev, gData);
+    check(gData.highGEvent, "the event is still published one poll later");
+
     TelemetryPayload p{};
     buildWith(gData, p);
-    check((p.flags & COMM_FLAG_IMU_HIGHG_ARMED) == 0u,
-          "and the payload stops claiming the backstop is armed");
+    check((p.flags & COMM_FLAG_IMU_HIGH_G) != 0u, "and reaches the telemetry payload");
+    check((p.flags & COMM_FLAG_IMU_HIGHG_ARMED) != 0u,
+          "with the backstop still reporting armed");
 
-    // Restore: put the threshold back and re-run bring-up, which resets the part.
-    (void)writePage1InConfig(address, BNO055_P1_ACC_HG_THRES_ADDR, IMU_HIGHG_THRESHOLD_LSB);
-    const bool recovered = bringUpSensor();
-    pollFor(100UL, 10UL);
-    check(recovered && gDev.init.highGArmed,
-          "and a re-initialisation re-arms it");
+    // A clear that failed would have disarmed the backstop and counted itself.
+    // On this part the register self-clears, so this should stay at zero — and a
+    // non-zero value is the one thing that would say the pin path is degraded.
+    note("highGClearFails", gDev.highGClearFails);
+    check(gDev.highGClearFails == failsBefore, "and no clear failure was recorded");
+
+    // It must also EXPIRE. A flag that latched on and stayed would mark every
+    // later window as an impact.
+    const uint32_t expireBy = millis() + (IMU_HIGHG_HOLD_MS * 3u);
+    bool cleared = false;
+    while ((int32_t)(millis() - expireBy) < 0) {
+        (void)getIMUData(gDev, gData);
+        if (!gData.highGEvent) { cleared = true; break; }
+        delay(10);
+    }
+    check(cleared, "and the hold expires rather than latching on");
 }
 
 // D3 — finding 10a. In AMG the part is configured for +/-16 g, so a reading
@@ -1002,7 +1047,7 @@ static void groupFaultInjection(uint8_t address)
     Serial.println(F("        production configuration is restored at the end"));
 
     testFreezeSplit(address);
-    testStuckLatch(address);
+    testHighGEvent();
     testAmgSaturationRail(address);
 }
 
@@ -1011,9 +1056,34 @@ static void groupSensor()
     group("C  live sensor");
 
     if (i2cBusBegin() != I2CBusState::Ready) {
+        // NAME THE LINE. "Not usable" is where a bench session stalls: the whole
+        // hardware half of this suite has just been skipped and the reason is a
+        // bitmask the bus module already computed and this test was discarding.
+        // Which line is stuck decides what to do about it, and the four cases
+        // call for different things.
+        const uint8_t stuck = i2cStuckLines();
+        note("i2c_stuck_mask", stuck);
+        if (stuck & I2C_STUCK_SDA_NEVER_MOVED) {
+            Serial.println(F("        SDA never moved at all - no pull-ups, no power to the"));
+            Serial.println(F("        sensor, or a disconnected/dead part. Check wiring first."));
+        }
+        if (stuck & I2C_STUCK_SDA_LOW) {
+            Serial.println(F("        SDA still clamped after nine clocks + STOP - a slave is"));
+            Serial.println(F("        holding it. Usually one reset mid-transaction, or a"));
+            Serial.println(F("        latch-up. POWER-CYCLE the board; an MCU reset will not"));
+            Serial.println(F("        clear it, because the slave is the one holding the line."));
+        }
+        if (stuck & I2C_STUCK_SCL_LOW) {
+            Serial.println(F("        SCL held low - clock stretching that never ended, or a short."));
+        }
+        if (stuck & I2C_STUCK_SCL_NO_RISE) {
+            Serial.println(F("        SCL never rose, so recovery could not even clock the bus."));
+            Serial.println(F("        Missing pull-up or SCL shorted to ground."));
+        }
         skip("all sensor tests", "I2C bus is not usable");
         return;
     }
+    gSensorBusOk = true;
 
     const uint8_t address = bno055FindAddress();
     if (address == 0u) {
@@ -1070,7 +1140,23 @@ void setup()
     Serial.print(F("  passed  ")); Serial.println(gPass);
     Serial.print(F("  failed  ")); Serial.println(gFail);
     Serial.print(F("  skipped ")); Serial.println(gSkip);
-    Serial.println(gFail == 0 ? F("  RESULT: OK") : F("  RESULT: FAILURES PRESENT"));
+
+    // THREE OUTCOMES, NOT TWO. "No failures" and "the tests ran" are different
+    // claims, and reporting OK for both is how a wedged bus or a missed prompt
+    // gets read as a clean run — the entire sensor half of this suite can skip
+    // and the old summary still said OK.
+    if (gFail != 0) {
+        Serial.println(F("  RESULT: FAILURES PRESENT"));
+    } else if (!gSensorBusOk) {
+        Serial.println(F("  RESULT: INCOMPLETE - the sensor tests never ran"));
+        Serial.println(F("          (see the I2C diagnosis above; fix that and re-run)"));
+    } else if (gSkip != 0) {
+        Serial.print(F("  RESULT: INCOMPLETE - "));
+        Serial.print(gSkip);
+        Serial.println(F(" check(s) did not run"));
+    } else {
+        Serial.println(F("  RESULT: OK"));
+    }
     Serial.println(F("════════════════════════════════════════════════════════════"));
 }
 

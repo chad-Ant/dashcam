@@ -137,32 +137,47 @@ static uint16_t profileCrc(const uint8_t *p, uint16_t installId)
  */
 static bool profilePlausible(const uint8_t *p)
 {
-    // Accelerometer and gyroscope offsets are +/-2000 in their raw units;
-    // magnetometer +/-6400. Bounds from the datasheet's offset register tables,
-    // taken generously — the aim is to catch garbage, not to second-guess Bosch.
+    // BOUNDS FROM THE DATASHEET, section 3.6.4 (docs/BST_BNO055_DS000-1509603.pdf).
+    //
+    // These were previously +/-2100 for accelerometer and gyroscope, described in
+    // this comment as "taken generously". They were the opposite: TIGHTER than
+    // the part can legitimately produce, so a valid profile could be refused and
+    // the sensor would run uncalibrated with nothing to show for it.
+    //
+    //   Accelerometer (Table 3-16): the offset range follows the G-range in
+    //   force when the profile was captured — +/-2000 mg at 2 g, rising to
+    //   +/-16000 at 16 g, and 1 mg = 1 LSB (Table 3-17). Fusion locks the part
+    //   at 4 g (so +/-4000) while this project's AMG mode selects 16 g. The
+    //   check cannot know which mode captured the file, so it takes the widest.
+    //
+    //   Magnetometer (3.6.4.2): +/-6400 LSB, independent of range.
+    //
+    //   Gyroscope (Table 3-21): follows the dps range — +/-32000 at the 2000 dps
+    //   the fusion modes run. This is a WEAK gate and worth saying so: against an
+    //   int16 it rejects only 32001..32767. It still catches an all-ones block,
+    //   which is the shape a garbage read takes, and there is nothing tighter
+    //   that would not risk refusing a legitimate profile.
     for (uint8_t i = 0; i < 6u; i += 2u) {
         const int16_t a = (int16_t)(p[i]      | (p[i + 1]      << 8));   // accel
         const int16_t m = (int16_t)(p[6 + i]  | (p[7 + i]      << 8));   // mag
         const int16_t g = (int16_t)(p[12 + i] | (p[13 + i]     << 8));   // gyro
-        if (a < -2100 || a > 2100) return false;
-        if (m < -6600 || m > 6600) return false;
-        if (g < -2100 || g > 2100) return false;
+        if (a < -16000 || a > 16000) return false;
+        if (m <  -6400 || m >  6400) return false;
+        if (g < -32000 || g > 32000) return false;
     }
     // SIGNED, like every other field in the block. Read as uint16 they were
     // being compared against a positive bound, so a negative radius became a
     // number above 32000 and the profile was refused — a valid file rejected by
-    // a type error rather than by anything about its contents. The magnitude is
-    // what the bound is about, so take it explicitly.
+    // a type error rather than by anything about its contents.
     //
-    // Bounded well below the encoding's range: a value near int16 max is the
-    // signature of a garbage block that happened to CRC. Deliberately generous —
-    // the aim is to catch garbage, not to second-guess Bosch — and worth
-    // tightening to the datasheet's exact radius limits once they have been
-    // confirmed against the part on the bench rather than from memory.
+    // Table 3-24: accelerometer +/-1000 LSB, magnetometer +/-960. These are by
+    // far the STRONGEST gates in this function — two orders of magnitude below
+    // the encoding's range — which is the opposite of how they were treated
+    // before, at a guessed +/-2048.
     const int16_t accRadius = (int16_t)(p[18] | (p[19] << 8));
     const int16_t magRadius = (int16_t)(p[20] | (p[21] << 8));
-    if (accRadius < -2048 || accRadius > 2048) return false;
-    if (magRadius < -2048 || magRadius > 2048) return false;
+    if (accRadius < -1000 || accRadius > 1000) return false;
+    if (magRadius <  -960 || magRadius >  960) return false;
     return true;
 }
 

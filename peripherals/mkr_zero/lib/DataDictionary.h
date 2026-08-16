@@ -322,21 +322,6 @@
 /// decision is never refused, while a loop is.
 #define IMU_MODE_MIN_INTERVAL_MS                     5000UL
 
-/// How long INT_STA may read High-G continuously before the latch is called
-/// stuck and the backstop disarmed (ms).
-///
-/// A DURATION, NOT A RETRY COUNT, and that is the whole design of the test. The
-/// clear write is retried and each attempt is checked, but an ACK only proves the
-/// part accepted the byte — a device on the wrong register page accepts it and
-/// discards it. The next burst carries INT_STA anyway, so a latch that never goes
-/// low is free to observe; what is NOT free is telling it apart from a genuine
-/// re-latch on the poll straight after an impact. A few consecutive polls cannot:
-/// a real crash pulse lasts 10-50 ms and re-arms the comparator repeatedly.
-///
-/// 500 ms is past any real pulse by an order of magnitude, so a latch still
-/// asserted after it is a latch that is not clearing.
-#define IMU_HIGHG_STUCK_MS                           500UL
-
 /// How long a latched High-G event is republished on the wire (ms).
 ///
 /// The same reasoning as the data-gap flag: telemetry publishes at 10 Hz, so an

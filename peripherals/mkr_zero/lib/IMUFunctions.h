@@ -398,17 +398,6 @@ struct IMUDevice{
     /// while every sample was being discarded, so a 200 ms hole reported none.
     uint32_t lastGoodMs;
 
-    /// @c millis() from which INT_STA has read High-G continuously.
-    ///
-    /// The clear is a write, and a write can be ACKed and ignored — by a part on
-    /// the wrong register page, most obviously, which is a failure this project
-    /// has already had.  An ACK is therefore not proof the latch cleared, and
-    /// treating it as proof left @c highGArmed claiming a backstop that had
-    /// stopped arming.  What settles it is the NEXT burst: INT_STA is in it
-    /// anyway, so a latch that never goes low is visible at no extra cost.  See
-    /// @c IMU_HIGHG_STUCK_MS for why the test is a duration and not a count.
-    uint32_t highGStuckSinceMs;
-    bool     highGStuckTracking;
 
     /// Windowed peak tracking, held as SQUARED magnitudes in a bucket ring.
     ///

@@ -58,14 +58,17 @@ Then open the monitor at 115200 and reset.
 - **D** — fault injection: frozen accelerometer, stuck High-G latch, AMG
   saturation rail. Needs the sensor.
 
-### You will be prompted twice
+### You will be prompted three times
 
 - `tap the board within 5 s` (C4) — an ordinary tap.
-- `tap the board FIRMLY within 8 s (needs > 4 g)` (D3) — harder; it must exceed
-  4 g to land in the band the test is about.
+- `knock the board HARD within 8 s (needs > 2 g)` (D2) — must cross the High-G
+  threshold so a real interrupt is latched.
+- `tap the board FIRMLY within 8 s (needs > 4 g)` (D3) — harder still; it must
+  exceed 4 g to land in the band that test is about.
 
-Missing either prompt yields a SKIP, not a failure. Re-run if you want the
-coverage.
+Missing any prompt yields a SKIP, not a failure — but a SKIP means that check
+did not run, and the summary reports `INCOMPLETE` rather than `OK`. Re-run if
+you want the coverage.
 
 ### Two things it changes
 
@@ -81,11 +84,37 @@ coverage.
 
 ### Pass criterion
 
-`RESULT: OK` with `failed 0`. SKIPs are acceptable and are explained inline —
-absent hardware, a missed tap, or an injection the part declined. An injection
-that does not take reports SKIP rather than FAIL on purpose: a sensor that
-ignored the fault has tested nothing, and calling that a driver failure would be
-a lie.
+Three outcomes, and only the first is a pass:
+
+- `RESULT: OK` — everything ran and everything passed.
+- `RESULT: INCOMPLETE` — nothing failed, but some checks did not run. A missed
+  tap prompt, a wedged bus, or an injection the part declined. **Not a pass**:
+  read which checks skipped and decide whether you need them.
+- `RESULT: FAILURES PRESENT` — a check failed.
+
+An injection that does not take reports SKIP rather than FAIL on purpose: a
+sensor that ignored the fault has tested nothing, and calling that a driver
+failure would be a lie. The reverse matters too, which is why a suite that
+skipped its whole hardware half no longer reports OK.
+
+### If group C skips with "I2C bus is not usable"
+
+The sketch prints the stuck-line bitmask and what it means. In short:
+
+- **SDA still clamped** — a slave is holding the line, usually after a reset
+  landed mid-transaction. **Power-cycle the board.** An MCU reset will not clear
+  it, because the MCU is not the thing holding the line, and neither will the
+  nine-clock recovery that has already been tried. On a USB-powered rig a power
+  cycle means unplugging USB (and the battery, if fitted) — the reset button is
+  not enough.
+- **SDA never moved** — no pull-ups, no power to the sensor, or a dead part.
+  Check wiring before anything else.
+- **SCL low / SCL never rose** — clock held or shorted; recovery could not even
+  run.
+
+Reflashing while a previous run was mid-poll is the usual way to get here, which
+is also why the group D warning above says to power-cycle after an interrupted
+run.
 
 ---
 
