@@ -264,6 +264,23 @@ struct IMUData{
     /// event's own timestamp either way, not the frame's.
     uint32_t highGMs;
 
+    /**
+     * Cumulative High-G latches since boot, mirrored from @c IMUDevice.
+     *
+     * A DEVICE counter carried on a per-sample struct, which needs justifying.
+     * @c highGEvent is held for @c IMU_HIGHG_HOLD_MS and then clears, so a
+     * consumer that samples this struct more slowly than that hold — the
+     * telemetry builder at 10 Hz, or the host behind a decimated stream — can
+     * step straight over an impact. A monotonic count cannot be stepped over:
+     * any two observations bracket every event between them.
+     *
+     * Mirrored here rather than reached for through @c IMUDevice because the
+     * publisher takes this struct and nothing else, and threading the device
+     * through it to reach one uint16 would widen a signature that four call
+     * sites already share.
+     */
+    uint16_t highGCount;
+
     /// The hardware backstop is armed. When false, an impact inside a loop
     /// stall goes unrecorded, and nothing else on the frame would say so.
     bool highGArmed;

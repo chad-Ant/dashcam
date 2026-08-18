@@ -108,6 +108,139 @@
 /// Chip-select pin for the external SD card module (SPI).
 #define SD_CS_PIN                                    4U
 
+// ─── Physical switch panel: 2x 74HC165 parallel-in shift registers ───────────
+//
+// DELIBERATELY OFF THE SPI BUS, on three bit-banged pins of its own.  The
+// 74HC165's Q7 is push-pull and has no chip-select that releases it, so a
+// register hung on D10/MISO would fight the MCP2515 and the SD card
+// CONTINUOUSLY - taking out CAN and logging rather than merely failing to read
+// switches.  A tri-state buffer would fix that at the cost of a package; three
+// spare pins are cheaper, and buttons have never needed SPI's speed.  A whole
+// 16-bit read costs about 80 us against a 20 ms poll interval.
+//
+// The parts are plain 74HC, NOT the HCT used for the LED panel's 74HCT595s.
+// That distinction is the opposite of the one made there and for the opposite
+// reason: the 595s run at 5 V driven by 3.3 V logic and need HCT's TTL
+// threshold, whereas these run entirely on the MKR's own 3.3 V rail, where HC's
+// VIH of 0.7 x VCC is 2.31 V.  74HCT is specified only from 4.5 V and would be
+// the WRONG part here.
+
+/// SH/LD (74HC165 pin 1), active low.  Common to both packages.
+#define SWITCH_LOAD_PIN                              0U
+/// Shift clock (pin 2).  Common to both packages.
+#define SWITCH_CLK_PIN                               1U
+/// Serial data in, from the LAST register's Q7 (pin 9).
+#define SWITCH_DATA_PIN                              2U
+
+/**
+ * Packages fitted, 1 or 2.  Chain order is #A (first, holds the sentinels) then
+ * #B, with #A's Q7 feeding #B's DS and #B's Q7 reaching @c SWITCH_DATA_PIN.
+ *
+ * The read is MSB-first from the far end, so #B's D7 arrives first and #A's D0
+ * last.  Both chain lengths therefore land the sentinels in the same two bits,
+ * and @c SwitchData::state is the same expression either way.
+ */
+#define SWITCH_REGISTERS                             2U
+#define SWITCH_CHAIN_BITS                            (SWITCH_REGISTERS * 8U)
+
+/**
+ * The two inputs that are NOT switches: #A D0 (pin 11) hard-wired to GND and
+ * #A D1 (pin 12) hard-wired to 3V3.
+ *
+ * A POSITIVE CONTROL IN COPPER, and the only reason this peripheral can report
+ * its own absence.  Every other input is a switch that is legitimately open
+ * most of the time, so an absent chain, a dead register and sixteen open
+ * switches all read as 0xFFFF and are otherwise indistinguishable.  A fixed
+ * pattern that every read must reproduce is what turns that into a testable
+ * claim - the same reasoning behind COMM_FLAG_IMU_PRESENT and
+ * COMM_FLAG_GPS_PRESENT, both added because idle hardware and absent hardware
+ * looked identical on the wire.
+ *
+ * OPPOSITE POLARITIES ARE THE POINT.  They sit on the FIRST register in the
+ * chain, so their arrival proves the cascade link as well as the reading - and
+ * if that link breaks, #B's serial input floats.  A floating CMOS input settles
+ * somewhere and stays there, so it can consistently satisfy one sentinel; it
+ * cannot satisfy two that disagree.
+ */
+#define SWITCH_SENTINEL_BITS                         2U
+/// Usable switch inputs: SW00 .. SW(SWITCH_COUNT-1).
+#define SWITCH_COUNT                                 (SWITCH_CHAIN_BITS - SWITCH_SENTINEL_BITS)
+
+/// Poll interval (ms).  50 Hz - the debounce window below is measured in polls.
+#define SWITCH_POLL_MS                               20UL
+
+/**
+ * Agreeing samples before a change is committed: 4 polls = 80 ms.
+ *
+ * Longer than a button design would take, deliberately.  Every input here is a
+ * LATCHING switch, so response latency is worth nothing - nobody flips a rocker
+ * expecting a reply inside 100 ms - and the budget is better spent on noise
+ * immunity, which matters because no RC filtering is fitted.  Sixteen
+ * capacitors would be real board area for something four samples solve free.
+ */
+#define SWITCH_DEBOUNCE_SAMPLES                      4U
+
+/// Consecutive sentinel failures before the chain is declared absent.
+#define SWITCH_ABSENT_READS                          4U
+
+/**
+ * Identical good reads required to establish a baseline before @c present is
+ * asserted, at boot and after every outage.
+ *
+ * Without it a single un-debounced sample became the published state - so one
+ * read landing mid-throw was adopted as truth, then corrected 80 ms later by a
+ * @c changed bit describing nothing an operator did.  The same qualification
+ * runs after a chain outage, because a read arriving the instant a connector
+ * reseats is exactly the read least worth trusting.
+ */
+#define SWITCH_QUALIFY_READS                         4U
+
+/**
+ * Chatter detector: more RAW input edges than this inside the sliding window
+ * below, on one input, marks that input's position untrustworthy.
+ *
+ * ⚠️ COUNTED ON RAW EDGES, NOT ON COMMITTED STATE CHANGES.  Counting committed
+ * changes - which is what this did at first - makes the detector blind to the
+ * one thing it exists for: an input alternating every poll resets the debounce
+ * integrator continuously, so it NEVER commits, so it would report zero
+ * transitions and perfect health while flapping at 50 Hz.  Only slow chatter
+ * got counted, and slow chatter is also what a person operating a switch
+ * briskly looks like.  It was exactly the wrong way round.
+ *
+ * The threshold follows from that change.  At a 20 ms poll a clean throw is one
+ * edge (contact bounce is mostly shorter than the interval and lands between
+ * samples), so even brisk human use is tens of edges over ten seconds, while a
+ * chattering contact approaches 500.  40 sits in a very wide gap.
+ *
+ * ⚠️ THIS IS THE ONLY WIRING FAULT THIS DESIGN CAN DETECT.  Because every input
+ * is latching, a position held indefinitely is CORRECT behaviour, so there is
+ * no stuck-input test to write.  A broken wire reads as "open" and a chassis
+ * short reads as "closed", and neither is distinguishable from a legitimate
+ * switch position without a different sense topology.  Both are accepted blind
+ * spots, recorded here so they are not rediscovered later as a mystery.
+ */
+#define SWITCH_CHATTER_MAX                           40U
+#define SWITCH_CHATTER_WINDOW_MS                     10000UL
+/**
+ * Half-window.  Two buckets are summed, so the window SLIDES in 5 s steps
+ * rather than resetting on a boundary.
+ *
+ * A single fixed bucket cannot see a burst that straddles its edge - the
+ * classic case being 25 edges either side of a reset, which is a badly
+ * intermittent connector reported as two quiet windows.
+ */
+#define SWITCH_CHATTER_BUCKET_MS                     (SWITCH_CHATTER_WINDOW_MS / 2UL)
+
+/**
+ * Settling margin around the parallel-load pulse (us).
+ *
+ * NOT a datasheet requirement - the 74HC165 needs tens of nanoseconds and a
+ * SAMD21 @c digitalWrite() already costs more than a microsecond.  It is margin
+ * for the one place this design has real RC: a switch loom running to the dash,
+ * pulled up through 10 kOhm against whatever capacitance the harness has.
+ */
+#define SWITCH_SETTLE_US                             1U
+
 /// Below this ground speed the GNSS course over ground is noise, not travel:
 /// a stationary receiver reports a heading that wanders the full circle.
 /// Heading is published as NAN below this threshold (km/h).

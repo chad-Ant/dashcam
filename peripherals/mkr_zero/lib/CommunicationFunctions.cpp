@@ -51,7 +51,7 @@ CommReturnStatus sendFrame(uint8_t type, const uint8_t *payload, uint8_t len){
     return (written == n) ? CommReturnStatus::OK : CommReturnStatus::NOK_BUSY;
 }
 
-void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode, TelemetryPayload &out){
+void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const SwitchData &sw, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode, TelemetryPayload &out){
     out.masterMillis = millis();
 
     out.speed       = obd.speed;
@@ -110,7 +110,30 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
 
     // Fusion output (v0x06). The sensor computes these; nothing is derived here.
     out.imuLinAccelPeak = imu.linAccelPeakMs2;
+    // The signed vector behind that magnitude (v0x07). Instantaneous, not
+    // windowed: these say which way, the peak beside them says how hard.
+    out.imuLinAccelX    = imu.linAccelX;
+    out.imuLinAccelY    = imu.linAccelY;
+    out.imuLinAccelZ    = imu.linAccelZ;
     out.imuYawRelDeg    = imu.yawRelDeg;
+
+    // ---- High-G durability (v0x07) ----
+    //
+    // AGE, not a timestamp, and saturating rather than wrapping. UINT16_MAX is
+    // the sentinel for "no latch has ever happened", which is a different
+    // statement from "the last one was a long time ago" only in principle:
+    // both mean nothing recent, and collapsing them costs a consumer nothing
+    // while removing a special case.
+    //
+    // The subtraction is on unsigned millis() and is therefore correct across
+    // the 49-day wrap; the clamp below is what keeps the result meaningful.
+    if (imu.highGCount == 0u) {
+        out.imuHighGMs = UINT16_MAX;
+    } else {
+        const uint32_t age = millis() - imu.highGMs;
+        out.imuHighGMs = (age >= (uint32_t)UINT16_MAX) ? UINT16_MAX : (uint16_t)age;
+    }
+    out.imuHighGCount = imu.highGCount;
     // Packed in the sensor's own CALIB_STAT order — mag, accel, gyro, system —
     // so a consumer holding the datasheet reads it without a translation table.
     out.imuCalib = (uint8_t)(( imu.calibMag         & 0x03u)        |
@@ -174,7 +197,21 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     // accelerometer, so a rail the raw channel hit propagates straight into it.
     if (imu.accelSaturated) flags |= COMM_FLAG_IMU_SATURATED;
     if (map != nullptr && map->loaded) flags |= COMM_FLAG_CANMAP_LOADED;
+    // The switch chain's own positive control (v0x07). Without it an absent
+    // chain, a dead register and fourteen open latching switches all serialise
+    // as the same word — the same trap COMM_FLAG_IMU_PRESENT and
+    // COMM_FLAG_GPS_PRESENT were added to close for their subsystems.
+    if (sw.present) flags |= COMM_FLAG_SWITCHES_PRESENT;
     out.flags = flags;
+
+    // ---- panel switches (v0x07) ----
+    //
+    // Copied whatever `present` says. When it is clear these are the last
+    // MEASURED positions rather than current ones, which is strictly better
+    // than zeroing them: zeroed positions are indistinguishable from fourteen
+    // open switches that were actually read.
+    out.switchState   = sw.state;
+    out.switchChanged = sw.changed;
 
     // ---- vehicle bus ----
     // Copied verbatim from the template, sentinels included. expireVehicleSignals()
@@ -247,10 +284,25 @@ void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu,
     }
 }
 
-CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
+CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, SwitchData &sw, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
     TelemetryPayload p;
-    buildTelemetry(obd, gps, imu, derived, veh, canMode, p);
-    return sendFrame(MSG_TELEMETRY, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+    buildTelemetry(obd, gps, imu, sw, derived, veh, canMode, p);
+    const CommReturnStatus r = sendFrame(MSG_TELEMETRY, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+
+    // ONLY ON A CONFIRMED SEND (v0x07).
+    //
+    // sendFrame() returns NOK_BUSY when the frame did not fit the TX buffer, and
+    // clearing on the ATTEMPT would discard the switch event along with the
+    // frame that failed to carry it — after which the next frame reports a quiet
+    // interval over a window in which a switch moved. Exactly the bug that was
+    // found and fixed in the bridge's coalescing accumulator, which is the same
+    // shape one hop further up.
+    //
+    // Held rather than cleared means at worst a change is reported twice, which
+    // is a consumer's problem to idempotently ignore. The other way round loses
+    // it permanently.
+    if (r == CommReturnStatus::OK) switchClearChanged(sw);
+    return r;
 }
 
 void initCommMaster(CommMaster &m){
@@ -265,7 +317,7 @@ void initCommMaster(CommMaster &m){
     commRxInit(m.rx);
 }
 
-void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
+void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, SwitchData &sw, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode){
     // 1) Service inbound C3 commands: non-blocking and bounded to a fixed budget
     //    per call so a command flood cannot monopolise the loop.
     uint8_t  type = 0, len = 0;
@@ -303,7 +355,7 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
                 // A one-shot must not be lost to a momentarily full TX buffer:
                 // the requester gets no answer and no error, and simply waits.
                 // Latch it instead and let the retry below deliver it.
-                if (sendTelemetry(obd, gps, imu, derived, veh, canMode) != CommReturnStatus::OK){
+                if (sendTelemetry(obd, gps, imu, sw, derived, veh, canMode) != CommReturnStatus::OK){
                     m.oncePending   = true;
                     m.onceRequestMs = millis();
                 }
@@ -384,7 +436,7 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
     if (m.oncePending){
         if ((millis() - m.onceRequestMs) >= COMM_ONCE_TIMEOUT_MS){
             m.oncePending = false;  // give up: the answer would be stale anyway
-        } else if (sendTelemetry(obd, gps, imu, derived, veh, canMode) == CommReturnStatus::OK){
+        } else if (sendTelemetry(obd, gps, imu, sw, derived, veh, canMode) == CommReturnStatus::OK){
             m.oncePending = false;
         }
     }
@@ -394,7 +446,7 @@ void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, cons
     //    the clock only when the frame actually went out, so a NOK_BUSY (congested TX)
     //    retries on the next loop instead of being silently dropped for a full period.
     if (m.streaming && (millis() - m.lastPushMs) >= COMM_STREAM_INTERVAL_MS){
-        if (sendTelemetry(obd, gps, imu, derived, veh, canMode) == CommReturnStatus::OK){
+        if (sendTelemetry(obd, gps, imu, sw, derived, veh, canMode) == CommReturnStatus::OK){
             m.lastPushMs = millis();
         }
     }

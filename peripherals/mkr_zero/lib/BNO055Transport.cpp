@@ -192,10 +192,25 @@ static bool identifyWithPageRecovery(uint8_t address)
 {
     uint8_t id = 0u;
     // Probe, so a silent candidate address is not charged to the counters.
-    if (busReadInto(address, BNO055_CHIP_ID_ADDR, &id, 1u, false) != BNO_OK) return false;
+    const bool idRead = (busReadInto(address, BNO055_CHIP_ID_ADDR, &id, 1u, false) == BNO_OK);
     // Identified by CHIP_ID, not by a bare address ACK. Something else can sit
     // at either address, and an ACK only proves that something is there.
-    if (id == BNO055_EXPECTED_CHIP_ID) return true;
+    if (idRead && id == BNO055_EXPECTED_CHIP_ID) return true;
+
+    // A FAILED read is not the same as "nothing there", and returning here was a
+    // gap. This part answers page-1 register 0x00 with 0x00 — measured — but
+    // 0x00..0x06 are RESERVED on page 1, so their read behaviour is unspecified
+    // and another part or clone may NACK the data phase instead. That would
+    // leave a present, recoverable sensor classified absent until someone pulled
+    // the power, which is the whole failure mode this function exists to end.
+    //
+    // So a failed read falls through to the page check, gated on the address
+    // ACKing at all: without that, the PAGE_ID probe below would be issued at an
+    // address with nothing on it on every single bring-up.
+    if (!idRead) {
+        Wire.beginTransmission(address);
+        if (Wire.endTransmission() != 0u) return false;   // genuinely silent
+    }
 
     // Something answered and it is not a BNO055 on page 0. Ask the only question
     // that is meaningful without knowing the page.

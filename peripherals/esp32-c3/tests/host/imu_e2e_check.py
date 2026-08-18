@@ -57,7 +57,7 @@ except ImportError:
 # with the CRC covering VER..PAYLOAD and NOT the SOF.
 
 SOF = 0x7E
-VERSION = 0x06
+VERSION = 0x07
 
 MSG_TELEMETRY = 0x81
 MSG_STATUS = 0x82
@@ -84,8 +84,9 @@ TLM_FLAG_IMU_SATURATED = 0x0200
 TLM_FLAG_CANMAP_LOADED = 0x0400
 TLM_FLAG_IMU_HIGHG_ARMED = 0x0800
 TLM_FLAG_IMU_FUSION_MODE = 0x1000
+TLM_FLAG_SWITCHES_PRESENT = 0x2000
 
-# hostproto::Telemetry, packed, 160 bytes. '<' is little-endian AND no padding,
+# hostproto::Telemetry, packed, 180 bytes. '<' is little-endian AND no padding,
 # which is what makes this match a __attribute__((packed)) struct exactly.
 TELEMETRY_FMT = (
     "<"
@@ -96,14 +97,18 @@ TELEMETRY_FMT = (
     "3B"      # satellites fixType fixValid
     "H"       # year
     "5B"      # month day hour minute second
-    "14f"     # imuAccelX/Y/Z imuGyroX/Y/Z imuMagX/Y/Z imuTempC
-              # imuAccelPeak imuGyroPeak imuLinAccelPeak imuYawRelDeg
+    "13f"     # imuAccelX/Y/Z imuGyroX/Y/Z imuMagX/Y/Z imuTempC
+              # imuAccelPeak imuGyroPeak imuLinAccelPeak
+    "3f"      # imuLinAccelX/Y/Z                              (v0x07)
+    "2H"      # imuHighGMs imuHighGCount                      (v0x07)
+    "f"       # imuYawRelDeg
     "3B"      # imuCalib canMapChecksum canMapFlags
     "H"       # flags
     "5B"      # canMode sigSource gearPos vehFlags pedalGas
     "H"       # steerMotorTorque
     "h"       # yawRateCdps
     "4H"      # wheelRaw
+    "2H"      # switchState switchChanged                     (v0x07)
 )
 
 TELEMETRY_FIELDS = (
@@ -112,17 +117,52 @@ TELEMETRY_FIELDS = (
     "gpsSpeedKmh heading satellites fixType fixValid year month day hour "
     "minute second imuAccelX imuAccelY imuAccelZ imuGyroX imuGyroY imuGyroZ "
     "imuMagX imuMagY imuMagZ imuTempC imuAccelPeak imuGyroPeak "
-    "imuLinAccelPeak imuYawRelDeg imuCalib canMapChecksum canMapFlags flags "
+    "imuLinAccelPeak imuLinAccelX imuLinAccelY imuLinAccelZ "
+    "imuHighGMs imuHighGCount imuYawRelDeg "
+    "imuCalib canMapChecksum canMapFlags flags "
     "canMode sigSource gearPos vehFlags pedalGas steerMotorTorque "
-    "yawRateCdps wheel0 wheel1 wheel2 wheel3"
+    "yawRateCdps wheel0 wheel1 wheel2 wheel3 switchState switchChanged"
 ).split()
 
 TELEMETRY_SIZE = struct.calcsize(TELEMETRY_FMT)
-assert TELEMETRY_SIZE == 160, f"layout drift: {TELEMETRY_SIZE} bytes, expected 160"
+assert TELEMETRY_SIZE == 180, f"layout drift: {TELEMETRY_SIZE} bytes, expected 180"
 assert len(TELEMETRY_FIELDS) == len(struct.unpack(TELEMETRY_FMT, b"\0" * TELEMETRY_SIZE))
 
 HELLO_FMT = "<BBBBBBHI"   # protoVersion fwMajor fwMinor resetReason
                           # telemetryBytes statusBytes bootCount bridgeMillis
+
+BRIDGE_FLAG_MASTER_LINK = 0x01
+BRIDGE_FLAG_STREAMING = 0x02
+BRIDGE_FLAG_PM_PRESENT = 0x20
+
+# hostproto::BridgeStatus, packed, 44 bytes.
+#
+# DECODED, not merely counted. An earlier version tallied MSG_STATUS frames and
+# threw the contents away — so a run where telemetry stopped while status kept
+# arriving reported only "no telemetry", when the bridge had been sending the
+# answer once a second the whole time. Whether the master link is up, how stale
+# its last frame is, and whether forwarding is even enabled are all in here.
+STATUS_FMT = "<6I3fHBBBB2s"
+STATUS_FIELDS = (
+    "bridgeMillis telemetryAgeMs masterFrames masterCrcErrors hostFrames "
+    "hostTxDropped batteryVolts batteryPercent tempC freeHeapKb batteryStatus "
+    "chargeState flags decimation reserved"
+).split()
+STATUS_SIZE = struct.calcsize(STATUS_FMT)
+assert STATUS_SIZE == 44, f"BridgeStatus layout drift: {STATUS_SIZE} bytes, expected 44"
+
+
+def unpack_status(payload: bytes) -> dict:
+    return dict(zip(STATUS_FIELDS, struct.unpack(STATUS_FMT, payload)))
+
+
+def describe_bridge(s: dict) -> str:
+    on = []
+    if s["flags"] & BRIDGE_FLAG_MASTER_LINK:
+        on.append("MASTER_LINK")
+    if s["flags"] & BRIDGE_FLAG_STREAMING:
+        on.append("STREAMING")
+    return "|".join(on) if on else "none"
 
 
 def crc16(data: bytes) -> int:
@@ -253,9 +293,14 @@ def check_mode_contract(rep: Report, t: dict, mode: str):
         rep.check(finite(t["imuLinAccelPeak"]),
                   "IMUPLUS: linear-acceleration peak is published",
                   f"{t['imuLinAccelPeak']:.2f}")
-        rep.check(finite(t["imuYawRelDeg"]),
-                  "IMUPLUS: relative yaw is published",
-                  f"{t['imuYawRelDeg']:.1f} deg")
+        # RANGE, not just finiteness. The origin is arbitrary and drifts — 270
+        # at rest is perfectly valid and must not be treated as a fault — but the
+        # encoding is 0..360, so a value outside that is a scaling or sign error
+        # rather than a heading this driver declines to interpret.
+        yaw = t["imuYawRelDeg"]
+        rep.check(finite(yaw) and 0.0 <= yaw < 360.0,
+                  "IMUPLUS: relative yaw is published and inside [0,360)",
+                  f"{yaw:.1f} deg")
         # The magnetometer is switched off on purpose. Zeros here would be a
         # fabricated field strength, and zero is a plausible reading.
         rep.check(mag_absent,
@@ -305,13 +350,38 @@ MODE_NAMES = {"imuplus": IMU_MODE_FUSION, "amg": IMU_MODE_RAW}
 # Waiting less than this measures the blind period and calls it a failure.
 MODE_SETTLE_S = 2.5
 
+# MUST match IMU_MODE_MIN_INTERVAL_MS in the master's DataDictionary.h.
+#
+# The master refuses a mode change that arrives sooner than this after the last
+# one, because each costs the sensor a ~700 ms blind window and a host looping on
+# the command would hold it in permanent re-initialisation. That guard is correct
+# and this script has to live with it.
+#
+# It did not. With --seconds 1.5 the cleanup landed 2.5 + 1.5 = 4.0 s after the
+# AMG change and was REFUSED, and nothing checked — so a run reporting OK left
+# the rig in AMG, publishing no linear acceleration at all, for the next person
+# to find. The two numbers below are why the restore now waits and then verifies.
+MODE_GUARD_S = 5.0
+
+# When the script last had a mode change applied, as time.monotonic().
+_last_mode_change = 0.0
+
+
+def wait_out_mode_guard():
+    """Sleeps until the master will accept another mode change."""
+    remaining = MODE_GUARD_S - (time.monotonic() - _last_mode_change)
+    if remaining > 0:
+        print(f"  waiting {remaining:.1f} s for the master's mode-change guard")
+        time.sleep(remaining)
+
 
 def collect(ser, dec, seconds, raw=False):
     """Drains frames for @p seconds and returns what arrived."""
     acc = {
         "telemetry": 0, "status": 0, "hello": 0, "log": 0,
         "gap": 0, "highg": 0, "armed": 0, "present": 0, "fusion": 0,
-        "newest": None, "hello_data": None, "logs": [], "master_millis": [],
+        "newest": None, "hello_data": None, "status_data": None,
+        "logs": [], "master_millis": [],
     }
     deadline = time.time() + seconds
     while time.time() < deadline:
@@ -337,6 +407,8 @@ def collect(ser, dec, seconds, raw=False):
                           f"{describe_flags(f)}")
             elif mtype == MSG_STATUS:
                 acc["status"] += 1
+                if len(payload) == STATUS_SIZE:
+                    acc["status_data"] = unpack_status(payload)
             elif mtype == MSG_HELLO:
                 acc["hello"] += 1
                 if len(payload) >= struct.calcsize(HELLO_FMT):
@@ -353,11 +425,26 @@ def run_pass(ser, dec, rep, mode, seconds, do_set, raw):
     """Optionally commands @p mode, then collects and judges one pass."""
     print(f"\n===== pass: {mode.upper()} " + "=" * (46 - len(mode)))
 
+    # RE-ASSERTED EVERY PASS, not once at startup.
+    #
+    # The bridge resets streaming to its power-on default on any host reconnect,
+    # and the master clears its own streaming flag on reset — hostLink.h states
+    # plainly that "the host must re-issue CMD_START_STREAM, that is the
+    # documented contract". Sending it once at the beginning met that contract
+    # only for as long as nothing restarted, and a master that rebooted mid-run
+    # therefore went quiet for the rest of the session while MSG_STATUS carried
+    # on at 1 Hz. Re-issuing is idempotent and costs one 6-byte frame.
+    ser.write(build_frame(CMD_START_STREAM))
+    ser.flush()
+
     if do_set:
+        global _last_mode_change
+        wait_out_mode_guard()
         print(f"  sending CMD_SET_IMU_MODE({MODE_NAMES[mode]}), "
               f"waiting {MODE_SETTLE_S:.1f} s for bring-up")
         ser.write(build_frame(CMD_SET_IMU_MODE, bytes((MODE_NAMES[mode],))))
         ser.flush()
+        _last_mode_change = time.monotonic()
         # Drain and DISCARD across the switch. The frames during a bring-up are
         # a sensor that is legitimately absent, and judging the mode contract
         # against them would fail every check for a firmware doing exactly what
@@ -384,12 +471,48 @@ def run_pass(ser, dec, rep, mode, seconds, do_set, raw):
         rep.check(h[4] == TELEMETRY_SIZE, "bridge telemetry size matches this decoder",
                   f"{h[4]} vs {TELEMETRY_SIZE}")
 
+    # The bridge's own account of itself, which is the discriminator whenever
+    # telemetry stops: it separates "the master went away" from "the master is
+    # fine and forwarding is off" from "the C3 is dropping frames".
+    s = acc["status_data"]
+    if s:
+        print(f"        bridge: {describe_bridge(s)}  "
+              f"telemetryAge={s['telemetryAgeMs']} ms  "
+              f"masterFrames={s['masterFrames']}  "
+              f"masterCrc={s['masterCrcErrors']}  "
+              f"hostTxDropped={s['hostTxDropped']}  "
+              f"decim={s['decimation']}  up={s['bridgeMillis']} ms")
+
     rep.check(acc["telemetry"] > 0, "telemetry arrived from the MKR via the C3",
               f"{acc['telemetry']} frames")
     if not acc["telemetry"]:
-        print("\n  No telemetry. Check the MKR is powered and cross-wired to the C3,")
-        print("  and that MSG_STATUS shows the master link up.")
+        print("\n  No telemetry.")
+        if not s:
+            print("  No MSG_STATUS either - the C3 itself is not talking. Check the")
+            print("  USB cable and that nothing else holds the port.")
+        elif not (s["flags"] & BRIDGE_FLAG_MASTER_LINK):
+            print(f"  The bridge says the MASTER LINK IS DOWN (last master frame "
+                  f"{s['telemetryAgeMs']} ms ago).")
+            print("  The C3 is fine; the MKR is not talking to it. Check the MKR's own")
+            print("  console for a reset banner, and note that the MKR clears its")
+            print("  streaming flag on reset - which this script now re-asserts.")
+        elif not (s["flags"] & BRIDGE_FLAG_STREAMING):
+            print("  The master link is UP but FORWARDING IS OFF. The bridge reset its")
+            print("  streaming state, most likely on a host reconnect.")
+        elif s["hostTxDropped"]:
+            print(f"  The master link is up and forwarding is on, but the bridge has")
+            print(f"  dropped {s['hostTxDropped']} frames to a full host TX ring.")
+        else:
+            print("  Master link up, forwarding on, nothing dropped - so the MKR is")
+            print("  connected but producing no telemetry. Check its console.")
         return
+
+    # A live link is not the same as a healthy one: the master can be forwarding
+    # stale frames after it stopped producing new ones.
+    if s:
+        rep.check((s["flags"] & BRIDGE_FLAG_MASTER_LINK) != 0,
+                  "the bridge reports the master link up",
+                  describe_bridge(s))
 
     rep.check(dec.crc_errors == 0, "no CRC errors on the USB link", str(dec.crc_errors))
 
@@ -432,6 +555,55 @@ def run_pass(ser, dec, rep, mode, seconds, do_set, raw):
     rep.check(acc["armed"] == acc["telemetry"],
               "High-G backstop reports armed on every frame",
               f"{acc['armed']}/{acc['telemetry']}")
+
+
+def restore_imuplus(ser, dec, rep):
+    """Puts the master back in IMUPLUS and CONFIRMS it, rather than assuming.
+
+    Assuming was the bug. The old cleanup sent the command and slept, so a
+    request the master refused — which is what happened, every time, because it
+    arrived inside the 5 s guard — left the rig in AMG under a report that said
+    OK. A cleanup nobody checks is a cleanup that silently does not happen.
+    """
+    global _last_mode_change
+    print("\n  restoring IMUPLUS")
+
+    # RE-ASSERTED HERE TOO, and forgetting it here was a real bug. run_pass()
+    # re-issues CMD_START_STREAM for the documented reason — the bridge resets
+    # streaming to its power-on default on any host reconnect — and this path
+    # needs it for exactly the same reason but did not have it. The result was a
+    # restore that WAS applied (the master's console said so every time) and then
+    # could not be confirmed, so a working rig reported FAILURES PRESENT.
+    ser.write(build_frame(CMD_START_STREAM))
+    ser.flush()
+
+    wait_out_mode_guard()
+    ser.write(build_frame(CMD_SET_IMU_MODE, bytes((IMU_MODE_FUSION,))))
+    ser.flush()
+    _last_mode_change = time.monotonic()
+
+    acc = collect(ser, dec, MODE_SETTLE_S)          # ride out the bring-up
+    acc = collect(ser, dec, 1.0)                    # then judge settled frames
+
+    if acc["telemetry"] == 0:
+        # Say what WAS seen. "No frames" on its own cannot distinguish a master
+        # that stopped from a bridge that stopped forwarding, and this check
+        # failing while the mode change plainly worked is the case that needs
+        # telling apart.
+        s = acc["status_data"]
+        print(f"        saw status={acc['status']} hello={acc['hello']}"
+              + (f" bridge={describe_bridge(s)}" if s else " (no status decoded)"))
+        rep.check(False, "IMUPLUS restored after the run", "no frames to confirm with")
+        print("  *** The mode change may still have been applied - check the master's")
+        print("  *** console for 'host requested IMUPLUS'. This check only reports")
+        print("  *** what the host could OBSERVE.")
+        return
+    restored = acc["fusion"] == acc["telemetry"]
+    rep.check(restored, "IMUPLUS restored after the run",
+              f"FUSION_MODE on {acc['fusion']}/{acc['telemetry']}")
+    if not restored:
+        print("  *** The rig is still in AMG. Re-run with:")
+        print("  ***   --mode imuplus --set")
 
 
 def main() -> int:
@@ -485,17 +657,17 @@ def main() -> int:
         ser.write(build_frame(CMD_START_STREAM))
         time.sleep(0.2)
 
-        for m in modes:
-            run_pass(ser, dec, rep, m, args.seconds, args.do_set, args.raw)
-
-        # Leave the master the way production expects to find it. A rig left in
-        # AMG after a test run publishes no linear acceleration at all, and the
-        # next person to look would be debugging a mode change they never made.
-        if args.do_set and (args.both or args.mode != "imuplus"):
-            print("\n  restoring IMUPLUS")
-            ser.write(build_frame(CMD_SET_IMU_MODE, bytes((IMU_MODE_FUSION,))))
-            ser.flush()
-            time.sleep(MODE_SETTLE_S)
+        try:
+            for m in modes:
+                run_pass(ser, dec, rep, m, args.seconds, args.do_set, args.raw)
+        finally:
+            # IN A finally, AND VERIFIED. Leaving the rig in AMG is not a tidy-up
+            # detail: that mode publishes no linear acceleration at all, so the
+            # next person to look is debugging a mode change they never made.
+            # An exception or Ctrl-C part-way through is exactly when the restore
+            # matters most, which is why it no longer sits on the success path.
+            if args.do_set and (args.both or args.mode != "imuplus"):
+                restore_imuplus(ser, dec, rep)
 
     print("\n=== summary ==================================================")
     print(f"  passed {rep.passed}, failed {rep.failed}")

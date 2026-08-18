@@ -35,7 +35,7 @@
  *
  * ── Frame layout ─────────────────────────────────────────────────────────────
  *   SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
- *   VER is hostproto::VERSION, currently 0x06; Telemetry is 160 bytes.
+ *   VER is hostproto::VERSION, currently 0x07; Telemetry is 180 bytes.
  *
  * CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over VER..last payload byte,
  * transmitted low byte first.  Both ends are little-endian IEEE-754, so a
@@ -90,8 +90,21 @@ constexpr uint8_t  SOF            = 0x7E; ///< Start-of-frame delimiter.
  *
  * @c flags widened from uint8 to uint16 to carry the three new bits, and
  * IMU_DEGRADED changed meaning — read it against VERSION, not on its own.
+ *
+ * 0x07 (160 -> 180 bytes) closes two holes and adds a subsystem:
+ *
+ *   - DIRECTION. @c imuLinAccelPeak is a MAGNITUDE, so a frontal impact and a
+ *     side impact of equal severity are the same number. @c imuLinAccelX/Y/Z
+ *     carry the signed vector, which is what separates them and what any
+ *     reconstruction needs.
+ *   - A HIGH-G EVENT CAN NO LONGER BE MISSED. IMU_HIGH_G is held for a fixed
+ *     window and then clears, so a decimated stream could step over one
+ *     entirely. @c imuHighGCount only climbs, so any two frames bracket every
+ *     event between them; @c imuHighGMs locates the most recent one in time.
+ *   - PANEL SWITCHES. @c switchState and @c switchChanged, qualified by
+ *     @c TLM_FLAG_SWITCHES_PRESENT.
  */
-constexpr uint8_t  VERSION        = 0x06;
+constexpr uint8_t  VERSION        = 0x07;
 constexpr uint16_t MAX_PAYLOAD    = 255;  ///< Largest payload (LEN is one byte).
 constexpr uint16_t FRAME_OVERHEAD = 6;    ///< SOF+VER+TYPE+LEN + CRC16(2).
 constexpr uint16_t MAX_FRAME      = FRAME_OVERHEAD + MAX_PAYLOAD;
@@ -409,10 +422,33 @@ constexpr uint16_t TLM_FLAG_IMU_HIGHG_ARMED = 0x0800;
  */
 constexpr uint16_t TLM_FLAG_IMU_FUSION_MODE = 0x1000;
 /**
- * NOTE: @c Telemetry::flags became @c uint16_t in v0x06 and 0x1000 is in use.
- * Seven bits remain. A further widening is another payload size change and so
- * another VERSION bump on both hops — the v0x05 note said exactly this about the
- * change that has just happened.
+ * The 74HC165 switch chain answered its sentinels on the master's most recent
+ * poll, so @c switchState describes measured positions.
+ *
+ * The counterpart of @c TLM_FLAG_IMU_PRESENT and @c TLM_FLAG_GPS_PRESENT, and
+ * added for exactly their reason. Every switch on the panel latches and is
+ * legitimately open most of the time, so an absent chain, a dead register and
+ * fourteen open switches all produce the same word. Two of the sixteen inputs
+ * are hard-wired to opposite rails and checked on every read; this bit is that
+ * check.
+ *
+ * Clear means @c switchState is STALE, not that every switch is open — the
+ * master holds the last measured positions rather than zeroing them, because
+ * zeroed positions look measured.
+ */
+constexpr uint16_t TLM_FLAG_SWITCHES_PRESENT = 0x2000;
+/**
+ * NOTE: @c Telemetry::flags became @c uint16_t in v0x06. With 0x2000 in use,
+ * TWO bits remain — 0x4000 and 0x8000.
+ *
+ * (The v0x06 note here said seven remained, which was a miscount: thirteen of
+ * the sixteen were already allocated when it was written. Recorded rather than
+ * quietly corrected, because that number is the input to deciding when the next
+ * widening becomes unavoidable, and a wrong one postpones the decision past the
+ * point where it is cheap.)
+ *
+ * A further widening is another payload size change and so another VERSION bump
+ * on both hops.
  */
 
 /// @c CMD_SET_IMU_MODE payload values.
@@ -553,6 +589,49 @@ struct __attribute__((packed)) Telemetry {
      */
     float imuLinAccelPeak;
     /**
+     * ---- signed linear acceleration (v0x07) ----
+     *
+     * Sensor-frame linear acceleration with gravity removed by the on-chip
+     * fusion (m/s²). NAN in the raw (AMG) mode, which produces no fusion.
+     *
+     * WHY THE PEAK WAS NOT ENOUGH. @c imuLinAccelPeak is a magnitude, so a
+     * frontal impact and a side impact of the same severity are the same
+     * number. Direction is most of what an incident reconstruction wants —
+     * which way the energy arrived from decides what the recording means — and
+     * it cannot be recovered from a magnitude afterwards at any price.
+     *
+     * These are INSTANTANEOUS, from the frame's own sample; the peak beside
+     * them is the window. A frame carrying a High-G event will usually not have
+     * caught the peak instant in these three, which is the honest limit of
+     * publishing at 10 Hz what is sampled at 100 Hz: they give the DIRECTION of
+     * an event and @c imuLinAccelPeak gives its SIZE.
+     */
+    float imuLinAccelX;
+    float imuLinAccelY;
+    float imuLinAccelZ;
+    /**
+     * Age of the most recent High-G latch (ms). @c 0xFFFF when none has
+     * occurred, or the last was longer ago than this can express.
+     *
+     * An AGE rather than a timestamp, so it needs no arithmetic against
+     * @c masterMillis and carries its own "never" value. Saturating at 65.5 s
+     * costs nothing: past a minute the only question left is the count.
+     */
+    uint16_t imuHighGMs;
+    /**
+     * Cumulative High-G latches since the master booted. Wraps at 65535.
+     *
+     * THE FIELD THAT MAKES THE EVENT UNMISSABLE. @c TLM_FLAG_IMU_HIGH_G is held
+     * for a fixed window and then clears, so an application reading a decimated
+     * stream — or one that lost a frame to a full ring — can step straight over
+     * an impact and see nothing. A monotonic counter cannot be stepped over: any
+     * two frames bracket every event between them, whatever was dropped in the
+     * middle.
+     *
+     * Compare against the previous frame's value. Do not test for non-zero.
+     */
+    uint16_t imuHighGCount;
+    /**
      * Rotation about the vertical (deg), RELATIVE AND DRIFTING.
      *
      * NOT a heading, and named so it cannot be mistaken for one — the sensor
@@ -675,6 +754,38 @@ struct __attribute__((packed)) Telemetry {
      * a scalar cannot reconstruct afterwards.
      */
     uint16_t wheelRaw[4];
+    /**
+     * ---- panel switches (v0x07) ----
+     *
+     * Debounced positions behind the master's 74HC165 chain. Bit @e n is
+     * @c SWn and 1 means CLOSED. Qualified by @c TLM_FLAG_SWITCHES_PRESENT:
+     * when that is clear these are the last measured positions, not current
+     * ones.
+     *
+     * DELIBERATELY UNNAMED, and this is the end of the chain where that pays
+     * off. Neither MCU knows what any switch controls, and no firmware branches
+     * on one — the mapping from index to function belongs in THIS
+     * application's configuration, beside the CAN map, so a switch can be
+     * re-purposed or moved to a different hole in the dash without reflashing
+     * anything. Naming one here would undo that as surely as naming it in the
+     * firmware.
+     */
+    uint16_t switchState;
+    /**
+     * Bits that changed at least once since the previous frame you received.
+     *
+     * A latching switch holds its own position, so @c switchState alone cannot
+     * miss one — but a switch flipped and returned BETWEEN two frames is
+     * invisible in level alone, and frames are genuinely lost to decimation and
+     * to a full ring. Accumulated on the master, cleared only on a CONFIRMED
+     * send, and OR-ed across any frames the bridge coalesced, so the guarantee
+     * survives both hops rather than only the first.
+     *
+     * Also set when a chain that had gone away returns holding a different
+     * position: something moved while nobody was looking, and the fact survives
+     * even though the moment does not.
+     */
+    uint16_t switchChanged;
 };
 
 /**
@@ -739,7 +850,7 @@ constexpr size_t MAX_LOG_TEXT = MAX_PAYLOAD - sizeof(LogHeader);
 // The wire contract depends on these exact sizes on both ends.  Telemetry must
 // also equal sizeof(TelemetryPayload) in CommProtocol.h — the bridge asserts
 // that separately, where both headers are visible.
-static_assert(sizeof(Telemetry)    == 160, "hostproto::Telemetry must be tightly packed to 160 bytes");
+static_assert(sizeof(Telemetry)    == 180, "hostproto::Telemetry must be tightly packed to 180 bytes");
 /**
  * Must fit the frame's one-byte LEN field and @c Hello::telemetryBytes, which is
  * also one byte.  Stated explicitly now the struct has grown 79 -> 83 -> 123 -> 131:

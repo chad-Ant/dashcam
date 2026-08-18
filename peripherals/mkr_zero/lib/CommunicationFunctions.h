@@ -7,6 +7,7 @@
 #include "VehicleSignals.h"
 #include "DataDictionary.h"
 #include "IMUFunctions.h"   // IMUData, carried in the telemetry payload
+#include "SwitchFunctions.h" // SwitchData, carried in the telemetry payload
 
 /// GPS uses I2C on the MKR Zero, leaving @c Serial1 free for the ESP32-C3 link.
 
@@ -82,14 +83,14 @@ CommReturnStatus sendFrame(uint8_t type, const uint8_t *payload, uint8_t len);
  *                       because these are derived, not sensor readings.
  * @param[out] out       Telemetry struct to fill.
  */
-void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode, TelemetryPayload &out);
+void buildTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const SwitchData &sw, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode, TelemetryPayload &out);
 
 /**
  * @brief Builds and transmits one @c MSG_TELEMETRY frame on @c Serial1.
  *
  * @return @c CommReturnStatus::OK, or @c NOK_OVERFLOW if framing failed.
  */
-CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode);
+CommReturnStatus sendTelemetry(const OBD2Data &obd, const GPSData &gps, const IMUData &imu, SwitchData &sw, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode);
 
 /**
  * @brief Runtime state for the master link: streaming toggle + RX decoder.
@@ -192,6 +193,6 @@ void initCommMaster(CommMaster &m);
  * @param[in]     gps       Latest GPS snapshot to publish.
  * @param[in]     derived   Latest master-computed signals.
  */
-void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode);
+void tickCommMaster(CommMaster &m, const OBD2Data &obd, const GPSData &gps, const IMUData &imu, SwitchData &sw, const DerivedSignals &derived, const VehicleSignals &veh, uint8_t canMode);
 
 #endif

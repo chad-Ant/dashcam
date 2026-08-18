@@ -214,6 +214,61 @@ static void groupWireFlags()
           "fusion-mode flag occupies the documented bit position");
 }
 
+// ─── group A3: preserved failure evidence ─────────────────────────────────────
+//
+// bno055InitFail() touches no hardware — it records and schedules — so the latch
+// can be driven directly with a local state struct. That makes the one property
+// that matters testable without a fault: the FIRST failure must survive every
+// later one, because once a part is unreachable every subsequent attempt reports
+// not-found and would otherwise overwrite the fault that started it with its own
+// echo.
+
+static void groupFailureRecord()
+{
+    group("A3  bring-up failure evidence is preserved");
+
+    BNO055InitState st{};
+    check(!st.firstFailure.valid, "a fresh state has no failure recorded");
+
+    // A configuration failure with register evidence, of the kind that says a
+    // write was acknowledged and ignored.
+    st.address        = 0x29u;
+    st.stage          = BNO055InitStage::SetUnits;
+    st.lastRegAddr    = BNO055_UNIT_SEL_ADDR;
+    st.lastRegWrote   = 0x00u;
+    st.lastRegRead    = 0x80u;
+    st.lastRegWriteOk = true;
+    st.lastRegReadOk  = true;
+    st.sysStatus      = 0x05u;
+    bno055InitFail(st, BNO055InitStatus::NOK_CONFIG_FAILED);
+
+    check(st.firstFailure.valid, "a failure is recorded");
+    check(st.firstFailure.failedAt == BNO055InitStage::SetUnits,
+          "and names the stage that refused");
+    check(st.firstFailure.lastStatus == BNO055InitStatus::NOK_CONFIG_FAILED,
+          "and why it refused");
+    check(st.firstFailure.lastRegRead == 0x80u && st.firstFailure.lastRegWrote == 0x00u,
+          "and carries the register write/read-back evidence");
+    check(st.firstFailure.sysStatus == 0x05u, "and the part's own status byte");
+    check(st.firstFailure.address == 0x29u, "and the address it was talking to");
+
+    // THE POINT. Recovery restarts the machine, and the retries that follow all
+    // fail at FindDevice with not-found. Those must not replace the diagnosis.
+    for (uint8_t i = 0; i < 5u; ++i) {
+        st.stage = BNO055InitStage::FindDevice;
+        bno055InitFail(st, BNO055InitStatus::NOK_NOT_FOUND);
+    }
+    check(st.firstFailure.failedAt == BNO055InitStage::SetUnits &&
+          st.firstFailure.lastStatus == BNO055InitStatus::NOK_CONFIG_FAILED,
+          "five later not-found failures do NOT overwrite it");
+    note("failuresTotal", st.failuresTotal);
+    check(st.failuresTotal == 6u, "while the cumulative count keeps rising");
+
+    // A success releases it — the evidence then describes a fault that is gone.
+    st.firstFailure = BNO055FailureRecord{};
+    check(!st.firstFailure.valid, "and a successful bring-up releases it");
+}
+
 // ─── group B: the calibration file (findings 4 and 7) ─────────────────────────
 
 static char     gBackup[BNO055_CALIB_MAX_FILE_BYTES + 64];
@@ -1125,6 +1180,7 @@ void setup()
 
     groupPeakGeometry();
     groupWireFlags();
+    groupFailureRecord();
 
     if (initializeSD() == SDReturnStatus::OK) {
         groupCalibFile();

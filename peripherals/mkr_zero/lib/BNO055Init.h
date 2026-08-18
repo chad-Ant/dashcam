@@ -188,6 +188,57 @@ enum class BNO055InitStage : uint8_t{
  * a pointer to this any more, so the requirement is gone with it. The production
  * instance is still at file scope for its own reasons.
  */
+/**
+ * @brief Everything worth knowing about a bring-up failure, LATCHED.
+ *
+ * WHY THIS EXISTS AS A SEPARATE RECORD. Every field it copies already lives in
+ * @c BNO055InitState — and every one of them is destroyed by the retry.
+ * @c bno055InitBegin() resets @c lastStatus, walks the stage machine from the
+ * top, and re-runs the reads that overwrite @c sysStatus, @c sysError and the
+ * register read-back; @c imuMarkAbsent() clears the fault counters. So by the
+ * time anybody looks at a rig that has been retrying for a minute, the state
+ * that would explain WHY has been overwritten by the attempts to fix it, and
+ * what is left says only "not found" over and over.
+ *
+ * FIRST FAILURE WINS. Later failures are usually consequences of the first —
+ * once the part is unreachable every subsequent attempt reports not-found — so
+ * the record keeps the one that started it and does not let the noise after it
+ * overwrite the signal. It is cleared only when a bring-up actually succeeds,
+ * because at that point the evidence describes a fault that no longer exists.
+ */
+struct BNO055FailureRecord{
+    bool     valid     = false;  ///< False when nothing has failed since the last success.
+    uint32_t atMs      = 0;      ///< @c millis() of the FIRST failure in this run.
+    uint16_t failureNo = 0;      ///< Which consecutive failure this was.
+
+    BNO055InitStage  failedAt   = BNO055InitStage::Idle;  ///< Which step refused.
+    BNO055InitStatus lastStatus = BNO055InitStatus::OK;   ///< Why it refused.
+
+    uint8_t address = 0;   ///< Where it was being addressed. 0 = never identified.
+    uint8_t opMode  = 0;   ///< Mode being configured when it failed.
+    uint8_t chipId  = 0;   ///< What identification actually read back.
+    uint8_t pageId  = 0;   ///< The register page identification saw.
+
+    uint8_t sysStatus  = 0;  ///< The part's own account of itself...
+    uint8_t sysError   = 0;  ///< ...and its error code, if either could be read.
+    uint8_t opModeSeen = 0;  ///< OPR_MODE as last read.
+
+    /// The last configuration write and its read-back — the three-way
+    /// distinction between a NACKed write, a failed read-back and a write the
+    /// part accepted and ignored.
+    uint8_t lastRegAddr    = 0;
+    uint8_t lastRegWrote   = 0;
+    uint8_t lastRegRead    = 0;
+    bool    lastRegWriteOk = false;
+    bool    lastRegReadOk  = false;
+
+    uint16_t transportFaults = 0;  ///< Consecutive transport faults at that moment.
+    uint32_t transportErrors = 0;  ///< Cumulative since boot.
+    /// @c I2C_STUCK_* mask from the last recovery attempt. The one field that
+    /// says the fault was the shared bus rather than this part.
+    uint8_t  stuckLines      = 0;
+};
+
 struct BNO055InitState{
     /// What the part reported at identification: address, chip and revision IDs.
     BNO055Device dev = {};
@@ -199,6 +250,19 @@ struct BNO055InitState{
     uint32_t nextStepMs = 0;   ///< Earliest @c millis() for the next step.
     uint16_t failures   = 0;   ///< Consecutive failed bring-ups, for backoff.
     uint8_t  stepRetries = 0;  ///< In-stage retries used by the current step.
+
+    /// Failed bring-ups since BOOT, never reset.
+    ///
+    /// @c failures above is the backoff counter and clears on every success, so
+    /// it cannot answer "has this rig ever had trouble?" — and a part that fails
+    /// and recovers repeatedly is a different diagnosis from one that has been
+    /// solid since power-on. Distinguishing them needs a counter that success
+    /// does not erase.
+    uint16_t failuresTotal = 0;
+
+    /// The first failure since the last successful bring-up, preserved from the
+    /// retries that would otherwise overwrite it. See @c BNO055FailureRecord.
+    BNO055FailureRecord firstFailure = {};
 
     uint8_t  address = 0;      ///< Where it actually answered.  0 until found.
     uint8_t  opMode  = OPERATION_MODE_IMUPLUS;  ///< Mode being configured.

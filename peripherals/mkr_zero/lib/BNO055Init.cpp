@@ -284,7 +284,53 @@ void bno055InitFail(BNO055InitState &state, BNO055InitStatus why)
 
     state.stage      = BNO055InitStage::Failed;
     state.lastStatus = why;
-    if (state.failures < 0xFFFFu) state.failures++;
+    if (state.failures      < 0xFFFFu) state.failures++;
+    if (state.failuresTotal < 0xFFFFu) state.failuresTotal++;
+
+    // ── latch the evidence, BEFORE the retry destroys it ─────────────────────
+    //
+    // Every field copied here is about to be overwritten by the recovery: the
+    // next bno055InitBegin() resets lastStatus and walks the machine from the
+    // top, re-running the reads that fill sysStatus, sysError and the register
+    // read-back. A rig that has been retrying for a minute therefore reports
+    // only the LAST attempt's "not found", and the fault that started it is
+    // gone. Preserving it costs one 32-byte struct and is the difference
+    // between diagnosing a failure and reproducing it.
+    //
+    // FIRST WINS. Once the part is unreachable every later attempt says
+    // not-found, so letting them overwrite would replace the signal with its own
+    // echo. Cleared on a successful bring-up, where it describes a fault that no
+    // longer exists.
+    if (!state.firstFailure.valid){
+        BNO055FailureRecord &r = state.firstFailure;
+        r.valid      = true;
+        r.atMs       = millis();
+        r.failureNo  = state.failuresTotal;
+        r.failedAt   = state.failedAt;
+        r.lastStatus = why;
+
+        r.address = state.address;
+        r.opMode  = state.opMode;
+        r.chipId  = state.dev.chipId;
+        r.pageId  = state.dev.pageId;
+
+        r.sysStatus  = state.sysStatus;
+        r.sysError   = state.sysError;
+        r.opModeSeen = state.opModeSeen;
+
+        r.lastRegAddr    = state.lastRegAddr;
+        r.lastRegWrote   = state.lastRegWrote;
+        r.lastRegRead    = state.lastRegRead;
+        r.lastRegWriteOk = state.lastRegWriteOk;
+        r.lastRegReadOk  = state.lastRegReadOk;
+
+        // From the transport and the bus, not from this struct: whether the
+        // fault was this part or the shared line is the first fork in the
+        // diagnosis, and neither module's counters survive a recovery either.
+        r.transportFaults = bno055TransportFaults();
+        r.transportErrors = bno055TransportErrorCount();
+        r.stuckLines      = i2cStuckLines();
+    }
 
     state.nextStepMs = millis() + ((state.failures <= BNO055_INIT_FAST_RETRIES)
                                        ? BNO055_INIT_FAST_RETRY_MS
@@ -769,6 +815,12 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             state.stage          = BNO055InitStage::Configured;
             state.lastStatus     = BNO055InitStatus::OK;
             state.configuredAtMs = millis();
+            // The preserved failure describes a fault that no longer exists, so
+            // it is released here and the next one gets to latch. failuresTotal
+            // is NOT cleared: that a rig recovered is not the same as that it
+            // never had trouble, and only the cumulative count keeps the
+            // difference.
+            state.firstFailure = BNO055FailureRecord{};
             // Cleared here, unlike the GNSS machine, and the difference is not
             // an inconsistency.  That one withholds the reset because reaching
             // Done says nothing about whether data follows, so clearing it would

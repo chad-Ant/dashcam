@@ -37,6 +37,7 @@
 #include "SignalProcessingFunctions.h"
 #include "IMUFunctions.h"
 #include "BNO055Calib.h"   // calibration offsets, saved to and restored from SD
+#include "SwitchFunctions.h"
 
 /**
  * ENABLED: the u-blox module is fitted on I2C, sharing the bus with the IMU.
@@ -128,6 +129,14 @@ static bool    imuCalibProfileValid = false;
 static unsigned long lastCalibSaveMs = 0;
 static unsigned long lastIMUPoll  = 0;
 static unsigned long lastIMURetry = 0;
+
+/// Panel switches behind the 74HC165 chain. Positions only — this firmware
+/// never branches on one; see SwitchFunctions.h for why that is deliberate.
+static SwitchData    switches;
+static unsigned long lastSwitchPoll = 0;
+/// Edge-detect for logging the chain's presence, matching the other subsystems.
+static bool          prevSwitchesUp = false;
+
 /// Master-computed signals published alongside the raw sensor readings.
 DerivedSignals derived;
 
@@ -161,6 +170,11 @@ static GPSInitStage  prevGPSStage = GPSInitStage::Idle;
 static bool          gpsBusBlockedLogged = false;
 /// Latches the one-off latch-up notice, cleared if the bus ever frees.
 static bool          imuLatchLogged = false;
+/// Which preserved failure has already been printed, so the block below is
+/// reported once per episode rather than on every five-second retry. Keyed on
+/// the failure NUMBER rather than a bool: a second, different failure after a
+/// recovery is new evidence and has to print again.
+static uint16_t      imuFailureLogged = 0;
 #endif
 
 /// Last-reported state for each subsystem's edge log.  Seeded false so the
@@ -268,6 +282,70 @@ static VehiclePower vehiclePowerState()
 static void onIMUHighG()
 {
     imuNoteHighGPin(millis());
+}
+
+/**
+ * @brief Prints the preserved bring-up failure, once per episode.
+ *
+ * THE STATE THIS PRINTS IS ALREADY GONE FROM EVERYWHERE ELSE. Recovery restarts
+ * the bring-up machine, which resets @c lastStatus, re-runs the reads behind
+ * @c sysStatus / @c sysError / the register read-back, and clears the fault
+ * counters. So a rig found retrying after a minute could previously only report
+ * the LAST attempt — invariably "not found" — while the fault that started it
+ * had been overwritten by the attempts to fix it. @c BNO055FailureRecord latches
+ * the first failure; this is where it reaches a human.
+ *
+ * Deliberately verbose and deliberately RARE. It is the block that decides
+ * whether the next recurrence is diagnosed or merely reproduced, and it prints
+ * once per failure episode rather than on every five-second retry.
+ */
+static void printIMUFailureRecord()
+{
+    const BNO055FailureRecord &r = imuDev.init.firstFailure;
+    if (!r.valid || r.failureNo == imuFailureLogged) return;
+    imuFailureLogged = r.failureNo;
+
+    Serial.println(F("IMU: ---- preserved failure evidence ------------------------"));
+    Serial.print(F("     first failure #")); Serial.print(r.failureNo);
+    Serial.print(F(" at "));                 Serial.print(r.atMs);
+    Serial.print(F(" ms, total since boot ")); Serial.println(imuDev.init.failuresTotal);
+
+    Serial.print(F("     stage=")); Serial.print(bno055InitStageName(r.failedAt));
+    Serial.print(F(" why="));       Serial.println(bno055InitStatusName(r.lastStatus));
+
+    // Address 0 means identification never succeeded, which is a different fault
+    // from a part that answered and then refused its configuration. The chip and
+    // page IDs say which: a page of 1 is the recoverable case, and a chip ID that
+    // is neither 0xA0 nor 0x00 suggests something else is at that address.
+    Serial.print(F("     addr=0x"));   Serial.print(r.address, HEX);
+    Serial.print(F(" chipId=0x"));     Serial.print(r.chipId, HEX);
+    Serial.print(F(" pageId="));       Serial.print(r.pageId);
+    Serial.print(F(" opMode=0x"));     Serial.print(r.opMode, HEX);
+    Serial.print(F(" seen=0x"));       Serial.println(r.opModeSeen, HEX);
+
+    Serial.print(F("     sysStatus=0x")); Serial.print(r.sysStatus, HEX);
+    Serial.print(F(" sysErr=0x"));        Serial.println(r.sysError, HEX);
+
+    // The three-way distinction a bare "config-failed" cannot make: a NACKed
+    // write, a failed read-back, or a write the part accepted and ignored.
+    Serial.print(F("     reg 0x"));  Serial.print(r.lastRegAddr, HEX);
+    Serial.print(F(" wrote 0x"));    Serial.print(r.lastRegWrote, HEX);
+    Serial.print(F(" read 0x"));     Serial.print(r.lastRegRead, HEX);
+    Serial.print(F(" writeOk="));    Serial.print(r.lastRegWriteOk ? 1 : 0);
+    Serial.print(F(" readOk="));     Serial.println(r.lastRegReadOk ? 1 : 0);
+    if (r.lastRegWriteOk && r.lastRegReadOk && r.lastRegWrote != r.lastRegRead) {
+        Serial.println(F("     ^ write was ACKED AND IGNORED - wrong page, wrong mode, or no clock"));
+    }
+
+    Serial.print(F("     transport faults=")); Serial.print(r.transportFaults);
+    Serial.print(F(" errors="));               Serial.print(r.transportErrors);
+    Serial.print(F(" i2cStuck=0x"));           Serial.println(r.stuckLines, HEX);
+    // The first fork in the diagnosis: a stuck line is the SHARED bus, so the
+    // GNSS is affected too and this part is not the culprit.
+    if (r.stuckLines != 0u) {
+        Serial.println(F("     ^ the shared bus was stuck - check the GNSS too, this may not be the IMU"));
+    }
+    Serial.println(F("IMU: -------------------------------------------------------"));
 }
 
 /*
@@ -628,6 +706,36 @@ void setup()
     }
     lastIMUPoll  = millis();
     lastIMURetry = lastIMUPoll;
+    watchdogFeed();
+
+    // ── panel switches ───────────────────────────────────────────────────────
+    //
+    // Unconditional, and safe on a quarantined boot: the 74HC165 chain has three
+    // pins of its own and touches neither the I2C bus nor SPI, so nothing it can
+    // do affects the two subsystems that quarantine exists to protect. It is
+    // also the only peripheral here that cannot hang — the read is a fixed count
+    // of GPIO toggles with no acknowledgement to wait for.
+    initializeSwitches(switches);
+    lastSwitchPoll = millis();
+    prevSwitchesUp = switches.present;
+    Serial.print("SW: 74HC165 x");
+    Serial.print(SWITCH_REGISTERS);
+    Serial.print(" -> ");
+    if (switches.present) {
+        Serial.print("present, ");
+        Serial.print(SWITCH_COUNT);
+        Serial.print(" inputs, state 0x");
+        Serial.println(switches.state, HEX);
+    } else {
+        // Named at boot for the same reason the I2C bus is: nothing has run yet,
+        // so this is wiring or an unpowered chain, not something a later path
+        // did. The sentinel pattern is the whole test — see SwitchFunctions.h.
+        Serial.print("ABSENT (raw 0x");
+        Serial.print(switches.lastRaw, HEX);
+        Serial.println(") - sentinels not answering.");
+        Serial.println("    Expect #A D0 (pin 11) tied to GND and #A D1 (pin 12) tied to 3V3.");
+        Serial.println("    A raw word of 0xFFFF with no chain fitted is the normal reading here.");
+    }
     watchdogFeed();
 
 #ifdef USE_GPS
@@ -1277,6 +1385,23 @@ void loop()
         (void)getIMUData(imuDev, imuData);   // status is carried by the data's own valid flags
     }
 
+    // ── 2b-ii) Panel switches ────────────────────────────────────────────────
+    //
+    // ~80 us of GPIO toggling every 20 ms, on three pins shared with nothing.
+    // The return is deliberately discarded: a false is the ordinary report of a
+    // chain that is not fitted, and the state it describes is carried by
+    // SwitchData::present, which the edge log below reads. Escalating "no
+    // switch panel" every 20 ms would bury the log for a build that simply does
+    // not have one.
+    //
+    // The debounce window is counted in POLLS, so this interval is part of the
+    // 80 ms figure in DataDictionary.h rather than an independent choice.
+    if (isTimeout(SWITCH_POLL_MS, lastSwitchPoll)) {
+        lastSwitchPoll = millis();
+        (void)pollSwitches(switches);
+        logSubsystemEdge("SW", switches.present, prevSwitchesUp);
+    }
+
     // ── 2c-i) Persist a calibration once it is fully converged ───────────────
     //
     // Only at 3/3. A partial profile is worse than none: it would be restored at
@@ -1367,6 +1492,15 @@ void loop()
     } else if (isIMUDegraded(imuDev) && isTimeout(IMU_RETRY_MS, lastIMURetry)) {
         imuLatchLogged = false;   // bus is free again; a real fault may still recover
         lastIMURetry = millis();
+
+        // The preserved evidence, printed ONCE per failure episode.
+        //
+        // Not on every retry: the retry line below already repeats, and a block
+        // this size repeating every five seconds would bury the one thing worth
+        // reading. Not at the moment of failure either — the first failure often
+        // happens during setup() before anyone is watching the console, and this
+        // way it is still on screen when someone connects.
+        printIMUFailureRecord();
         // Outcome logged, not discarded: an IMU that drops off mid-drive was
         // previously retried forever in complete silence, so the console gave
         // no hint that anything had changed.
@@ -1419,7 +1553,7 @@ void loop()
     // ── 3) Serve the ESP32-C3 link ───────────────────────────────────────────
     // Non-blocking: services queued commands and pushes the 10 Hz stream.
     // Must run every pass — this is the only thing that answers the bridge.
-    tickCommMaster(commMaster, obdData, gpsData, imuData, derived, vehSignals, (uint8_t)canMode);
+    tickCommMaster(commMaster, obdData, gpsData, imuData, switches, derived, vehSignals, (uint8_t)canMode);
 
     // ── 3b) Subsystem transitions ────────────────────────────────────────────
     // Every module is optional at runtime: any of them can be absent at boot or
@@ -1643,7 +1777,35 @@ void loop()
         Serial.print("  c3=");
         Serial.print(isCommLinkSilent(commMaster, COMM_LINK_SILENT_MS) ? "down" : "up");
         Serial.print(" stream=");
-        Serial.println(commMaster.streaming ? "on" : "off");
+        Serial.print(commMaster.streaming ? "on" : "off");
+
+        // Switch panel, on the same principle as c3= above: a chain absent from
+        // boot never transitions, so the edge log alone would never mention it.
+        // Positions are printed as a hex word rather than as named signals
+        // because this firmware does not know what any of them mean, and a
+        // console label would be the first place that knowledge crept in.
+        Serial.print("  sw=");
+        if (!switches.present) {
+            Serial.print("absent");
+        } else {
+            Serial.print("0x");
+            Serial.print(switches.state, HEX);
+            // Only when non-zero. A chatter word of 0 on every line trains the
+            // eye to skip the field, which is where the one that matters would
+            // then also be skipped.
+            if (switches.chatter != 0u) {
+                Serial.print(" CHATTER=0x");
+                Serial.print(switches.chatter, HEX);
+            }
+            // Cumulative, so one glance answers "were there any?" over a soak —
+            // the same reason gaps= and hg= are printed above rather than only
+            // being flagged while they are current.
+            if (switches.rejected != 0u) {
+                Serial.print(" rej=");
+                Serial.print(switches.rejected);
+            }
+        }
+        Serial.println();
         lastDebugPrint = millis();
     }
 }

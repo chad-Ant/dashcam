@@ -7,3 +7,9 @@ archive/*
 models/*
 docs/*
 testlogs/*
+
+# Host test binaries. The sources are the deliverable; these are rebuilt by
+# peripherals/mkr_zero/tests/host/RunTests.cmd or its Makefile on every run.
+peripherals/*/tests/host/*.exe
+peripherals/*/tests/host/*.obj
+peripherals/*/tests/host/switch_tests

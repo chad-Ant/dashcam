@@ -12,7 +12,7 @@ Both hops use the same wire format, so they fail the same way and can be
 debugged with the same reasoning:
 
 ```
-SOF(0x7E) | VER(0x04) | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
+SOF(0x7E) | VER(0x07) | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
 CRC-16/CCITT-FALSE over VER..last payload byte, low byte first.
 ```
 
@@ -27,7 +27,7 @@ CRC-16/CCITT-FALSE over VER..last payload byte, low byte first.
 | 0x11 | `CMD_STOP_STREAM` | J→C3 | — | Stop forwarding (status keeps flowing) |
 | 0x12 | `CMD_SET_DECIM` | J→C3 | `uint8 N` | Forward every Nth master frame (N ≥ 1) |
 | 0x20 | `CMD_PING` | J→C3 | — | Link check **and** host-liveness keepalive |
-| 0x81 | `MSG_TELEMETRY` | C3→J | 131 B `Telemetry` | OBD2 + GPS + IMU snapshot, relayed verbatim |
+| 0x81 | `MSG_TELEMETRY` | C3→J | 180 B `Telemetry` | OBD2 + GPS + IMU + switch snapshot, relayed verbatim |
 | 0x82 | `MSG_STATUS` | C3→J | 44 B `BridgeStatus` | Bridge health, 1 Hz |
 | 0x83 | `MSG_LOG` | C3→J | `uint8 level` + ASCII | Bridge log line → Jetson liblog |
 | 0xA0 | `MSG_PONG` | C3→J | — | Ping ack |

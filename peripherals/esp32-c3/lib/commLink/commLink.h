@@ -156,6 +156,18 @@ private:
     /// forward, and the maxima to match. Held here rather than folded into
     /// latest_ so the raw newest snapshot stays available unmodified.
     uint16_t coalescedFlags_ = 0;
+    /**
+     * OR of switchChanged across every frame coalesced behind the newest one.
+     *
+     * Carried for the same reason the sticky flags are. The master clears this
+     * word only on a confirmed send, so it correctly describes the interval
+     * since the last frame IT transmitted - but the bridge then drops some of
+     * those frames to decimation or to a full host ring, and the one that
+     * survives carries only its own interval. A switch flipped during a
+     * discarded frame would vanish between the two hops, which is precisely the
+     * gap the master's clear-on-confirmed-send discipline exists to close.
+     */
+    uint16_t coalescedSwitchChanged_ = 0;
     float    coalescedAccelPeak_ = NAN;
     float    coalescedGyroPeak_ = NAN;
     float    coalescedLinAccelPeak_ = NAN;

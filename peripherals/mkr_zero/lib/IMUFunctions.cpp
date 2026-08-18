@@ -339,6 +339,7 @@ void initIMUData(IMUData &data){
     data.accelSaturated  = false;
     data.highGEvent      = false;
     data.highGMs         = 0u;
+    data.highGCount      = 0u;
     data.highGArmed      = false;
     data.dataGap         = false;
     data.lowPower        = false;
@@ -463,6 +464,7 @@ static void expireChannels(IMUDevice &dev, IMUData &data, uint32_t now){
     }
     data.highGEvent = dev.highGActive;
     data.highGMs    = dev.highGAtMs;
+    data.highGCount = dev.highGCount;
 }
 
 /**

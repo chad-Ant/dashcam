@@ -10,7 +10,7 @@
  * string / stdint, so it drags in no board-specific or project libraries.
  *
  * Frame: SOF(0x7E) | VER | TYPE(1) | LEN(1) | PAYLOAD(LEN) | CRC16_LE(2)
- * VER is COMM_VERSION, currently 0x06; the payload is 160 bytes.
+ * VER is COMM_VERSION, currently 0x07; the payload is 180 bytes.
  * CRC-16/CCITT-FALSE over VER..last payload byte, transmitted low byte first.
  * Both MCUs are little-endian IEEE-754, so a packed struct copies verbatim.
  */
@@ -33,8 +33,23 @@
  * 0x04 added the windowed inertial peaks (123 -> 131 bytes), once the LSM6DSOX
  * FIFO began being drained in full rather than the output registers sampled at
  * 20 Hz, plus the IMU_DATA_GAP and IMU_LOWPOWER flags that qualify them.
+ *
+ * 0x07 (160 -> 180 bytes) closes two holes and adds a subsystem:
+ *
+ *   - DIRECTION.  @c imuLinAccelPeak is a MAGNITUDE, so a frontal impact and a
+ *     side impact produce the same number.  @c imuLinAccelX/Y/Z carry the signed
+ *     vector, which is what tells them apart and what any reconstruction needs.
+ *
+ *   - A HIGH-G EVENT CAN NO LONGER BE MISSED.  @c COMM_FLAG_IMU_HIGH_G is held
+ *     for a fixed window and then clears, so a host reading a decimated stream
+ *     could step over one entirely.  @c imuHighGCount only ever climbs, so any
+ *     two frames bracket every event between them, and @c imuHighGMs locates
+ *     the most recent one inside the window rather than merely asserting it.
+ *
+ *   - PANEL SWITCHES.  @c switchState and @c switchChanged, qualified by
+ *     @c COMM_FLAG_SWITCHES_PRESENT.
  */
-#define COMM_VERSION         0x06u
+#define COMM_VERSION         0x07u
 #define COMM_MAX_PAYLOAD     255u   ///< Largest payload (LEN is one byte).
 #define COMM_FRAME_OVERHEAD  6u     ///< SOF+VER+TYPE+LEN + CRC16(2).
 #define COMM_MAX_FRAME       (COMM_FRAME_OVERHEAD + COMM_MAX_PAYLOAD)
@@ -221,10 +236,33 @@
  */
 #define COMM_FLAG_IMU_FUSION_MODE 0x1000u
 /**
- * NOTE: @c TelemetryPayload::flags became @c uint16_t in v0x06 and 0x1000 is in
- * use. Seven bits remain. The next widening is another payload size change and
- * therefore another COMM_VERSION bump — the v0x05 note said the same thing about
- * this one, and it was accurate.
+ * The 74HC165 switch chain answered its sentinels on the most recent poll, so
+ * @c switchState describes measured positions.
+ *
+ * The counterpart of @c COMM_FLAG_IMU_PRESENT and @c COMM_FLAG_GPS_PRESENT, and
+ * added for exactly their reason. Every switch on the panel is a LATCHING
+ * switch that is legitimately open most of the time, so an absent chain, a dead
+ * register and fourteen open switches all produce the same word. Two of the
+ * sixteen inputs are hard-wired to opposite rails and are checked on every read;
+ * this bit is that check.
+ *
+ * Clear means @c switchState is STALE, not that every switch is open — the
+ * master holds the last measured positions rather than zeroing them, because
+ * zeroed positions look measured.
+ */
+#define COMM_FLAG_SWITCHES_PRESENT 0x2000u
+/**
+ * NOTE: @c TelemetryPayload::flags became @c uint16_t in v0x06. With 0x2000 in
+ * use, TWO bits remain — 0x4000 and 0x8000.
+ *
+ * (The v0x06 note here said seven remained, which was simply a miscount: thirteen
+ * of the sixteen were already allocated when it was written. Recorded rather
+ * than quietly corrected, because the number is the input to the decision about
+ * when the next widening becomes unavoidable, and a wrong one postpones that
+ * decision past the point where it is cheap.)
+ *
+ * The next widening is another payload size change and therefore another
+ * COMM_VERSION bump.
  */
 
 /// @c CMD_SET_IMU_MODE payload values.
@@ -482,6 +520,50 @@ struct __attribute__((packed)) TelemetryPayload {
      */
     float imuLinAccelPeak;
     /**
+     * ---- signed linear acceleration (v0x07) ----
+     *
+     * Sensor-frame linear acceleration, gravity removed by the on-chip fusion
+     * (m/s²). NAN in the raw mode, which produces no fusion.
+     *
+     * WHY THE PEAK WAS NOT ENOUGH. @c imuLinAccelPeak is a magnitude, so a
+     * frontal impact and a side impact of the same severity are the same number.
+     * Direction is most of what an incident reconstruction wants — which way the
+     * energy came from decides what the recording means — and it cannot be
+     * recovered from a magnitude afterwards at any price.
+     *
+     * These are the INSTANTANEOUS values from the frame's own sample, not
+     * windowed. The peak beside them is the window. A frame carrying a High-G
+     * event will usually not have caught the peak instant in these three, which
+     * is the honest limitation of publishing at 10 Hz what is sampled at 100 Hz:
+     * they give the direction of the event, and @c imuLinAccelPeak gives its
+     * size.
+     */
+    float imuLinAccelX;
+    float imuLinAccelY;
+    float imuLinAccelZ;
+    /**
+     * Age of the most recent High-G latch (ms). @c 0xFFFF when none has occurred
+     * or the last was longer ago than the field can express.
+     *
+     * An AGE rather than a timestamp, so it needs no arithmetic against
+     * @c masterMillis and carries its own "never" value. Saturating at 65.5 s
+     * costs nothing: past a minute the only question left is the count.
+     */
+    uint16_t imuHighGMs;
+    /**
+     * Cumulative High-G latches since the master booted. Wraps at 65535.
+     *
+     * THE FIELD THAT MAKES THE EVENT UNMISSABLE. @c COMM_FLAG_IMU_HIGH_G is held
+     * for a fixed window and then clears, so a host reading a decimated stream —
+     * or one that lost a frame to a full TX ring — can step straight over an
+     * impact and see nothing. A monotonic counter cannot be stepped over: any
+     * two frames bracket every event that happened between them, whatever was
+     * dropped in the middle.
+     *
+     * Compare against the previous frame's value; do not test for non-zero.
+     */
+    uint16_t imuHighGCount;
+    /**
      * Rotation about the vertical (deg), RELATIVE AND DRIFTING.
      *
      * NOT a heading, and named so it cannot be mistaken for one. The master runs
@@ -619,14 +701,44 @@ struct __attribute__((packed)) TelemetryPayload {
      * scalar can never reconstruct that afterwards.
      */
     uint16_t wheelRaw[4];
+    /**
+     * ---- panel switches (v0x07) ----
+     *
+     * Debounced positions behind the 74HC165 chain. Bit @e n is @c SWn and 1
+     * means CLOSED. Qualified by @c COMM_FLAG_SWITCHES_PRESENT: when that is
+     * clear these are the last measured positions, not current ones.
+     *
+     * DELIBERATELY UNNAMED. The master reports positions and does not know what
+     * any of them controls — no firmware on either MCU branches on one. The
+     * mapping from index to function lives in Jetson-side configuration beside
+     * the CAN map, so a switch can be re-purposed, or moved to a different hole
+     * in the dash, without reflashing anything. A name here would undo that as
+     * surely as a name in the code.
+     */
+    uint16_t switchState;
+    /**
+     * Bits that changed at least once since the last frame this host received.
+     *
+     * A latching switch holds its own position, so @c switchState alone cannot
+     * miss one — but a switch flipped and returned BETWEEN two published frames
+     * is invisible in level alone, and frames are genuinely lost to decimation
+     * and to a full host TX ring. Accumulated on the master and cleared only on
+     * a CONFIRMED send, then OR-ed across any frames the bridge coalesces, so
+     * the guarantee survives both hops.
+     *
+     * Also set when a chain that had gone away returns holding a different
+     * position: something moved while nobody was looking, and the fact survives
+     * even though the moment does not.
+     */
+    uint16_t switchChanged;
 };
 
 /// The wire contract depends on this exact size on both MCUs.
-static_assert(sizeof(TelemetryPayload) == 160, "TelemetryPayload must be tightly packed to 160 bytes");
+static_assert(sizeof(TelemetryPayload) == 180, "TelemetryPayload must be tightly packed to 180 bytes");
 /**
  * The payload has to fit the frame's one-byte LEN field, and the bridge's
  * one-byte @c telemetryBytes self-check.  Worth stating now that the struct has
- * grown 79 -> 83 -> 123 -> 131 -> 148 -> 160: another addition the size of the IMU
+ * grown 79 -> 83 -> 123 -> 131 -> 148 -> 160 -> 180: another addition the size of the IMU
  * block lands at 200, and the failure mode past 255 is a silently truncated length
  * rather than anything that looks like an error.
  */

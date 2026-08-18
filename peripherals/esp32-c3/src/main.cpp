@@ -111,6 +111,22 @@ static_assert(offsetof(TelemetryPayload, wheelRaw) == offsetof(hostproto::Teleme
               "wheelRaw offset differs between the two protocol headers");
 static_assert(offsetof(TelemetryPayload, flags) == offsetof(hostproto::Telemetry, flags),
               "TelemetryPayload/hostproto::Telemetry field order diverged (flags)");
+// The v0x07 additions, anchored at both ends of each block on the same principle
+// as everything above: the linear-accel vector is three consecutive floats and
+// the switch pair two consecutive uint16s, so a single anchor per block would
+// pass while an interior field had been transposed between the two headers.
+static_assert(offsetof(TelemetryPayload, imuLinAccelX) == offsetof(hostproto::Telemetry, imuLinAccelX),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuLinAccelX)");
+static_assert(offsetof(TelemetryPayload, imuLinAccelZ) == offsetof(hostproto::Telemetry, imuLinAccelZ),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuLinAccelZ)");
+static_assert(offsetof(TelemetryPayload, imuHighGMs) == offsetof(hostproto::Telemetry, imuHighGMs),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuHighGMs)");
+static_assert(offsetof(TelemetryPayload, imuHighGCount) == offsetof(hostproto::Telemetry, imuHighGCount),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (imuHighGCount)");
+static_assert(offsetof(TelemetryPayload, switchState) == offsetof(hostproto::Telemetry, switchState),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (switchState)");
+static_assert(offsetof(TelemetryPayload, switchChanged) == offsetof(hostproto::Telemetry, switchChanged),
+              "TelemetryPayload/hostproto::Telemetry field order diverged (switchChanged)");
 
 // ─── state ────────────────────────────────────────────────────────────────────
 

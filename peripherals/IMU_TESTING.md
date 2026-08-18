@@ -6,7 +6,7 @@ phase 3 puts production firmware back before the end-to-end run.
 
 | Phase | What it tests | Board(s) | Needs |
 |---|---|---|---|
-| 1 | Driver, calibration file, fault injection | MKR Zero | test sketch, sensor, SD card, two taps |
+| 1 | Driver, calibration file, fault injection | MKR Zero | test sketch, sensor, SD card, three taps |
 | 2 | Bridge frame coalescing | ESP32-C3 | test sketch only — no MKR, no wiring |
 | 3 | — | both | restore production firmware |
 | 4 | MKR → C3 → PC, both IMU modes | both | production firmware, `pyserial` |
@@ -51,11 +51,12 @@ Then open the monitor at 115200 and reset.
 
 ### What it does
 
-- **A** — peak-ring geometry and telemetry flag mapping. No hardware needed.
+- **A** — peak-ring geometry, telemetry flag mapping, and preserved
+  failure evidence. No hardware needed.
 - **B** — calibration file parsing. Needs the SD card.
 - **C** — page-1 recovery, gap accounting, armed reporting, peak retention.
   Needs the sensor.
-- **D** — fault injection: frozen accelerometer, stuck High-G latch, AMG
+- **D** — fault injection: frozen accelerometer, a real High-G event, AMG
   saturation rail. Needs the sensor.
 
 ### You will be prompted three times
@@ -173,6 +174,13 @@ python peripherals/esp32-c3/tests/host/imu_e2e_check.py --port COM7 --both --set
 This commands IMUPLUS, checks it, commands AMG, checks it, and restores IMUPLUS
 at the end. `--set` sends `CMD_SET_IMU_MODE` over the wire, so **no reflash is
 needed** to test the raw mode.
+
+The restore runs in a `finally` (so Ctrl-C still triggers it), waits out the
+master's 5 s mode-change guard, and then **verifies** the mode actually came
+back — `IMUPLUS restored after the run` is a checked assertion, not a hopeful
+message. If it fails, the rig is still in AMG and the script says so; re-run with
+`--mode imuplus --set`. An earlier version sent the command inside the guard,
+had it refused, and reported OK anyway.
 
 ### Other useful forms
 

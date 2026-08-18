@@ -99,6 +99,9 @@ void CommLink::accumulate(const TelemetryPayload &src)
     coalescedAccelPeak_     = maxOf(coalescedAccelPeak_,    src.imuAccelPeak);
     coalescedGyroPeak_      = maxOf(coalescedGyroPeak_,     src.imuGyroPeak);
     coalescedLinAccelPeak_  = maxOf(coalescedLinAccelPeak_, src.imuLinAccelPeak);
+    // A set bit is an event that happened; OR is the only merge that cannot
+    // lose one. (v0x07)
+    coalescedSwitchChanged_ |= src.switchChanged;
 }
 
 void CommLink::mergeCoalesced(TelemetryPayload &out) const
@@ -107,6 +110,7 @@ void CommLink::mergeCoalesced(TelemetryPayload &out) const
     out.imuAccelPeak    = maxOf(out.imuAccelPeak,    coalescedAccelPeak_);
     out.imuGyroPeak     = maxOf(out.imuGyroPeak,     coalescedGyroPeak_);
     out.imuLinAccelPeak = maxOf(out.imuLinAccelPeak, coalescedLinAccelPeak_);
+    out.switchChanged   = (uint16_t)(out.switchChanged | coalescedSwitchChanged_);
 }
 
 void CommLink::clearCoalesced()
@@ -115,6 +119,7 @@ void CommLink::clearCoalesced()
     coalescedAccelPeak_    = NAN;
     coalescedGyroPeak_     = NAN;
     coalescedLinAccelPeak_ = NAN;
+    coalescedSwitchChanged_ = 0;
 }
 
 bool CommLink::poll()
