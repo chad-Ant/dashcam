@@ -246,10 +246,19 @@ static void parseLog(pugi::xml_node node, LogConfig& l,
 
 static void parseRecording(pugi::xml_node node, RecordingConfig& r,
                            const dashcam::log::LogCallback& log) {
-    readVar(node, r.recordFps,    log);
-    readVar(node, r.queueDepth,   log);
-    readVar(node, r.recordWidth,  log);
-    readVar(node, r.recordHeight, log);
+    readVar(node, r.recordFps,      log);
+    readVar(node, r.queueDepth,     log);
+    readVar(node, r.recordWidth,    log);
+    readVar(node, r.recordHeight,   log);
+    readVar(node, r.segmentSeconds, log);
+}
+
+static void parseStartup(pugi::xml_node node, StartupConfig& s,
+                         const dashcam::log::LogCallback& log) {
+    readVar(node, s.laneDetection,    log);
+    readVar(node, s.driverMonitoring, log);
+    readVar(node, s.vehicleBridge,    log);
+    readVar(node, s.networkBringUp,   log);
 }
 
 static void parseDetection(pugi::xml_node node, DetectionConfig& d,
@@ -419,6 +428,15 @@ static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
     writeVar(n, r.queueDepth);
     writeVar(n, r.recordWidth);
     writeVar(n, r.recordHeight);
+    writeVar(n, r.segmentSeconds);
+}
+
+static void writeStartup(pugi::xml_node parent, const StartupConfig& s) {
+    pugi::xml_node n = parent.append_child("Startup");
+    writeVar(n, s.laneDetection);
+    writeVar(n, s.driverMonitoring);
+    writeVar(n, s.vehicleBridge);
+    writeVar(n, s.networkBringUp);
 }
 
 static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
@@ -522,6 +540,7 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
         parseDriverScore(ds, config.driverScore, log);
     if (auto lg  = root.child("Log"))       parseLog      (lg,  config.log,       log);
     if (auto net = root.child("Network"))   parseNetwork  (net, config.network,   log);
+    if (auto st  = root.child("Startup"))   parseStartup  (st,  config.startup,   log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
@@ -559,6 +578,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writeDriverScore(root, config.driverScore);
     writeLog(root, config.log);
     writeNetwork(root, config.network);
+    writeStartup(root, config.startup);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {
         doLog(log, dashcam::log::LogLevel::ERROR,

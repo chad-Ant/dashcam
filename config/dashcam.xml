@@ -36,7 +36,13 @@
         <Attribute name="Sensor Modes" writable="false" readable="true" min="0" max="30" step="1" />
       </Attributes>
     </Camera>
-    <Camera name="usb0" type="USB">
+    <!-- name="record" pins this camera as the road/recording camera (v0.4+).
+         Prefer a /dev/v4l/by-id/... symlink over /dev/videoN: node numbering is
+         assigned in probe order and changes across reboots and replugs, so a
+         /dev/videoN pin is no more reliable than no pin at all.  List yours
+         with:  ls -l /dev/v4l/by-id/
+         e.g. <Device>/dev/v4l/by-id/usb-Generic_HD_Camera-video-index0</Device> -->
+    <Camera name="record" type="USB">
       <Enabled>true</Enabled>
       <Device>/dev/video1</Device>
       <SensorId>0</SensorId>
@@ -63,4 +69,21 @@
     <FootagePath>/user/output/footage</FootagePath>
     <WarmupFrames>9</WarmupFrames>
   </System>
+  <Recording>
+    <!-- Length of each recorded MKV segment, in seconds; each gets its own .ass
+         sidecar.  0 = one continuous file.  Segments are what make retention
+         possible at all: a full card silently stops recording, and you cannot
+         trim the front of a single growing file. -->
+    <SegmentSeconds>300</SegmentSeconds>
+  </Recording>
+  <!-- Which subsystems come up at startup.  Read by dashcam_v0_4 ONLY; v0.2 and
+       v0.3 ignore this section.  All default false so an unattended boot does
+       the one job that must not fail - record the road - and nothing else.
+       Switch one on here and restart; no rebuild needed. -->
+  <Startup>
+    <LaneDetection>false</LaneDetection>
+    <DriverMonitoring>false</DriverMonitoring>
+    <VehicleBridge>false</VehicleBridge>
+    <NetworkBringUp>false</NetworkBringUp>
+  </Startup>
 </DashcamConfig>

@@ -309,17 +309,124 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
     }
 }
 
+// ─── sidecar path helpers ─────────────────────────────────────────────────────
+
+// "/footage/clip.mkv" → "/footage/clip.ass".  Replaces the extension when the
+// basename has one, otherwise appends.
+static std::string sidecarPathFor(const std::string& videoPath) {
+    std::string p = videoPath;
+    const auto dot = p.find_last_of('.');
+    const auto sep = p.find_last_of('/');
+    if (dot != std::string::npos && (sep == std::string::npos || dot > sep))
+        p.erase(dot);
+    return p + ".ass";
+}
+
+std::string Recorder::segmentPattern(const std::string& filename) {
+    // splitmuxsink runs g_strdup_printf() on `location`, so any '%' already in
+    // the caller's path would be read as a conversion and corrupt the output
+    // name (or worse, read a non-existent argument).  Escape them.
+    auto escapePercent = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 8);
+        for (char c : s) { out += c; if (c == '%') out += '%'; }
+        return out;
+    };
+    const auto dot = filename.find_last_of('.');
+    const auto sep = filename.find_last_of('/');
+    const bool hasExt = (dot != std::string::npos) &&
+                        (sep == std::string::npos || dot > sep + 1);
+    const std::string base = hasExt ? filename.substr(0, dot) : filename;
+    const std::string ext  = hasExt ? filename.substr(dot)    : std::string(".mkv");
+    return escapePercent(base) + "_%05d" + escapePercent(ext);
+}
+
+void Recorder::openSidecarLocked(const std::string& path) {
+    assPath_ = path;
+    assFile_.open(assPath_, std::ios::trunc);
+    if (assFile_.is_open()) {
+        writeAssHeader();
+        doLog(log_, dashcam::log::LogLevel::INFO,
+              "telemetry sidecar: %s", assPath_.c_str());
+    } else {
+        doLog(log_, dashcam::log::LogLevel::ERROR,
+              "cannot open telemetry sidecar %s — recording without it",
+              assPath_.c_str());
+    }
+}
+
+void Recorder::closeSidecarLocked() {
+    if (!assFile_.is_open()) return;
+    assFile_.flush();
+    assFile_.close();
+    doLog(log_, dashcam::log::LogLevel::INFO,
+          "telemetry sidecar closed: %s", assPath_.c_str());
+}
+
+// ─── segment rotation ─────────────────────────────────────────────────────────
+
+gchar* Recorder::onFormatLocation(GstElement* splitmux, guint fragmentId,
+                                  GstSample* firstSample, gpointer user) {
+    (void)splitmux;
+    auto* self = static_cast<Recorder*>(user);
+
+    // Build this fragment's name from the pattern splitmuxsink already holds, so
+    // the naming rule lives in exactly one place (segmentPattern()).
+    gchar*      cLoc = nullptr;
+    g_object_get(G_OBJECT(splitmux), "location", &cLoc, NULL);
+    const std::string pattern = cLoc ? cLoc : "";
+    if (cLoc) g_free(cLoc);
+    if (pattern.empty()) return nullptr;     // fall back to splitmuxsink's own naming
+
+    gchar* namedC = g_strdup_printf(pattern.c_str(), fragmentId);
+    const std::string named = namedC ? namedC : "";
+    if (!namedC) return nullptr;
+
+    // Where this segment starts on the pipeline's running-time axis.  The
+    // subtitle thread samples gst_element_query_position(), which keeps counting
+    // across fragments, so without this rebase every sidecar after the first
+    // would carry timestamps far beyond its own segment's duration and render
+    // nothing.
+    int64_t baseNs = 0;
+    if (firstSample) {
+        if (GstBuffer* buf = gst_sample_get_buffer(firstSample)) {
+            const GstClockTime pts = GST_BUFFER_PTS(buf);
+            if (GST_CLOCK_TIME_IS_VALID(pts)) baseNs = static_cast<int64_t>(pts);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(self->assMutex_);
+        // Rotation is atomic under the lock: the outgoing sidecar is flushed and
+        // closed before the new base time is published, so a Dialogue line can
+        // never straddle two segments.
+        self->closeSidecarLocked();
+        self->segmentBaseNs_ = baseNs;
+
+        bool assEnabled;
+        {
+            std::lock_guard<std::mutex> cfgLock(self->overlayMutex_);
+            assEnabled = (bool)self->overlayConfig_.enabled;
+        }
+        if (assEnabled) self->openSidecarLocked(sidecarPathFor(named));
+    }
+
+    doLog(self->log_, dashcam::log::LogLevel::INFO,
+          "recording segment %u: %s", fragmentId, named.c_str());
+    return namedC;   // transfer full — splitmuxsink g_free()s it
+}
+
 // ─── subtitle / bus thread ────────────────────────────────────────────────────
 
 void Recorder::subtitleLoop() {
     float   rateHz;
-    bool    writeAss;
+    bool    assConfigured;
     int64_t staleMs;
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
-        rateHz   = (float)overlayConfig_.subtitleRateHz;
-        writeAss = (bool)overlayConfig_.enabled && assFile_.is_open();
-        staleMs  = (int64_t)(int)overlayConfig_.staleTimeoutMs;
+        rateHz        = (float)overlayConfig_.subtitleRateHz;
+        assConfigured = (bool)overlayConfig_.enabled;
+        staleMs       = (int64_t)(int)overlayConfig_.staleTimeoutMs;
     }
     if (rateHz <= 0.0f) rateHz = 5.0f;
     const auto interval =
@@ -347,7 +454,7 @@ void Recorder::subtitleLoop() {
             }
         }
 
-        if (!writeAss) continue;
+        if (!assConfigured) continue;
 
         gint64 pos = 0;
         if (!gst_element_query_position(pipeline_, GST_FORMAT_TIME, &pos))
@@ -400,12 +507,24 @@ void Recorder::subtitleLoop() {
             !od.headingValid || !headingRenderable(od.headingDeg) ||
             (staleMs > 0 && (nowMs - od.headingTimestampMs) > staleMs);
 
-        writeAssSample(pos, durNs, od, nowMs, speedStale, accelStale,
-                       positionStale, headingStale);
-        if (std::chrono::steady_clock::now() >= nextAssFlush) {
-            assFile_.flush();
-            nextAssFlush = std::chrono::steady_clock::now()
-                         + std::chrono::seconds(5);
+        // The sidecar file and the segment time base are both republished by
+        // onFormatLocation() on a streaming thread, so re-check them under the
+        // lock on every sample rather than caching either at thread start.
+        {
+            std::lock_guard<std::mutex> lock(assMutex_);
+            if (!assFile_.is_open()) continue;
+            // Timestamps are relative to the segment this sample belongs to, so
+            // each sidecar starts near 00:00:00 and lines up with its own MKV.
+            // Clamped: a sample can be queried a hair before the fragment's
+            // first buffer PTS, which would otherwise go negative.
+            const int64_t rel = std::max<int64_t>(0, pos - segmentBaseNs_);
+            writeAssSample(rel, durNs, od, nowMs, speedStale, accelStale,
+                           positionStale, headingStale);
+            if (std::chrono::steady_clock::now() >= nextAssFlush) {
+                assFile_.flush();
+                nextAssFlush = std::chrono::steady_clock::now()
+                             + std::chrono::seconds(5);
+            }
         }
     }
 
@@ -418,7 +537,8 @@ bool Recorder::startRecording(const std::string& devicePath,
                               const RecordingFormat& fmt,
                               const std::string& filename,
                               uint32_t maxFps,
-                              uint32_t eosTimeoutMs) {
+                              uint32_t eosTimeoutMs,
+                              uint32_t segmentSeconds) {
     if (pipeline_) {
         doLog(log_, dashcam::log::LogLevel::ERROR,
               "startRecording: session already active");
@@ -466,12 +586,44 @@ bool Recorder::startRecording(const std::string& devicePath,
     }
 
     // Record branch: (H264 needs h264parse for matroskamux) → queue → mux → file.
-    // Kept byte-identical to the pre-streaming pipeline when no tap is attached.
+    //
+    // segmentSeconds == 0 keeps the original single-file tail byte-identical.
+    // Non-zero swaps the mux+filesink pair for a splitmuxsink, which finalises
+    // each segment as it closes so an abrupt power cut can only lose the one in
+    // progress.
+    //
+    // muxer= and sink= MUST be spelled into this string rather than assigned
+    // afterwards.  They are GstElement-valued properties, and parse-launch
+    // builds the element from the description — which matters because
+    // splitmuxsink requests its sink pad FROM THE CURRENT MUXER at link time.
+    // Set them after the parse and the queue is linked against the default
+    // mp4mux instead, which rejects the caps, releases the request pad and fails
+    // the pipeline with "Internal data stream error" before a frame moves.
+    //
+    // (The string-valued muxer-factory / muxer-properties pair is the wrong tool
+    // here regardless: it only takes effect with async-finalize=true, which this
+    // design avoids — see the stopRecording() note.)
+    //
+    // offset-to-zero on the muxer matters MORE with splitmuxsink than without:
+    // reset-muxer defaults true, so matroskamux is driven to NULL between
+    // fragments and recomputes its zero per segment.  Each segment therefore
+    // starts at t=0 instead of at its absolute running time, which is exactly
+    // what the per-segment sidecars assume.
+    const std::string recTail =
+        segmentSeconds > 0
+            ? " ! splitmuxsink name=fsink"
+              " muxer=\"matroskamux offset-to-zero=true\""
+              " sink=\"filesink sync=false async=false\""
+              " max-size-bytes=0"
+              " max-size-time=" +
+                  std::to_string(static_cast<guint64>(segmentSeconds) * GST_SECOND) +
+              " location=" + gstQuoted(segmentPattern(filename))
+            : " ! matroskamux offset-to-zero=true"
+              " ! filesink name=fsink sync=false async=false location=" +
+                  gstQuoted(filename);
     const std::string recBranch =
         std::string(h264 ? " ! h264parse" : "") +
-        " ! queue max-size-buffers=8 leaky=0"
-        " ! matroskamux offset-to-zero=true"
-        " ! filesink name=fsink sync=false async=false location=" + gstQuoted(filename);
+        " ! queue max-size-buffers=8 leaky=0" + recTail;
 
     std::string desc;
     if (!streaming) {
@@ -503,9 +655,36 @@ bool Recorder::startRecording(const std::string& devicePath,
         return false;
     }
 
-    videoW_       = fmt.width;
-    videoH_       = fmt.height;
-    eosTimeoutMs_ = eosTimeoutMs;
+    videoW_         = fmt.width;
+    videoH_         = fmt.height;
+    eosTimeoutMs_   = eosTimeoutMs;
+    segmentSeconds_ = segmentSeconds;
+    segmentBaseNs_  = 0;
+
+    // Everything about the splitmuxsink except the rotation callback is already
+    // configured by the parse string above, so all that is left is to hook the
+    // per-fragment signal that names each segment and rotates its sidecar.
+    if (segmentSeconds > 0) {
+        GstElement* smux = gst_bin_get_by_name(GST_BIN(pipeline_), "fsink");
+        if (!smux) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "splitmuxsink 'fsink' not found in the recording pipeline");
+            gst_element_set_state(pipeline_, GST_STATE_NULL);
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+            return false;
+        }
+        g_signal_connect(smux, "format-location-full",
+                         G_CALLBACK(&Recorder::onFormatLocation), this);
+        gst_object_unref(smux);
+
+        doLog(log_, dashcam::log::LogLevel::INFO,
+              "segmented recording: %us per segment, pattern %s%s",
+              segmentSeconds, segmentPattern(filename).c_str(),
+              mjpeg ? " (MJPEG is intra-only — segments cut exactly on time)"
+                    : " (H264: cuts land on the camera's own IDRs, so a segment "
+                      "can overrun the target)");
+    }
 
     // Attach the live-stream tap: pull each compressed frame off the appsink and
     // forward it to frameCb_.  set_callbacks() does not take ownership of the
@@ -540,23 +719,12 @@ bool Recorder::startRecording(const std::string& devicePath,
         std::lock_guard<std::mutex> lock(overlayMutex_);
         assEnabled = (bool)overlayConfig_.enabled;
     }
-    if (assEnabled) {
-        assPath_ = filename;
-        const auto dot = assPath_.find_last_of('.');
-        const auto sep = assPath_.find_last_of('/');
-        if (dot != std::string::npos && (sep == std::string::npos || dot > sep))
-            assPath_.erase(dot);
-        assPath_ += ".ass";
-        assFile_.open(assPath_, std::ios::trunc);
-        if (assFile_.is_open()) {
-            writeAssHeader();
-            doLog(log_, dashcam::log::LogLevel::INFO,
-                  "telemetry sidecar: %s", assPath_.c_str());
-        } else {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
-                  "cannot open telemetry sidecar %s — recording without it",
-                  assPath_.c_str());
-        }
+    // In segmented mode the sidecar is opened (and rotated) by
+    // onFormatLocation() as each fragment forms, so there is nothing to open
+    // here — and nothing to clobber, since that handler may already have run.
+    if (assEnabled && segmentSeconds == 0) {
+        std::lock_guard<std::mutex> lock(assMutex_);
+        openSidecarLocked(sidecarPathFor(filename));
     }
 
     stopFlag_.store(false);
@@ -600,12 +768,14 @@ void Recorder::stopRecording() {
     pipeline_ = nullptr;
     healthy_.store(false);
 
-    if (assFile_.is_open()) {
-        assFile_.flush();
-        assFile_.close();
-        doLog(log_, dashcam::log::LogLevel::INFO,
-              "telemetry sidecar closed: %s", assPath_.c_str());
+    // Closed only after the pipeline is fully down, so the rotation handler can
+    // no longer fire and reopen it behind us.
+    {
+        std::lock_guard<std::mutex> lock(assMutex_);
+        closeSidecarLocked();
     }
+    segmentSeconds_ = 0;
+    segmentBaseNs_  = 0;
 }
 
 bool Recorder::isRecording() const {

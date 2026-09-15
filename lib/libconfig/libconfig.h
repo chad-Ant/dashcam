@@ -346,6 +346,48 @@ struct RecordingConfig {
     ConfigVar<int> queueDepth   {"QueueDepth",   3,  1, 32,   1, "Recording-branch queue depth (buffers)"};
     ConfigVar<int> recordWidth  {"RecordWidth",  0,  0, 4096, 2, "Downscale the recording to this width before overlay/encoder (0 = source width; set BOTH dims; keep aspect)"};
     ConfigVar<int> recordHeight {"RecordHeight", 0,  0, 4096, 2, "Downscale the recording to this height before overlay/encoder (0 = source height)"};
+
+    // Split the recording into fixed-length files, each with its own .ass
+    // sidecar (timestamps rebased to that segment).  0 keeps the historical
+    // single continuous file and no sidecar rotation.
+    //
+    // What this does and does NOT buy, measured rather than assumed:
+    // Matroska is already crash-tolerant — matroskamux writes its master
+    // elements with unknown size and patches them at EOS, so a SIGKILLed single
+    // recording still demuxes, still reports a duration and is still seekable.
+    // Segmenting is therefore NOT the difference between keeping and losing a
+    // drive's footage.  What it actually gives:
+    //   - Bounded loss: only the in-progress segment holds unflushed data.
+    //   - Every closed segment is properly finalised (Cues/SeekHead written).
+    //   - RETENTION becomes possible at all.  A full card silently stops
+    //     recording, and you cannot trim the front of one growing file; you can
+    //     delete whole segments.  This is the strongest reason to keep it on.
+    //   - Bounded file size, so a multi-hour drive stays copyable and
+    //     reviewable, and telemetry sidecars stay aligned with manageable chunks.
+    ConfigVar<int> segmentSeconds {"SegmentSeconds", 300, 0, 3600, 10, "Length of each recorded MKV segment in seconds, each with its own .ass sidecar; keeps files copyable and lets old footage be aged out a segment at a time (0 = one continuous file)"};
+};
+
+/**
+ * @brief Which subsystems come up automatically at startup.
+ * XML section: @c \<Startup\>
+ *
+ * Read by dashcam_v0_4 ONLY — v0.2 and v0.3 ignore this section entirely and
+ * keep their historical "start everything that has hardware for it" behaviour.
+ *
+ * v0.4 is built to run unattended from a systemd unit at boot, where the only
+ * job that must never fail is recording the road.  Every other subsystem is an
+ * optional extra that costs startup latency (the WiFi associate waits
+ * WifiTimeoutSec; each TensorRT engine load is seconds) and CPU on a box with
+ * no NVENC.  So they all default OFF and are switched on per-drive by editing
+ * the config — no rebuild.
+ *
+ * These gate startup only; they do not disable a subsystem's config section.
+ */
+struct StartupConfig {
+    ConfigVar<bool> laneDetection    {"LaneDetection",    false, "Start IMX296 lane detection at startup (loads the UFLD TensorRT engine)"};
+    ConfigVar<bool> driverMonitoring {"DriverMonitoring", false, "Start cabin-camera drowsiness monitoring at startup (loads the classifier engine + YuNet face model)"};
+    ConfigVar<bool> vehicleBridge    {"VehicleBridge",    false, "Start the ESP32-C3 vehicle telemetry bridge at startup (supplies GPS/IMU fields to the sidecar)"};
+    ConfigVar<bool> networkBringUp   {"NetworkBringUp",   false, "Run WiFi auto-connect and the SNTP clock query at startup; also required before the stream and control servers start"};
 };
 
 /**
@@ -476,6 +518,7 @@ struct AppConfig {
     DriverScoreConfig         driverScore;
     LogConfig                 log;
     NetworkConfig             network;
+    StartupConfig             startup;
 };
 
 // ─── reader / writer ─────────────────────────────────────────────────────────

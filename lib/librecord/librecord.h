@@ -269,6 +269,29 @@ public:
      *                    Ignored for H264 (dropping would corrupt GOPs).
      * @param eosTimeoutMs  How long stopRecording() waits for the EOS to
      *                    flush before forcing teardown.
+     * @param segmentSeconds  0 (default) writes ONE continuous MKV, exactly as
+     *                    before.  Non-zero splits the recording into segments of
+     *                    this length via splitmuxsink: @p filename becomes a base
+     *                    name and the files written are `<base>_00000.mkv`,
+     *                    `<base>_00001.mkv`, … each with its OWN `.ass` sidecar
+     *                    whose timestamps restart at that segment.
+     *
+     *                    Note what this is NOT for: Matroska already survives an
+     *                    abrupt power cut (unknown-size masters mean a SIGKILLed
+     *                    single recording still demuxes, reports a duration and
+     *                    seeks), so segmenting is not what saves a drive's
+     *                    footage.  It buys bounded unflushed loss, properly
+     *                    finalised Cues/SeekHead on every closed segment,
+     *                    bounded file size — and retention, which is the real
+     *                    one: a full card stops recording, and only whole
+     *                    segments can be aged out.
+     *
+     *                    Segment length is exact for MJPEG (intra-only: every
+     *                    frame is a cut point).  For H.264 the cut can only land
+     *                    on an IDR the CAMERA emits — there is no encoder in this
+     *                    pipeline to request one — so segments run to the next
+     *                    IDR and may overrun.  startRecording() logs which case
+     *                    applies.
      * @return true when the pipeline reached PLAYING; false on any failure
      *         (bad format, busy device, negotiation error) — details logged.
      */
@@ -276,7 +299,19 @@ public:
                         const RecordingFormat& fmt,
                         const std::string& filename,
                         uint32_t maxFps = 0,
-                        uint32_t eosTimeoutMs = 4000);
+                        uint32_t eosTimeoutMs = 4000,
+                        uint32_t segmentSeconds = 0);
+
+    /**
+     * @brief Turn a base clip path into the splitmuxsink printf location pattern.
+     *
+     * "/footage/primary_20260915_1015.mkv" → "/footage/primary_20260915_1015_%05d.mkv"
+     *
+     * Any '%' already in @p filename is escaped to "%%" so a path can never
+     * corrupt the g_strdup_printf() splitmuxsink runs on this pattern.  Public so
+     * callers can log or enumerate the files a session will produce.
+     */
+    static std::string segmentPattern(const std::string& filename);
 
     /**
      * @brief Stop the session: EOS-finalise the MKV, close the ASS sidecar.
@@ -312,6 +347,31 @@ private:
     std::thread       subThread_;
     std::atomic<bool> stopFlag_{false};
     std::atomic<bool> healthy_{false};
+
+    // ── segmented-recording state ────────────────────────────────────────────
+    // Guards assFile_ / assPath_ / segmentBaseNs_ against the fragment-rotation
+    // handler, which runs on a GStreamer streaming thread while subtitleLoop()
+    // is writing Dialogue lines on its own thread.  Lock ORDER where both are
+    // needed: assMutex_ then overlayMutex_ (writeAssHeader() takes the latter);
+    // subtitleLoop() releases overlayMutex_ before taking assMutex_, so the two
+    // never nest the other way round.
+    std::mutex        assMutex_;
+    uint32_t          segmentSeconds_ = 0;   ///< 0 = single continuous file.
+    /// Running time (ns) at which the current segment began; subtracted from the
+    /// pipeline position so each sidecar's timestamps start near zero.
+    int64_t           segmentBaseNs_ = 0;
+
+    /// splitmuxsink "format-location-full" handler: names the next segment file
+    /// and rotates the ASS sidecar to match.  Runs on a streaming thread.
+    static gchar* onFormatLocation(GstElement* splitmux, guint fragmentId,
+                                   GstSample* firstSample, gpointer user);
+
+    /// Open @p path as the active sidecar and write its header.  Caller holds
+    /// assMutex_.  Logs and leaves the sidecar closed on failure.
+    void openSidecarLocked(const std::string& path);
+
+    /// Flush and close the active sidecar, if any.  Caller holds assMutex_.
+    void closeSidecarLocked();
 
     /// Subtitle/bus thread: samples telemetry at SubtitleRateHz, appends ASS
     /// Dialogue events timed by pipeline position, and polls the bus for errors.

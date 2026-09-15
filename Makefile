@@ -129,6 +129,14 @@ V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
                 $(LIBUART_SRCS) $(LIBCOMM_SRCS) src/dashcam_v0_3.cpp) \
             $(call make_cu_objs, $(LIBLANE_CU_SRCS) $(LIBDSTATE_CU_SRCS))
 
+# dashcam_v0_4: v0.4 app — v0.3 wired for unattended boot: recording-only startup
+# (<Startup> gates), segmented recording, and by-id camera pinning.  Same
+# libraries as v0.3.
+V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
+                $(LIBLANE_SRCS) $(LIBDSTATE_SRCS) $(LIBNET_SRCS) \
+                $(LIBUART_SRCS) $(LIBCOMM_SRCS) src/dashcam_v0_4.cpp) \
+            $(call make_cu_objs, $(LIBLANE_CU_SRCS) $(LIBDSTATE_CU_SRCS))
+
 # scan_cameras: enumerate all V4L2 devices
 SCAN_OBJS := $(call make_objs, $(LIBCAM_CORE_SRCS) src/tests/scan_cameras.cpp)
 
@@ -178,7 +186,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
                     $(call make_cu_objs, $(LIBDSTATE_CU_SRCS))
 
 # Always compile these; no VPI dependency.
-BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(SCAN_OBJS) \
+BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(SCAN_OBJS) \
                     $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                     $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                     $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
@@ -199,6 +207,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/record_test \
            $(BUILD_DIR)/dashcam_v0_2 \
            $(BUILD_DIR)/dashcam_v0_3 \
+           $(BUILD_DIR)/dashcam_v0_4 \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
@@ -216,7 +225,7 @@ ifneq ($(VPI_HDRS),)
 TARGETS += $(BUILD_DIR)/dashcam
 endif
 
-.PHONY: all clean run dashcam_v0_3 commlink_test
+.PHONY: all clean run dashcam_v0_3 dashcam_v0_4 commlink_test
 
 # Convenience alias so `make commlink_test` works without the build-dir prefix.
 commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
@@ -238,6 +247,10 @@ endif
 # remains available to development/test workflows.
 dashcam_v0_3: $(BUILD_DIR)/dashcam_v0_3 | $(BUILD_DIR)/logs $(BUILD_DIR)/config
 	@echo "Built dashcam_v0_3 in $(BUILD_DIR)/"
+
+# Same for the v0.4 launcher / systemd unit.
+dashcam_v0_4: $(BUILD_DIR)/dashcam_v0_4 | $(BUILD_DIR)/logs $(BUILD_DIR)/config
+	@echo "Built dashcam_v0_4 in $(BUILD_DIR)/"
 
 $(BUILD_DIR)/logs:
 	@mkdir -p $@
@@ -269,6 +282,9 @@ $(BUILD_DIR)/dashcam_v0_2: $(V02_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT)
 
 $(BUILD_DIR)/dashcam_v0_3: $(V03_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)
+
+$(BUILD_DIR)/dashcam_v0_4: $(V04_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)
