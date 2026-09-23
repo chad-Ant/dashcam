@@ -28,7 +28,7 @@
  * Determine it on the device, after the pinmux step:
  *
  *   ls -l /sys/class/pwm/                    # which chips exist
- *   cat /sys/class/pwm/pwmchip*/device/uevent | grep -i of_node
+ *   grep OF_FULLNAME /sys/class/pwm/pwmchip[0-9]/device/uevent  # chip -> pwm@<addr>
  *
  * The tests default to chip 0 because that is the common case, not because it
  * is reliable. If a channel exports but the pin does not move, a wrong chip
