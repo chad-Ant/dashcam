@@ -24,6 +24,7 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now dashcam-v04.service
 # Logs: journalctl -u dashcam-v04 -f      Stop: sudo systemctl stop dashcam-v04
+# Remove from autostart: docker_dev/remove_autostart_v0_4.sh
 #
 # Usage: [SRC_DIR=...] [MEDIA_DIR=...] launchcode_v0_4.sh [--rebuild]
 

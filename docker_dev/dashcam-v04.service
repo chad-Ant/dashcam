@@ -6,6 +6,7 @@
 #   sudo systemctl enable --now dashcam-v04.service
 # Follow logs:  journalctl -u dashcam-v04 -f
 # Stop / disable: sudo systemctl stop dashcam-v04 / sudo systemctl disable dashcam-v04
+# Remove from autostart entirely: /home/jetson/dashcam/docker_dev/remove_autostart_v0_4.sh
 #
 # User/paths assume the Jetson account "jetson" and the launcher's clone at
 # /home/jetson/dashcam; edit both if yours differ.
