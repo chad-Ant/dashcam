@@ -54,6 +54,7 @@ VPI_HDRS := $(wildcard /usr/include/vpi/Image.h)
 # ─── library source groups ────────────────────────────────────────────────────
 
 LIBCAM_CORE_SRCS := lib/libcamera/libcamera.cpp
+LIBCAM_EXPO_SRCS := lib/libcamera/libcamera_exposure.cpp
 
 LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
                lib/libcamera/libcamera_gst.cpp \
@@ -132,8 +133,11 @@ V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
 
 # dashcam_v0_4: recording-only app — one UVC camera, compressed passthrough into
 # gapless segments with loop overwrite; no inference, no network (no TRT/OpenCV)
-V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
-                src/dashcam_v0_4.cpp)
+V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCFG_SRCS) \
+                $(LIBREC_SRCS) src/dashcam_v0_4.cpp)
+
+# exposure_test: frame-rate-priority auto-exposure loop (pure logic, no camera)
+EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests/test_exposure.cpp)
 
 # scan_cameras: enumerate all V4L2 devices
 SCAN_OBJS := $(call make_objs, $(LIBCAM_CORE_SRCS) src/tests/scan_cameras.cpp)
@@ -184,7 +188,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
                     $(call make_cu_objs, $(LIBDSTATE_CU_SRCS))
 
 # Always compile these; no VPI dependency.
-BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(SCAN_OBJS) \
+BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(SCAN_OBJS) \
                     $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                     $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                     $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
@@ -206,6 +210,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/dashcam_v0_2 \
            $(BUILD_DIR)/dashcam_v0_3 \
            $(BUILD_DIR)/dashcam_v0_4 \
+           $(BUILD_DIR)/exposure_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
@@ -286,6 +291,9 @@ $(BUILD_DIR)/dashcam_v0_3: $(V03_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)
 
 $(BUILD_DIR)/dashcam_v0_4: $(V04_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/exposure_test: $(EXPO_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)

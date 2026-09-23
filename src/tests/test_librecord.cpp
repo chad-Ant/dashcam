@@ -4,7 +4,7 @@
 //     naming, segmented MJPEG/H.264 (gapless, t=0 starts, per-segment sidecars
 //     covering each segment's start), EOS before the first frame (no abort),
 //     stall watchdog, mid-stream source error still finalises, loop-overwrite
-//     retention safety.
+//     retention safety, luma tap for software auto-exposure.
 //   Part B (first USB camera; SKIPPED when none):
 //     1. Strict precompressed gate: a raw format must be REJECTED.
 //     2. UVC compressed passthrough + ASS sidecar + live-stream tap.
@@ -569,6 +569,57 @@ static void testRetention() {
     }
 }
 
+// ─── A9: luma tap (software auto-exposure feed) ───────────────────────────────
+
+static void testLumaTap() {
+    std::cout << "\n--- A9: luma tap ---\n";
+    struct Case { const char* pattern; float lo, hi; };
+    for (const Case& c : {Case{"white", 200.f, 255.f}, Case{"black", 0.f, 40.f}}) {
+        const std::string dir = makeTempDir("luma");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(dashcam::log::getCallback());
+        r.setLumaTap(true);
+        rec::RecorderTestHook::setSource(
+            r, std::string("videotestsrc is-live=true pattern=") + c.pattern +
+               " ! video/x-raw,width=320,height=240,framerate=30/1 ! jpegenc");
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)),
+              std::string(c.pattern) + ": start with luma tap");
+        float luma = -1;
+        uint64_t seq = 0;
+        check(!r.latestLuma(luma, seq), std::string(c.pattern) + ": no sample before frames flow");
+        feedClockOnly(r, 3000);
+        const bool got = r.latestLuma(luma, seq);
+        check(got && seq >= 4 && seq <= 8, std::string(c.pattern) + ": ~2 samples/s (" +
+              std::to_string(seq) + " in 3 s)");
+        check(got && luma >= c.lo && luma <= c.hi, std::string(c.pattern) + ": mean luma " +
+              std::to_string(int(luma)) + " in [" + std::to_string(int(c.lo)) + "," +
+              std::to_string(int(c.hi)) + "]");
+        check(r.isRecording(), std::string(c.pattern) + ": recording healthy with the tap");
+        check(r.stop(), std::string(c.pattern) + ": stop finalised");
+        const uint64_t frames = r.framesReceived();
+        const auto segs = listSegments(dir);
+        const MkvInfo mi = segs.empty() ? MkvInfo{} : probeMkv(segs.begin()->second.first);
+        check(mi.ok && (uint64_t)mi.frames == frames, std::string(c.pattern) +
+              ": every frame recorded despite the tap (" + std::to_string(mi.frames) + "/" +
+              std::to_string(frames) + ")");
+        fs::remove_all(dir);
+    }
+    // H.264 sources get no tap (it would need a full-rate software decode).
+    const std::string dir = makeTempDir("luma264");
+    rec::SegmentedRecorder r;
+    r.setLumaTap(true);
+    rec::RecorderTestHook::setSource(
+        r, "videotestsrc is-live=true ! video/x-raw,width=320,height=240,framerate=30/1 "
+           "! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30");
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_H264), segOpts(dir, 60)), "H.264: start");
+    sleepMs(1500);
+    float luma = 0;
+    uint64_t seq = 0;
+    check(!r.latestLuma(luma, seq) && r.isRecording(), "H.264: no tap, recording unaffected");
+    r.stop();
+    fs::remove_all(dir);
+}
+
 static void runPartA() {
     std::cout << "=== Part A: hardware-free ===\n";
     testGoldenSingleFile();
@@ -583,6 +634,7 @@ static void runPartA() {
     testStall();
     testSourceError();
     testRetention();
+    testLumaTap();
 }
 
 // ─── Part B6: live segmented recording on the real camera ─────────────────────

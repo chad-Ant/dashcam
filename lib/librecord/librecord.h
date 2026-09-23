@@ -437,6 +437,20 @@ public:
     void        setLogCallback(dashcam::log::LogCallback cb);                ///< Before start().
 
     /**
+     * @brief MJPEG only: also decode ~2 frames/s, shrunk to 64×36 grey, and
+     *        publish the scene's mean luma (for software auto-exposure).
+     *
+     * Call before start().  The tap is a leaky side branch: it never delays or
+     * drops recorded frames, and the recording itself stays passthrough.
+     * Ignored for H.264 (decoding it would cost a full-rate software decode).
+     */
+    void        setLumaTap(bool enabled) { lumaTap_ = enabled; }
+
+    /// Newest mean luma (0..255, lower two-thirds of the frame — the road, not
+    /// the sky) and its sample number; false before the first sample.
+    bool        latestLuma(float& luma, uint64_t& seq) const;
+
+    /**
      * @brief Start a session.  Segment SEQs continue after the highest owned
      *        SEQ already in opts.dir.
      * @return true once the pipeline is PLAYING; false on any failure, with
@@ -489,6 +503,9 @@ private:
     dashcam::config::OverlayConfig overlayConfig_;
     mutable std::mutex             overlayMutex_;
     std::string                    testSourceDesc_;   ///< Test hook: replaces v4l2src+caps.
+    bool                           lumaTap_ = false;
+    std::atomic<float>             luma_{0.0f};
+    std::atomic<uint64_t>          lumaSeq_{0};
 
     // session
     GstElement*          pipeline_ = nullptr;
@@ -533,6 +550,7 @@ private:
     static gchar*            onFormatLocation(GstElement* smx, guint fragmentId,
                                               GstSample* first, gpointer self);
     static GstPadProbeReturn onRecqProbe(GstPad* pad, GstPadProbeInfo* info, gpointer self);
+    static GstFlowReturn     onLumaSample(GstAppSink* sink, gpointer self);
 };
 
 // ─── loop overwrite (libretention.cpp) ────────────────────────────────────────

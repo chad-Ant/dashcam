@@ -16,12 +16,19 @@
 // restarts recording into a new segment (retry forever).  A process crash or a
 // teardown wedged in the kernel is left to the launcher's restart loop.
 //
+// Low light (ExposureMode=framerate, the default): the camera's own
+// auto-exposure would stretch exposure past the frame time and drop to ~15 fps
+// in the dark.  Instead a software loop (libcamera_exposure) keeps exposure
+// under the frame time and adds gain, fed ~2 Hz by the recorder's luma tap —
+// 30 fps held, darker/noisier night footage.  MJPEG cameras only.
+//
 // Camera choice (resolveRecordCamera): enabled explicit <Camera type="USB">
 // pins first (a pin that is not a capture device right now is logged and
 // ignored), then the first compressed-capable USB camera.  A <Camera
 // name="cabin" type="USB"> device is the last resort: it is recorded (with a
 // warning) only when no other USB camera can record.
 #include "libcamera.h"
+#include "libcamera_exposure.h"
 #include "libconfig.h"
 #include "liblog.h"
 #include "librecord.h"
@@ -471,6 +478,10 @@ int main(int argc, char* argv[]) {
     const uint64_t quota = gbToBytes(r.maxFootageGB);
     const uint64_t floor = gbToBytes(r.minFreeGB);
     log(LogLevel::INFO, "dashcam v0.4 starting (recording only)");
+    const std::string exposureMode = r.exposureMode;
+    const bool frameRateExposure = exposureMode != "camera";
+    if (exposureMode != "camera" && exposureMode != "framerate")
+        log(LogLevel::WARN, "ExposureMode '" + exposureMode + "' unknown (framerate|camera) — using framerate");
     {
         char quotaBuf[32];
         std::snprintf(quotaBuf, sizeof(quotaBuf), "%.1f GB", (double)(float)r.maxFootageGB);
@@ -478,11 +489,15 @@ int main(int argc, char* argv[]) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
                       "settings: footage=%s segment=%d s quota=%s floor=%.1f GB stall=%d ms "
-                      "firstFrame=%d ms retry=%d s recordFps=%d config=%s/dashcam.xml",
+                      "firstFrame=%d ms retry=%d s recordFps=%d exposure=%s config=%s/dashcam.xml",
                       std::string(cfg.system.footagePath).c_str(), (int)r.segmentSec,
                       quotaText.c_str(),
                       (double)(float)r.minFreeGB, (int)r.stallTimeoutMs, (int)r.firstFrameTimeoutMs,
-                      (int)r.retryIntervalSec, (int)r.recordFps, configsDir.c_str());
+                      (int)r.retryIntervalSec, (int)r.recordFps,
+                      frameRateExposure ? ("framerate (target luma " +
+                                           std::to_string((int)r.targetLuma) + ")").c_str()
+                                        : "camera",
+                      configsDir.c_str());
         log(LogLevel::INFO, buf);
     }
     if (quota > 0 && quota < 3000000000ULL)
@@ -505,6 +520,15 @@ int main(int argc, char* argv[]) {
     rec::SegmentedRecorder recorder;
     recorder.setLogCallback(recLog);
     recorder.setOverlayConfig(cfg.overlay);
+
+    UvcExposureControl exposure;
+    uint64_t           lastLumaSeq = 0;
+    // Every session end hands exposure back to the camera (a no-op after an
+    // unplug), so a stopped dashcam never leaves the camera in manual mode.
+    auto stopRecording = [&]() {
+        recorder.stop();
+        exposure.close();
+    };
 
     std::set<std::string> notesSeen;   // resolver warnings are logged once each
     uint64_t sessions = 0;
@@ -569,6 +593,8 @@ int main(int argc, char* argv[]) {
         opts.stallTimeoutMs      = static_cast<uint32_t>((int)r.stallTimeoutMs);
         opts.firstFrameTimeoutMs = static_cast<uint32_t>((int)r.firstFrameTimeoutMs);
 
+        const bool mjpeg = f.pixelFormat == V4L2_PIX_FMT_MJPEG;
+        recorder.setLumaTap(frameRateExposure && mjpeg);
         if (!recorder.start(rc.cam->address, fmt, opts)) {
             scheduleRetry(rc.cam->address + ": " + recorder.lastError());
             return false;
@@ -582,6 +608,14 @@ int main(int argc, char* argv[]) {
                       f.pixelFormat == V4L2_PIX_FMT_H264 ? "H264" : "MJPEG",
                       (double)f.frameRate, dir.c_str(), rc.cabinFallback ? " (cabin camera)" : "");
         log(LogLevel::INFO, buf);
+        if (frameRateExposure) {
+            std::string whyNot;
+            lastLumaSeq = 0;
+            if (!mjpeg)
+                log(LogLevel::INFO, "exposure: camera auto-exposure kept (frame-rate priority needs MJPEG)");
+            else if (!exposure.open(rc.cam->address, f.frameRate, (int)r.targetLuma, recLog, whyNot))
+                log(LogLevel::WARN, "exposure: camera auto-exposure kept — " + whyNot);
+        }
         runRetention();
         return true;
     };
@@ -593,7 +627,7 @@ int main(int argc, char* argv[]) {
             if (now >= nextAttempt) tryStart();
         } else if (!recorder.isRecording()) {
             const std::string why = recorder.lastError();
-            recorder.stop();
+            stopRecording();
             scheduleRetry(why.empty() ? "recording stopped" : why);
         } else {
             rec::OverlayData od;
@@ -604,12 +638,19 @@ int main(int argc, char* argv[]) {
             od.adasValid     = false;
             recorder.setOverlayData(od);
 
+            float    luma = 0.0f;
+            uint64_t seq  = 0;
+            if (exposure.isOpen() && recorder.latestLuma(luma, seq) && seq != lastLumaSeq) {
+                lastLumaSeq = seq;
+                exposure.onLuma(luma);
+            }
+
             if (recorder.consumeFragmentClosed() || now >= nextRetention) runRetention();
             if (now >= nextProbe) {
                 nextProbe = now + kPreferredProbe;
                 if (storage.preferredBack()) {
                     log(LogLevel::INFO, "preferred footage directory is back — switching to it");
-                    recorder.stop();
+                    stopRecording();
                     storage.release();
                     nextAttempt = now;
                 }
@@ -619,7 +660,7 @@ int main(int argc, char* argv[]) {
     }
 
     log(LogLevel::INFO, "shutdown requested");
-    recorder.stop();
+    stopRecording();
     storage.release();
     log(LogLevel::INFO, "dashcam v0.4 stopped (" + std::to_string(sessions) + " recording session" +
                         (sessions == 1 ? "" : "s") + ")");

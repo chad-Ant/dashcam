@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 
 namespace dashcam::record {
@@ -211,6 +212,36 @@ GstPadProbeReturn SegmentedRecorder::onRecqProbe(GstPad*, GstPadProbeInfo* info,
     return GST_PAD_PROBE_OK;
 }
 
+GstFlowReturn SegmentedRecorder::onLumaSample(GstAppSink* sink, gpointer user) {
+    auto* self = static_cast<SegmentedRecorder*>(user);
+    GstSample* sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_OK;
+    GstBuffer* buf = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    constexpr int kW = 64, kH = 36;                      // GRAY8: stride 64 (4-aligned)
+    if (buf && gst_buffer_map(buf, &map, GST_MAP_READ)) {
+        if (map.size >= size_t(kW) * kH) {
+            // Lower two-thirds only: at dusk the sky would otherwise hold the
+            // exposure down while the road goes black.
+            uint64_t sum = 0;
+            for (int y = kH / 3; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) sum += map.data[y * kW + x];
+            self->luma_.store(static_cast<float>(sum) / float(kW * (kH - kH / 3)));
+            self->lumaSeq_.fetch_add(1);
+        }
+        gst_buffer_unmap(buf, &map);
+    }
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+bool SegmentedRecorder::latestLuma(float& luma, uint64_t& seq) const {
+    seq = lumaSeq_.load();
+    if (seq == 0) return false;
+    luma = luma_.load();
+    return true;
+}
+
 // ─── bus handling (worker thread; stop() thread after the worker joined) ─────
 
 void SegmentedRecorder::handleMessage(GstMessage* msg) {
@@ -219,6 +250,15 @@ void SegmentedRecorder::handleMessage(GstMessage* msg) {
         GError* err = nullptr;
         gchar*  dbg = nullptr;
         gst_message_parse_error(msg, &err, &dbg);
+        // A failure inside the luma tap costs exposure control, not footage.
+        const char* src = GST_MESSAGE_SRC_NAME(msg);
+        if (src && g_str_has_prefix(src, "luma")) {
+            doLog(log_, LogLevel::WARN, "luma tap error (%s): %s — exposure control starved",
+                  src, err ? err->message : "?");
+            if (err) g_error_free(err);
+            g_free(dbg);
+            break;
+        }
         const std::string text = std::string("pipeline error: ") + (err ? err->message : "?");
         doLog(log_, LogLevel::DEBUG, "recording pipeline error detail: %s", dbg ? dbg : "-");
         if (err) g_error_free(err);
@@ -443,11 +483,24 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     if (mjpeg && opts.maxFps > 0 && static_cast<float>(opts.maxFps) < fmt.fps)
         desc += " ! videorate drop-only=true max-rate=" + std::to_string(opts.maxFps);
     if (h264) desc += " ! h264parse";
+    const bool lumaTap = lumaTap_ && mjpeg;
+    if (lumaTap) desc += " ! tee name=rectee rectee.";
     desc += " ! queue name=recq max-size-buffers=8 leaky=0"
             " ! splitmuxsink name=smx async-finalize=true muxer-factory=matroskamux"
             " muxer-properties=\"properties,offset-to-zero=true\""
             " sink-properties=\"properties,sync=false,async=false\""
             " max-size-time=" + std::to_string(uint64_t(opts.segmentSec) * GST_SECOND);
+    // Luma tap: a leaky branch that decodes ~2 frames/s at thumbnail size.  Its
+    // elements are named luma* so a failure inside it is not mistaken for a
+    // recording failure (see handleMessage); max-errors=-1 keeps a corrupt
+    // JPEG from ever turning into a pipeline error.
+    if (lumaTap)
+        desc += " rectee. ! queue name=lumaq max-size-buffers=1 leaky=downstream"
+                " ! videorate name=lumarate drop-only=true max-rate=2"
+                " ! jpegdec name=lumadec max-errors=-1 ! videoscale name=lumascale"
+                " ! videoconvert name=lumaconv ! video/x-raw,format=GRAY8,width=64,height=36"
+                " ! appsink name=lumasink emit-signals=false sync=false async=false"
+                " max-buffers=1 drop=true";
 
     doLog(log_, LogLevel::INFO, "segmented recording pipeline: %s", desc.c_str());
 
@@ -475,6 +528,17 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     }
     g_signal_connect(smx, "format-location-full", G_CALLBACK(&SegmentedRecorder::onFormatLocation),
                      this);
+    if (lumaTap) {
+        if (GstElement* sink = gst_bin_get_by_name(GST_BIN(pipe), "lumasink")) {
+            GstAppSinkCallbacks cbs;
+            std::memset(&cbs, 0, sizeof(cbs));
+            cbs.new_sample = &SegmentedRecorder::onLumaSample;
+            gst_app_sink_set_callbacks(GST_APP_SINK(sink), &cbs, this, nullptr);
+            gst_object_unref(sink);
+        }
+    }
+    luma_.store(0.0f);
+    lumaSeq_.store(0);
     gst_object_unref(smx);
     GstPad* sinkPad = gst_element_get_static_pad(recq, "sink");
     gst_pad_add_probe(sinkPad,
