@@ -13,3 +13,5 @@ testlogs/*
 peripherals/*/tests/host/*.exe
 peripherals/*/tests/host/*.obj
 peripherals/*/tests/host/switch_tests
+# dashcam_v0_4 records here when the footage mount is unusable.
+footage_fallback/

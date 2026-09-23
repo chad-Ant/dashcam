@@ -28,7 +28,8 @@ static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lv
 // Quote a GStreamer string property.  Device paths and filenames are external
 // configuration, so they must not be able to terminate the property and append
 // arbitrary pipeline elements.
-static std::string gstQuoted(const std::string& value) {
+namespace detail {
+std::string gstQuoted(const std::string& value) {
     std::string out;
     out.reserve(value.size() + 2);
     out.push_back('"');
@@ -39,6 +40,8 @@ static std::string gstQuoted(const std::string& value) {
     out.push_back('"');
     return out;
 }
+} // namespace detail
+using detail::gstQuoted;
 
 // ─── telemetry formatting (same content the Cairo overlay drew) ───────────────
 
@@ -139,11 +142,24 @@ void Recorder::writeAssHeader() {
         std::lock_guard<std::mutex> lock(overlayMutex_);
         cfg = overlayConfig_;
     }
+    detail::writeAssHeader(assFile_, cfg, videoW_, videoH_);
+}
 
+void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
+                              int64_t wallNowMs, bool speedStale, bool accelStale,
+                              bool positionStale, bool headingStale) {
+    detail::writeAssSample(assFile_, posNs, durNs, od, wallNowMs, speedStale, accelStale,
+                           positionStale, headingStale);
+}
+
+namespace detail {
+
+void writeAssHeader(std::ostream& out, const dashcam::config::OverlayConfig& cfg,
+                    uint32_t videoW, uint32_t videoH) {
     // Font size scales with the video resolution: OverlayConfig::fontSize is
     // the size at 720p and PlayResY tracks the real height, so the rendered
     // text keeps the same proportion of the frame at any resolution.
-    const float scale   = static_cast<float>(videoH_) / 720.0f;
+    const float scale   = static_cast<float>(videoH) / 720.0f;
     const int   fontPx  = std::max(4, static_cast<int>(std::lround(
                               static_cast<float>(cfg.fontSize) * scale)));
     const int   marginX = static_cast<int>(std::lround((float)cfg.labelPadX * scale));
@@ -162,18 +178,18 @@ void Recorder::writeAssHeader() {
     if (b != std::string::npos) { bold = -1; face.erase(b, 5); }
     if (face.empty()) face = "Monospace";
 
-    assFile_ << "[Script Info]\n"
+    out << "[Script Info]\n"
                 "Title: dashcam telemetry\n"
                 "ScriptType: v4.00+\n"
-                "PlayResX: " << videoW_ << "\n"
-                "PlayResY: " << videoH_ << "\n"
+                "PlayResX: " << videoW << "\n"
+                "PlayResY: " << videoH << "\n"
                 "WrapStyle: 2\n"
                 "ScaledBorderAndShadow: yes\n\n";
 
     // BorderStyle=3 draws an opaque box (BackColour) behind the text — the
     // overlay rectangle; Outline doubles as the box padding.
     // Alignment (numpad): 7=TL, 9=TR, 1=BL, 3=BR — the four corners.
-    assFile_ << "[V4+ Styles]\n"
+    out << "[V4+ Styles]\n"
                 "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
                 "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
                 "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
@@ -183,7 +199,7 @@ void Recorder::writeAssHeader() {
     const int aligns[4] = { 7, 9, 1, 3 };
     static const char* names[4] = { "TL", "TR", "BL", "BR" };
     for (int i = 0; i < 4; ++i) {
-        assFile_ << "Style: " << names[i] << "," << face << "," << fontPx
+        out << "Style: " << names[i] << "," << face << "," << fontPx
                  << ",&H00FFFFFF,&H00FFFFFF,&H" << alphaHex << "000000,&H"
                  << alphaHex << "000000," << bold
                  << ",0,0,0,100,100,0,0,3," << boxPad << ",0,"
@@ -193,20 +209,20 @@ void Recorder::writeAssHeader() {
 
     // ADAS status banner (top-centre, alignment 8): the lane + driver-fatigue
     // telemetry the dashcam computes onboard.  Same box style as the corners.
-    assFile_ << "Style: ADAS," << face << "," << fontPx
+    out << "Style: ADAS," << face << "," << fontPx
              << ",&H00FFFFFF,&H00FFFFFF,&H" << alphaHex << "000000,&H"
              << alphaHex << "000000," << bold
              << ",0,0,0,100,100,0,0,3," << boxPad << ",0,8,"
              << marginX << "," << marginX << "," << marginY << ",1\n";
 
-    assFile_ << "\n[Events]\n"
+    out << "\n[Events]\n"
                 "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
                 "MarginV, Effect, Text\n";
 }
 
-void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
-                              int64_t wallNowMs, bool speedStale, bool accelStale,
-                              bool positionStale, bool headingStale) {
+void writeAssSample(std::ostream& out, int64_t posNs, int64_t durNs,
+                    const OverlayData& od, int64_t wallNowMs, bool speedStale,
+                    bool accelStale, bool positionStale, bool headingStale) {
     const std::string t0 = assTime(posNs);
     const std::string t1 = assTime(posNs + durNs);
     char buf[192];
@@ -235,7 +251,7 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
     else            std::snprintf(accBuf, sizeof(accBuf), "ACC %+.1f m/s2",
                                   static_cast<double>(od.accelerationMs2));
     std::snprintf(buf, sizeof(buf), "%s\\N%s", spdBuf, accBuf);
-    assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",TL,,0,0,0,," << buf << "\n";
+    out << "Dialogue: 0," << t0 << "," << t1 << ",TL,,0,0,0,," << buf << "\n";
 
     // Heading is dashed INDEPENDENTLY of the coordinates.  A stationary vehicle
     // has a perfectly good fix and no trustworthy course — below roughly walking
@@ -245,22 +261,22 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
     // 90.0f placeholder before any fix at all, was rendered as live at every
     // stop.
     if (headingStale) {
-        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",TR,,0,0,0,,HDG --\n";
+        out << "Dialogue: 0," << t0 << "," << t1 << ",TR,,0,0,0,,HDG --\n";
     } else {
         std::snprintf(buf, sizeof(buf), "HDG %03.0f %s",
                       static_cast<double>(od.headingDeg), headingToCardinal(od.headingDeg));
-        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",TR,,0,0,0,," << buf << "\n";
+        out << "Dialogue: 0," << t0 << "," << t1 << ",TR,,0,0,0,," << buf << "\n";
     }
 
     if (positionStale) {
-        assFile_ << "Dialogue: 0," << t0 << "," << t1
+        out << "Dialogue: 0," << t0 << "," << t1
                  << ",BL,,0,0,0,,LAT --\\NLON --\\NALT --\n";
     } else {
         std::snprintf(buf, sizeof(buf), "LAT %.6f %c\\NLON %.6f %c\\NALT %.1f m",
                       std::abs(od.latitude),  od.latitude  >= 0.0 ? 'N' : 'S',
                       std::abs(od.longitude), od.longitude >= 0.0 ? 'E' : 'W',
                       od.altitudeM);
-        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",BL,,0,0,0,," << buf << "\n";
+        out << "Dialogue: 0," << t0 << "," << t1 << ",BL,,0,0,0,," << buf << "\n";
     }
 
     // The bottom-right clock is the device wall clock, not GPS telemetry, so it
@@ -271,7 +287,7 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
     char dateBuf[16], timeBuf[16];
     std::strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", &tmBuf);
     std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S %Z", &tmBuf);
-    assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",BR,,0,0,0,,"
+    out << "Dialogue: 0," << t0 << "," << t1 << ",BR,,0,0,0,,"
              << dateBuf << "\\N" << timeBuf << "\n";
 
     // ADAS banner (top-centre): lane position + fatigue state.  Drawn only when
@@ -305,9 +321,53 @@ void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& o
 
         char adas[256];
         std::snprintf(adas, sizeof(adas), "%s   %s", lane, fat);
-        assFile_ << "Dialogue: 0," << t0 << "," << t1 << ",ADAS,,0,0,0,," << adas << "\n";
+        out << "Dialogue: 0," << t0 << "," << t1 << ",ADAS,,0,0,0,," << adas << "\n";
     }
 }
+
+
+AssStaleness assStaleness(const OverlayData& od, int64_t nowMs, int64_t staleMs) {
+    // Stale when the snapshot's own capture time is older than the window
+    // (a timestamp in the future is treated as fresh).  staleMs==0 disables.
+    //
+    // Judged per domain.  A domain is also stale whenever its validity flag
+    // is clear, so a source the application knows to be dead is dashed
+    // immediately rather than after the timeout: the flag says "this is not
+    // backed by a live source", which is a stronger statement than "this has
+    // not been refreshed lately" and should not wait for a clock.
+    // A non-finite value is treated as stale REGARDLESS of its validity
+    // flag.  The flag is set by the application, which is outside this
+    // library's control, and a NaN or Inf reaching the formatters below
+    // becomes "nan" burned into the recording.  Trusting a caller-supplied
+    // bool over the number it describes would put a garbage reading in the
+    // render path of a device whose output is evidence.
+    //
+    // Heading is checked for RANGE, not just finiteness, because finiteness
+    // is not enough for it: the cardinal-point conversion divides by 45 and
+    // calls std::lround(), which is undefined for an argument that does not
+    // fit a long — and 1e30f is finite.  An out-of-range heading is also
+    // simply not a heading, so dashing it is the correct rendering as well
+    // as the safe one.
+    AssStaleness st;
+    st.speed =
+        !od.speedValid || !std::isfinite(od.speedKmh) ||
+        (staleMs > 0 && (nowMs - od.speedTimestampMs) > staleMs);
+    st.accel =
+        !od.accelValid || !std::isfinite(od.accelerationMs2) ||
+        (staleMs > 0 && (nowMs - od.accelTimestampMs) > staleMs);
+    st.position =
+        !od.positionValid ||
+        !std::isfinite(od.latitude) || !std::isfinite(od.longitude) ||
+        !std::isfinite(od.altitudeM) ||
+        (staleMs > 0 && (nowMs - od.positionTimestampMs) > staleMs);
+    st.heading =
+        !od.headingValid || !headingRenderable(od.headingDeg) ||
+        (staleMs > 0 && (nowMs - od.headingTimestampMs) > staleMs);
+
+    return st;
+}
+
+} // namespace detail
 
 // ─── subtitle / bus thread ────────────────────────────────────────────────────
 
@@ -364,44 +424,8 @@ void Recorder::subtitleLoop() {
         const int64_t nowMs =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-        // Stale when the snapshot's own capture time is older than the window
-        // (a timestamp in the future is treated as fresh).  staleMs==0 disables.
-        //
-        // Judged per domain.  A domain is also stale whenever its validity flag
-        // is clear, so a source the application knows to be dead is dashed
-        // immediately rather than after the timeout: the flag says "this is not
-        // backed by a live source", which is a stronger statement than "this has
-        // not been refreshed lately" and should not wait for a clock.
-        // A non-finite value is treated as stale REGARDLESS of its validity
-        // flag.  The flag is set by the application, which is outside this
-        // library's control, and a NaN or Inf reaching the formatters below
-        // becomes "nan" burned into the recording.  Trusting a caller-supplied
-        // bool over the number it describes would put a garbage reading in the
-        // render path of a device whose output is evidence.
-        //
-        // Heading is checked for RANGE, not just finiteness, because finiteness
-        // is not enough for it: the cardinal-point conversion divides by 45 and
-        // calls std::lround(), which is undefined for an argument that does not
-        // fit a long — and 1e30f is finite.  An out-of-range heading is also
-        // simply not a heading, so dashing it is the correct rendering as well
-        // as the safe one.
-        const bool speedStale =
-            !od.speedValid || !std::isfinite(od.speedKmh) ||
-            (staleMs > 0 && (nowMs - od.speedTimestampMs) > staleMs);
-        const bool accelStale =
-            !od.accelValid || !std::isfinite(od.accelerationMs2) ||
-            (staleMs > 0 && (nowMs - od.accelTimestampMs) > staleMs);
-        const bool positionStale =
-            !od.positionValid ||
-            !std::isfinite(od.latitude) || !std::isfinite(od.longitude) ||
-            !std::isfinite(od.altitudeM) ||
-            (staleMs > 0 && (nowMs - od.positionTimestampMs) > staleMs);
-        const bool headingStale =
-            !od.headingValid || !headingRenderable(od.headingDeg) ||
-            (staleMs > 0 && (nowMs - od.headingTimestampMs) > staleMs);
-
-        writeAssSample(pos, durNs, od, nowMs, speedStale, accelStale,
-                       positionStale, headingStale);
+        const detail::AssStaleness st = detail::assStaleness(od, nowMs, staleMs);
+        writeAssSample(pos, durNs, od, nowMs, st.speed, st.accel, st.position, st.heading);
         if (std::chrono::steady_clock::now() >= nextAssFlush) {
             assFile_.flush();
             nextAssFlush = std::chrono::steady_clock::now()

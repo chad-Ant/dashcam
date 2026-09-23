@@ -346,6 +346,14 @@ struct RecordingConfig {
     ConfigVar<int> queueDepth   {"QueueDepth",   3,  1, 32,   1, "Recording-branch queue depth (buffers)"};
     ConfigVar<int> recordWidth  {"RecordWidth",  0,  0, 4096, 2, "Downscale the recording to this width before overlay/encoder (0 = source width; set BOTH dims; keep aspect)"};
     ConfigVar<int> recordHeight {"RecordHeight", 0,  0, 4096, 2, "Downscale the recording to this height before overlay/encoder (0 = source height)"};
+
+    // ── segmented recording + loop overwrite (dashcam_v0_4) ───────────────────
+    ConfigVar<int>   segmentSec          {"SegmentSec",          180,    10,   3600,    1,    "Segment length (s); a new file starts every SegmentSec with no gap between files"};
+    ConfigVar<float> maxFootageGB        {"MaxFootageGB",        400.0f, 0.0f, 100000.0f, 1.0f, "Loop-overwrite quota (GB = 1e9 bytes) for this program's own segments; oldest are deleted beyond it; 0 = no quota"};
+    ConfigVar<float> minFreeGB           {"MinFreeGB",           20.0f,  0.0f, 10000.0f, 1.0f, "Free-space floor (GB) on the footage filesystem; oldest segments are deleted to keep it"};
+    ConfigVar<int>   stallTimeoutMs      {"StallTimeoutMs",      5000,   0,    60000,   100,  "Restart recording when no frame arrives for this long (ms); 0 = off"};
+    ConfigVar<int>   firstFrameTimeoutMs {"FirstFrameTimeoutMs", 15000,  1000, 120000,  100,  "Restart recording when the first frame has not arrived this long after start (ms)"};
+    ConfigVar<int>   retryIntervalSec    {"RetryIntervalSec",    3,      1,    60,      1,    "Delay between recording restart attempts (s) after the first immediate retry"};
 };
 
 /**

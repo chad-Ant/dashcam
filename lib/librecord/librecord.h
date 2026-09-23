@@ -78,8 +78,13 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <deque>
 #include <mutex>
+#include <optional>
+#include <ostream>
+#include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace dashcam::record {
@@ -337,6 +342,235 @@ private:
                         int64_t wallNowMs, bool speedStale, bool accelStale,
                         bool positionStale, bool headingStale);
 };
+
+// ─── shared internals (librecord.cpp) ─────────────────────────────────────────
+
+namespace detail {
+/// Quote a GStreamer string property so external paths cannot inject elements.
+std::string gstQuoted(const std::string& value);
+/// ASS header ([Script Info] + corner/ADAS styles) for a videoW×videoH stream.
+void writeAssHeader(std::ostream& out, const dashcam::config::OverlayConfig& cfg,
+                    uint32_t videoW, uint32_t videoH);
+/// One telemetry sample (corner Dialogue events) at video time @p posNs; each
+/// stale flag dashes its own field (see Recorder::writeAssSample).
+void writeAssSample(std::ostream& out, int64_t posNs, int64_t durNs,
+                    const OverlayData& od, int64_t wallNowMs, bool speedStale,
+                    bool accelStale, bool positionStale, bool headingStale);
+/// Per-source staleness of one telemetry snapshot.
+struct AssStaleness {
+    bool speed = true, accel = true, position = true, heading = true;
+};
+/// Judge each source: invalid flag, non-finite / out-of-range value, or older
+/// than @p staleMs (0 = no age limit) → stale.
+AssStaleness assStaleness(const OverlayData& od, int64_t nowMs, int64_t staleMs);
+} // namespace detail
+
+// ─── segment naming (libsegment.cpp) ──────────────────────────────────────────
+//
+// Segments are named <prefix>_<SEQ>_<YYYYMMDD_HHMMSS>.mkv (+ .ass sidecar).
+// SEQ is a per-directory sequence (zero-padded to 6 digits, grows beyond) and
+// is the ONLY ordering used for loop overwrite: the wall-clock part is for
+// humans, and this Jetson can boot with an unset clock.
+
+/**
+ * @brief Parse an owned segment file name.
+ * @return SEQ when @p name is exactly <prefix>_<6..12 digits>_<8 digits>_<6
+ *         digits>.mkv|.ass; std::nullopt for anything else (a foreign file).
+ *         @p isAss (optional) reports the extension.  Never throws.
+ */
+std::optional<uint64_t> parseSegmentName(std::string_view name, std::string_view prefix,
+                                         bool* isAss = nullptr);
+
+/// Build <prefix>_<SEQ>_<YYYYMMDD_HHMMSS>.mkv from @p wallSec (local time).
+std::string segmentFileName(const std::string& prefix, uint64_t seq, time_t wallSec);
+
+/// Next free SEQ in @p dir: 1 + the highest owned SEQ (1 when none / unreadable).
+uint64_t nextSegmentSeq(const std::string& dir, const std::string& prefix);
+
+// ─── SegmentedRecorder (libsegment.cpp) ───────────────────────────────────────
+
+/// Session parameters for SegmentedRecorder::start().
+struct SegmentOptions {
+    std::string dir;                     ///< Output directory (must exist).
+    std::string prefix = "dashcam";      ///< File-name prefix (see parseSegmentName).
+    uint32_t segmentSec          = 180;  ///< Segment length; split lands on a keyframe.
+    uint32_t maxFps              = 0;    ///< MJPEG drop-only rate cap; 0 = camera rate.
+    uint32_t eosTimeoutMs        = 4000; ///< stop(): wait this long for the EOS to finalise.
+    uint32_t stallTimeoutMs      = 5000; ///< Unhealthy after this long without a frame; 0 = off.
+    uint32_t firstFrameTimeoutMs = 15000;///< Unhealthy when no first frame arrives in time.
+    /// stop() teardown still stuck eosTimeoutMs + 3 s after it began (a D-state
+    /// write or a wedged V4L2 ioctl): log FATAL and _exit(3) so the outer restart
+    /// loop recovers.  Tests turn it off.
+    bool exitOnTeardownHang = true;
+};
+
+/**
+ * @brief Records a UVC camera's compressed stream into gapless, individually
+ *        playable MKV segments, each with its own ASS telemetry sidecar.
+ *
+ * @verbatim
+ *   v4l2src ! caps [! videorate drop-only (MJPEG)] [! h264parse]
+ *     ! queue name=recq ! splitmuxsink (matroskamux, async-finalize)
+ * @endverbatim
+ * Every segment starts at t=0 and at a keyframe.  A pad probe on the queue's
+ * sink pad (upstream of splitmuxsink's GOP gate) feeds the stall watchdog and
+ * drops an EOS that arrives before the first buffer (splitmuxsink 1.20
+ * g_assert-aborts the whole process on that).  Sidecar events are timed from
+ * the pipeline clock and replayed into each new .ass from a short ring, so the
+ * first GOP of every segment is covered even though splitmuxsink announces a
+ * new fragment only after that GOP completes.
+ *
+ * Thread safety: start()/stop() from one control thread; everything else
+ * (overlay data, health, watermark, fragment flag) is safe from any thread.
+ */
+class SegmentedRecorder {
+public:
+    SegmentedRecorder();
+    ~SegmentedRecorder();   ///< stop()s any active session.
+
+    SegmentedRecorder(const SegmentedRecorder&)            = delete;
+    SegmentedRecorder& operator=(const SegmentedRecorder&) = delete;
+
+    void        setOverlayData(const OverlayData& data);
+    OverlayData getOverlayData() const;
+    void        setOverlayConfig(const dashcam::config::OverlayConfig& cfg); ///< Before start().
+    void        setLogCallback(dashcam::log::LogCallback cb);                ///< Before start().
+
+    /**
+     * @brief Start a session.  Segment SEQs continue after the highest owned
+     *        SEQ already in opts.dir.
+     * @return true once the pipeline is PLAYING; false on any failure, with
+     *         the reason (including the GStreamer bus error) in lastError().
+     */
+    bool start(const std::string& devicePath, const RecordingFormat& fmt,
+               const SegmentOptions& opts);
+
+    /**
+     * @brief End the session: EOS-finalise the open segment (also after a
+     *        mid-stream source error) and close its sidecar.  No-op when idle.
+     * @return false when the finalise wait timed out (the file may lack its
+     *         index; it is still recoverable).
+     */
+    bool stop();
+
+    /// A session exists (start() succeeded and stop() has not run).
+    bool isActive() const { return pipeline_ != nullptr; }
+
+    /// Active and healthy: no bus error, no unsolicited EOS, frames flowing
+    /// (first frame within firstFrameTimeoutMs, then no gap > stallTimeoutMs).
+    bool isRecording() const;
+
+    /// Why the session went unhealthy / failed to start ("" when fine).
+    std::string lastError() const;
+
+    /// Retention watermark: owned segments with SEQ below this are closed and
+    /// safe to delete.  UINT64_MAX when no session is active.
+    uint64_t deletableBelowSeq() const;
+
+    /// True once per segment close since the last call (triggers retention).
+    bool consumeFragmentClosed();
+
+    std::string currentFile() const;   ///< Segment being written ("" before the first).
+    uint64_t    framesReceived() const { return bufferCount_.load(); }
+
+private:
+    friend struct RecorderTestHook;
+
+    struct Sample {                     ///< One ring entry for sidecar replay.
+        int64_t              rtNs;
+        OverlayData          od;
+        int64_t              wallMs;
+        detail::AssStaleness stale;
+    };
+
+    // configuration / telemetry
+    dashcam::log::LogCallback      log_{};
+    OverlayData                    overlayData_;
+    dashcam::config::OverlayConfig overlayConfig_;
+    mutable std::mutex             overlayMutex_;
+    std::string                    testSourceDesc_;   ///< Test hook: replaces v4l2src+caps.
+
+    // session
+    GstElement*          pipeline_ = nullptr;
+    GstElement*          recq_     = nullptr;   ///< Owned ref to the "recq" queue.
+    SegmentOptions       opts_;
+    uint32_t             videoW_ = 0, videoH_ = 0;
+    std::thread          worker_;
+    std::atomic<bool>    stopFlag_{false};
+    std::atomic<bool>    healthy_{false};
+    std::atomic<bool>    eosSeen_{false};
+    std::atomic<bool>    errorSeen_{false};
+    std::atomic<uint64_t> bufferCount_{0};
+    std::atomic<int64_t> lastBufferNs_{0};      ///< steady_clock ns of the newest frame.
+    int64_t              playingAtNs_ = 0;      ///< steady_clock ns when PLAYING was requested.
+    std::atomic<bool>    fragmentClosed_{false};
+
+    mutable std::mutex   stateMutex_;           ///< Guards the fields below.
+    std::string          lastError_;
+    std::string          currentFile_;
+    std::set<uint64_t>   openSeqs_;             ///< Assigned, not yet confirmed closed.
+    uint64_t             sessionStartSeq_ = 0;
+    uint64_t             nextSeq_         = 0;  ///< Next SEQ format-location will assign.
+
+    // sidecar (worker thread, then the stop() thread after the worker joined)
+    bool                 assEnabled_ = false;
+    std::ofstream        assFile_;
+    std::string          assPath_;
+    int64_t              fragStartRtNs_ = -1;   ///< Running time where the open .ass starts.
+    std::deque<Sample>   ring_;
+
+    void workerLoop();
+    void handleMessage(GstMessage* msg);
+    void onFragmentOpened(const std::string& location, int64_t rtNs);
+    void onFragmentClosed(const std::string& location);
+    void checkWatchdog();
+    void takeSample(int64_t durNs, int64_t staleMs);
+    int64_t runningTimeNs() const;               ///< Pipeline clock − base time; -1 if unknown.
+    void setError(const std::string& why);
+    void closeSidecar();
+    void teardown();                             ///< EOS/finalise + NULL; stop()'s body.
+
+    static gchar*            onFormatLocation(GstElement* smx, guint fragmentId,
+                                              GstSample* first, gpointer self);
+    static GstPadProbeReturn onRecqProbe(GstPad* pad, GstPadProbeInfo* info, gpointer self);
+};
+
+// ─── loop overwrite (libretention.cpp) ────────────────────────────────────────
+
+/// What enforceRetention() may delete and when.
+struct RetentionPolicy {
+    std::string dir;                  ///< Footage directory (scanned non-recursively).
+    std::string prefix = "dashcam";   ///< Only names parseSegmentName() accepts are touched.
+    uint64_t    maxBytes     = 0;     ///< Quota on owned segment bytes; 0 = no quota.
+    uint64_t    minFreeBytes = 0;     ///< Free-space floor (statvfs f_bavail × f_frsize).
+};
+
+/// Outcome of one enforceRetention() pass.
+struct RetentionResult {
+    int      deleted     = 0;         ///< Files unlinked.
+    uint64_t freedBytes  = 0;         ///< Allocated bytes of the unlinked files.
+    uint64_t ownedBytes  = 0;         ///< Owned bytes remaining after the pass.
+    int64_t  freeBytes   = -1;        ///< Free bytes after the pass; -1 = statvfs failed.
+    int      errors      = 0;         ///< unlink failures (logged, skipped).
+    bool     stillOver   = false;     ///< Quota or floor still violated (nothing deletable left).
+};
+
+/**
+ * @brief Delete the oldest owned segments until owned bytes ≤ maxBytes and
+ *        free space ≥ minFreeBytes.
+ *
+ * Oldest = lowest SEQ (ties: file name), never the wall-clock part.  A .mkv and
+ * its .ass are one unit; an orphan .ass is its own unit.  Only regular files
+ * (lstat — no symlinks, no directories) whose names parse as owned segments are
+ * considered, and only units with SEQ < @p deletableBelowSeq (the recorder's
+ * watermark, protecting the open and still-finalising segments).  Uses
+ * ::unlink; ENOENT counts as done; other failures are logged and skipped, so a
+ * pass always terminates.  @p keepGoing is checked between deletions (pass the
+ * shutdown flag).
+ */
+RetentionResult enforceRetention(const RetentionPolicy& policy, uint64_t deletableBelowSeq,
+                                 const std::function<bool()>& keepGoing,
+                                 const dashcam::log::LogCallback& log);
 
 } // namespace dashcam::record
 

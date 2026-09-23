@@ -1,0 +1,28 @@
+# systemd unit: start dashcam v0.4 (recording only) at boot.
+#
+# Install (once, needs sudo):
+#   sudo cp /home/jetson/dashcam/docker_dev/dashcam-v04.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dashcam-v04.service
+# Follow logs:  journalctl -u dashcam-v04 -f
+# Stop / disable: sudo systemctl stop dashcam-v04 / sudo systemctl disable dashcam-v04
+#
+# User/paths assume the Jetson account "jetson" and the launcher's clone at
+# /home/jetson/dashcam; edit both if yours differ.
+
+[Unit]
+Description=dashcam v0.4 recording
+After=docker.service local-fs.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=jetson
+ExecStart=/home/jetson/dashcam/docker_dev/launchcode_v0_4.sh
+ExecStop=/usr/bin/docker stop -t 20 dashcam_v04
+Restart=always
+RestartSec=3
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

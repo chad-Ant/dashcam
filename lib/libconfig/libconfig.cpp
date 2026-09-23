@@ -250,6 +250,12 @@ static void parseRecording(pugi::xml_node node, RecordingConfig& r,
     readVar(node, r.queueDepth,   log);
     readVar(node, r.recordWidth,  log);
     readVar(node, r.recordHeight, log);
+    readVar(node, r.segmentSec,          log);
+    readVar(node, r.maxFootageGB,        log);
+    readVar(node, r.minFreeGB,           log);
+    readVar(node, r.stallTimeoutMs,      log);
+    readVar(node, r.firstFrameTimeoutMs, log);
+    readVar(node, r.retryIntervalSec,    log);
 }
 
 static void parseDetection(pugi::xml_node node, DetectionConfig& d,
@@ -419,6 +425,12 @@ static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
     writeVar(n, r.queueDepth);
     writeVar(n, r.recordWidth);
     writeVar(n, r.recordHeight);
+    writeVar(n, r.segmentSec);
+    writeVar(n, r.maxFootageGB);
+    writeVar(n, r.minFreeGB);
+    writeVar(n, r.stallTimeoutMs);
+    writeVar(n, r.firstFrameTimeoutMs);
+    writeVar(n, r.retryIntervalSec);
 }
 
 static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {

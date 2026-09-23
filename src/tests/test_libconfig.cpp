@@ -92,6 +92,12 @@ static bool test_roundtrip() {
     src.overlay.staleTimeoutMs = 1500;
     src.recording.recordWidth  = 1280;
     src.recording.recordHeight = 720;
+    src.recording.segmentSec          = 60;
+    src.recording.maxFootageGB        = 123.0f;
+    src.recording.minFreeGB           = 7.0f;
+    src.recording.stallTimeoutMs      = 2500;
+    src.recording.firstFrameTimeoutMs = 9000;
+    src.recording.retryIntervalSec    = 5;
     src.system.footagePath  = "/mnt/ssd/footage";
     src.system.warmupFrames = 30;
     src.pipeline.branchQueueDepth = 5;
@@ -197,6 +203,12 @@ static bool test_roundtrip() {
     check(dst.overlay.staleTimeoutMs == 1500,   "overlay.staleTimeoutMs round-trip");
     check(dst.recording.recordWidth  == 1280, "recording.recordWidth round-trip");
     check(dst.recording.recordHeight == 720,  "recording.recordHeight round-trip");
+    check(dst.recording.segmentSec          == 60,     "recording.segmentSec round-trip");
+    check(dst.recording.maxFootageGB        == 123.0f, "recording.maxFootageGB round-trip");
+    check(dst.recording.minFreeGB           == 7.0f,   "recording.minFreeGB round-trip");
+    check(dst.recording.stallTimeoutMs      == 2500,   "recording.stallTimeoutMs round-trip");
+    check(dst.recording.firstFrameTimeoutMs == 9000,   "recording.firstFrameTimeoutMs round-trip");
+    check(dst.recording.retryIntervalSec    == 5,      "recording.retryIntervalSec round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
     check(dst.system.warmupFrames == 30,      "system.warmupFrames round-trip");
     check(dst.pipeline.branchQueueDepth == 5, "pipeline.branchQueueDepth round-trip");
