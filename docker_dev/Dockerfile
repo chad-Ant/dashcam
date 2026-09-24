@@ -71,6 +71,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         kmod \
     && rm -rf /var/lib/apt/lists/*
 
+# ESP32-C3 bridge tooling: build and flash peripherals/esp32-c3 from the Jetson
+# (peripherals/esp32-c3/build_and_upload.sh) and inspect the chip.
+#   - arduino-cli + the esp32 core: the verified firmware build (same FQBN as
+#     BuildAndUpload.cmd).  Core pinned to 3.2.0 (ESP-IDF 5.4.1), the version
+#     the bridge firmware was last built with; the core bundles the RISC-V
+#     toolchain and its own esptool for uploads.
+#   - esptool (pip): chip_id / read_flash / erase diagnostics.  The base image
+#     points pip at the Jetson wheel mirror, which does not carry it, so this
+#     one install uses public PyPI.
+#   - picocom: serial console for bring-up.
+# The core is ~1.2 GB from GitHub: the install retries, keeping finished
+# downloads, so one dropped connection does not fail the build.
+# Kept last so the layers above stay cached.
+ARG ARDUINO_ESP32_CORE=3.2.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        picocom \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+        | BINDIR=/usr/local/bin sh \
+    && arduino-cli config init --overwrite \
+    && arduino-cli config add board_manager.additional_urls \
+        https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json \
+    && arduino-cli core update-index \
+    && for i in 1 2 3; do \
+           arduino-cli core install "esp32:esp32@${ARDUINO_ESP32_CORE}" && break; \
+           echo "core install attempt $i failed; retrying (finished downloads are kept)"; sleep 10; \
+       done \
+    && arduino-cli core list | grep -q "^esp32:esp32 *${ARDUINO_ESP32_CORE}" \
+    && PIP_INDEX_URL=https://pypi.org/simple pip3 install esptool \
+    && arduino-cli version && esptool.py version
+
 WORKDIR /home/app
 
 CMD ["/bin/bash"]
