@@ -485,6 +485,11 @@ public:
     bool consumeFragmentClosed();
 
     std::string currentFile() const;   ///< Segment being written ("" before the first).
+
+    /// Close the open segment now and continue in a new one (gapless), e.g.
+    /// after the system clock was corrected so the next file is named right.
+    /// Call from the control thread while active; false before the first frame.
+    bool splitNow();
     uint64_t    framesReceived() const { return bufferCount_.load(); }
 
 private:
@@ -510,6 +515,7 @@ private:
     // session
     GstElement*          pipeline_ = nullptr;
     GstElement*          recq_     = nullptr;   ///< Owned ref to the "recq" queue.
+    GstElement*          smx_      = nullptr;   ///< Owned ref to the splitmuxsink.
     SegmentOptions       opts_;
     uint32_t             videoW_ = 0, videoH_ = 0;
     std::thread          worker_;

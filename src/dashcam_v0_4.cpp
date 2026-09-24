@@ -22,6 +22,14 @@
 // under the frame time and adds gain, fed ~2 Hz by the recorder's luma tap —
 // 30 fps held, darker/noisier night footage.  MJPEG cameras only.
 //
+// Clock (no RTC battery: the Jetson boots with the last shutdown time): a
+// background thread asks an NTP server and, while NTP has not succeeded in
+// the last hour, GPS UTC from the ESP32-C3 bridge is the fallback
+// (libtimesync).  A wrong clock is corrected by setting the system clock; any
+// clock step — ours or the host's own NTP service — starts a new segment so
+// file names and the sidecar clock are right from then on.  Recording never
+// waits for the time: it starts immediately and is split when the clock moves.
+//
 // Camera choice (resolveRecordCamera): enabled explicit <Camera type="USB">
 // pins first (a pin that is not a capture device right now is logged and
 // ignored), then the first compressed-capable USB camera.  A <Camera
@@ -29,10 +37,14 @@
 // warning) only when no other USB camera can record.
 #include "libcamera.h"
 #include "libcamera_exposure.h"
+#include "libcommlink.h"
 #include "libconfig.h"
 #include "liblog.h"
+#include "libnetwork.h"
 #include "librecord.h"
+#include "libtimesync.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -41,6 +53,8 @@
 #include <cstring>
 #include <filesystem>
 #include <gst/gst.h>
+#include <memory>
+#include <mutex>
 #include <linux/videodev2.h>
 #include <set>
 #include <string>
@@ -410,6 +424,24 @@ private:
     }
 };
 
+// ─── repeated-message damper ──────────────────────────────────────────────────
+
+// Wraps a log callback: each distinct message is logged once at its own level,
+// repeats at DEBUG.  For chatty retry loops (a missing bridge, an offline NTP
+// server) that would otherwise write the same line every few seconds forever.
+static dashcam::log::LogCallback quietRepeats(dashcam::log::LogCallback log) {
+    auto seen = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
+    return [log, seen](LogLevel lvl, const std::string& msg) {
+        bool first;
+        {
+            std::lock_guard<std::mutex> lock(seen->first);
+            if (seen->second.size() > 256) seen->second.clear();
+            first = seen->second.insert(msg).second;
+        }
+        log(first || lvl == LogLevel::DEBUG ? lvl : LogLevel::DEBUG, msg);
+    };
+}
+
 // ─── failure reporting: first ERROR, repeats DEBUG, a summary every minute ────
 
 class FailureLog {
@@ -530,6 +562,68 @@ int main(int argc, char* argv[]) {
         exposure.close();
     };
 
+    // ── clock: NTP first, GPS fallback ───────────────────────────────────────
+    const auto& net = cfg.network;
+    const bool clockSet = (bool)net.clockSetEnabled;
+    dashcam::timesync::TimeKeeper        timeKeeper({}, log);
+    dashcam::timesync::ClockJumpDetector clockJumps;
+    std::atomic<bool>                    timeRun{true};
+    std::thread                          ntpThread;
+    if ((bool)net.timeSyncEnabled) {
+        ntpThread = std::thread([&, ntpLog = quietRepeats(log)] {
+            const std::string server = net.ntpServer;
+            const int  tries   = 1 + std::max(0, (int)net.ntpRetries);
+            bool       failing = false;
+            while (timeRun.load()) {
+                dashcam::network::TimeResult t;
+                for (int i = 0; i < tries && !t.valid && timeRun.load(); ++i)
+                    t = dashcam::network::queryTime(server, static_cast<uint16_t>((int)net.ntpPort),
+                                                    (int)net.ntpTimeoutMs, ntpLog);
+                if (t.valid) {
+                    if (clockSet) {
+                        timeKeeper.offerNtp(t.offsetSeconds, server);
+                    } else if (failing || !timeKeeper.synced()) {
+                        char off[48];
+                        std::snprintf(off, sizeof(off), "%+.3f s", t.offsetSeconds);
+                        log(LogLevel::INFO, std::string("time: NTP offset ") + off +
+                                            " (ClockSetEnabled=false: clock left alone)");
+                    }
+                    failing = false;
+                } else if (!failing) {
+                    ntpLog(LogLevel::INFO, "time: no NTP reply from " + server + " (offline?) — retrying "
+                                           "every 30 s" + ((bool)net.gpsTimeFallback && clockSet
+                                                           ? "; GPS time is the fallback" : ""));
+                    failing = true;
+                }
+                // Until NTP answers, retry every 30 s; afterwards re-check every
+                // 30 min (the host's own NTP service keeps the clock fine-tuned).
+                const auto until = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(t.valid ? 1800 : 30);
+                while (timeRun.load() && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        });
+    } else {
+        log(LogLevel::INFO, "time: NTP disabled (<Network><TimeSyncEnabled>)");
+    }
+
+    // GPS time comes from the ESP32-C3 bridge (MKR Zero GPS).  Optional: without
+    // the bridge the link retries quietly in its own thread.
+    dashcam::commlink::CommLink bridge;
+    if (clockSet && (bool)net.gpsTimeFallback) {
+        bridge.setTelemetryCallback([&timeKeeper](const dashcam::commlink::Telemetry& t) {
+            dashcam::timesync::UtcFields u;
+            u.year = t.year; u.month = t.month; u.day = t.day;
+            u.hour = t.hour; u.minute = t.minute; u.second = t.second;
+            timeKeeper.offerGps(u, (t.flags & hostproto::TLM_FLAG_TIME_VALID) != 0);
+        });
+        dashcam::commlink::CommLinkConfig bcfg;          // by-id discovery, auto-stream
+        auto bridgeLog = quietRepeats(recLog);
+        if (!bridge.open(bcfg, bridgeLog))
+            bridgeLog(LogLevel::INFO, "time: GPS bridge (ESP32-C3) not present — retrying in the background");
+        bridge.start();
+    }
+
     std::set<std::string> notesSeen;   // resolver warnings are logged once each
     uint64_t sessions = 0;
     auto nextAttempt   = std::chrono::steady_clock::now();
@@ -623,6 +717,15 @@ int main(int argc, char* argv[]) {
     // ── supervisor loop ──────────────────────────────────────────────────────
     while (g_run) {
         const auto now = std::chrono::steady_clock::now();
+        double jump = 0.0;
+        if (clockJumps.poll(jump)) {
+            char b[96];
+            std::snprintf(b, sizeof(b), "time: system clock stepped by %+.1f s", jump);
+            if (recorder.isRecording() && recorder.splitNow())
+                log(LogLevel::INFO, std::string(b) + " — new segment so names and the sidecar clock are right");
+            else
+                log(LogLevel::INFO, b);
+        }
         if (!recorder.isActive()) {
             if (now >= nextAttempt) tryStart();
         } else if (!recorder.isRecording()) {
@@ -661,6 +764,9 @@ int main(int argc, char* argv[]) {
 
     log(LogLevel::INFO, "shutdown requested");
     stopRecording();
+    timeRun.store(false);
+    bridge.close();
+    if (ntpThread.joinable()) ntpThread.join();
     storage.release();
     log(LogLevel::INFO, "dashcam v0.4 stopped (" + std::to_string(sessions) + " recording session" +
                         (sessions == 1 ? "" : "s") + ")");

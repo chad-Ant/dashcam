@@ -235,6 +235,17 @@ GstFlowReturn SegmentedRecorder::onLumaSample(GstAppSink* sink, gpointer user) {
     return GST_FLOW_OK;
 }
 
+bool SegmentedRecorder::splitNow() {
+    if (!smx_ || bufferCount_.load() == 0) return false;
+    // splitmuxsink's action signal: close the current fragment and open the next
+    // at the upcoming keyframe (every MJPEG frame is one).  Gapless, like a
+    // timed rollover; the new file is named by format-location with the
+    // current clock.
+    g_signal_emit_by_name(smx_, "split-now");
+    doLog(log_, LogLevel::INFO, "segment split requested");
+    return true;
+}
+
 bool SegmentedRecorder::latestLuma(float& luma, uint64_t& seq) const {
     seq = lumaSeq_.load();
     if (seq == 0) return false;
@@ -539,7 +550,7 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     }
     luma_.store(0.0f);
     lumaSeq_.store(0);
-    gst_object_unref(smx);
+    smx_ = smx;                                  // kept for splitNow()
     GstPad* sinkPad = gst_element_get_static_pad(recq, "sink");
     gst_pad_add_probe(sinkPad,
                       static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER |
@@ -576,6 +587,8 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
         gst_element_set_state(pipe, GST_STATE_NULL);
         gst_object_unref(recq_);
         recq_ = nullptr;
+        gst_object_unref(smx_);
+        smx_ = nullptr;
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             pipeline_ = nullptr;
@@ -693,6 +706,8 @@ bool SegmentedRecorder::stop() {
 
     gst_object_unref(recq_);
     recq_ = nullptr;
+    gst_object_unref(smx_);
+    smx_ = nullptr;
     GstElement* pipe = pipeline_;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);

@@ -431,11 +431,13 @@ struct NetworkConfig {
     ConfigVar<int>         wifiTimeoutSec      {"WifiTimeoutSec",      20, 5, 120, 1, "Seconds to wait for the WiFi association before declaring offline"};
     ConfigVar<bool>        wifiRequireInternet {"WifiRequireInternet", false, "Require full internet connectivity (not just WiFi association) to count as online"};
 
-    ConfigVar<bool>        timeSyncEnabled {"TimeSyncEnabled", true, "Query an internet time server (SNTP) at startup and log the clock offset; does not change the system clock"};
+    ConfigVar<bool>        timeSyncEnabled {"TimeSyncEnabled", true, "Query an internet time server (SNTP): v0.3 logs the clock offset at startup; v0.4 also corrects the clock (see ClockSetEnabled) and keeps retrying while offline"};
     ConfigVar<std::string> ntpServer       {"NtpServer",       "pool.ntp.org", "SNTP/NTP time server hostname or IP"};
     ConfigVar<int>         ntpPort         {"NtpPort",         123,   1,   65535, 1,   "SNTP/NTP server UDP port (123 = standard NTP)"};
     ConfigVar<int>         ntpTimeoutMs    {"NtpTimeoutMs",    3000,  100, 30000, 100, "Per-attempt wait for the SNTP reply (ms)"};
     ConfigVar<int>         ntpRetries      {"NtpRetries",      2,     0,   10,    1,   "Extra SNTP attempts after the first when no reply arrives (total tries = 1 + this)"};
+    ConfigVar<bool>        clockSetEnabled {"ClockSetEnabled", true, "dashcam_v0_4: set the system clock when NTP (or GPS) says it is more than 2 s off — the Jetson has no RTC battery, so it boots with the last shutdown time. v0.3 never sets the clock"};
+    ConfigVar<bool>        gpsTimeFallback {"GpsTimeFallback", true, "dashcam_v0_4: while NTP has not succeeded within the last hour, set the clock from GPS UTC relayed by the ESP32-C3 bridge"};
 
     // Live video streaming of the recording camera's precompressed feed (the
     // direct libnetwork MediaStreamServer path).  The wire format is chosen

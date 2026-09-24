@@ -151,6 +151,8 @@ static bool test_roundtrip() {
     src.network.ntpPort             = 1230;
     src.network.ntpTimeoutMs        = 5000;
     src.network.ntpRetries          = 4;
+    src.network.clockSetEnabled     = false;
+    src.network.gpsTimeFallback     = false;
     src.network.streamEnabled       = true;
     src.network.streamPort          = 9000;
     src.network.streamMaxClients    = 8;
@@ -273,6 +275,8 @@ static bool test_roundtrip() {
     check(dst.network.ntpPort == 1230,                   "network.ntpPort round-trip");
     check(dst.network.ntpTimeoutMs == 5000,              "network.ntpTimeoutMs round-trip");
     check(dst.network.ntpRetries == 4,                   "network.ntpRetries round-trip");
+    check(!dst.network.clockSetEnabled,                  "network.clockSetEnabled round-trip");
+    check(!dst.network.gpsTimeFallback,                  "network.gpsTimeFallback round-trip");
     check(dst.network.streamEnabled == true,             "network.streamEnabled round-trip");
     check(dst.network.streamPort == 9000,                "network.streamPort round-trip");
     check(dst.network.streamMaxClients == 8,             "network.streamMaxClients round-trip");

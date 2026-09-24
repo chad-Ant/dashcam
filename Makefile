@@ -28,6 +28,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/librecord \
             -Ilib/libspi \
             -Ilib/libstereocam \
+            -Ilib/libtimesync \
             -Ilib/libuart \
             $(shell pkg-config --cflags \
                 gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 \
@@ -63,6 +64,7 @@ LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
 
 LIBCAN_SRCS    := lib/libcan/libcan.cpp
 LIBCOMM_SRCS   := lib/libcommlink/libcommlink.cpp
+LIBTIME_SRCS   := lib/libtimesync/libtimesync.cpp
 LIBGPIO_SRCS   := lib/libgpio/libgpio.cpp lib/libgpio/libgpio_pwm.cpp
 LIBI2C_SRCS    := lib/libi2c/libi2c.cpp
 LIBMIDI_SRCS   := lib/libmidi/libmidi.cpp
@@ -134,7 +136,11 @@ V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
 # dashcam_v0_4: recording-only app — one UVC camera, compressed passthrough into
 # gapless segments with loop overwrite; no inference, no network (no TRT/OpenCV)
 V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCFG_SRCS) \
-                $(LIBREC_SRCS) src/dashcam_v0_4.cpp)
+                $(LIBREC_SRCS) $(LIBNET_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) $(LIBTIME_SRCS) \
+                src/dashcam_v0_4.cpp)
+
+# timesync_test: NTP-first / GPS-fallback clock decisions + clock-jump detection (no privileges)
+TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests/test_timesync.cpp)
 
 # exposure_test: frame-rate-priority auto-exposure loop (pure logic, no camera)
 EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests/test_exposure.cpp)
@@ -188,7 +194,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
                     $(call make_cu_objs, $(LIBDSTATE_CU_SRCS))
 
 # Always compile these; no VPI dependency.
-BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(SCAN_OBJS) \
+BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(SCAN_OBJS) \
                     $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                     $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                     $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
@@ -211,6 +217,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/dashcam_v0_3 \
            $(BUILD_DIR)/dashcam_v0_4 \
            $(BUILD_DIR)/exposure_test \
+           $(BUILD_DIR)/timesync_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
@@ -294,6 +301,9 @@ $(BUILD_DIR)/dashcam_v0_4: $(V04_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/exposure_test: $(EXPO_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/timesync_test: $(TIMESYNC_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)

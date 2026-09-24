@@ -292,6 +292,8 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
     readVar(node, n.ntpPort,             log);
     readVar(node, n.ntpTimeoutMs,        log);
     readVar(node, n.ntpRetries,          log);
+    readVar(node, n.clockSetEnabled,     log);
+    readVar(node, n.gpsTimeFallback,     log);
     if (node.child("NtpStepClock") || node.child("NtpStepThresholdSec"))
         doLog(log, dashcam::log::LogLevel::WARN,
               "Network NtpStepClock/NtpStepThresholdSec are obsolete and "
@@ -469,6 +471,8 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     writeVar(node, n.ntpPort);
     writeVar(node, n.ntpTimeoutMs);
     writeVar(node, n.ntpRetries);
+    writeVar(node, n.clockSetEnabled);
+    writeVar(node, n.gpsTimeFallback);
     writeVar(node, n.streamEnabled);
     writeVar(node, n.streamPort);
     writeVar(node, n.streamMaxClients);

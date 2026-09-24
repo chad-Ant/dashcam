@@ -620,6 +620,37 @@ static void testLumaTap() {
     fs::remove_all(dir);
 }
 
+// ─── A10: splitNow (clock corrected → new segment) ────────────────────────────
+
+static void testSplitNow() {
+    std::cout << "\n--- A10: splitNow ---\n";
+    const std::string dir = makeTempDir("split");
+    rec::SegmentedRecorder r;
+    r.setLogCallback(dashcam::log::getCallback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    check(!r.splitNow(), "no split before a session");
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)), "start (60 s segments)");
+    feedClockOnly(r, 2000);
+    check(r.splitNow(), "split requested mid-segment");
+    feedClockOnly(r, 2000);
+    check(r.isRecording(), "healthy after the split");
+    check(r.stop(), "stop finalised");
+    const uint64_t frames = r.framesReceived();
+    const auto segs = listSegments(dir);
+    int total = 0;
+    bool ok = true;
+    for (const auto& [seq, files] : segs) {
+        const MkvInfo mi = probeMkv(files.first);
+        total += mi.frames;
+        ok = ok && mi.ok && mi.firstPts >= 0 && mi.firstPts < 100'000'000LL && readAss(files.second).exists;
+    }
+    check(segs.size() == 2, std::to_string(segs.size()) + " segments (split + remainder)");
+    check(ok, "both segments start at t~0 with their own sidecar");
+    check((uint64_t)total == frames, "gapless across the split (" + std::to_string(total) + "/" +
+          std::to_string(frames) + " frames)");
+    fs::remove_all(dir);
+}
+
 static void runPartA() {
     std::cout << "=== Part A: hardware-free ===\n";
     testGoldenSingleFile();
@@ -635,6 +666,7 @@ static void runPartA() {
     testSourceError();
     testRetention();
     testLumaTap();
+    testSplitNow();
 }
 
 // ─── Part B6: live segmented recording on the real camera ─────────────────────
