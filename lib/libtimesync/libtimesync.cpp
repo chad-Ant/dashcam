@@ -84,7 +84,10 @@ Source TimeKeeper::lastSource() const {
     return last_;
 }
 
-bool TimeKeeper::step(double target, Source src, const std::string& detail) {
+bool TimeKeeper::step(double utcAtMono, double monoRef, Source src, const std::string& detail) {
+    // Absolute target, recomputed at the last moment: whatever the wall clock
+    // reads now (even if someone else just stepped it) is irrelevant to it.
+    const double target = utcAtMono + (mono_() - monoRef);
     const double before = now_();
     std::string err;
     if (!set_(target, err)) {
@@ -105,21 +108,25 @@ bool TimeKeeper::step(double target, Source src, const std::string& detail) {
     return true;
 }
 
-bool TimeKeeper::offerNtp(double offsetSeconds, const std::string& server) {
-    if (!std::isfinite(offsetSeconds)) return false;
+bool TimeKeeper::offerNtp(double utcAtReceipt, double monoAtReceipt, const std::string& server) {
+    if (!std::isfinite(utcAtReceipt) || !std::isfinite(monoAtReceipt)) return false;
     std::lock_guard<std::mutex> lock(mu_);
-    lastNtpMono_  = mono_();
+    const double mono = mono_();
+    const double age  = mono - monoAtReceipt;
+    if (age < 0.0 || age > 3600.0) return false;           // not a sample of this clock
+    const double error = (utcAtReceipt + age) - now_();     // true time now − wall clock
+    lastNtpMono_  = mono;
     gpsWarnedNtp_ = false;
-    if (std::fabs(offsetSeconds) <= pol_.stepThresholdSec) {
+    if (std::fabs(error) <= pol_.stepThresholdSec) {
         if (last_ != Source::Ntp && log_) {
             char off[32];
-            std::snprintf(off, sizeof(off), "%+.3f s", offsetSeconds);
+            std::snprintf(off, sizeof(off), "%+.3f s", error);
             log_(LogLevel::INFO, "time: clock confirmed by NTP " + server + " (offset " + off + ")");
         }
         last_ = Source::Ntp;
         return false;
     }
-    return step(now_() + offsetSeconds, Source::Ntp, server);
+    return step(utcAtReceipt, monoAtReceipt, Source::Ntp, server);
 }
 
 bool TimeKeeper::offerGps(const UtcFields& utc, bool timeValid) {
@@ -165,7 +172,7 @@ bool TimeKeeper::offerGps(const UtcFields& utc, bool timeValid) {
     }
     char detail[32];
     std::snprintf(detail, sizeof(detail), "%d agreeing fixes", gpsAgreeing_);
-    return step(gpsNow + (mono_() - mono), Source::Gps, detail);
+    return step(gpsNow, mono, Source::Gps, detail);
 }
 
 // ─── ClockJumpDetector ────────────────────────────────────────────────────────

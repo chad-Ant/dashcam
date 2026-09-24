@@ -8,7 +8,12 @@
  * is the fallback time source.
  *
  * TimeKeeper is the decision logic, fed observations from wherever they come
- * from (libnetwork::queryTime(), CommLink telemetry):
+ * from (libnetwork::queryTime(), CommLink telemetry).  Every observation is an
+ * ABSOLUTE time estimate pinned to a monotonic instant, never a relative
+ * offset: if anything steps the clock between the measurement and its use (GPS,
+ * the host's NTP service, another thread), an offset would be applied on top of
+ * the correction a second time, whereas an absolute estimate still says what
+ * time it is now.  Applying one is idempotent.
  *   - An NTP observation more than @c stepThresholdSec off steps the clock.
  *   - GPS may step the clock only while no NTP observation succeeded in the last
  *     @c ntpAuthoritySec, and only after @c gpsConfirmSamples consecutive GPS
@@ -73,10 +78,14 @@ public:
                         SetFn set = setSystemClock);
 
     /**
-     * @brief An NTP/SNTP observation: @p offsetSeconds = server − local.
+     * @brief An NTP/SNTP observation: the true UTC time @p utcAtReceipt (Unix
+     *        seconds; server transmit time + half the round trip) at the
+     *        monotonic instant @p monoAtReceipt (monotonicNow() when the reply
+     *        arrived).  Samples older than an hour, or from the future, are
+     *        rejected.
      * @return true when the clock was stepped.
      */
-    bool offerNtp(double offsetSeconds, const std::string& server);
+    bool offerNtp(double utcAtReceipt, double monoAtReceipt, const std::string& server);
 
     /**
      * @brief One GPS UTC sample, received now.  @p timeValid is the receiver's
@@ -112,7 +121,9 @@ private:
     int                       gpsAgreeing_ = 0;
     bool                      gpsWarnedNtp_ = false;
 
-    bool step(double target, Source src, const std::string& detail);   // mu_ held
+    /// Set the clock to @p utcAtMono, the true time at monotonic instant
+    /// @p monoRef — advanced to the moment of setting.  mu_ held.
+    bool step(double utcAtMono, double monoRef, Source src, const std::string& detail);
 };
 
 /// Detects steps of the wall clock relative to a monotonic clock.

@@ -4,7 +4,8 @@
 //     naming, segmented MJPEG/H.264 (gapless, t=0 starts, per-segment sidecars
 //     covering each segment's start), EOS before the first frame (no abort),
 //     stall watchdog, mid-stream source error still finalises, loop-overwrite
-//     retention safety, luma tap for software auto-exposure.
+//     retention safety, luma tap for software auto-exposure, splitNow, and
+//     stop()'s hard deadline covering a worker blocked on sidecar I/O.
 //   Part B (first USB camera; SKIPPED when none):
 //     1. Strict precompressed gate: a raw format must be REJECTED.
 //     2. UVC compressed passthrough + ASS sidecar + live-stream tap.
@@ -36,6 +37,10 @@
 #include <thread>
 #include <vector>
 
+#include <csignal>
+#include <ctime>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 using namespace dashcam::camera;
@@ -651,6 +656,61 @@ static void testSplitNow() {
     fs::remove_all(dir);
 }
 
+// ─── A11: stop()'s deadline covers a worker stuck in sidecar I/O ─────────────
+
+// Child half (record_test --hang-child <dir>): the segment's .ass path is a FIFO
+// nobody reads, so the worker blocks forever opening it — the stand-in for a
+// wedged filesystem.  stop() must still _exit(3) at eosTimeoutMs + 3 s.
+static int hangChild(const std::string& dir) {
+    rec::SegmentedRecorder r;
+    r.setLogCallback(dashcam::log::getCallback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    auto o = segOpts(dir, 2);                             // roll over after 2 s
+    o.eosTimeoutMs       = 100;                           // deadline = 3.1 s
+    o.exitOnTeardownHang = true;                          // the production behaviour
+    if (!r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o)) return 10;
+    // Wait for the first segment, then plant FIFOs for the NEXT one's sidecar
+    // (planting them earlier would bump the session's starting SEQ past them).
+    for (int i = 0; i < 50 && r.currentFile().empty(); ++i) sleepMs(100);
+    const auto seq = rec::parseSegmentName(fs::path(r.currentFile()).filename().string(), "dashcam");
+    if (!seq) return 11;
+    const time_t now = std::time(nullptr);
+    for (time_t t = now - 1; t <= now + 10; ++t) {
+        std::string ass = rec::segmentFileName("dashcam", *seq + 1, t);
+        ass.replace(ass.size() - 4, 4, ".ass");
+        ::mkfifo((dir + "/" + ass).c_str(), 0644);
+    }
+    sleepMs(3500);                                        // rollover: worker now stuck in open()
+    r.stop();                                             // must not return
+    return 0;
+}
+
+static void testStopDeadlineCoversWorker() {
+    std::cout << "\n--- A11: stop() deadline covers a worker blocked on sidecar I/O ---\n";
+    const std::string dir = makeTempDir("hang");
+    const auto t0 = std::chrono::steady_clock::now();
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::execl("/proc/self/exe", "record_test", "--hang-child", dir.c_str(), static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+    check(pid > 0, "child started");
+    int status = 0;
+    bool exited = false;
+    while (pid > 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(15)) {
+        if (::waitpid(pid, &status, WNOHANG) == pid) { exited = true; break; }
+        sleepMs(50);
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!exited && pid > 0) { ::kill(pid, SIGKILL); ::waitpid(pid, &status, 0); }
+    check(exited, "stop() did not hang past its deadline (" + std::to_string(secs) + " s)");
+    check(exited && WIFEXITED(status) && WEXITSTATUS(status) == 3,
+          "worker really was blocked and the guard exited with 3 (status " +
+          std::to_string(exited && WIFEXITED(status) ? WEXITSTATUS(status) : -1) + ")");
+    check(exited && secs < 11.0, "exit within start + 3.5 s + the 3.1 s deadline (+ slack)");
+    fs::remove_all(dir);
+}
+
 static void runPartA() {
     std::cout << "=== Part A: hardware-free ===\n";
     testGoldenSingleFile();
@@ -667,6 +727,7 @@ static void runPartA() {
     testRetention();
     testLumaTap();
     testSplitNow();
+    testStopDeadlineCoversWorker();
 }
 
 // ─── Part B6: live segmented recording on the real camera ─────────────────────
@@ -712,6 +773,7 @@ static void testLiveSegmented(const std::string& device, const rec::RecordingFor
 
 int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
+    if (argc >= 3 && std::string(argv[1]) == "--hang-child") return hangChild(argv[2]);
     const int seconds = argc > 1 ? std::stoi(argv[1]) : 10;
 
     auto log = dashcam::log::getCallback();

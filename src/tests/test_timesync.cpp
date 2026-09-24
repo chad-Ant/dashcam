@@ -3,7 +3,8 @@
 // it needs no privileges.
 //
 // Covers: UTC→Unix conversion and invalid dates; NTP small offset (confirm,
-// no step) vs large offset (step); GPS needs its time-valid flag, a sane year,
+// no step) vs large offset (step); an NTP sample applied after another
+// correction (GPS / host) is applied once, never twice; GPS needs its time-valid flag, a sane year,
 // second BOUNDARIES and N agreeing boundaries before stepping; a skipped or
 // backwards second restarts confirmation; GPS may not override a fresh NTP
 // result but may once NTP has been silent past its authority window; a failing
@@ -79,29 +80,73 @@ int main() {
     // the last shutdown time, ~17 h behind.
     const double truthEpoch = 1790224955.0;
     const double bootError  = -17 * 3600.0;
+    // True UTC at a simulated monotonic instant (every Sim starts at mono 1000).
+    auto truthAt = [&](double mono) { return truthEpoch + (mono - 1000.0); };
 
     std::printf("--- NTP ---\n");
     {
         Sim sim;
         sim.wallOffset = truthEpoch - sim.mono + 0.4;       // 0.4 s off: leave it to timesyncd
         TimeKeeper k = sim.keeper();
-        check(!k.offerNtp(-0.4, "pool") && sim.sets == 0 && k.lastSource() == Source::Ntp,
-              "0.4 s offset: confirmed, not stepped");
+        check(!k.offerNtp(truthAt(sim.mono), sim.mono, "pool") && sim.sets == 0 &&
+              k.lastSource() == Source::Ntp, "0.4 s offset: confirmed, not stepped");
     }
     {
         Sim sim;
         sim.wallOffset = truthEpoch - sim.mono + bootError;
         TimeKeeper k = sim.keeper();
-        check(k.offerNtp(-bootError, "pool") && sim.sets == 1, "17 h behind: stepped");
-        check(std::fabs(sim.wall() - (sim.mono + truthEpoch - 1000.0)) < 1e-6, "clock now correct");
-        check(!k.offerNtp(NAN, "pool") && sim.sets == 1, "NaN offset ignored");
+        check(k.offerNtp(truthAt(sim.mono), sim.mono, "pool") && sim.sets == 1, "17 h behind: stepped");
+        check(std::fabs(sim.wall() - truthAt(sim.mono)) < 1e-6, "clock now correct");
+        check(!k.offerNtp(NAN, sim.mono, "pool") && sim.sets == 1, "NaN sample ignored");
+        check(!k.offerNtp(truthAt(sim.mono), sim.mono + 5, "pool") && sim.sets == 1,
+              "sample from the future ignored");
     }
     {
         Sim sim;
         sim.setFails = true;
         TimeKeeper k = sim.keeper();
-        check(!k.offerNtp(3600, "pool") && k.lastSource() == Source::None,
+        check(!k.offerNtp(truthAt(sim.mono) + 3600, sim.mono, "pool") && k.lastSource() == Source::None,
               "failing clock set: reported, source not claimed");
+    }
+
+    std::printf("--- NTP sample vs a concurrent correction (applied once, never twice) ---\n");
+    {
+        // Measured while 17 h behind; before it is applied, GPS or the host's own
+        // NTP service corrects the clock.  An offset would now add 17 h again.
+        Sim sim;
+        sim.wallOffset = truthEpoch - sim.mono + bootError;
+        TimeKeeper k = sim.keeper();
+        const double utcRx = truthAt(sim.mono), monoRx = sim.mono;
+        sim.wallOffset = truthEpoch - 1000.0;                 // someone else fixed the clock
+        sim.mono += 2.0;
+        check(!k.offerNtp(utcRx, monoRx, "pool") && sim.sets == 0,
+              "late sample after an external fix: no step");
+        check(std::fabs(sim.wall() - truthAt(sim.mono)) < 1e-6, "clock still correct (no +17 h)");
+    }
+    {
+        // A sample that waited 30 s (clock still wrong) lands on the time NOW,
+        // not the time it was taken.
+        Sim sim;
+        sim.wallOffset = truthEpoch - sim.mono + bootError;
+        TimeKeeper k = sim.keeper();
+        const double utcRx = truthAt(sim.mono), monoRx = sim.mono;
+        sim.mono += 30.0;
+        check(k.offerNtp(utcRx, monoRx, "pool") && std::fabs(sim.wall() - truthAt(sim.mono)) < 1e-6,
+              "30 s old sample: stepped to the current true time");
+        check(!k.offerNtp(utcRx, monoRx, "pool") && sim.sets == 1,
+              "same sample offered twice: applied once");
+    }
+    {
+        // GPS steps the clock between an NTP measurement and its application.
+        Sim sim;
+        sim.wallOffset = truthEpoch - sim.mono + bootError;
+        TimeKeeper k = sim.keeper();
+        const double utcRx = truthAt(sim.mono), monoRx = sim.mono;
+        feedGps(sim, k, truthAt, 5);                          // GPS fixes the clock first
+        check(sim.sets == 1 && k.lastSource() == Source::Gps, "GPS corrected the clock first");
+        check(!k.offerNtp(utcRx, monoRx, "pool") && sim.sets == 1 &&
+              std::fabs(sim.wall() - truthAt(sim.mono)) < 0.2,
+              "then the stale NTP sample: confirms, no second step");
     }
 
     std::printf("--- GPS fallback (no NTP) ---\n");
@@ -136,7 +181,7 @@ int main() {
         Sim sim;
         sim.wallOffset = truthEpoch - sim.mono;              // correct, NTP just confirmed it
         TimeKeeper k = sim.keeper();
-        k.offerNtp(0.01, "pool");
+        k.offerNtp(truthAt(sim.mono), sim.mono, "pool");
         const double badOff = truthEpoch - sim.mono + 30;    // GPS 30 s wrong
         auto bad = [&](double mono) { return mono + badOff; };
         check(!feedGps(sim, k, bad, 5) && sim.sets == 0, "fresh NTP: GPS 30 s off is not applied");

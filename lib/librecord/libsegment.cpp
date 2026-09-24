@@ -412,8 +412,10 @@ void SegmentedRecorder::workerLoop() {
     const int64_t durNs    = static_cast<int64_t>(1e9 / rateHz);
 
     GstBus* bus = gst_element_get_bus(pipeline_);
+    // APPLICATION: stop()'s wake-up, so the worker exits without waiting out
+    // its poll interval (up to 2 s at the lowest subtitle rate).
     const auto types = static_cast<GstMessageType>(
-        GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT);
+        GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT | GST_MESSAGE_APPLICATION);
     auto nextFlush = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
     while (!stopFlag_.load()) {
@@ -673,10 +675,10 @@ void SegmentedRecorder::teardown() {
 bool SegmentedRecorder::stop() {
     if (!pipeline_) return true;
 
-    stopFlag_.store(true);
-    if (worker_.joinable()) worker_.join();
-
-    // Hard deadline: a teardown stuck in the kernel cannot be recovered in-process.
+    // Hard deadline over the WHOLE shutdown — joining the worker included: it
+    // can be stuck in a sidecar write/open on a wedged filesystem just as the
+    // teardown can be stuck in the kernel, and neither is recoverable
+    // in-process.  The guard must therefore start before the join.
     std::mutex              m;
     std::condition_variable cv;
     bool                    done = false;
@@ -689,6 +691,14 @@ bool SegmentedRecorder::stop() {
         if (opts_.exitOnTeardownHang) _exit(3);
         cv.wait(lk, [&] { return done; });
     });
+
+    stopFlag_.store(true);
+    if (GstBus* bus = gst_element_get_bus(pipeline_)) {        // wake the worker now
+        gst_bus_post(bus, gst_message_new_application(GST_OBJECT(pipeline_),
+                                                      gst_structure_new_empty("dashcam-stop")));
+        gst_object_unref(bus);
+    }
+    if (worker_.joinable()) worker_.join();
 
     const std::string file = currentFile();
     teardown();

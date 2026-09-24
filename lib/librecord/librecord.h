@@ -398,9 +398,10 @@ struct SegmentOptions {
     uint32_t eosTimeoutMs        = 4000; ///< stop(): wait this long for the EOS to finalise.
     uint32_t stallTimeoutMs      = 5000; ///< Unhealthy after this long without a frame; 0 = off.
     uint32_t firstFrameTimeoutMs = 15000;///< Unhealthy when no first frame arrives in time.
-    /// stop() teardown still stuck eosTimeoutMs + 3 s after it began (a D-state
-    /// write or a wedged V4L2 ioctl): log FATAL and _exit(3) so the outer restart
-    /// loop recovers.  Tests turn it off.
+    /// stop() still not finished eosTimeoutMs + 3 s after it was called — the
+    /// worker stuck in a sidecar write, or the teardown in a D-state write or a
+    /// wedged V4L2 ioctl: log an error and _exit(3) so the outer restart loop
+    /// recovers.  Tests turn it off.
     bool exitOnTeardownHang = true;
 };
 

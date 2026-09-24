@@ -34,7 +34,8 @@
 // pins first (a pin that is not a capture device right now is logged and
 // ignored), then the first compressed-capable USB camera.  A <Camera
 // name="cabin" type="USB"> device is the last resort: it is recorded (with a
-// warning) only when no other USB camera can record.
+// warning) only when no other USB camera can record, and never when that entry
+// is disabled.
 #include "libcamera.h"
 #include "libcamera_exposure.h"
 #include "libcommlink.h"
@@ -48,10 +49,12 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <gst/gst.h>
 #include <memory>
 #include <mutex>
@@ -173,8 +176,13 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
                                         const std::vector<dashcam::config::CameraConfig>& configs) {
     RecordChoice rc;
     std::string cabinDev;
+    bool        cabinEnabled = true;
     for (const auto& cfg : configs)
-        if (cfg.type == "USB" && cfg.name == "cabin") { cabinDev = (std::string)cfg.device; break; }
+        if (cfg.type == "USB" && cfg.name == "cabin") {
+            cabinDev     = (std::string)cfg.device;
+            cabinEnabled = (bool)cfg.enabled;
+            break;
+        }
 
     auto exactConfig = [&](const cameraInfo& c) -> const dashcam::config::CameraConfig* {
         for (const auto& cfg : configs)
@@ -196,6 +204,10 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
                                " is out of range; selecting a format automatically");
         }
         return pickUsbRecordFormat(c);
+    };
+    auto disabled = [&](const cameraInfo& c) {
+        const auto* cfg = exactConfig(c);
+        return cfg && !(bool)cfg->enabled;
     };
     auto findUsb = [&](const std::string& dev) -> const cameraInfo* {
         for (const auto& c : cams)
@@ -220,10 +232,6 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
     }
 
     // 2. First compressed-capable USB camera that is not disabled or the cabin.
-    auto disabled = [&](const cameraInfo& c) {
-        const auto* cfg = exactConfig(c);
-        return cfg && !(bool)cfg->enabled;
-    };
     for (const auto& c : cams) {
         if (c.type != CAMERA_TYPE::USB || disabled(c)) continue;
         if (!cabinDev.empty() && c.address == cabinDev) continue;
@@ -231,8 +239,15 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
         if (idx >= 0) { rc.cam = &c; rc.fmt = idx; return rc; }
     }
 
-    // 3. Last resort: the cabin camera — footage beats no footage.
-    if (!cabinDev.empty()) {
+    // 3. Last resort: the cabin camera — footage beats no footage.  Never one
+    //    the operator disabled (<Enabled>false</Enabled> on the cabin entry, or
+    //    a disabled entry for that device).
+    auto anyEntryDisables = [&](const std::string& dev) {
+        for (const auto& cfg : configs)
+            if (cfg.type == "USB" && (std::string)cfg.device == dev && !(bool)cfg.enabled) return true;
+        return false;
+    };
+    if (!cabinDev.empty() && cabinEnabled && !anyEntryDisables(cabinDev)) {
         if (const cameraInfo* c = findUsb(cabinDev)) {
             const int idx = pickUsbRecordFormat(*c);
             if (idx >= 0) {
@@ -249,7 +264,7 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
 
 // ─── --self-test: resolver invariants, no hardware ────────────────────────────
 
-static int runSelfTest() {
+static int selfTestCameras() {
     int failures = 0;
     auto check = [&](bool ok, const char* what) {
         std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
@@ -331,57 +346,94 @@ static int runSelfTest() {
         const auto rc = resolveRecordCamera(cams, {pin("cabin", "/dev/video0")});
         check(rc.cam == &cams[0] && rc.cabinFallback, "cabin recorded when the other camera is raw-only");
     }
-    std::printf("RESULT: %s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures,
-                failures == 1 ? "" : "s");
-    return failures ? 1 : 0;
+    {
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("cabin", "/dev/video0", false)});
+        check(rc.cam == nullptr, "disabled lone cabin camera is NOT recorded");
+    }
+    {
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080}), usb("/dev/video2", {yuyv})};
+        const auto rc = resolveRecordCamera(cams, {pin("cabin", "/dev/video0", false)});
+        check(rc.cam == nullptr, "disabled cabin not recorded even when the other camera is raw-only");
+    }
+    {
+        // Cabin entry enabled, but a separate entry disables the same device.
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("off", "/dev/video0", false), pin("cabin", "/dev/video0")});
+        check(rc.cam == nullptr, "cabin device disabled by another entry is NOT recorded");
+        const auto rc2 = resolveRecordCamera(cams, {pin("cabin", "/dev/video0"), pin("off", "/dev/video0", false)});
+        check(rc2.cam == nullptr, "... whichever order the entries are in");
+    }
+    return failures;
 }
 
 // ─── storage: preferred footage dir or the fixed fallback, single-instance lock ─
 
 class Storage {
 public:
-    Storage(std::string preferred, rec::RetentionPolicy policy, dashcam::log::LogCallback log)
-        : preferred_(std::move(preferred)), fallback_(fallbackFootageDir()),
-          policy_(std::move(policy)), log_(std::move(log)) {}
+    using ProbeFn = std::function<int(const std::string&)>;
+
+    Storage(std::string preferred, rec::RetentionPolicy policy, dashcam::log::LogCallback log,
+            std::string fallback = fallbackFootageDir(), ProbeFn probe = probeDir)
+        : preferred_(std::move(preferred)), fallback_(std::move(fallback)),
+          policy_(std::move(policy)), log_(std::move(log)), probe_(std::move(probe)) {}
     ~Storage() { release(); }
 
-    /// Pick (and lock) the directory to record into; "" when nothing is usable.
+    /**
+     * Pick and lock the directory to record into: the preferred one, else the
+     * fallback.  "" (with @p why) when neither is usable.
+     *
+     * Must be called while this process is NOT recording.  A full directory
+     * (ENOSPC) is cleaned up only AFTER its lock is held: the lock is what
+     * guarantees no other dashcam_v0_4 is writing its open segment there, and
+     * our own recorder is stopped — so every owned segment in it is closed.
+     */
     std::string acquire(std::string& why) {
-        std::string dir;
-        const int err = usable(preferred_);
-        if (err == 0) {
-            dir = preferred_;
-        } else {
-            const int ferr = usable(fallback_);
-            if (ferr != 0) {
-                why = "no writable footage directory (" + preferred_ + ": " + std::strerror(err) +
-                      "; " + fallback_ + ": " + std::strerror(ferr) + ")";
-                return "";
+        std::string reasons, preferredWhy;
+        for (const std::string* dir : {&preferred_, &fallback_}) {
+            std::string whyNot;
+            if (claim(*dir, whyNot)) {
+                const bool fallback = (*dir != preferred_);
+                if (fallback && !onFallback_)
+                    log_(LogLevel::WARN, "footage directory " + preferred_ + " unusable (" + preferredWhy +
+                                         ") — recording to " + fallback_);
+                onFallback_ = fallback;
+                return dir_;
             }
-            if (!onFallback_ || dir_ != fallback_)
-                log_(LogLevel::WARN, "footage directory " + preferred_ + " unusable (" +
-                                     std::strerror(err) + ") — recording to " + fallback_);
-            dir = fallback_;
+            if (*dir == preferred_) preferredWhy = whyNot;
+            reasons += (reasons.empty() ? "" : "; ") + *dir + ": " + whyNot;
         }
-        if (dir != dir_) {
-            release();
-            if (!lock(dir, why)) return "";
-            dir_ = dir;
-        }
-        onFallback_ = (dir_ != preferred_);
-        return dir_;
+        why = "no usable footage directory (" + reasons + ")";
+        return "";
     }
 
-    /// True when running on the fallback and the preferred directory works again.
-    bool preferredBack() const { return onFallback_ && usable(preferred_) == 0; }
+    /**
+     * On the fallback: true when the preferred directory takes writes again and
+     * no other dashcam_v0_4 holds it.  A full preferred directory is cleaned up
+     * here only under a temporary hold of its lock (we record on the fallback,
+     * so all our segments there are closed); a directory locked by another
+     * instance is never touched and does not count as "back" — otherwise every
+     * probe would restart our recording for nothing.
+     */
+    bool preferredBack() {
+        if (!onFallback_) return false;
+        int err = probe_(preferred_);
+        if (err != 0 && err != ENOSPC) return false;
+        std::string whyNot;
+        const int fd = lockDir(preferred_, whyNot);
+        if (fd < 0) return false;
+        if (err == ENOSPC) {
+            retainIn(preferred_, UINT64_MAX);
+            err = probe_(preferred_);
+        }
+        ::close(fd);                              // acquire() re-takes it
+        return err == 0;
+    }
 
     const std::string& dir() const { return dir_; }
 
-    rec::RetentionResult retain(uint64_t watermark) {
-        rec::RetentionPolicy p = policy_;
-        p.dir = dir_;
-        return rec::enforceRetention(p, watermark, [] { return g_run != 0; }, log_);
-    }
+    /// Retention in the held directory; @p watermark protects the open segments.
+    rec::RetentionResult retain(uint64_t watermark) { return retainIn(dir_, watermark); }
 
     void release() {
         if (lockFd_ >= 0) { ::close(lockFd_); lockFd_ = -1; }   // closing drops the flock
@@ -392,37 +444,121 @@ private:
     std::string               preferred_, fallback_, dir_;
     rec::RetentionPolicy      policy_;
     dashcam::log::LogCallback log_;
+    ProbeFn                   probe_;
     int                       lockFd_ = -1;
     bool                      onFallback_ = false;
 
-    // 0 when @p dir takes a write.  A full disk (ENOSPC) is still OUR storage:
-    // make room with retention (nothing is recording, so every owned segment is
-    // closed) and probe again.
-    int usable(const std::string& dir) const {
-        int err = probeDir(dir);
-        if (err == ENOSPC) {
-            rec::RetentionPolicy p = policy_;
-            p.dir = dir;
-            rec::enforceRetention(p, UINT64_MAX, [] { return g_run != 0; }, log_);
-            err = probeDir(dir);
-        }
-        return err;
+    rec::RetentionResult retainIn(const std::string& dir, uint64_t watermark) {
+        rec::RetentionPolicy p = policy_;
+        p.dir = dir;
+        return rec::enforceRetention(p, watermark, [] { return g_run != 0; }, log_);
     }
 
-    bool lock(const std::string& dir, std::string& why) {
-        const std::string path = dir + "/" + kLockName;
-        const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (fd < 0) { why = "cannot open " + path + ": " + std::strerror(errno); return false; }
-        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-            why = errno == EWOULDBLOCK ? "another dashcam_v0_4 is recording into " + dir
-                                       : "cannot lock " + path + ": " + std::strerror(errno);
-            ::close(fd);
-            return false;
+    // Lock @p dir (unless already held) and make sure it takes a write.  Never
+    // deletes anything in a directory whose lock it does not hold.
+    bool claim(const std::string& dir, std::string& whyNot) {
+        int err = probe_(dir);
+        if (err != 0 && err != ENOSPC) { whyNot = std::strerror(err); return false; }
+        int fd = -1;
+        if (dir != dir_) {
+            fd = lockDir(dir, whyNot);             // keep the current lock until this one works
+            if (fd < 0) return false;
         }
-        lockFd_ = fd;
+        if (err == ENOSPC) {
+            retainIn(dir, UINT64_MAX);            // lock held, our recorder stopped: all closed
+            err = probe_(dir);
+            if (err != 0) {
+                whyNot = std::string("still unwritable after cleanup: ") + std::strerror(err);
+                if (fd >= 0) ::close(fd);
+                return false;
+            }
+        }
+        if (fd >= 0) {
+            release();
+            lockFd_ = fd;
+            dir_    = dir;
+        }
         return true;
     }
+
+    // A new descriptor holding @p dir's flock; -1 (with @p whyNot) if another
+    // dashcam_v0_4 holds it or it cannot be opened.  flock conflicts between
+    // separate opens even within one process, so a second lock on the directory
+    // we already hold would fail — callers check dir_ first.
+    static int lockDir(const std::string& dir, std::string& whyNot) {
+        const std::string path = dir + "/" + kLockName;
+        const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd < 0) { whyNot = "cannot open " + path + ": " + std::strerror(errno); return -1; }
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            whyNot = errno == EWOULDBLOCK ? "another dashcam_v0_4 is recording into " + dir
+                                          : "cannot lock " + path + ": " + std::strerror(errno);
+            ::close(fd);
+            return -1;
+        }
+        return fd;
+    }
 };
+
+// ─── --self-test: storage never deletes in a directory it does not own ────────
+
+static int selfTestStorage() {
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+    std::printf("dashcam_v0_4 self-test (storage)\n");
+    char ta[] = "/tmp/v04_selftest_pref_XXXXXX";
+    char tb[] = "/tmp/v04_selftest_fb_XXXXXX";
+    if (!::mkdtemp(ta) || !::mkdtemp(tb)) { check(false, "temp dirs"); return failures; }
+    const std::string A = ta, B = tb;
+    const std::string seg = A + "/dashcam_000001_20260101_000000.mkv";   // "another recorder's open segment"
+    auto writeSeg = [&] { std::FILE* f = std::fopen(seg.c_str(), "w"); if (f) { std::fputs("frames", f); std::fclose(f); } };
+    // A is "full" (ENOSPC) while that segment exists; deleting it frees space.
+    auto probe = [&](const std::string& d) { return d == A && fs::exists(seg) ? ENOSPC : probeDir(d); };
+    rec::RetentionPolicy pol;
+    pol.prefix   = kPrefix;
+    pol.maxBytes = 1;                                   // any owned byte is over quota
+    auto quiet = [](LogLevel, const std::string&) {};
+
+    writeSeg();
+    const int other = ::open((A + "/" + kLockName).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    const bool held = other >= 0 && ::flock(other, LOCK_EX | LOCK_NB) == 0;
+    check(held, "a second instance holds the preferred directory");
+    {
+        Storage st(A, pol, quiet, B, probe);
+        std::string why;
+        check(st.acquire(why) == B, "full preferred held by another instance: falls back");
+        check(fs::exists(seg), "... and deletes nothing there (the other recorder's segment survives)");
+        check(!st.preferredBack() && fs::exists(seg),
+              "preferredBack() while it is held: not back, nothing deleted");
+        if (other >= 0) ::close(other);                 // the other instance exits
+        check(st.preferredBack(), "preferred back once free (cleaned under its own lock)");
+        check(!fs::exists(seg), "... owned segment deleted only then");
+        st.release();
+        check(st.acquire(why) == A, "acquire then takes the preferred directory");
+    }
+    writeSeg();
+    {
+        Storage st(A, pol, quiet, B, probe);
+        std::string why;
+        check(st.acquire(why) == A && !fs::exists(seg), "full preferred with a free lock: cleaned under the lock, used");
+    }
+    {
+        Storage s1(A, pol, quiet, B), s2(A, pol, quiet, B);
+        std::string why;
+        check(s1.acquire(why) == A && s2.acquire(why) == B, "two instances never share a directory");
+    }
+    {
+        Storage st("/proc/v04_selftest_no", pol, quiet, "/proc/v04_selftest_no2");
+        std::string why;
+        check(st.acquire(why).empty() && !why.empty(), "nothing usable: empty result with a reason");
+    }
+    std::error_code ec;
+    fs::remove_all(A, ec);
+    fs::remove_all(B, ec);
+    return failures;
+}
 
 // ─── repeated-message damper ──────────────────────────────────────────────────
 
@@ -488,7 +624,12 @@ private:
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    if (argc == 2 && std::string(argv[1]) == "--self-test") return runSelfTest();
+    if (argc == 2 && std::string(argv[1]) == "--self-test") {
+        const int failures = selfTestCameras() + selfTestStorage();
+        std::printf("RESULT: %s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures,
+                    failures == 1 ? "" : "s");
+        return failures ? 1 : 0;
+    }
 
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
@@ -575,13 +716,30 @@ int main(int argc, char* argv[]) {
             const int  tries   = 1 + std::max(0, (int)net.ntpRetries);
             bool       failing = false;
             while (timeRun.load()) {
+                using dashcam::timesync::TimeKeeper;
                 dashcam::network::TimeResult t;
-                for (int i = 0; i < tries && !t.valid && timeRun.load(); ++i)
+                double monoRx = 0.0;
+                for (int i = 0; i < tries && !t.valid && timeRun.load(); ++i) {
+                    const double base0 = TimeKeeper::systemNow() - TimeKeeper::monotonicNow();
                     t = dashcam::network::queryTime(server, static_cast<uint16_t>((int)net.ntpPort),
                                                     (int)net.ntpTimeoutMs, ntpLog);
+                    monoRx = TimeKeeper::monotonicNow();
+                    // SNTP times the round trip on the wall clock: if GPS or the host
+                    // stepped it mid-query, the estimate is off by half the step.
+                    if (t.valid && std::fabs((TimeKeeper::systemNow() - monoRx) - base0) > 0.05) {
+                        ntpLog(LogLevel::DEBUG, "time: clock stepped during the NTP query — sample dropped");
+                        t = dashcam::network::TimeResult{};
+                    }
+                }
                 if (t.valid) {
                     if (clockSet) {
-                        timeKeeper.offerNtp(t.offsetSeconds, server);
+                        // Absolute estimate (server transmit time + half the round
+                        // trip) pinned to when the reply arrived — never the
+                        // offset, which would be applied a second time if GPS or
+                        // the host's NTP service stepped the clock meanwhile.
+                        const double utcRx = static_cast<double>(t.unixSeconds) + t.unixNanos / 1e9 +
+                                             std::max(0.0, t.roundTripSeconds) / 2.0;
+                        timeKeeper.offerNtp(utcRx, monoRx, server);
                     } else if (failing || !timeKeeper.synced()) {
                         char off[48];
                         std::snprintf(off, sizeof(off), "%+.3f s", t.offsetSeconds);
@@ -625,7 +783,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::set<std::string> notesSeen;   // resolver warnings are logged once each
-    uint64_t sessions = 0;
+    uint64_t    sessions = 0;          // sessions that delivered frames
+    std::string pendingStart;          // "recording ..." line, logged once frames flow
+    bool        startConfirmed = false;
     auto nextAttempt   = std::chrono::steady_clock::now();
     auto nextRetention = nextAttempt;
     auto nextProbe     = nextAttempt + kPreferredProbe;
@@ -693,15 +853,17 @@ int main(int argc, char* argv[]) {
             scheduleRetry(rc.cam->address + ": " + recorder.lastError());
             return false;
         }
-        quiet.store(false);
-        failures.recovered();
-        ++sessions;
+        // start() only means the pipeline was asked to play: a busy or failing
+        // camera errors a moment later.  Recovery (and the first-retry-is-
+        // immediate reset that goes with it) is declared by the supervisor once
+        // frames actually arrive.
         char buf[256];
         std::snprintf(buf, sizeof(buf), "recording %s %ux%u %s @%.0f fps into %s%s",
                       rc.cam->address.c_str(), f.width, f.height,
                       f.pixelFormat == V4L2_PIX_FMT_H264 ? "H264" : "MJPEG",
                       (double)f.frameRate, dir.c_str(), rc.cabinFallback ? " (cabin camera)" : "");
-        log(LogLevel::INFO, buf);
+        pendingStart   = buf;
+        startConfirmed = false;
         if (frameRateExposure) {
             std::string whyNot;
             lastLumaSeq = 0;
@@ -729,6 +891,10 @@ int main(int argc, char* argv[]) {
         if (!recorder.isActive()) {
             if (now >= nextAttempt) tryStart();
         } else if (!recorder.isRecording()) {
+            // Deliberately NOT confirmed here even if a few frames arrived: a
+            // session that dies before the next tick (<= 200 ms) counts as a
+            // failed start and backs off, so a camera that fails right after its
+            // first frame cannot drive a tight restart loop.
             const std::string why = recorder.lastError();
             stopRecording();
             scheduleRetry(why.empty() ? "recording stopped" : why);
@@ -740,6 +906,14 @@ int main(int argc, char* argv[]) {
             // only the clock is live.
             od.adasValid     = false;
             recorder.setOverlayData(od);
+
+            if (!startConfirmed && recorder.framesReceived() > 0) {
+                startConfirmed = true;
+                quiet.store(false);
+                failures.recovered();
+                ++sessions;
+                log(LogLevel::INFO, pendingStart);
+            }
 
             float    luma = 0.0f;
             uint64_t seq  = 0;
