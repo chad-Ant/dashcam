@@ -16,11 +16,16 @@
 // restarts recording into a new segment (retry forever).  A process crash or a
 // teardown wedged in the kernel is left to the launcher's restart loop.
 //
-// Low light (ExposureMode=framerate, the default): the camera's own
-// auto-exposure would stretch exposure past the frame time and drop to ~15 fps
-// in the dark.  Instead a software loop (libcamera_exposure) keeps exposure
-// under the frame time and adds gain, fed ~2 Hz by the recorder's luma tap —
-// 30 fps held, darker/noisier night footage.  MJPEG cameras only.
+// Exposure (ExposureMode=auto, the default): a software loop
+// (libcamera_exposure), fed ~2 Hz by the recorder's luma tap, keeps exposure
+// under the frame time and adds gain — 30 fps held in dim light.  At night
+// that ceiling is near-black (the camera's own auto-exposure is ~8x brighter:
+// it uses internal gain the UVC gain control does not expose), so when the
+// loop is pinned at its ceiling and still darker than NightLuma for 10 s the
+// camera's auto-exposure takes over (~20 fps) until the camera runs at full
+// frame rate again with a picture at least as bright as NightLuma.
+// framerate = never hand over; camera = always the camera.
+// MJPEG cameras only.
 //
 // Clock (no RTC battery: the Jetson boots with the last shutdown time): a
 // background thread asks an NTP server and, while NTP has not succeeded in
@@ -53,6 +58,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <gst/gst.h>
@@ -651,10 +657,17 @@ int main(int argc, char* argv[]) {
     const uint64_t quota = gbToBytes(r.maxFootageGB);
     const uint64_t floor = gbToBytes(r.minFreeGB);
     log(LogLevel::INFO, "dashcam v0.4 starting (recording only)");
-    const std::string exposureMode = r.exposureMode;
-    const bool frameRateExposure = exposureMode != "camera";
-    if (exposureMode != "camera" && exposureMode != "framerate")
-        log(LogLevel::WARN, "ExposureMode '" + exposureMode + "' unknown (framerate|camera) — using framerate");
+    std::string exposureMode = r.exposureMode;
+    if (exposureMode != "auto" && exposureMode != "camera" && exposureMode != "framerate") {
+        log(LogLevel::WARN, "ExposureMode '" + exposureMode + "' unknown (auto|framerate|camera) — using auto");
+        exposureMode = "auto";
+    }
+    const bool frameRateExposure = exposureMode != "camera";   // v0.4 runs the exposure (auto|framerate)
+    const bool nightModeEnabled  = exposureMode == "auto";
+    std::string exposureText = exposureMode;
+    if (frameRateExposure) exposureText += " (target luma " + std::to_string((int)r.targetLuma) +
+                                           (nightModeEnabled ? ", night below " + std::to_string((int)r.nightLuma)
+                                                             : std::string()) + ")";
     {
         char quotaBuf[32];
         std::snprintf(quotaBuf, sizeof(quotaBuf), "%.1f GB", (double)(float)r.maxFootageGB);
@@ -667,9 +680,7 @@ int main(int argc, char* argv[]) {
                       quotaText.c_str(),
                       (double)(float)r.minFreeGB, (int)r.stallTimeoutMs, (int)r.firstFrameTimeoutMs,
                       (int)r.retryIntervalSec, (int)r.syncIntervalMs, (int)r.recordFps,
-                      frameRateExposure ? ("framerate (target luma " +
-                                           std::to_string((int)r.targetLuma) + ")").c_str()
-                                        : "camera",
+                      exposureText.c_str(),
                       configsDir.c_str());
         log(LogLevel::INFO, buf);
     }
@@ -696,6 +707,9 @@ int main(int argc, char* argv[]) {
 
     UvcExposureControl exposure;
     uint64_t           lastLumaSeq = 0;
+    // (monotonic s, camera frames) samples: the camera's real frame rate over
+    // the last ~2 s — night mode's "light is back" test.
+    std::deque<std::pair<double, uint64_t>> fpsWindow;
     // Every session end hands exposure back to the camera (a no-op after an
     // unplug), so a stopped dashcam never leaves the camera in manual mode —
     // first, because recorder.stop() can end in _exit(3) on a wedged disk.
@@ -873,6 +887,12 @@ int main(int argc, char* argv[]) {
                 log(LogLevel::INFO, "exposure: camera auto-exposure kept (frame-rate priority needs MJPEG)");
             else if (!exposure.open(rc.cam->address, f.frameRate, (int)r.targetLuma, recLog, whyNot))
                 log(LogLevel::WARN, "exposure: camera auto-exposure kept — " + whyNot);
+            else if (nightModeEnabled) {
+                dashcam::camera::NightModeSwitch::Policy night;
+                night.nightLuma = static_cast<float>((int)r.nightLuma);
+                exposure.enableNightMode(night);
+            }
+            fpsWindow.clear();
         }
         runRetention();
         return true;
@@ -921,7 +941,14 @@ int main(int argc, char* argv[]) {
             uint64_t seq  = 0;
             if (exposure.isOpen() && recorder.latestLuma(luma, seq) && seq != lastLumaSeq) {
                 lastLumaSeq = seq;
-                exposure.onLuma(luma);
+                const double t = dashcam::timesync::TimeKeeper::monotonicNow();
+                fpsWindow.emplace_back(t, recorder.sourceFramesReceived());
+                while (fpsWindow.size() > 2 && t - fpsWindow.front().first > 2.5) fpsWindow.pop_front();
+                const double span = t - fpsWindow.front().first;
+                const float fps = span >= 1.0 ? static_cast<float>((fpsWindow.back().second -
+                                                                    fpsWindow.front().second) / span)
+                                              : NAN;
+                exposure.onLuma(luma, fps, t);
             }
 
             if (recorder.consumeFragmentClosed() || now >= nextRetention) runRetention();

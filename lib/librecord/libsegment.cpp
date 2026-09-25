@@ -255,6 +255,11 @@ bool SegmentedRecorder::splitNow() {
     return true;
 }
 
+GstPadProbeReturn SegmentedRecorder::onSourceProbe(GstPad*, GstPadProbeInfo*, gpointer user) {
+    static_cast<SegmentedRecorder*>(user)->sourceCount_.fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_OK;
+}
+
 bool SegmentedRecorder::latestLuma(float& luma, uint64_t& seq) const {
     seq = lumaSeq_.load();
     if (seq == 0) return false;
@@ -650,7 +655,7 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     }
     // MJPEG frames are intra-only, so dropping them to cap the rate is safe.
     if (mjpeg && opts.maxFps > 0 && static_cast<float>(opts.maxFps) < fmt.fps)
-        desc += " ! videorate drop-only=true max-rate=" + std::to_string(opts.maxFps);
+        desc += " ! videorate name=recrate drop-only=true max-rate=" + std::to_string(opts.maxFps);
     if (h264) desc += " ! h264parse";
     const bool lumaTap = lumaTap_ && mjpeg;
     if (lumaTap) desc += " ! tee name=rectee rectee.";
@@ -708,6 +713,15 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     }
     luma_.store(0.0f);
     lumaSeq_.store(0);
+    sourceCount_.store(0);
+    hasRateCap_ = false;
+    if (GstElement* rate = gst_bin_get_by_name(GST_BIN(pipe), "recrate")) {
+        GstPad* in = gst_element_get_static_pad(rate, "sink");
+        gst_pad_add_probe(in, GST_PAD_PROBE_TYPE_BUFFER, &SegmentedRecorder::onSourceProbe, this, nullptr);
+        gst_object_unref(in);
+        gst_object_unref(rate);
+        hasRateCap_ = true;
+    }
     smx_ = smx;                                  // kept for splitNow()
     GstPad* sinkPad = gst_element_get_static_pad(recq, "sink");
     gst_pad_add_probe(sinkPad,

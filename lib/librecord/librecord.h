@@ -504,6 +504,12 @@ public:
     /// Call from the control thread while active; false before the first frame.
     bool splitNow();
     uint64_t    framesReceived() const { return bufferCount_.load(); }
+    /// Frames the CAMERA delivered — before any RecordFps drop-only cap (equal
+    /// to framesReceived() when there is none).  Its rate tells whether the
+    /// camera is lengthening exposure (night mode's exit test).
+    uint64_t    sourceFramesReceived() const {
+        return hasRateCap_ ? sourceCount_.load() : bufferCount_.load();
+    }
 
 private:
     friend struct RecorderTestHook;
@@ -542,6 +548,8 @@ private:
     std::atomic<bool>    fragmentClosed_{false};
     std::atomic<uint64_t> syncCount_{0};
     std::atomic<uint64_t> syncedFiles_{0};
+    std::atomic<uint64_t> sourceCount_{0};      ///< Frames entering the RecordFps cap.
+    bool                  hasRateCap_ = false;
 
     // durability: a dedicated sync thread owns every sync descriptor, so a
     // slow or stuck disk never blocks the worker's bus handling, watchdog or
@@ -586,6 +594,7 @@ private:
                                               GstSample* first, gpointer self);
     static GstPadProbeReturn onRecqProbe(GstPad* pad, GstPadProbeInfo* info, gpointer self);
     static GstFlowReturn     onLumaSample(GstAppSink* sink, gpointer self);
+    static GstPadProbeReturn onSourceProbe(GstPad* pad, GstPadProbeInfo* info, gpointer self);
 };
 
 // ─── loop overwrite (libretention.cpp) ────────────────────────────────────────

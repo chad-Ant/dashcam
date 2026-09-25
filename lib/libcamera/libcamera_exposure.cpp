@@ -103,6 +103,84 @@ ExposureSetting FrameRateExposure::update(float meanLuma) {
     return cur_;
 }
 
+void FrameRateExposure::setCurrent(const ExposureSetting& s) {
+    cur_.exposure = std::clamp(s.exposure, lim_.exposureMin, lim_.exposureCap);
+    cur_.gain     = std::clamp(s.gain, lim_.gainMin, lim_.gainMax);
+}
+
+// ─── NightModeSwitch ──────────────────────────────────────────────────────────
+
+NightModeSwitch::NightModeSwitch() : NightModeSwitch(Policy{}) {}
+
+NightModeSwitch::Mode NightModeSwitch::update(double nowSec, bool atCeiling, float meanLuma,
+                                              float measuredFps, float nominalFps) {
+    // Leaky accumulators: a condition that holds adds time; one that lapses
+    // drains it twice as fast, so a headlight flash or a lit junction slows the
+    // count without restarting it, while a real change of light wins quickly.
+    const bool first = lastT_ < 0;
+    const double dt = first ? 0.0 : std::clamp(nowSec - lastT_, 0.0, 2.0);
+    lastT_ = nowSec;
+    auto startProbe = [&](bool afterTakeBack) {
+        probing_ = true;
+        probeAfterTakeBack_ = afterTakeBack;
+        probeStart_ = nowSec;
+        okSec_ = 0.0;
+    };
+    // A session starts as a probe: the loop races to its ceiling within ~1.5 s
+    // when it is dark, and a night boot or recovery restart should not record
+    // 10 more near-black seconds before the camera takes over.
+    if (first) startProbe(false);
+    auto leak = [dt](double& acc, bool holds) {
+        acc = holds ? acc + dt : std::max(0.0, acc - 2.0 * dt);
+    };
+
+    if (mode_ == Mode::FrameRate) {
+        // Held long enough since the last take-back: the back-off is over.
+        if (takenBackAt_ >= 0 && nowSec - takenBackAt_ >= pol_.stableSec) {
+            exitHold_    = pol_.exitSec;
+            takenBackAt_ = -1.0;
+        }
+        leak(darkSec_, atCeiling && std::isfinite(meanLuma) && meanLuma < pol_.nightLuma);
+        // Probing (just after a take-back, which starts at the ceiling, or a
+        // session start): a dark reading at the ceiling is conclusive — hand
+        // over after probeEnterSec instead of a 10 s dark gap.  Usable light
+        // ends the probe (the first reading after a take-back can still be a
+        // camera-AE frame, hence probeOkSec rather than one sample).
+        if (probing_) {
+            okSec_ = std::isfinite(meanLuma) && meanLuma >= pol_.nightLuma ? okSec_ + dt : 0.0;
+            if (okSec_ >= pol_.probeOkSec || nowSec - probeStart_ > pol_.probeSec) probing_ = false;
+        }
+        if (darkSec_ >= (probing_ ? pol_.probeEnterSec : pol_.enterSec)) {
+            // Still dark when trying to take exposure back: that take-back was
+            // premature — wait twice as long before the next one.
+            if (probing_ && probeAfterTakeBack_)
+                exitHold_ = std::min(exitHold_ * 2.0, pol_.exitSecMax);
+            mode_    = Mode::Camera;
+            darkSec_ = 0.0;
+            fullSec_ = 0.0;
+            probing_ = false;
+        }
+    } else {
+        // The camera lengthens exposure (drops frames) only when it needs the
+        // light; back at full rate for a while means there is light again —
+        // unless its picture is still darker than nightLuma: frame-rate
+        // priority, with less gain, could only be darker (a 60 fps mode never
+        // slows down, so the frame rate alone says nothing there).
+        const bool fullRate = std::isfinite(measuredFps) && nominalFps > 0 &&
+                              measuredFps >= pol_.fullRateFrac * nominalFps;
+        const bool bright   = std::isfinite(meanLuma) && meanLuma >= pol_.nightLuma;
+        leak(fullSec_, fullRate && bright);
+        if (fullSec_ >= exitHold_) {
+            mode_        = Mode::FrameRate;
+            fullSec_     = 0.0;
+            darkSec_     = 0.0;
+            takenBackAt_ = nowSec;
+            startProbe(true);
+        }
+    }
+    return mode_;
+}
+
 // ─── UvcExposureControl ───────────────────────────────────────────────────────
 
 UvcExposureControl::~UvcExposureControl() { close(); }
@@ -152,8 +230,12 @@ bool UvcExposureControl::open(const std::string& device, float fps, int targetLu
     lim.gainMin     = qGain.minimum;
     lim.gainMax     = qGain.maximum;
     loop_    = std::make_unique<FrameRateExposure>(lim, targetLuma);
+    night_.reset();
+    nominalFps_ = fps > 0.0f ? fps : 30.0f;
     applied_ = {-1, -1};
     wasLowLight_ = false;
+    modePending_ = false;
+    modeWarned_  = false;
     onLuma(NAN);                                  // apply the starting setting
 
     if (log_)
@@ -164,8 +246,69 @@ bool UvcExposureControl::open(const std::string& device, float fps, int targetLu
     return true;
 }
 
-void UvcExposureControl::onLuma(float meanLuma) {
+void UvcExposureControl::enableNightMode(const NightModeSwitch::Policy& policy) {
+    night_ = std::make_unique<NightModeSwitch>(policy);
+    if (log_)
+        log_(LogLevel::INFO, "exposure: auto night mode on (camera takes over below luma " +
+                             std::to_string(static_cast<int>(policy.nightLuma)) + " at the ceiling)");
+}
+
+void UvcExposureControl::onLuma(float meanLuma) { onLuma(meanLuma, NAN, -1.0); }
+
+void UvcExposureControl::onLuma(float meanLuma, float measuredFps, double nowSec) {
     if (fd_ < 0 || !loop_) return;
+    if (!night_ || nowSec < 0 || !std::isfinite(meanLuma)) {
+        if (!nightMode() && !modePending_) apply(meanLuma);
+        return;
+    }
+    const NightModeSwitch::Mode before = night_->mode();
+    if (before == NightModeSwitch::Mode::FrameRate && !modePending_) apply(meanLuma);
+    const NightModeSwitch::Mode now =
+        night_->update(nowSec, loop_->atCeiling(), meanLuma, measuredFps, nominalFps_);
+    if (now != before) {
+        if (now == NightModeSwitch::Mode::Camera) {
+            if (log_) log_(LogLevel::INFO, "exposure: night mode — the camera's own auto-exposure takes "
+                                           "over (far brighter; frame rate may drop to ~20 fps)");
+        } else {
+            loop_->setCurrent(loop_->ceiling());   // it was dark: start bright, the loop trims
+            char hold[32];
+            std::snprintf(hold, sizeof(hold), "%.0f s", night_->exitHoldSec());
+            if (log_) log_(LogLevel::INFO, std::string("exposure: light is back — frame-rate priority "
+                                                       "again (next night-mode exit waits ") + hold + ")");
+        }
+        modePending_ = true;
+    }
+    if (modePending_) writeMode(now);
+}
+
+// Puts the camera in the mode the switch chose.  A control write can fail on a
+// transient USB error; the switch has already moved, so the write is retried on
+// every sample until it sticks rather than leaving the camera in the wrong mode
+// (e.g. manual at default gain all night).
+void UvcExposureControl::writeMode(NightModeSwitch::Mode mode) {
+    const bool camera = mode == NightModeSwitch::Mode::Camera;
+    // Camera: auto first, so a failure leaves the manual ceiling, not manual at
+    // default gain.  Frame rate: manual, then the loop's setting.
+    bool ok = camera ? setCtrl(V4L2_CID_EXPOSURE_AUTO, autoMode_) && setCtrl(V4L2_CID_GAIN, gainDefault_)
+                     : setCtrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+    if (!ok) {
+        if (!modeWarned_ && log_)
+            log_(LogLevel::WARN, "exposure: cannot switch " + device_ + " to " +
+                                 (camera ? "auto" : "manual") + " exposure (" + std::strerror(errno) +
+                                 ") — retrying");
+        modeWarned_ = true;
+        return;
+    }
+    if (modeWarned_ && log_)
+        log_(LogLevel::INFO, std::string("exposure: switched ") + device_ + " to " +
+                             (camera ? "auto" : "manual") + " exposure after retrying");
+    modePending_ = false;
+    modeWarned_  = false;
+    applied_     = {-1, -1};
+    if (!camera) apply(NAN);                      // its own write failures retry via apply()
+}
+
+void UvcExposureControl::apply(float meanLuma) {
     const ExposureSetting s = std::isfinite(meanLuma) ? loop_->update(meanLuma) : loop_->current();
     if (s == applied_) return;
     bool ok = true;
@@ -199,6 +342,7 @@ void UvcExposureControl::close() {
         if (log_) log_(LogLevel::INFO, "exposure: handed back to the camera on " + device_);
     }
     loop_.reset();
+    night_.reset();
 }
 
 } // namespace dashcam::camera

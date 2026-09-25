@@ -101,6 +101,7 @@ static bool test_roundtrip() {
     src.recording.syncIntervalMs      = 2500;
     src.recording.exposureMode        = std::string("camera");
     src.recording.targetLuma          = 90;
+    src.recording.nightLuma           = 50;
     src.system.footagePath  = "/mnt/ssd/footage";
     src.system.warmupFrames = 30;
     src.pipeline.branchQueueDepth = 5;
@@ -217,6 +218,7 @@ static bool test_roundtrip() {
     check(dst.recording.syncIntervalMs      == 2500,   "recording.syncIntervalMs round-trip");
     check((std::string)dst.recording.exposureMode == "camera", "recording.exposureMode round-trip");
     check(dst.recording.targetLuma          == 90,     "recording.targetLuma round-trip");
+    check(dst.recording.nightLuma           == 50,     "recording.nightLuma round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
     check(dst.system.warmupFrames == 30,      "system.warmupFrames round-trip");
     check(dst.pipeline.branchQueueDepth == 5, "pipeline.branchQueueDepth round-trip");
