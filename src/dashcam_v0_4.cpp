@@ -61,12 +61,14 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <gst/gst.h>
 #include <memory>
 #include <mutex>
 #include <linux/videodev2.h>
 #include <set>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -95,6 +97,10 @@ static constexpr auto        kPreferredProbe    = std::chrono::seconds(60);
 static constexpr auto        kFailureSummary    = std::chrono::seconds(60);
 static constexpr uint64_t    kHardFloorBytes    = 1000000000ULL;  // retain BEFORE starting below this
 static constexpr uint32_t    kEosTimeoutMs      = 4000;
+// A camera that has not taken the exposure hand-back (two UVC control writes,
+// normally a few ms) this long after the footage is final is wedged: a stuck
+// control write only returns at the USB timeout (~5 s each).
+static constexpr int         kCameraRestoreMs   = 2000;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -266,6 +272,67 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
         }
     }
     return rc;
+}
+
+// ─── session stop: footage and camera, neither waiting on the other ───────────
+
+// Runs restoreCamera on its own thread beside stopRecorder (which has its own
+// hard deadline), then waits at most budgetMs more for it.  False = the camera
+// part is still stuck; its thread is left running and the caller must exit.
+// The footage never waits on a camera control write, and the camera is
+// restored even when stopRecorder ends in _exit(3) on a wedged disk.
+static bool stopSession(const std::function<void()>& restoreCamera,
+                        const std::function<void()>& stopRecorder, int budgetMs) {
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> restored = done->get_future();
+    try {
+        std::thread([restoreCamera, done] { restoreCamera(); done->set_value(); }).detach();
+    } catch (const std::system_error&) {                 // no thread: footage first, then the camera
+        stopRecorder();
+        restoreCamera();
+        return true;
+    }
+    stopRecorder();
+    return restored.wait_for(std::chrono::milliseconds(budgetMs)) == std::future_status::ready;
+}
+
+// ─── --self-test: session stop ordering and bounds ────────────────────────────
+
+static int selfTestStopSession() {
+    int failures = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++failures;
+    };
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) {
+        return (long)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+    auto sleep = [](int m) { std::this_thread::sleep_for(std::chrono::milliseconds(m)); };
+    std::printf("dashcam_v0_4 self-test (session stop)\n");
+    {
+        const auto t0 = clk::now();
+        const bool ok = stopSession([&] { sleep(300); }, [&] { sleep(300); }, 1000);
+        const long el = ms(t0, clk::now());
+        check(ok && el < 550, "camera restore and recorder stop run side by side (" + std::to_string(el) + " ms, not 600)");
+    }
+    {
+        // A wedged camera: its control write would block for seconds.
+        const auto t0 = clk::now();
+        clk::time_point recStart{};
+        const bool ok = stopSession([] { std::this_thread::sleep_for(std::chrono::seconds(3)); },
+                                    [&] { recStart = clk::now(); sleep(100); }, 200);
+        const long el = ms(t0, clk::now());
+        check(ms(t0, recStart) < 50, "footage finalising starts at once, not after the camera (" +
+              std::to_string(ms(t0, recStart)) + " ms)");
+        check(!ok && el < 600, "stuck camera reported within recorder stop + budget (" + std::to_string(el) + " ms)");
+    }
+    {
+        // A slow finalise (EOS) gives the camera time to answer.
+        const bool ok = stopSession([&] { sleep(300); }, [&] { sleep(500); }, 50);
+        check(ok, "camera restored during a slow finalise: no extra wait");
+    }
+    return failures;
 }
 
 // ─── --self-test: resolver invariants, no hardware ────────────────────────────
@@ -631,7 +698,7 @@ private:
 
 int main(int argc, char* argv[]) {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
-        const int failures = selfTestCameras() + selfTestStorage();
+        const int failures = selfTestCameras() + selfTestStorage() + selfTestStopSession();
         std::printf("RESULT: %s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures,
                     failures == 1 ? "" : "s");
         return failures ? 1 : 0;
@@ -710,12 +777,31 @@ int main(int argc, char* argv[]) {
     // (monotonic s, camera frames) samples: the camera's real frame rate over
     // the last ~2 s — night mode's "light is back" test.
     std::deque<std::pair<double, uint64_t>> fpsWindow;
-    // Every session end hands exposure back to the camera (a no-op after an
-    // unplug), so a stopped dashcam never leaves the camera in manual mode —
-    // first, because recorder.stop() can end in _exit(3) on a wedged disk.
+    // Every session end finalises the footage and hands exposure back to the
+    // camera (a no-op after an unplug), so a stopped dashcam never leaves the
+    // camera in manual mode.  The two run side by side (stopSession): the
+    // footage never waits on a camera control write, and the camera is still
+    // restored when recorder.stop() ends in _exit(3) on a wedged disk.  A camera
+    // still not answering kCameraRestoreMs after the footage is final is wedged
+    // as well, and the stuck write cannot be cancelled: exit.  Mid-run with 3 for
+    // the launcher's restart loop, like a wedged teardown; on SIGINT/SIGTERM with
+    // 0 — the footage is final, which is all the graceful exit promises.
     auto stopRecording = [&]() {
-        exposure.close();
-        recorder.stop();
+        if (!stopSession([&exposure] { exposure.close(); }, [&recorder] { recorder.stop(); },
+                         kCameraRestoreMs)) {
+            const bool shuttingDown = !g_run;
+            const std::string why = "camera not answering the exposure hand-back " +
+                                    std::to_string(kCameraRestoreMs) + " ms after the footage was "
+                                    "finalised — " + (shuttingDown ? "exiting (shutdown)"
+                                                                   : "exiting for the restart loop");
+            log(LogLevel::ERROR, why);
+            // The log is asynchronous: stderr too (the journal gets it), and a
+            // brief, bounded moment for the log file before the process is gone.
+            std::fprintf(stderr, "%s\n", why.c_str());
+            std::fflush(stderr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            _exit(shuttingDown ? 0 : 3);
+        }
     };
 
     // ── clock: NTP first, GPS fallback ───────────────────────────────────────

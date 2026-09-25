@@ -31,8 +31,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -55,6 +57,7 @@ namespace dashcam::record {
 struct RecorderTestHook {
     static void setSource(SegmentedRecorder& r, std::string desc) { r.testSourceDesc_ = std::move(desc); }
     static GstElement* pipeline(SegmentedRecorder& r) { return r.pipeline_; }
+    static void setSyncHook(SegmentedRecorder& r, std::function<void()> fn) { r.syncTestHook_ = std::move(fn); }
 };
 } // namespace dashcam::record
 
@@ -754,6 +757,122 @@ static void testDurableSync() {
     }
 }
 
+// ─── A13: an abrupt exit at a low RecordFps loses only the newest frame ───────
+
+// Child half (record_test --abrupt-child <dir>): records at RecordFps 2 and dies
+// without stop() just after a frame arrives — what a power cut does to the
+// process (the page cache survives; making it durable is the sync thread's
+// part).  Writes the frames it had received to <dir>/received.txt first.
+static int abruptChild(const std::string& dir) {
+    rec::SegmentedRecorder r;
+    r.setLogCallback(dashcam::log::getCallback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    auto o = segOpts(dir, 60);
+    o.maxFps = 2;                                         // videorate drop-only, as RecordFps=2
+    if (!r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o)) return 10;
+    for (int i = 0; i < 200 && r.framesReceived() < 8; ++i) sleepMs(25);
+    const uint64_t before = r.framesReceived();
+    for (int i = 0; i < 200 && r.framesReceived() == before; ++i) sleepMs(5);
+    sleepMs(150);                                         // well inside the 500 ms frame gap
+    const uint64_t n = r.framesReceived();
+    if (FILE* f = std::fopen((dir + "/received.txt").c_str(), "w")) {
+        std::fprintf(f, "%llu\n", static_cast<unsigned long long>(n));
+        std::fclose(f);
+    }
+    ::_exit(0);                                           // no stop(), no finalise
+}
+
+static void testAbruptExitLowRate() {
+    std::cout << "\n--- A13: abrupt exit at RecordFps 2 ---\n";
+    const std::string dir = makeTempDir("abrupt");
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::execl("/proc/self/exe", "record_test", "--abrupt-child", dir.c_str(), static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+    int status = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool exited = false;
+    while (pid > 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(20)) {
+        if (::waitpid(pid, &status, WNOHANG) == pid) { exited = true; break; }
+        sleepMs(50);
+    }
+    if (!exited && pid > 0) { ::kill(pid, SIGKILL); ::waitpid(pid, &status, 0); }
+    check(exited && WIFEXITED(status) && WEXITSTATUS(status) == 0, "child recorded and exited abruptly");
+    long long received = -1;
+    if (std::ifstream in{dir + "/received.txt"}) in >> received;
+    const auto segs = listSegments(dir);
+    const MkvInfo mi = segs.empty() ? MkvInfo{} : probeMkv(segs.begin()->second.first);
+    check(received >= 8 && segs.size() == 1, "one unfinalised segment, " + std::to_string(received) +
+          " frames received");
+    // Only the newest frame may be missing: splitmuxsink holds it until the
+    // next keyframe.  Nothing may sit in a user-space file buffer.
+    check(received > 0 && mi.frames >= received - 1 && mi.frames <= received,
+          "file holds " + std::to_string(mi.frames) + " of " + std::to_string(received) +
+          " frames (at most the newest one lost)");
+    fs::remove_all(dir);
+}
+
+// ─── A14: a stuck disk sync is reported while stuck, then ends the session ────
+
+// syncIntervalMs 500 → warning after max(3 s, 1 s) = 3 s; the session goes
+// unhealthy at max(stallMs, 2 x 3 s).
+static void syncStallCase(uint32_t stallMs, double expectFailAt) {
+    const std::string tag = "stall limit " + std::to_string(stallMs) + " ms";
+    const std::string dir = makeTempDir("stall");
+    std::mutex               lm;
+    std::vector<std::string> logs;
+    auto base = dashcam::log::getCallback();
+    auto logged = [&](const char* what) {
+        std::lock_guard<std::mutex> lk(lm);
+        for (const auto& l : logs) if (l.find(what) != std::string::npos) return true;
+        return false;
+    };
+    rec::SegmentedRecorder r;
+    r.setLogCallback([&](dashcam::log::LogLevel lv, const std::string& m) {
+        { std::lock_guard<std::mutex> lk(lm); logs.push_back(m); }
+        if (base) base(lv, m);
+    });
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    std::atomic<bool> stall{false}, release{false};
+    rec::RecorderTestHook::setSyncHook(r, [&] {
+        if (!stall.load()) return;
+        while (!release.load()) sleepMs(10);               // a disk that stopped answering
+    });
+    auto o = segOpts(dir, 60);
+    o.syncIntervalMs     = 500;
+    o.syncStallTimeoutMs = stallMs;
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), tag + ": start");
+    feedClockOnly(r, 1500);
+    const uint64_t roundsBefore = r.syncCount();
+    stall.store(true);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    double warnAt = -1, failAt = -1;
+    while (secs() < expectFailAt + 4 && failAt < 0) {
+        feedClockOnly(r, 100);
+        if (warnAt < 0 && logged("disk sync not responding")) warnAt = secs();
+        if (!r.isRecording()) failAt = secs();
+    }
+    check(roundsBefore >= 2 && r.syncCount() <= roundsBefore + 1, tag + ": no sync round completes while stuck");
+    check(warnAt >= 2.5 && warnAt < 4.5, tag + ": warned while still stuck (" + std::to_string(warnAt) + " s)");
+    check(failAt >= expectFailAt - 0.5 && failAt < expectFailAt + 1.5 && failAt > warnAt,
+          tag + ": unhealthy after the warning, at ~" + std::to_string(int(expectFailAt)) + " s (" +
+          std::to_string(failAt) + " s)");
+    check(r.lastError().find("disk sync stuck") != std::string::npos, tag + ": reason: " + r.lastError());
+    release.store(true);                                  // the disk answers again
+    check(r.stop(), tag + ": stop() finalises once the disk answers");
+    const auto segs = listSegments(dir);
+    check(segs.size() == 1 && probeMkv(segs.begin()->second.first).ok, tag + ": segment playable");
+    fs::remove_all(dir);
+}
+
+static void testSyncStall() {
+    std::cout << "\n--- A14: stuck disk sync ---\n";
+    syncStallCase(7000, 7.0);                             // the configured limit
+    syncStallCase(1000, 6.0);                             // below 2 x warning: floored, warning first
+}
+
 static void runPartA() {
     std::cout << "=== Part A: hardware-free ===\n";
     testGoldenSingleFile();
@@ -772,6 +891,8 @@ static void runPartA() {
     testSplitNow();
     testStopDeadlineCoversWorker();
     testDurableSync();
+    testAbruptExitLowRate();
+    testSyncStall();
 }
 
 // ─── Part B6: live segmented recording on the real camera ─────────────────────
@@ -818,6 +939,7 @@ static void testLiveSegmented(const std::string& device, const rec::RecordingFor
 int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
     if (argc >= 3 && std::string(argv[1]) == "--hang-child") return hangChild(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--abrupt-child") return abruptChild(argv[2]);
     const int seconds = argc > 1 ? std::stoi(argv[1]) : 10;
 
     auto log = dashcam::log::getCallback();

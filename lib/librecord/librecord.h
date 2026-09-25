@@ -401,13 +401,25 @@ struct SegmentOptions {
     uint32_t firstFrameTimeoutMs = 15000;///< Unhealthy when no first frame arrives in time.
     /// Force the open segment and its sidecar out of the page cache to disk
     /// (fdatasync) this often, so a power cut — the normal way a car dashcam
-    /// stops — loses at most about this much footage instead of the ~5-30 s
-    /// Linux writeback would.  (MJPEG: every frame is a keyframe.  H.264: add
-    /// one camera GOP, which splitmuxsink holds in memory until it completes.)
-    /// Closed segments and new directory entries are synced too, all on a
-    /// dedicated thread so a slow disk never stalls sampling or the watchdog.
-    /// 0 = off (leave it to writeback).
+    /// stops — loses about this much footage instead of the ~5-30 s Linux
+    /// writeback would, PLUS what is still inside the pipeline, which no sync
+    /// can reach: the newest frame for MJPEG (splitmuxsink holds each GOP until
+    /// the next keyframe arrives — 33 ms at 30 fps, but a whole second at
+    /// RecordFps 1), one camera GOP for H.264, and any frames queued while the
+    /// disk lags.  The segment's file sink is unbuffered, so every muxed byte
+    /// reaches the page cache at once.  Closed segments and new directory
+    /// entries are synced too, all on a dedicated thread so a slow disk never
+    /// stalls sampling or the watchdog.  0 = off (leave it to writeback).
     uint32_t syncIntervalMs      = 1000;
+    /// A sync round (open + fdatasync/fsync) still not back after this long
+    /// means the disk stopped responding: the session is marked unhealthy
+    /// ("disk sync stuck"), so the caller restarts it — and if the teardown
+    /// then hangs on the same disk, stop()'s deadline _exit(3)s for the
+    /// restart loop.  The watchdog warns earlier, once a round is overdue by
+    /// max(3 s, 2 x syncIntervalMs), because a stuck call never returns to
+    /// report itself.  The limit used is at least twice that warning time: a
+    /// long interval means long, healthy rounds.  0 = warn only.
+    uint32_t syncStallTimeoutMs  = 20000;
     /// stop() still not finished eosTimeoutMs + 3 s after it was called — the
     /// worker stuck in a sidecar write, or the teardown in a D-state write or a
     /// wedged V4L2 ioctl: log an error and _exit(3) so the outer restart loop
@@ -548,6 +560,9 @@ private:
     std::atomic<bool>    fragmentClosed_{false};
     std::atomic<uint64_t> syncCount_{0};
     std::atomic<uint64_t> syncedFiles_{0};
+    std::atomic<int64_t>  syncBusySinceNs_{0};  ///< steady ns a sync round began; 0 = idle.
+    int64_t               syncWarnedFor_ = 0;   ///< Worker: the stuck round already reported.
+    std::function<void()> syncTestHook_;        ///< Test hook: runs before each sync call.
     std::atomic<uint64_t> sourceCount_{0};      ///< Frames entering the RecordFps cap.
     bool                  hasRateCap_ = false;
 

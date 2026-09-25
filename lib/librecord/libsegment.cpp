@@ -427,6 +427,7 @@ void SegmentedRecorder::syncLoop() {
     auto lastReport = clock::now() - std::chrono::minutes(1);
 
     auto syncOne = [&](int fd, bool directory) {
+        if (syncTestHook_) syncTestHook_();
         const int64_t t0 = steadyNowNs();
         if ((directory ? ::fsync(fd) : ::fdatasync(fd)) != 0) {
             ++failCount;
@@ -460,6 +461,7 @@ void SegmentedRecorder::syncLoop() {
         const std::string wantAss = syncAssPath_;
         const bool stopping = syncStop_;
         lk.unlock();
+        syncBusySinceNs_.store(steadyNowNs());          // the watchdog times each round
 
         for (const auto& [path, directory] : jobs) {
             // A closed file we were tracking: sync it through our descriptor.
@@ -498,11 +500,14 @@ void SegmentedRecorder::syncLoop() {
             lastReport = clock::now();
         }
 
+        syncBusySinceNs_.store(0);
         if (stopping) break;
         lk.lock();
     }
+    syncBusySinceNs_.store(steadyNowNs());
     for (int* fd : {&mkvFd, &assFd})
         if (*fd >= 0) { syncOne(*fd, false); ::close(*fd); *fd = -1; }
+    syncBusySinceNs_.store(0);
 }
 
 // ─── watchdog + sidecar sampling (worker thread) ──────────────────────────────
@@ -510,6 +515,33 @@ void SegmentedRecorder::syncLoop() {
 void SegmentedRecorder::checkWatchdog() {
     if (!healthy_.load()) return;
     const int64_t now = steadyNowNs();
+
+    // Disk sync progress is watched from here: a stuck fdatasync never
+    // returns to report itself, and recording would carry on "healthy".
+    const int64_t busy = syncBusySinceNs_.load();
+    if (syncWarnedFor_ != 0 && busy != syncWarnedFor_) {        // that round finished
+        doLog(log_, LogLevel::INFO, "disk sync responding again after ~%lld ms",
+              static_cast<long long>((now - syncWarnedFor_) / 1000000));
+        syncWarnedFor_ = 0;
+    }
+    if (busy != 0 && opts_.syncIntervalMs > 0) {
+        const int64_t stuckMs = (now - busy) / 1000000;
+        const int64_t warnMs  = std::max<int64_t>(3000, 2 * int64_t(opts_.syncIntervalMs));
+        // A long interval means long healthy rounds (more to flush): the limit
+        // scales with it and always leaves room for the warning first.
+        const int64_t stallMs = opts_.syncStallTimeoutMs == 0
+                                    ? 0 : std::max<int64_t>(opts_.syncStallTimeoutMs, 2 * warnMs);
+        if (stuckMs >= warnMs && syncWarnedFor_ != busy) {
+            syncWarnedFor_ = busy;
+            doLog(log_, LogLevel::WARN, "disk sync not responding for %lld ms — footage written "
+                  "since then may not survive a power cut", static_cast<long long>(stuckMs));
+        }
+        if (stallMs > 0 && stuckMs >= stallMs) {
+            setError("disk sync stuck for " + std::to_string(stuckMs) + " ms (disk not responding)");
+            return;
+        }
+    }
+
     if (bufferCount_.load() == 0) {
         if (now - playingAtNs_ > int64_t(opts_.firstFrameTimeoutMs) * 1000000)
             setError("no first frame within " + std::to_string(opts_.firstFrameTimeoutMs) + " ms");
@@ -662,7 +694,7 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     desc += " ! queue name=recq max-size-buffers=8 leaky=0"
             " ! splitmuxsink name=smx async-finalize=true muxer-factory=matroskamux"
             " muxer-properties=\"properties,offset-to-zero=true\""
-            " sink-properties=\"properties,sync=false,async=false\""
+            " sink-properties=\"properties,sync=false,async=false,buffer-mode=(int)2\""
             " max-size-time=" + std::to_string(uint64_t(opts.segmentSec) * GST_SECOND);
     // Luma tap: a leaky branch that decodes ~2 frames/s at thumbnail size.  Its
     // elements are named luma* so a failure inside it is not mistaken for a
@@ -747,6 +779,8 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     ring_.clear();
     syncCount_.store(0);
     syncedFiles_.store(0);
+    syncBusySinceNs_.store(0);
+    syncWarnedFor_ = 0;
     {
         std::lock_guard<std::mutex> lock(syncMu_);
         syncStop_ = false;
@@ -869,7 +903,16 @@ bool SegmentedRecorder::stop() {
         if (cv.wait_for(lk, std::chrono::milliseconds(limitMs), [&] { return done; })) return;
         doLog(log_, LogLevel::ERROR, "recording teardown hung for %u ms%s", limitMs,
               opts_.exitOnTeardownHang ? " — exiting for the restart loop" : "");
-        if (opts_.exitOnTeardownHang) _exit(3);
+        if (opts_.exitOnTeardownHang) {
+            // The log is asynchronous: say it on stderr too (the journal gets
+            // it) and give the log a moment — bounded, its disk may be the
+            // wedged one — before the process is gone.
+            std::fprintf(stderr, "recording teardown hung for %u ms — exiting for the restart loop\n",
+                         limitMs);
+            std::fflush(stderr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            _exit(3);
+        }
         cv.wait(lk, [&] { return done; });
     });
 
