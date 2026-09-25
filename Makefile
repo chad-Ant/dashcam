@@ -45,13 +45,6 @@ LD_VPI  := -lvpi
 LD_GPIO  := -lgpiod
 LD_ALSA  := -lasound
 
-# ─── VPI guard ────────────────────────────────────────────────────────────────
-# libstereocam and the production dashcam binary require VPI 3.x headers
-# (vpi3-dev on JetPack 6.x).  Skip them when headers are absent so that
-# tests and demos build in environments where VPI is not installed.
-
-VPI_HDRS := $(wildcard /usr/include/vpi/Image.h)
-
 # ─── library source groups ────────────────────────────────────────────────────
 
 LIBCAM_CORE_SRCS := lib/libcamera/libcamera.cpp
@@ -86,11 +79,6 @@ LIBREC_SRCS      := lib/librecord/librecord.cpp lib/librecord/libsegment.cpp \
                     lib/librecord/libretention.cpp
 LIBSTEREO_SRCS := lib/libstereocam/libstereocam.cpp
 
-# Convenience group: all peripheral interface libs (no GStreamer / OpenCV dependency)
-# libcommlink sits on top of libuart, so it must follow it in the link order.
-LIBPERIPH_SRCS := $(LIBCAN_SRCS) $(LIBGPIO_SRCS) $(LIBI2C_SRCS) $(LIBMIDI_SRCS) $(LIBSPI_SRCS) \
-                  $(LIBUART_SRCS) $(LIBCOMM_SRCS)
-
 # ─── build directory (timestamped so parallel invocations don't collide) ──────
 
 TIMESTAMP := $(shell date +%Y%m%d_%H%M%S)
@@ -115,11 +103,6 @@ USB_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) src/t
 # record_test: UVC compressed-passthrough recording + ASS telemetry sidecar
 REC_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
                 $(LIBNET_SRCS) src/tests/test_librecord.cpp)
-
-# RETIRED with the librecord redesign (Cairo overlay + x264 branch recording
-# removed): recording_and_safe_shutdown, test_dual_recording,
-# test_single_record, dashcam_v0_1, demo_graphical, demo_terminal.  Sources
-# remain in-tree for reference but no longer compile against the new API.
 
 # dashcam_v0_2: v0.2 app — v0.1 + UFLD v2 lane detection on the IMX296 (needs TRT, no VPI)
 V02_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBREC_SRCS) \
@@ -179,10 +162,6 @@ CSI_RTP_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
 GPIO_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBGPIO_SRCS) $(LIBUART_SRCS) \
                  $(LIBI2C_SRCS) $(LIBSPI_SRCS) src/tests/gpio_test.cpp)
 
-# dashcam: production application (1 CSI + 3 USB + stereo + recording) — needs VPI
-DASHCAM_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPERIPH_SRCS) $(LIBCAM_SRCS) \
-                    $(LIBCFG_SRCS) $(LIBREC_SRCS) $(LIBSTEREO_SRCS) src/main.cpp)
-
 # lane_test: live-camera lane detection smoke test (10 s run)
 LANE_TEST_OBJS := $(call make_objs,    $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
                                         $(LIBLANE_SRCS) src/tests/test_lanedetector.cpp) \
@@ -193,23 +172,15 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
                                          $(LIBDSTATE_SRCS) src/tests/test_libdriverstate.cpp) \
                     $(call make_cu_objs, $(LIBDSTATE_CU_SRCS))
 
-# Always compile these; no VPI dependency.
-BASE_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(SCAN_OBJS) \
-                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
-                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
-                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
-
-ifneq ($(VPI_HDRS),)
-ALL_OBJS := $(sort $(BASE_OBJS) $(DASHCAM_OBJS))
-else
-ALL_OBJS := $(BASE_OBJS)
-endif
+ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(SCAN_OBJS) \
+                   $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
+                   $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
+                   $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
 
 DEPS := $(ALL_OBJS:.o=.d)
 
 # ─── targets ──────────────────────────────────────────────────────────────────
 
-# Targets that never need VPI.
 TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/usb_test \
            $(BUILD_DIR)/record_test \
@@ -230,11 +201,6 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/lane_test \
            $(BUILD_DIR)/driverstate_test
 
-# dashcam requires libstereocam which requires VPI headers.
-ifneq ($(VPI_HDRS),)
-TARGETS += $(BUILD_DIR)/dashcam
-endif
-
 .PHONY: all clean run dashcam_v0_3 dashcam_v0_4 commlink_test
 
 # `all` stays the default goal even though convenience aliases precede it.
@@ -250,9 +216,6 @@ commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
 # config/ dir is seeded with a default-valued dashcam.xml (and the attribute
 # dictionary); libconfig also recreates the defaults on demand at runtime.
 all: $(TARGETS) | $(BUILD_DIR)/logs $(BUILD_DIR)/config
-ifeq ($(VPI_HDRS),)
-	@echo "NOTE: VPI headers not found — dashcam target skipped (install vpi3-dev)"
-endif
 	@echo "Built all targets in $(BUILD_DIR)/ (logs -> $(BUILD_DIR)/logs/, config -> $(BUILD_DIR)/config/)"
 
 # Production launcher target: compile only v0.3 and its libraries, while still
@@ -276,11 +239,6 @@ $(BUILD_DIR)/config: $(BUILD_DIR)/write_default_config
 	@test -f $@/dashcam.xml || $(BUILD_DIR)/write_default_config $@/dashcam.xml
 	@cp -n config/camera_attributes.xml $@/ 2>/dev/null || true
 	@echo "Seeded $@/ (default dashcam.xml + camera_attributes.xml)"
-
-ifneq ($(VPI_HDRS),)
-$(BUILD_DIR)/dashcam: $(DASHCAM_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_CV) $(LD_VPI) $(LD_GPIO) $(LD_ALSA)
-endif
 
 $(BUILD_DIR)/csi_test: $(CSI_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
@@ -355,6 +313,7 @@ clean:
 	rm -rf bin/
 
 # ─── notes ────────────────────────────────────────────────────────────────────
-# To add a stereo standalone test binary, link:
+# libstereocam needs VPI 3.x (vpi3-dev) and has no target since the old
+# `dashcam` app (src/main.cpp) was removed.  To add a stereo test binary, link:
 #   $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBSTEREO_SRCS) + LD_BASE + LD_CV + LD_VPI
 # No stereo test binary exists yet; add src/tests/test_stereocam.cpp to activate.

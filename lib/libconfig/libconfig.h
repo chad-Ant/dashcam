@@ -296,7 +296,7 @@ inline constexpr const char* kFallbackConfigsName = "config";
  * XML section: @c \<System\>
  *
  * The config's own directory is not stored here — it is bootstrap-located from
- * kDefaultConfigsDir (see main.cpp), so a field pointing at it would be unusable.
+ * kDefaultConfigsDir (see the dashcam_v0_* apps), so a field pointing at it would be unusable.
  */
 struct SystemConfig {
     ConfigVar<std::string> footagePath  {"FootagePath",  kDefaultFootageDir, "Directory for recorded dashcam video (USB primary feed, with overlay)"};
@@ -307,7 +307,7 @@ struct SystemConfig {
  * @brief Camera GStreamer pipeline timing and queue tuning.
  *
  * libcamera cannot depend on libconfig (that would be circular — libconfig.cpp
- * includes libcamera.h), so main.cpp copies these values into a
+ * includes libcamera.h), so the app (dashcam_v0_2 / v0_3) copies these values into a
  * dashcam::camera::PipelineParams and calls Camera_GST::setPipelineParams().
  * XML section: @c \<Pipeline\>
  */
@@ -324,7 +324,7 @@ struct PipelineConfig {
  * @brief Async logger tuning.
  *
  * liblog cannot depend on libconfig (libconfig already depends on liblog), so
- * main.cpp copies these values into a dashcam::log::LogParams and passes them
+ * each app copies these values into a dashcam::log::LogParams and passes them
  * to dashcam::log::init().  The DASHCAM_LOG_LEVEL environment variable
  * overrides @c level at runtime.  XML section: @c \<Log\>
  */

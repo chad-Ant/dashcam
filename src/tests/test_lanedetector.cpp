@@ -78,7 +78,7 @@ static LaneDetectorConfig makeLaneConfig(
 }
 
 // True if this video node's sensor is the IMX296 (sysfs card name) — same
-// probe-order-proof selection dashcam_v0_1 uses.
+// probe-order-proof selection dashcam_v0_2 uses.
 static bool isImx296(const cameraInfo& info) {
     const std::string::size_type slash = info.address.find_last_of('/');
     const std::string node = (slash == std::string::npos)
