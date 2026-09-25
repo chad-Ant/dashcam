@@ -103,6 +103,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && PIP_INDEX_URL=https://pypi.org/simple pip3 install esptool \
     && arduino-cli version && esptool.py version
 
+# MKR Zero telemetry-master tooling: build and flash peripherals/mkr_zero from
+# the Jetson (peripherals/mkr_zero/build_and_upload.sh) over the MKR's
+# development USB port.
+#   - arduino:samd pinned to 1.8.14: vendor/Wire is a patched copy of that
+#     core's Wire and uses its private SERCOM API (the build script refuses any
+#     other core).  arduino-cli cannot install it on aarch64: one tool
+#     dependency, avrdude 6.3.0-arduino9, has no aarch64 build — the MKR boards
+#     upload with bossac, never avrdude — so install_samd_aarch64.py places the
+#     core and its other tools from Arduino's own index, checksum-verified.
+#   - The sketch's external libraries, pinned to the versions it was verified
+#     with on the Jetson (2026-09-25), without their example-only dependencies.
+ARG ARDUINO_SAMD_CORE=1.8.14
+COPY install_samd_aarch64.py /tmp/install_samd_aarch64.py
+RUN arduino-cli core update-index \
+    && python3 /tmp/install_samd_aarch64.py "$(arduino-cli config get directories.data)" "${ARDUINO_SAMD_CORE}" \
+    && arduino-cli core list | grep -q "^arduino:samd *${ARDUINO_SAMD_CORE}" \
+    && arduino-cli lib update-index \
+    && arduino-cli lib install --no-deps \
+        "Time@1.6.1" \
+        "SparkFun u-blox GNSS Arduino Library@2.2.29" \
+        "Servo@1.3.0" \
+        "RTCZero@1.6.0" \
+        "Adafruit BusIO@1.17.4" \
+        "Adafruit GFX Library@1.12.6" \
+        "Adafruit SSD1306@2.5.17" \
+        "Adafruit LED Backpack Library@1.5.1" \
+    && rm /tmp/install_samd_aarch64.py
+
 WORKDIR /home/app
 
 CMD ["/bin/bash"]
