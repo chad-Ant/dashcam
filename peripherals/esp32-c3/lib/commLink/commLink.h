@@ -29,6 +29,20 @@
 #ifndef COMMLINK_MAX_FRAMES_PER_POLL
 #define COMMLINK_MAX_FRAMES_PER_POLL 8u  ///< RX budget per poll() call (bounds work per loop).
 #endif
+/**
+ * How far the master's clock may disagree with this bridge's over the gap
+ * between two frames before they are taken to come from different master boots
+ * (ms). A proportional term of 1/1024 of the gap (~1000 ppm) is added on top.
+ *
+ * Both clocks time the same interval, so a continuous master agrees to within
+ * UART buffering and loop jitter — milliseconds — and crystal drift, which is
+ * tens of ppm. A reboot restarts the master's clock and misses by the whole
+ * uptime it lost. See CommLink::endedSession() for why a false positive is
+ * cheap.
+ */
+#ifndef COMMLINK_MASTER_CLOCK_SLACK_MS
+#define COMMLINK_MASTER_CLOCK_SLACK_MS 2000UL
+#endif
 
 /** @brief Non-blocking receiver + command sender for the master telemetry link. */
 class CommLink {
@@ -98,6 +112,45 @@ public:
      */
     void clearCoalesced();
 
+    /**
+     * @brief The frame a rebooted master's previous boot is still owed, if any.
+     *
+     * The accumulator above describes "every master frame since the last one
+     * forwarded", and a master reboot ends that interval: the frames after it
+     * come from a different boot. Merging across it put the old boot's High-G
+     * flag and 30 m/s2 peak on the new boot's first frame, beside an
+     * imuHighGCount of zero — an impact claimed by a session that never saw one.
+     *
+     * So poll() closes the accumulator at the boundary. What the old boot had
+     * not yet forwarded becomes ITS OWN frame: the old boot's masterMillis,
+     * imuHighGCount/imuHighGMs and flags, merged with its own events — and
+     * nothing that claims to be live. Every instantaneous field (vehicle, GPS,
+     * UTC, IMU axes, vehicle bus) carries the wire's "not supplied" value and
+     * OBD2_VALID / GPS_FIX / TIME_VALID are clear, because by the time it goes
+     * up those readings are a reboot old, and a consumer that takes the newest
+     * frame as current must not be handed one. The new boot starts from an
+     * empty accumulator.
+     *
+     * HELD UNTIL IT IS SENT, like the accumulator it came from: the caller
+     * forwards it ahead of the next frame it forwards and calls
+     * clearEndedSession() only on a confirmed send. So a host that is not
+     * streaming, or a full TX ring, delays the old boot's events rather than
+     * losing them — and a false positive costs nothing either, since the state
+     * goes up as a frame of its own instead of merged into the next one.
+     *
+     * One slot, keep-first: a second reboot while one is still owed clears the
+     * newer boot's accumulator (counted in endedDropped()). The older frame is
+     * the one no later frame could stand in for.
+     */
+    bool hasEndedSession() const { return endedPending_; }
+    const TelemetryPayload &endedSession() const { return ended_; }  ///< Valid while hasEndedSession().
+    void clearEndedSession() { endedPending_ = false; }  ///< Call ONLY after a confirmed send.
+    /** @brief Boots whose unsent frames were discarded because the slot was full. */
+    uint32_t endedDropped() const { return endedDropped_; }
+
+    /** @brief Master reboots detected since begin(), from the telemetry clock. */
+    uint32_t masterRestarts() const { return masterRestarts_; }
+
     /** @brief True if no telemetry arrived within the last @p ms milliseconds. */
     bool isStale(uint32_t ms) const { return !hasData_ || (millis() - lastRxMs_) > ms; }
 
@@ -143,6 +196,9 @@ private:
     /** @brief Folds one accepted frame into the coalescing accumulator. */
     void accumulate(const TelemetryPayload &src);
 
+    /** @brief Closes the accumulator at a master reboot; see endedSession(). */
+    void endMasterSession();
+
     HardwareSerial  *uart_ = nullptr;
     CommRxState      rx_;
     TelemetryPayload latest_ = {};
@@ -171,4 +227,13 @@ private:
     float    coalescedAccelPeak_ = NAN;
     float    coalescedGyroPeak_ = NAN;
     float    coalescedLinAccelPeak_ = NAN;
+
+    /// Frames folded into the accumulator since it was last cleared, i.e. not
+    /// yet carried by a successful forward. Zero means a reboot loses nothing.
+    uint32_t         unsent_ = 0;
+    uint32_t         masterRestarts_ = 0;
+    uint32_t         endedDropped_ = 0;
+    /// The ended boot's event frame, owed until clearEndedSession().
+    TelemetryPayload ended_ = {};
+    bool             endedPending_ = false;
 };

@@ -11,9 +11,12 @@
  * Downward (commLink) it asks the MKR for a 10 Hz stream and re-asks if the
  * link goes quiet.  Upward (hostLink) it answers the Jetson's commands and
  * forwards each master snapshot as it lands — event-driven, so the Jetson never
- * receives the same sample twice and never receives a stale one.  A 1 Hz
- * MSG_STATUS heartbeat carries bridge health regardless of whether telemetry is
- * flowing, which is what lets the Jetson tell "USB gone" from "MKR gone".
+ * receives the same sample twice and never receives a stale one.  (One kind of
+ * frame arrives late by design: after an MKR reboot, the old boot's unsent
+ * events, with every instantaneous reading blanked — CommLink::endedSession().)
+ * A 1 Hz MSG_STATUS heartbeat carries bridge health regardless of whether
+ * telemetry is flowing, which is what lets the Jetson tell "USB gone" from
+ * "MKR gone".
  *
  * Wiring:
  *   MKR Zero Serial1 TX (pin 14) -> C3 RX (GPIO20)
@@ -154,6 +157,7 @@ static bool     gForwardOnce    = false; ///< A CMD_GET_ONCE is waiting for the 
 static uint32_t gForwardOnceMs  = 0;     ///< millis() when that request was latched (expiry clock).
 static bool     gOncePendingTx  = false; ///< CMD_GET_ONCE not yet handed to the MKR (its TX was busy).
 static uint8_t  gDecimCount     = 0;
+static uint32_t gMasterRestarts = 0;     ///< gLink.masterRestarts() already logged.
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -283,9 +287,27 @@ static void forwardTelemetry()
         // count. The flags are sticky, so the event would eventually ride out on
         // a later frame; sending it now removes up to half a second of delay from
         // the one signal that exists because delay loses data.
-        if (!gLink.hasUrgent() && (++gDecimCount < gHost.decimation())) return;
+        //
+        // So does a frame still owed from a rebooted master's previous boot: it
+        // is an event record, and has waited at least a reboot already.
+        if (!gLink.hasUrgent() && !gLink.hasEndedSession() &&
+            (++gDecimCount < gHost.decimation())) return;
     }
     gDecimCount = 0;
+
+    // A rebooted master's previous boot goes up FIRST, as its own frame — its
+    // masterMillis, count and events, none of its stale readings (see
+    // CommLink::endedSession()). Cleared only on a confirmed send, like the
+    // accumulator it came from; until then nothing may overtake it, so a busy
+    // ring holds this frame too and both are retried with the next one. A
+    // one-shot requester receives it ahead of its answer: that host asked for
+    // telemetry, and this is telemetry it is owed.
+    if (gLink.hasEndedSession()) {
+        hostproto::Telemetry e;
+        toHostTelemetry(gLink.endedSession(), e);
+        if (!gHost.sendTelemetry(e)) return;   // a drop is counted in hostTxDropped
+        gLink.clearEndedSession();
+    }
 
     // The snapshot is the newest master frame; the merge restores what the frames
     // coalesced behind it carried. Done on a COPY, before the hand-off, so a
@@ -384,7 +406,15 @@ void loop()
     //    host-liveness timer fed.
     (void)gHost.poll(now);
     if (gHost.connectSeen()) {
-        gDecimCount = 0;
+        // A new host session starts with nothing owed to it. hostLink has
+        // already dropped the commands it had not handed over; the one-shot
+        // this sketch had latched from them is the same kind of leftover. Kept,
+        // the next master frame went to a host that never asked for it and had
+        // not enabled streaming. A GET_ONCE sent by the NEW host in this same
+        // batch is still pending in hostLink and is latched just below.
+        gDecimCount    = 0;
+        gForwardOnce   = false;
+        gOncePendingTx = false;
         greetHost(now);
     }
 
@@ -445,7 +475,17 @@ void loop()
 
     // 3) Master telemetry.  Always polled, host attached or not, so the UART
     //    ring never overflows and the staleness view stays honest.
-    if (gLink.poll()) {
+    const bool fresh = gLink.poll();
+
+    //    A master reboot ends a boot's frames. Say so; what that boot had not
+    //    yet forwarded goes up ahead of the next forwarded frame, from
+    //    forwardTelemetry().
+    if (gLink.masterRestarts() != gMasterRestarts) {
+        gMasterRestarts = gLink.masterRestarts();
+        bridgeLog(hostproto::LOG_WARN, "master restarted (telemetry clock discontinuity)");
+    }
+
+    if (fresh) {
         gMasterSeen   = true;
         gLastMasterMs = now;
         forwardTelemetry();

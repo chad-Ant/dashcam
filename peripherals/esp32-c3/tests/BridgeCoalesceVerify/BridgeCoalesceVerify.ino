@@ -65,6 +65,11 @@ static void group(const char *title)
 static void blankPayload(TelemetryPayload &p)
 {
     memset(&p, 0, sizeof(p));
+    // Stamped like a running master's, on this board's clock — which is the one
+    // CommLink compares it against. A fixed 0 would read as a master that
+    // rebooted between groups more than a couple of seconds apart, and poll()
+    // closes the accumulator and stops at a reboot (CommLink::takeEndedSession()).
+    p.masterMillis    = millis();
     p.imuAccelPeak    = NAN;
     p.imuGyroPeak     = NAN;
     p.imuLinAccelPeak = NAN;
