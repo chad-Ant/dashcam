@@ -48,10 +48,12 @@ struct LogParams {
 // config file.
 //
 // getCallback() returns a LogCallback that is safe to call from any number of
-// concurrent threads.  Once shutdown() has completed, late callbacks fall back
-// to stderr.  Under log pressure the async queue drops the oldest messages
-// rather than blocking the caller, so a slow console never stalls a producer
-// thread.
+// concurrent threads.  Under log pressure the async queue drops the oldest
+// messages rather than blocking the caller, so a slow console never stalls a
+// producer thread.  If the log FILE cannot be created, init() still installs
+// the async logger (console output only), so callers never block on a full
+// pipe.  Only before init() and after shutdown() do callbacks write to stderr
+// synchronously.
 //
 // shutdown() flushes and closes the log.  CONTRACT: stop/join every thread that
 // may call the log callback before invoking shutdown().  A callback racing
@@ -63,8 +65,16 @@ void        shutdown();
 LogCallback getCallback();
 
 // The directory init() resolved the log file into.  Empty until init() runs (or
-// if the file sink failed and logging fell back to stderr).
+// if the file sink failed and logging is console only).
 std::string logDir();
+
+// Log @p msg (ERROR) through @p log and _exit(@p code) — never blocking on the
+// callback, which may be synchronous (the stderr fallback, or any caller's)
+// and stuck on a full pipe or a wedged disk: it runs on a throwaway thread and
+// the process exits after @p waitMs regardless.  For last-resort exits that
+// hand recovery to an outer restart loop.
+[[noreturn]] void emergencyExit(const LogCallback& log, const std::string& msg, int code,
+                                int waitMs = 150);
 
 } // namespace dashcam::log
 

@@ -65,6 +65,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -112,6 +113,15 @@ static constexpr uint32_t    kEosTimeoutMs      = 4000;
 // normally a few ms) this long after the footage is final is wedged: a stuck
 // control write only returns at the USB timeout (~5 s each).
 static constexpr int         kCameraRestoreMs   = 2000;
+// A directory probe (test write + fsync) not back after this long means that
+// filesystem stopped answering: the directory counts as unusable.
+static constexpr int         kProbeTimeoutMs    = 5000;
+// The supervisor loop silent this long is stuck (everything it waits on is
+// bounded well below this): exit for the launcher's restart loop.
+static constexpr int         kSupervisorStuckMs = 30000;
+// Before starting a session on a nearly full disk, wait this long at most for
+// the retention pass (it runs on its own thread).
+static constexpr int         kPreStartRetentionMs = 3000;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -157,6 +167,56 @@ static int probeDir(const std::string& dir) {
     ::unlink(probe.c_str());
     return err;
 }
+
+// probeDir() with a deadline: the supervisor must never wait on a filesystem
+// that stopped answering.  The probe runs on its own thread; past the deadline
+// it counts as ETIMEDOUT and the thread is left to finish (detached).  While a
+// probe of a directory is still stuck, later probes of it fail at once rather
+// than piling up threads.
+class BoundedProbe {
+public:
+    using Fn = std::function<int(const std::string&)>;
+    explicit BoundedProbe(Fn probe = probeDir, int timeoutMs = kProbeTimeoutMs)
+        : probe_(std::move(probe)), timeoutMs_(timeoutMs) {}
+
+    int operator()(const std::string& dir) const {
+        auto sh = shared_;                               // outlives the detached probe
+        {
+            std::lock_guard<std::mutex> lk(sh->m);
+            if (!sh->busy.insert(dir).second) return ETIMEDOUT;   // previous one still stuck
+        }
+        auto result = std::make_shared<std::promise<int>>();
+        std::future<int> done = result->get_future();
+        try {
+            std::thread([sh, dir, result, probe = probe_] {
+                const int err = probe(dir);
+                {
+                    std::lock_guard<std::mutex> lk(sh->m);
+                    sh->busy.erase(dir);
+                }
+                result->set_value(err);
+            }).detach();
+        } catch (const std::system_error&) {             // no thread: probe inline
+            {
+                std::lock_guard<std::mutex> lk(sh->m);
+                sh->busy.erase(dir);
+            }
+            return probe_(dir);
+        }
+        if (done.wait_for(std::chrono::milliseconds(timeoutMs_)) != std::future_status::ready)
+            return ETIMEDOUT;
+        return done.get();
+    }
+
+private:
+    struct Shared {
+        std::mutex            m;
+        std::set<std::string> busy;
+    };
+    std::shared_ptr<Shared> shared_ = std::make_shared<Shared>();
+    Fn                      probe_;
+    int                     timeoutMs_;
+};
 
 // <repo>/footage_fallback: the binary lives in <repo>/bin/build_<ts>/, so this is
 // stable across builds (v0.3's per-build fallback was never cleaned up).
@@ -755,6 +815,17 @@ public:
     /// Retention in the held directory; @p watermark protects the open segments.
     rec::RetentionResult retain(uint64_t watermark) { return retainIn(dir_, watermark); }
 
+    /// The same pass as a self-contained job (copies only — no reference to
+    /// this object), for the retention thread: a directory scan and deletes
+    /// can block on a failing disk and must not hold up the supervisor.
+    std::function<rec::RetentionResult()> retentionPass(uint64_t watermark) const {
+        rec::RetentionPolicy p = policy_;
+        p.dir = dir_;
+        return [p, watermark, log = log_] {
+            return rec::enforceRetention(p, watermark, [] { return g_run != 0; }, log);
+        };
+    }
+
     void release() {
         if (lockFd_ >= 0) { ::close(lockFd_); lockFd_ = -1; }   // closing drops the flock
         dir_.clear();
@@ -778,7 +849,10 @@ private:
     // deletes anything in a directory whose lock it does not hold.
     bool claim(const std::string& dir, std::string& whyNot) {
         int err = probe_(dir);
-        if (err != 0 && err != ENOSPC) { whyNot = std::strerror(err); return false; }
+        if (err != 0 && err != ENOSPC) {
+            whyNot = err == ETIMEDOUT ? "not answering (write probe still pending)" : std::strerror(err);
+            return false;
+        }
         int fd = -1;
         if (dir != dir_) {
             fd = lockDir(dir, whyNot);             // keep the current lock until this one works
@@ -885,6 +959,254 @@ static int selfTestStorage() {
 // Wraps a log callback: each distinct message is logged once at its own level,
 // repeats at DEBUG.  For chatty retry loops (a missing bridge, an offline NTP
 // server) that would otherwise write the same line every few seconds forever.
+// ─── retention thread: deletes never block the supervisor ─────────────────────
+
+// Runs retention passes one at a time on its own thread; the supervisor only
+// posts a pass and collects its result.  A pass still running when the next
+// is due is not queued again.  At shutdown a pass stuck on a dead disk is left
+// behind (detached) instead of blocking the exit — passes hold only copies.
+class RetentionRunner {
+public:
+    using Pass = std::function<rec::RetentionResult()>;
+    RetentionRunner() : thread_([this] { loop(); }) {}
+    ~RetentionRunner() { stop(); }
+    RetentionRunner(const RetentionRunner&)            = delete;
+    RetentionRunner& operator=(const RetentionRunner&) = delete;
+
+    /// Start @p pass; false (nothing queued) while a previous pass still runs.
+    bool post(Pass pass) {
+        std::lock_guard<std::mutex> lk(sh_->m);
+        if (sh_->busy || sh_->stop) return false;
+        sh_->busy      = true;
+        sh_->since     = std::chrono::steady_clock::now();
+        sh_->job       = std::move(pass);
+        sh_->cv.notify_one();
+        return true;
+    }
+    /// A finished pass's result, once.
+    bool poll(rec::RetentionResult& out) {
+        std::lock_guard<std::mutex> lk(sh_->m);
+        if (!sh_->hasResult) return false;
+        out            = sh_->result;
+        sh_->hasResult = false;
+        return true;
+    }
+    /// How long the current pass has run (0 when idle).
+    int64_t busyMs() const {
+        std::lock_guard<std::mutex> lk(sh_->m);
+        return sh_->busy ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - sh_->since).count()
+                         : 0;
+    }
+    /// Wait at most @p ms for the current pass to finish; true when idle.
+    bool waitIdle(int ms) {
+        std::unique_lock<std::mutex> lk(sh_->m);
+        return sh_->cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return !sh_->busy; });
+    }
+    void stop() {
+        if (!thread_.joinable()) return;
+        bool busy;
+        {
+            std::lock_guard<std::mutex> lk(sh_->m);
+            sh_->stop = true;
+            busy      = sh_->busy;
+            sh_->cv.notify_all();
+        }
+        if (busy && !waitIdle(1000)) thread_.detach();    // stuck on a dead disk: leave it
+        else thread_.join();
+    }
+
+private:
+    struct Shared {                                        // shared with a detached thread
+        mutable std::mutex                    m;
+        std::condition_variable               cv;
+        bool                                  stop = false, busy = false, hasResult = false;
+        std::chrono::steady_clock::time_point since{};
+        Pass                                  job;
+        rec::RetentionResult                  result{};
+    };
+    std::shared_ptr<Shared> sh_ = std::make_shared<Shared>();
+    std::thread             thread_;
+
+    void loop() {
+        auto sh = sh_;                                     // keep it alive even if detached
+        std::unique_lock<std::mutex> lk(sh->m);
+        for (;;) {
+            sh->cv.wait(lk, [&] { return sh->stop || (sh->busy && sh->job); });
+            if (sh->stop && !sh->job) return;
+            Pass job = std::move(sh->job);
+            sh->job  = nullptr;
+            lk.unlock();
+            const rec::RetentionResult r = job();
+            lk.lock();
+            sh->result    = r;
+            sh->hasResult = true;
+            sh->busy      = false;
+            sh->cv.notify_all();
+            if (sh->stop) return;
+        }
+    }
+};
+
+// ─── supervisor heartbeat: the last line of recovery ─────────────────────────
+
+// Everything the supervisor waits on is bounded (recorder.stop() by its own
+// deadline, the camera hand-back by kCameraRestoreMs, directory probes by
+// kProbeTimeoutMs; retention runs on its own thread) — but anything left that
+// blocks it (a V4L2 ioctl on a wedged device, a filesystem call not yet
+// bounded, a blocking log fallback) would leave a dead recording unrecovered.
+// This thread does no I/O: if the loop stops beating for limitMs it calls
+// onStuck (in v0.4: emergencyExit, so the launcher's restart loop takes over).
+class SupervisorWatchdog {
+public:
+    using StuckFn = std::function<void(int64_t silentMs)>;
+    SupervisorWatchdog(int limitMs, StuckFn onStuck)
+        : limitMs_(limitMs), onStuck_(std::move(onStuck)) {
+        beat();
+        thread_ = std::thread([this] { loop(); });
+    }
+    ~SupervisorWatchdog() { stop(); }
+    SupervisorWatchdog(const SupervisorWatchdog&)            = delete;
+    SupervisorWatchdog& operator=(const SupervisorWatchdog&) = delete;
+
+    void beat() {
+        beatNs_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    const int               limitMs_;
+    StuckFn                 onStuck_;
+    std::atomic<int64_t>    beatNs_{0};
+    std::mutex              m_;
+    std::condition_variable cv_;
+    bool                    stop_ = false;
+    std::thread             thread_;
+
+    void loop() {
+        const auto tick = std::chrono::milliseconds(std::max(50, std::min(500, limitMs_ / 8)));
+        std::unique_lock<std::mutex> lk(m_);
+        while (!cv_.wait_for(lk, tick, [&] { return stop_; })) {
+            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const int64_t silentMs = (now - beatNs_.load()) / 1000000;
+            if (silentMs < limitMs_) continue;
+            lk.unlock();
+            onStuck_(silentMs);                            // v0.4: does not return
+            return;
+        }
+    }
+};
+
+// ─── --self-test: nothing the supervisor does may block it ───────────────────
+
+static int selfTestSupervision() {
+    int failures = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++failures;
+    };
+    using clk = std::chrono::steady_clock;
+    auto msSince = [](clk::time_point t0) {
+        return (long)std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
+    };
+    std::printf("dashcam_v0_4 self-test (supervision)\n");
+    {
+        // A probe that blocks until released: a filesystem that stopped answering.
+        auto gate = std::make_shared<std::atomic<bool>>(false);
+        BoundedProbe probe([gate](const std::string&) {
+            while (!gate->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return 0;
+        }, 200);
+        auto t0 = clk::now();
+        const int e1 = probe("/stuck");
+        const long ms1 = msSince(t0);
+        check(e1 == ETIMEDOUT && ms1 >= 190 && ms1 < 600, "stuck probe times out (" + std::to_string(ms1) + " ms)");
+        t0 = clk::now();
+        const int e2 = probe("/stuck");
+        check(e2 == ETIMEDOUT && msSince(t0) < 50, "while it is still stuck, the next probe fails at once");
+        gate->store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check(probe("/stuck") == 0, "once the filesystem answers, probes work again");
+    }
+    {
+        // Storage with a preferred directory that stopped answering: falls back.
+        char ta[] = "/tmp/v04_selftest_stuckpref_XXXXXX";
+        char tb[] = "/tmp/v04_selftest_stuckfb_XXXXXX";
+        if (::mkdtemp(ta) && ::mkdtemp(tb)) {
+            const std::string A = ta, B = tb;
+            auto gate = std::make_shared<std::atomic<bool>>(false);
+            BoundedProbe probe([gate, A](const std::string& d) {
+                if (d == A) while (!gate->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                return probeDir(d);
+            }, 300);
+            rec::RetentionPolicy pol;
+            pol.prefix = kPrefix;
+            Storage st(A, pol, [](LogLevel, const std::string&) {}, B, probe);
+            std::string why;
+            const auto t0 = clk::now();
+            const std::string got = st.acquire(why);
+            check(got == B && msSince(t0) < 1500, "preferred directory not answering: fallback within the probe deadline");
+            check(!st.preferredBack(), "... and it is not 'back' while its probe is stuck");
+            gate->store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            check(st.preferredBack(), "... until it answers again");
+            st.release();
+            std::error_code ec;
+            fs::remove_all(A, ec);
+            fs::remove_all(B, ec);
+        } else {
+            check(false, "temp dirs");
+        }
+    }
+    {
+        auto gate = std::make_shared<std::atomic<bool>>(false);
+        RetentionRunner rr;
+        auto t0 = clk::now();
+        const bool posted = rr.post([gate] {
+            while (!gate->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            rec::RetentionResult r{};
+            r.deleted = 3;
+            return r;
+        });
+        check(posted && msSince(t0) < 50, "retention pass posted without waiting for it");
+        check(!rr.post([] { return rec::RetentionResult{}; }), "a second pass is not queued while one runs");
+        rec::RetentionResult res{};
+        check(!rr.poll(res) && !rr.waitIdle(100), "no result while the pass is stuck");
+        gate->store(true);
+        check(rr.waitIdle(1000) && rr.poll(res) && res.deleted == 3 && !rr.poll(res),
+              "its result is collected once when it finishes");
+        auto gate2 = std::make_shared<std::atomic<bool>>(false);
+        rr.post([gate2] {
+            while (!gate2->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return rec::RetentionResult{};
+        });
+        t0 = clk::now();
+        rr.stop();                                           // pass stuck on a dead disk
+        check(msSince(t0) < 1500, "shutdown does not wait for a stuck pass");
+        gate2->store(true);
+    }
+    {
+        std::atomic<int> fired{0};
+        std::atomic<int64_t> silent{0};
+        SupervisorWatchdog wd(300, [&](int64_t ms) { silent = ms; ++fired; });
+        for (int i = 0; i < 12; ++i) { wd.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+        check(fired == 0, "a beating supervisor is left alone");
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        check(fired == 1 && silent >= 300, "a silent supervisor is caught once (" + std::to_string(silent) + " ms)");
+        wd.stop();
+    }
+    return failures;
+}
+
 static dashcam::log::LogCallback quietRepeats(dashcam::log::LogCallback log) {
     auto seen = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
     return [log, seen](LogLevel lvl, const std::string& msg) {
@@ -945,7 +1267,8 @@ private:
 
 int main(int argc, char* argv[]) {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
-        const int failures = selfTestCameras() + selfTestStorage() + selfTestStopSession();
+        const int failures = selfTestCameras() + selfTestStorage() + selfTestStopSession() +
+                             selfTestSupervision();
         std::printf("RESULT: %s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures,
                     failures == 1 ? "" : "s");
         return failures ? 1 : 0;
@@ -1017,7 +1340,10 @@ int main(int argc, char* argv[]) {
     policy.prefix       = kPrefix;
     policy.maxBytes     = quota;
     policy.minFreeBytes = floor;
-    Storage   storage(cfg.system.footagePath, policy, log);
+    // Directory probes are bounded: a footage filesystem that stopped
+    // answering counts as unusable instead of stalling the supervisor.
+    Storage   storage(cfg.system.footagePath, policy, log, fallbackFootageDir(), BoundedProbe{});
+    RetentionRunner retention;             // deletes run off the supervisor
     FailureLog failures(log);
 
     rec::SegmentedRecorder recorder;
@@ -1046,13 +1372,8 @@ int main(int argc, char* argv[]) {
                                     std::to_string(kCameraRestoreMs) + " ms after the footage was "
                                     "finalised — " + (shuttingDown ? "exiting (shutdown)"
                                                                    : "exiting for the restart loop");
-            log(LogLevel::ERROR, why);
-            // The log is asynchronous: stderr too (the journal gets it), and a
-            // brief, bounded moment for the log file before the process is gone.
-            std::fprintf(stderr, "%s\n", why.c_str());
-            std::fflush(stderr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            _exit(shuttingDown ? 0 : 3);
+            // Never blocking on the log callback (it may be synchronous).
+            dashcam::log::emergencyExit(log, why, shuttingDown ? 0 : 3);
         }
     };
 
@@ -1144,8 +1465,23 @@ int main(int argc, char* argv[]) {
     auto nextProbe     = nextAttempt + kPreferredProbe;
     bool warnedStillOver = false;
 
+    // Retention runs on its own thread (a scan + deletes can block on a failing
+    // disk): runRetention() only posts a pass; collectRetention() logs results.
     auto runRetention = [&]() {
-        const auto res = storage.retain(recorder.deletableBelowSeq());
+        nextRetention = std::chrono::steady_clock::now() + kRetentionEvery;
+        if (!storage.dir().empty()) retention.post(storage.retentionPass(recorder.deletableBelowSeq()));
+    };
+    bool retentionSlowWarned = false;
+    auto collectRetention = [&]() {
+        const int64_t busyMs = retention.busyMs();
+        if (busyMs > 60000 && !retentionSlowWarned) {
+            log(LogLevel::WARN, "retention pass running for " + std::to_string(busyMs / 1000) +
+                                " s — footage disk slow or not answering");
+            retentionSlowWarned = true;
+        }
+        rec::RetentionResult res;
+        if (!retention.poll(res)) return;
+        retentionSlowWarned = false;
         if (res.deleted > 0)
             log(LogLevel::INFO, "retention: deleted " + std::to_string(res.deleted) + " file(s), " +
                                 std::to_string(res.freedBytes / 1000000) + " MB; footage now " +
@@ -1158,7 +1494,6 @@ int main(int argc, char* argv[]) {
                                 ")");
         }
         warnedStillOver = res.stillOver;
-        nextRetention = std::chrono::steady_clock::now() + kRetentionEvery;
     };
 
     auto scheduleRetry = [&](const std::string& why) {
@@ -1175,7 +1510,11 @@ int main(int argc, char* argv[]) {
         const std::string dir = storage.acquire(why);
         if (dir.empty()) { scheduleRetry(why); return false; }
         const int64_t freeNow = freeBytes(dir);
-        if (freeNow >= 0 && static_cast<uint64_t>(freeNow) < kHardFloorBytes) runRetention();
+        if (freeNow >= 0 && static_cast<uint64_t>(freeNow) < kHardFloorBytes) {
+            runRetention();                            // make room first — boundedly
+            retention.waitIdle(kPreStartRetentionMs);
+            collectRetention();
+        }
 
         std::vector<cameraInfo> cams;
         getCameraList(cams, recLog);
@@ -1236,9 +1575,25 @@ int main(int argc, char* argv[]) {
         return true;
     };
 
+    // ── supervisor heartbeat ─────────────────────────────────────────────────
+    // An independent, I/O-free thread: if this loop stops beating (a blocked
+    // device or filesystem call), exit so the launcher's restart loop recovers.
+    // Exit 0 only on SIGINT/SIGTERM once the footage is final.
+    std::atomic<bool> footageFinal{false};
+    SupervisorWatchdog heartbeat(kSupervisorStuckMs, [&](int64_t silentMs) {
+        const bool clean = !g_run && footageFinal.load();
+        dashcam::log::emergencyExit(
+            log, "supervisor stuck for " + std::to_string(silentMs / 1000) + " s (a blocked device "
+                 "or filesystem call) — " + (clean ? "exiting (shutdown, footage final)"
+                                                   : "exiting for the restart loop"),
+            clean ? 0 : 3);
+    });
+
     // ── supervisor loop ──────────────────────────────────────────────────────
     while (g_run) {
+        heartbeat.beat();
         const auto now = std::chrono::steady_clock::now();
+        collectRetention();
         double jump = 0.0;
         if (clockJumps.poll(jump)) {
             char b[96];
@@ -1303,12 +1658,18 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(kTick);
     }
 
+    heartbeat.beat();
     log(LogLevel::INFO, "shutdown requested");
     stopRecording();
+    footageFinal.store(true);
+    heartbeat.beat();
     timeRun.store(false);
     bridge.close();
+    heartbeat.beat();
     if (ntpThread.joinable()) ntpThread.join();
+    retention.stop();                          // a pass stuck on a dead disk is left behind
     storage.release();
+    heartbeat.stop();
     log(LogLevel::INFO, "dashcam v0.4 stopped (" + std::to_string(sessions) + " recording session" +
                         (sessions == 1 ? "" : "s") + ")");
     dashcam::log::shutdown();

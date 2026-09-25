@@ -22,6 +22,9 @@
 #include <iterator>
 #include <string>
 #include <thread>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -71,9 +74,78 @@ static int childLevelTest(const std::string& dir) {
     return f;
 }
 
+// Make @p fd a pipe that is full and blocking, with the read end kept open
+// and never read: a stalled log collector.
+static bool fillPipeOnto(int fd) {
+    int p[2];
+    if (::pipe(p) != 0) return false;
+    ::fcntl(p[1], F_SETFL, O_NONBLOCK);
+    static const char junk[4096] = {};
+    while (::write(p[1], junk, sizeof junk) > 0) {}
+    ::fcntl(p[1], F_SETFL, 0);
+    return ::dup2(p[1], fd) >= 0;
+}
+
+// Child: the log FILE cannot be created (its directory would live under a
+// regular file).  init() must still install the async logger, console only,
+// so producers never block — even with stdout and stderr both full pipes
+// (a synchronous stderr fallback would block right here).
+static int childConsoleFallback(const std::string& file) {
+    init(file + "/logs");
+    int f = logDir().empty() ? 0 : 1;              // no file sink
+    if (!fillPipeOnto(STDOUT_FILENO) || !fillPipeOnto(STDERR_FILENO)) return 20;
+    auto log = getCallback();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20000; ++i) log(LogLevel::ERROR, "console-only-" + std::to_string(i));
+    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2)) f += 2;
+    ::_exit(f);                                    // not shutdown(): it would flush into the full pipe
+}
+
+// Child: emergencyExit() with the synchronous stderr fallback (no init())
+// stuck on a full stderr pipe must still exit, with the given code.
+static int childEmergency() {
+    if (!fillPipeOnto(STDERR_FILENO)) return 20;
+    emergencyExit(getCallback(), "emergency-exit-test", 7);
+}
+
+// Run this binary with @p args; exit status, or -1 if it had to be killed
+// after @p limitMs.  @p ms receives the run time.
+static int runChild(const std::vector<std::string>& args, int limitMs, long& ms) {
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return -2;
+    exe[n] = '\0';
+    const auto t0 = std::chrono::steady_clock::now();
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        std::vector<char*> av{exe};
+        for (const auto& a : args) av.push_back(const_cast<char*>(a.c_str()));
+        av.push_back(nullptr);
+        ::execv(exe, av.data());
+        ::_exit(127);
+    }
+    int status = 0;
+    for (;;) {
+        if (::waitpid(pid, &status, WNOHANG) == pid) break;
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(limitMs)) {
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+            ms = limitMs;
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -3;
+}
+
 int main(int argc, char* argv[]) {
     if (argc == 3 && std::string(argv[1]) == "--child-level")
         return childLevelTest(argv[2]);
+    if (argc == 3 && std::string(argv[1]) == "--child-console-fallback")
+        return childConsoleFallback(argv[2]);
+    if (argc == 2 && std::string(argv[1]) == "--child-emergency")
+        return childEmergency();
 
     std::cout << "--- pre-init callback (should fall back to stderr, not crash) ---\n";
     getCallback()(LogLevel::WARN, "pre-init-warning");
@@ -162,6 +234,21 @@ int main(int argc, char* argv[]) {
             CHECK(false, "readlink(/proc/self/exe) failed; child test not run");
         }
         fs::remove_all("/tmp/liblog_test_child", ec);
+    }
+
+    std::cout << "\n--- child processes: never block on a full pipe ---\n";
+    {
+        const std::string regular = "/tmp/liblog_test_regular_file";
+        std::ofstream(regular) << "x";
+        long ms = 0;
+        const int rc = runChild({"--child-console-fallback", regular}, 10000, ms);
+        CHECK(rc == 0, "log file impossible: async console-only logger, producers never block on a full "
+                       "stdout (rc " + std::to_string(rc) + ", " + std::to_string(ms) + " ms)");
+        std::error_code ec;
+        fs::remove(regular, ec);
+        const int rc2 = runChild({"--child-emergency"}, 10000, ms);
+        CHECK(rc2 == 7 && ms < 2000, "emergencyExit exits (code 7) though the stderr fallback is stuck on a "
+                                     "full pipe (rc " + std::to_string(rc2) + ", " + std::to_string(ms) + " ms)");
     }
 
     std::cout << "\nLog file left for inspection: " << file << "\n";

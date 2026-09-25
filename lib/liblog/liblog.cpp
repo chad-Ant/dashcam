@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -98,33 +99,27 @@ void init(const std::string& logDir, const LogParams& params) {
         dir.c_str(),
         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
         tm.tm_hour, tm.tm_min, tm.tm_sec);
-    if (need < 0 || need >= static_cast<int>(sizeof(fname))) {
-        // A silently truncated path would create the log somewhere unintended;
-        // refuse instead — callbacks fall back to stderr (g_logger stays null).
-        std::fprintf(stderr, "liblog: log path exceeds PATH_MAX, logging to stderr\n");
-        return;
-    }
-
+    // The async machinery first: whatever happens to the log FILE below, a
+    // caller must never end up writing to stderr synchronously (a full pipe
+    // would block it).  Worker count stays 1: more workers would let spdlog
+    // interleave lines out of order.  Guard degenerate tunables so a
+    // hostile/corrupt config cannot zero the queue or the rotation.
+    const size_t queueSize = params.queueSize > 0 ? params.queueSize : 8192;
+    const size_t rotateKb  = params.rotateSizeKb > 0 ? params.rotateSizeKb : 3072;
+    const size_t rotFiles  = params.rotateFiles > 0 ? params.rotateFiles : 3;
     try {
-        // Worker count stays 1 regardless of params: more workers would let
-        // spdlog interleave lines out of order.  Guard degenerate tunables so
-        // a hostile/corrupt config cannot zero the queue or the rotation.
-        const size_t queueSize = params.queueSize > 0 ? params.queueSize : 8192;
-        const size_t rotateKb  = params.rotateSizeKb > 0 ? params.rotateSizeKb : 3072;
-        const size_t rotFiles  = params.rotateFiles > 0 ? params.rotateFiles : 3;
         spdlog::init_thread_pool(queueSize, 1);
+    } catch (const spdlog::spdlog_ex& ex) {
+        std::fprintf(stderr, "liblog: spdlog init failed: %s\n", ex.what());
+        return;                                  // callbacks fall back to stderr
+    }
+    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            fname, rotateKb * 1024, rotFiles);
-        file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-
-        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
-
-        std::vector<spdlog::sink_ptr> sinks{console_sink, file_sink};
-        // overrun_oldest (not block): under log pressure drop the oldest queued
-        // messages instead of blocking producers — a slow console must never
-        // stall a capture/inference thread on this real-time box.
+    // overrun_oldest (not block): under log pressure drop the oldest queued
+    // messages instead of blocking producers — a slow console must never
+    // stall a capture/inference thread on this real-time box.
+    auto publish = [&params](std::vector<spdlog::sink_ptr> sinks) {
         auto logger = std::make_shared<spdlog::async_logger>(
             "dashcam",
             sinks.begin(), sinks.end(),
@@ -132,8 +127,8 @@ void init(const std::string& logDir, const LogParams& params) {
             spdlog::async_overflow_policy::overrun_oldest);
         logger->set_level(initialLevel(params));
         // Without a flush policy the async sinks buffer until shutdown(), so a
-        // running app (or one killed before a clean shutdown) leaves the log file
-        // empty.  Flush at params.flushOn (default WARN) immediately, and
+        // running app (or one killed before a clean shutdown) leaves the log
+        // file empty.  Flush at params.flushOn (default WARN) immediately, and
         // everything else on a periodic timer so `tail -f` shows near-real-time
         // output without flushing every line (which would defeat the async
         // design on this real-time box).
@@ -141,18 +136,36 @@ void init(const std::string& logDir, const LogParams& params) {
         spdlog::register_logger(logger);
         if (params.flushEverySec > 0)
             spdlog::flush_every(std::chrono::seconds(params.flushEverySec));
-        {
-            std::lock_guard<std::mutex> lk(g_dirMutex);
-            g_logDir = dir;   // publish the resolved directory for logDir()
-        }
         // Publish atomically; the callback reads it via std::atomic_load.
         // g_logger is shared_ptr<spdlog::logger>; upcast the async_logger so the
         // std::atomic_store overload deduces a single element type.
-        std::atomic_store(&g_logger,
-                          std::static_pointer_cast<spdlog::logger>(logger));
+        std::atomic_store(&g_logger, std::static_pointer_cast<spdlog::logger>(logger));
+    };
+    // No log file after all: the same async logger with console output only.
+    auto consoleOnly = [&](const char* why) {
+        std::fprintf(stderr, "liblog: no log file (%s) — console only\n", why);
+        try {
+            spdlog::drop("dashcam");
+            publish({console_sink});
+        } catch (const spdlog::spdlog_ex& ex) {
+            std::fprintf(stderr, "liblog: spdlog init failed: %s\n", ex.what());
+        }
+    };
+
+    if (need < 0 || need >= static_cast<int>(sizeof(fname))) {
+        // A silently truncated path would create the log somewhere unintended.
+        consoleOnly("log path exceeds PATH_MAX");
+        return;
+    }
+    try {
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            fname, rotateKb * 1024, rotFiles);
+        file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+        publish({console_sink, file_sink});
+        std::lock_guard<std::mutex> lk(g_dirMutex);
+        g_logDir = dir;   // publish the resolved directory for logDir()
     } catch (const spdlog::spdlog_ex& ex) {
-        std::fprintf(stderr, "liblog: spdlog init failed: %s\n", ex.what());
-        // g_logger was never published; callbacks fall back to stderr.
+        consoleOnly(ex.what());
     }
 
     }); // call_once
@@ -169,6 +182,20 @@ void shutdown() {
     std::atomic_store(&g_logger, std::shared_ptr<spdlog::logger>{});
     spdlog::drop("dashcam");
     spdlog::shutdown();
+}
+
+void emergencyExit(const LogCallback& log, const std::string& msg, int code, int waitMs) {
+    // The callback may be synchronous (the stderr fallback, a caller's own)
+    // and block on a full pipe or a wedged disk: it runs on a throwaway
+    // thread, and the exit comes after waitMs whatever it does.
+    if (log) {
+        try {
+            std::thread([log, msg] { log(LogLevel::ERROR, msg); }).detach();
+        } catch (...) {                         // no thread: exit without the message
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(waitMs > 0 ? waitMs : 0));
+    ::_exit(code);
 }
 
 std::string logDir() {

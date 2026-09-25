@@ -512,12 +512,29 @@ void SegmentedRecorder::syncLoop() {
 
 // ─── watchdog + sidecar sampling (worker thread) ──────────────────────────────
 
+// ─── watchdog thread ──────────────────────────────────────────────────────────
+
+// No filesystem I/O here or in checkWatchdog(): only atomics, setError()
+// (stateMutex_, never held across I/O) and log calls, which only enqueue
+// (liblog: async, overrun_oldest).  So a disk that blocks the worker and the
+// sync thread cannot silence the checks that let the caller start recovery.
+void SegmentedRecorder::monitorLoop() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(monMu_);
+            if (monCv_.wait_for(lk, std::chrono::milliseconds(200), [&] { return monStop_; })) return;
+        }
+        checkWatchdog();
+    }
+}
+
 void SegmentedRecorder::checkWatchdog() {
     if (!healthy_.load()) return;
     const int64_t now = steadyNowNs();
 
-    // Disk sync progress is watched from here: a stuck fdatasync never
-    // returns to report itself, and recording would carry on "healthy".
+    // Disk sync progress is watched from here, the monitor thread: a stuck
+    // fdatasync never returns to report itself, and recording would carry on
+    // "healthy" — and the worker may be stuck on the same disk.
     const int64_t busy = syncBusySinceNs_.load();
     if (syncWarnedFor_ != 0 && busy != syncWarnedFor_) {        // that round finished
         doLog(log_, LogLevel::INFO, "disk sync responding again after ~%lld ms",
@@ -624,10 +641,11 @@ void SegmentedRecorder::workerLoop() {
             std::this_thread::sleep_for(interval);
         }
 
-        checkWatchdog();
         if (assEnabled_) takeSample(durNs, staleMs);
 
         if (assFile_.is_open()) {
+            if (workerTestHook_) workerTestHook_();
+
             if (durable) {
                 assFile_.flush();
             } else if (std::chrono::steady_clock::now() >= nextFlush) {
@@ -817,6 +835,11 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     // The sync thread first: the worker may hand it work as soon as it runs.
     if (opts.syncIntervalMs > 0) syncThread_ = std::thread(&SegmentedRecorder::syncLoop, this);
     worker_ = std::thread(&SegmentedRecorder::workerLoop, this);
+    {
+        std::lock_guard<std::mutex> lk(monMu_);
+        monStop_ = false;
+    }
+    monitor_ = std::thread(&SegmentedRecorder::monitorLoop, this);
     doLog(log_, LogLevel::INFO, "segmented recording started on %s (%ux%u %s @%.1f, %u s segments)",
           devicePath.c_str(), fmt.width, fmt.height, mjpeg ? "MJPEG" : "H264",
           static_cast<double>(fmt.fps), opts.segmentSec);
@@ -901,20 +924,21 @@ bool SegmentedRecorder::stop() {
     std::thread guard([&] {
         std::unique_lock<std::mutex> lk(m);
         if (cv.wait_for(lk, std::chrono::milliseconds(limitMs), [&] { return done; })) return;
-        doLog(log_, LogLevel::ERROR, "recording teardown hung for %u ms%s", limitMs,
-              opts_.exitOnTeardownHang ? " — exiting for the restart loop" : "");
-        if (opts_.exitOnTeardownHang) {
-            // The log is asynchronous: say it on stderr too (the journal gets
-            // it) and give the log a moment — bounded, its disk may be the
-            // wedged one — before the process is gone.
-            std::fprintf(stderr, "recording teardown hung for %u ms — exiting for the restart loop\n",
-                         limitMs);
-            std::fflush(stderr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            _exit(3);
-        }
+        const std::string why = "recording teardown hung for " + std::to_string(limitMs) + " ms";
+        // Nothing on the exit path may block — not a log callback (possibly
+        // synchronous, e.g. stuck on a full stderr pipe), not the wedged disk.
+        if (opts_.exitOnTeardownHang)
+            dashcam::log::emergencyExit(log_, why + " — exiting for the restart loop", 3);
+        doLog(log_, LogLevel::ERROR, "%s", why.c_str());
         cv.wait(lk, [&] { return done; });
     });
+
+    {                                                          // watchdog off (never blocks)
+        std::lock_guard<std::mutex> lk(monMu_);
+        monStop_ = true;
+    }
+    monCv_.notify_all();
+    if (monitor_.joinable()) monitor_.join();
 
     stopFlag_.store(true);
     if (GstBus* bus = gst_element_get_bus(pipeline_)) {        // wake the worker now

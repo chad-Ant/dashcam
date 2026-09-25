@@ -550,6 +550,13 @@ private:
     SegmentOptions       opts_;
     uint32_t             videoW_ = 0, videoH_ = 0;
     std::thread          worker_;
+    // The watchdog runs on its own thread, which does no filesystem I/O: a
+    // disk that blocks the worker's sidecar writes AND the sync thread's
+    // fdatasync must not also silence the checks that start recovery.
+    std::thread             monitor_;
+    std::mutex              monMu_;
+    std::condition_variable monCv_;
+    bool                    monStop_ = false;    ///< Guarded by monMu_.
     std::atomic<bool>    stopFlag_{false};
     std::atomic<bool>    healthy_{false};
     std::atomic<bool>    eosSeen_{false};
@@ -561,8 +568,9 @@ private:
     std::atomic<uint64_t> syncCount_{0};
     std::atomic<uint64_t> syncedFiles_{0};
     std::atomic<int64_t>  syncBusySinceNs_{0};  ///< steady ns a sync round began; 0 = idle.
-    int64_t               syncWarnedFor_ = 0;   ///< Worker: the stuck round already reported.
+    int64_t               syncWarnedFor_ = 0;   ///< Monitor: the stuck round already reported.
     std::function<void()> syncTestHook_;        ///< Test hook: runs before each sync call.
+    std::function<void()> workerTestHook_;      ///< Test hook: runs where the worker writes the sidecar.
     std::atomic<uint64_t> sourceCount_{0};      ///< Frames entering the RecordFps cap.
     bool                  hasRateCap_ = false;
 
@@ -594,7 +602,8 @@ private:
     void handleMessage(GstMessage* msg);
     void onFragmentOpened(const std::string& location, int64_t rtNs);
     void onFragmentClosed(const std::string& location);
-    void checkWatchdog();
+    void monitorLoop();                          ///< checkWatchdog() every 200 ms; no filesystem I/O.
+    void checkWatchdog();                        ///< Monitor thread: atomics, setError, log (enqueue only).
     void takeSample(int64_t durNs, int64_t staleMs);
     int64_t runningTimeNs() const;               ///< Pipeline clock − base time; -1 if unknown.
     void setError(const std::string& why);
