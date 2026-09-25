@@ -60,14 +60,18 @@ exec docker run $TTY_FLAGS --rm --name "$CONTAINER_NAME" --stop-timeout 20 \
     -v /etc/localtime:/etc/localtime:ro \
     -v /etc/timezone:/etc/timezone:ro \
     $IMAGE_NAME bash -c '
+        # Launcher messages share the container stdout with the binary: a
+        # stalled log collector must not block this script (above all the
+        # restart below), so a message that cannot be written in 1 s is dropped.
+        say() { timeout -s KILL 1 printf "%s\n" "$*" 2>/dev/null || true; }
         cd /user/dashcam || exit 1
         BIN=$(ls -td bin/build_*/dashcam_v0_4 2>/dev/null | head -1)
         if [ "$REBUILD" = 1 ] || [ -z "$BIN" ]; then
-            echo "building dashcam_v0_4 from the mounted source..."
+            say "building dashcam_v0_4 from the mounted source..."
             make -j6 dashcam_v0_4 || exit 1
             BIN=$(ls -td bin/build_*/dashcam_v0_4 2>/dev/null | head -1)
         fi
-        [ -n "$BIN" ] || { echo "no dashcam_v0_4 binary"; exit 1; }
+        [ -n "$BIN" ] || { say "no dashcam_v0_4 binary"; exit 1; }
 
         # Restart loop.  Signals are forwarded to the running binary; its exit
         # status then decides: 0 = graceful stop (leave), otherwise restart.
@@ -75,7 +79,7 @@ exec docker run $TTY_FLAGS --rm --name "$CONTAINER_NAME" --stop-timeout 20 \
         CHILD=0
         trap "STOP=1; [ \$CHILD -ne 0 ] && kill -TERM \$CHILD" TERM INT
         while :; do
-            echo "starting $BIN"
+            say "starting $BIN"
             "$BIN" &
             CHILD=$!
             wait $CHILD; RC=$?
@@ -84,7 +88,7 @@ exec docker run $TTY_FLAGS --rm --name "$CONTAINER_NAME" --stop-timeout 20 \
             CHILD=0
             [ $STOP -eq 1 ] && exit 0
             [ $RC -eq 0 ] && exit 0
-            echo "dashcam_v0_4 exited with status $RC — restarting in 2 s"
+            say "dashcam_v0_4 exited with status $RC — restarting in 2 s"
             sleep 2
         done
     '
