@@ -12,6 +12,16 @@
 // still-finalising segments, other programs' files and v0.3's footage are
 // never touched.
 //
+// Camera: <Camera name="dashcam" type="USB"> pins the recording camera, best by
+// its stable udev link (<Device>/dev/v4l/by-id/...-video-index0</Device>), which
+// follows the camera when /dev/videoN changes; <FormatIndex> picks the mode (4 =
+// 1080p30 MJPEG on the UGREEN 4K — 0 would be 4K).  With a pin, v0.4 records
+// that camera or nothing: while it is missing v0.4 waits, and a camera another
+// system owns (name="cabin" driver camera, a rangefinder) is never taken.
+// Without a pin: the first compressed-capable USB camera (cabin last resort) —
+// any camera, so the pin is what protects other systems'.  A dashcam.xml that
+// exists but cannot be read: only a lone recordable USB camera is recorded.
+//
 // Recovery: a missing camera, an unplug, a pipeline error or a silent stall
 // restarts recording into a new segment (retry forever).  A process crash or a
 // teardown wedged in the kernel is left to the launcher's restart loop.
@@ -60,6 +70,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <gst/gst.h>
@@ -181,25 +192,68 @@ struct RecordChoice {
     const cameraInfo*        cam = nullptr;
     int                      fmt = -1;
     bool                     cabinFallback = false;  ///< Only the cabin camera could record.
+    bool                     pinned = false;         ///< A <Camera name="dashcam"> entry decided.
+    std::string              why;                    ///< No camera: the reason (retry message).
     std::vector<std::string> notes;                  ///< WARN-level explanations.
 };
 
+// The config entry that pins v0.4's recording camera (name="cabin" is the
+// driver camera; other systems, e.g. a rangefinder, use their own names).
+static constexpr const char* kDashcamEntry = "dashcam";
+static constexpr const char* kByIdPrefix   = "/dev/v4l/by-id/";
+
+static std::string trimmed(const std::string& s) {
+    const auto a = s.find_first_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
+}
+
+// "idVendor:idProduct:serial" of the USB device behind a V4L2 node, from
+// sysfs; "" when unknown.  Two cameras of one model with the same (often
+// generic) serial share one /dev/v4l/by-id name.
+using UsbIdentityFn = std::function<std::string(const std::string& node)>;
+static std::string usbIdentity(const std::string& node) {
+    std::error_code ec;
+    const fs::path iface = fs::canonical(
+        "/sys/class/video4linux/" + fs::path(node).filename().string() + "/device", ec);
+    if (ec) return {};
+    auto read = [](const fs::path& p) {
+        std::ifstream in(p);
+        std::string s;
+        std::getline(in, s);
+        return s;
+    };
+    for (fs::path d = iface; d.has_relative_path(); d = d.parent_path())   // interface → device
+        if (fs::exists(d / "idVendor", ec))
+            return read(d / "idVendor") + ":" + read(d / "idProduct") + ":" + read(d / "serial");
+    return {};
+}
+
+// configKnown = false: dashcam.xml exists but could not be read, so any pin in
+// it is unknown.  Then v0.4 records only a lone recordable USB camera — with
+// several it cannot tell which one is the dashcam, and must not take a camera
+// another system owns.
 static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
-                                        const std::vector<dashcam::config::CameraConfig>& configs) {
+                                        const std::vector<dashcam::config::CameraConfig>& configs,
+                                        bool configKnown = true,
+                                        const UsbIdentityFn& identity = usbIdentity) {
     RecordChoice rc;
+    // A configured device is compared as the node it names NOW: a stable
+    // /dev/v4l/by-id|by-path link follows the camera when /dev/videoN changes.
+    auto node = [](const dashcam::config::CameraConfig& cfg) {
+        return resolveDeviceNode((std::string)cfg.device);
+    };
     std::string cabinDev;
     bool        cabinEnabled = true;
     for (const auto& cfg : configs)
         if (cfg.type == "USB" && cfg.name == "cabin") {
-            cabinDev     = (std::string)cfg.device;
+            cabinDev     = node(cfg);
             cabinEnabled = (bool)cfg.enabled;
             break;
         }
 
     auto exactConfig = [&](const cameraInfo& c) -> const dashcam::config::CameraConfig* {
         for (const auto& cfg : configs)
-            if (cfg.type == "USB" && !std::string(cfg.device).empty() &&
-                (std::string)cfg.device == c.address)
+            if (cfg.type == "USB" && !std::string(cfg.device).empty() && node(cfg) == c.address)
                 return &cfg;
         return nullptr;
     };
@@ -227,14 +281,95 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
         return nullptr;
     };
 
-    // 1. Explicit, enabled, non-cabin USB pins.
+    // 0. The dashcam camera, pinned by name: record that camera or nothing, so
+    //    a camera another system owns (the cabin driver camera, a rangefinder)
+    //    is never taken — not even while the dashcam camera is missing.  The
+    //    pin is the first dashcam entry with a Device (or a disabled one: off).
+    const dashcam::config::CameraConfig* pin = nullptr;
+    int dashcamEntries = 0;
     for (const auto& cfg : configs) {
-        if (cfg.type != "USB" || cfg.name == "cabin" || !(bool)cfg.enabled) continue;
-        const std::string dev = cfg.device;
-        if (dev.empty()) continue;
+        if (cfg.type != "USB" || cfg.name != kDashcamEntry) continue;
+        ++dashcamEntries;
+        if (!pin && (!(bool)cfg.enabled || !node(cfg).empty())) pin = &cfg;
+    }
+    if (dashcamEntries > 1)
+        rc.notes.push_back(std::string("more than one <Camera name=\"") + kDashcamEntry +
+                           "\"> entry — using the first one with a <Device>");
+    if (!pin && dashcamEntries > 0)
+        rc.notes.push_back(std::string("<Camera name=\"") + kDashcamEntry + "\"> has no <Device> — "
+                           "choosing a camera automatically (set it to the camera's "
+                           "/dev/v4l/by-id/...-video-index0 link to pin it)");
+    if (pin) {
+        rc.pinned = true;
+        const std::string want = trimmed(pin->device);   // as configured, for messages
+        const std::string dev  = node(*pin);
+        if (!(bool)pin->enabled) {
+            rc.why = "dashcam camera disabled in the config (<Enabled>false</Enabled>) — not recording";
+            return rc;
+        }
         const cameraInfo* c = findUsb(dev);
         if (!c) {
-            rc.notes.push_back("config pin '" + cfg.name + "' -> " + dev +
+            std::error_code ec;
+            rc.why = fs::exists(dev, ec)
+                ? "pinned dashcam camera " + want + " (" + dev + ") is not a USB video capture "
+                  "device — for a UVC camera use its ...-video-index0 link; not recording"
+                : "pinned dashcam camera " + want + " not present — waiting for it (other cameras "
+                  "are left alone)";
+            return rc;
+        }
+        // Owned by another entry (the cabin, a rangefinder, or disabled)?
+        for (const auto& cfg : configs) {
+            if (cfg.type != "USB" || cfg.name == kDashcamEntry || node(cfg) != c->address) continue;
+            rc.why = "pinned dashcam camera " + want + " is also configured as '" + cfg.name +
+                     "' — not recording";
+            return rc;
+        }
+        // A by-id name is shared by cameras of one model with the same serial.
+        if (want.rfind(kByIdPrefix, 0) == 0) {
+            const std::string id = identity(c->address);
+            for (const auto& o : cams)
+                if (!id.empty() && &o != c && o.type == CAMERA_TYPE::USB && identity(o.address) == id) {
+                    rc.why = "pinned dashcam camera " + want + " is ambiguous: " + o.address +
+                             " is the same model with the same serial — pin it by its "
+                             "/dev/v4l/by-path/... link instead; not recording";
+                    return rc;
+                }
+        }
+        const int idx = formatFor(pin, *c);
+        if (idx < 0) {
+            rc.why = "pinned dashcam camera " + want + " offers no MJPEG/H.264 mode — not recording";
+            return rc;
+        }
+        rc.cam = c;
+        rc.fmt = idx;
+        return rc;
+    }
+
+    // No pin: choose automatically (single-camera setups, older configs) —
+    // this may take ANY camera; the pin is what protects other systems'.
+    if (!configKnown) {
+        int recordable = 0;
+        for (const auto& c : cams)
+            if (c.type == CAMERA_TYPE::USB && pickUsbRecordFormat(c) >= 0) ++recordable;
+        if (recordable > 1) {
+            rc.why = "dashcam.xml could not be read and " + std::to_string(recordable) +
+                     " recordable USB cameras are present — no pin to tell the dashcam camera "
+                     "apart; not recording until the config is fixed";
+            return rc;
+        }
+    }
+    // 1. Explicit, enabled USB entries of no other role (dashcam entries were
+    //    handled above; cabin is the driver camera).
+    for (const auto& cfg : configs) {
+        if (cfg.type != "USB" || cfg.name == "cabin" || cfg.name == kDashcamEntry ||
+            !(bool)cfg.enabled)
+            continue;
+        const std::string want = trimmed(cfg.device);
+        if (want.empty()) continue;
+        const std::string dev = node(cfg);
+        const cameraInfo* c = findUsb(dev);
+        if (!c) {
+            rc.notes.push_back("config pin '" + cfg.name + "' -> " + want +
                                " is not a USB capture device right now (stale pin?) — ignored");
             continue;
         }
@@ -256,7 +391,7 @@ static RecordChoice resolveRecordCamera(const std::vector<cameraInfo>& cams,
     //    a disabled entry for that device).
     auto anyEntryDisables = [&](const std::string& dev) {
         for (const auto& cfg : configs)
-            if (cfg.type == "USB" && (std::string)cfg.device == dev && !(bool)cfg.enabled) return true;
+            if (cfg.type == "USB" && node(cfg) == dev && !(bool)cfg.enabled) return true;
         return false;
     };
     if (!cabinDev.empty() && cabinEnabled && !anyEntryDisables(cabinDev)) {
@@ -436,6 +571,118 @@ static int selfTestCameras() {
         check(rc.cam == nullptr, "cabin device disabled by another entry is NOT recorded");
         const auto rc2 = resolveRecordCamera(cams, {pin("cabin", "/dev/video0"), pin("off", "/dev/video0", false)});
         check(rc2.cam == nullptr, "... whichever order the entries are in");
+    }
+
+    // ── the dashcam pin: <Camera name="dashcam"> = that camera or nothing ──
+    auto has = [](const RecordChoice& rc, const char* what) {
+        return rc.why.find(what) != std::string::npos;
+    };
+    {
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080}), usb("/dev/video2", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("dashcam", "/dev/video2")});
+        check(rc.cam == &cams[1] && rc.pinned, "dashcam pin: records exactly that camera");
+    }
+    const char* absent = "/dev/v04-selftest-absent-video0";   // exists on no host
+    {
+        // Missing, while a recordable spare and a pinned cabin camera are present.
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080}), usb("/dev/video4", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("cabin", "/dev/video4"), pin("dashcam", absent)});
+        check(rc.cam == nullptr && rc.pinned && has(rc, "not present"),
+              "dashcam pin missing: waits — never records a spare camera");
+        const std::vector<cameraInfo> cabinOnly{usb("/dev/video4", {mj1080})};
+        const auto rc2 = resolveRecordCamera(cabinOnly, {pin("cabin", "/dev/video4"), pin("dashcam", absent)});
+        check(rc2.cam == nullptr && !rc2.cabinFallback && has(rc2, "not present"),
+              "dashcam pin missing, only the cabin camera present: still waits (no cabin fallback)");
+    }
+    {
+        // Another system's entry — or a disabled one — on the pinned device.
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080}), usb("/dev/video2", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("rangefinder", "/dev/video2"), pin("dashcam", "/dev/video2")});
+        check(rc.cam == nullptr && has(rc, "'rangefinder'"), "dashcam pin on a rangefinder's device: refused");
+        const auto rc2 = resolveRecordCamera(cams, {pin("dashcam", "/dev/video2"), pin("spare", "/dev/video2", false)});
+        check(rc2.cam == nullptr && has(rc2, "'spare'"), "dashcam pin on a device another entry disables: refused");
+    }
+    {
+        // An empty leftover dashcam entry above the real one.
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080}), usb("/dev/video2", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("dashcam", ""), pin("dashcam", "/dev/video2")});
+        check(rc.cam == &cams[1] && rc.pinned, "empty dashcam entry first: the one with a Device is the pin");
+        const auto rc2 = resolveRecordCamera(cams, {pin("dashcam", ""), pin("dashcam", absent)});
+        check(rc2.cam == nullptr && has(rc2, "not present"), "... and it still waits when missing (no fallback)");
+        const auto rc3 = resolveRecordCamera(cams, {pin("dashcam", "", false)});
+        check(rc3.cam == nullptr && has(rc3, "disabled"), "disabled dashcam entry without a Device: recording off");
+        const auto rc4 = resolveRecordCamera(cams, {pin("dashcam", "\n        /dev/video2\n      ")});
+        check(rc4.cam == &cams[1], "Device text wrapped onto its own line: whitespace ignored");
+    }
+    {
+        // Two cameras of one model with the same serial share a by-id name.
+        const std::string byId = std::string(kByIdPrefix) + "usb-Same_Model-0000000001-video-index0";
+        const std::vector<cameraInfo> cams{usb(byId.c_str(), {mj1080}), usb("/dev/video2", {mj1080})};
+        auto same = [](const std::string&) { return std::string("eba4:6579:0000000001"); };
+        auto diff = [](const std::string& n) { return std::string("eba4:6579:") + n; };
+        const auto rc = resolveRecordCamera(cams, {pin("dashcam", byId.c_str())}, true, same);
+        check(rc.cam == nullptr && has(rc, "ambiguous") && has(rc, "by-path"),
+              "by-id pin shared by two identical cameras: refused, pointing to by-path");
+        const auto rc2 = resolveRecordCamera(cams, {pin("dashcam", byId.c_str())}, true, diff);
+        check(rc2.cam == &cams[0], "by-id pin with a unique camera identity: recorded");
+    }
+    {
+        // dashcam.xml exists but cannot be read: no pin is known.
+        const std::vector<cameraInfo> two{usb("/dev/video0", {mj1080}), usb("/dev/video2", {mj1080})};
+        const auto rc = resolveRecordCamera(two, {}, false);
+        check(rc.cam == nullptr && has(rc, "could not be read"),
+              "unreadable config, two recordable cameras: waits (cannot tell the dashcam apart)");
+        const std::vector<cameraInfo> one{usb("/dev/video0", {mj1080}), usb("/dev/video2", {yuyv})};
+        check(resolveRecordCamera(one, {}, false).cam == &one[0],
+              "unreadable config, one recordable camera: recorded");
+    }
+    {
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("dashcam", "/dev/video0", false)});
+        check(rc.cam == nullptr && has(rc, "disabled"), "dashcam pin disabled: recording off, with the reason");
+        const auto rc2 = resolveRecordCamera(cams, {pin("cabin", "/dev/video0"), pin("dashcam", "/dev/video0")});
+        check(rc2.cam == nullptr && has(rc2, "cabin"), "dashcam pin on the cabin device: refused");
+    }
+    {
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj4k, mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("dashcam", "/dev/video0", true, 1)});
+        check(rc.cam == &cams[0] && rc.fmt == 1, "dashcam pin: its FormatIndex picks the mode");
+        const std::vector<cameraInfo> raw{usb("/dev/video0", {yuyv})};
+        check(has(resolveRecordCamera(raw, {pin("dashcam", "/dev/video0")}), "no MJPEG/H.264"),
+              "dashcam pin on a raw-only camera: refused, with the reason");
+    }
+    {
+        const std::vector<cameraInfo> cams{usb("/dev/video0", {mj1080})};
+        const auto rc = resolveRecordCamera(cams, {pin("dashcam", "")});
+        check(rc.cam == &cams[0] && !rc.pinned && !rc.notes.empty(),
+              "dashcam entry without a Device: automatic choice, with a note");
+        const auto rc2 = resolveRecordCamera(cams, {pin("dashcam", "/dev/video0"), pin("dashcam", "/dev/video7")});
+        check(rc2.cam == &cams[0] && !rc2.notes.empty(), "two dashcam entries: the first wins, with a note");
+    }
+    {
+        // Stable links: the pin names a by-id style link, not /dev/videoN.
+        char td[] = "/tmp/v04_selftest_pin_XXXXXX";
+        if (!::mkdtemp(td)) { check(false, "pin temp dir"); return failures; }
+        const std::string dir = td, link = dir + "/usb-Cam-video-index0";
+        for (const char* f : {"/video7", "/video9", "/meta"}) std::ofstream(dir + f).put('x');
+        const std::vector<cameraInfo> cams{usb((dir + "/video7").c_str(), {mj1080}),
+                                           usb((dir + "/video9").c_str(), {mj1080})};
+        std::error_code ec;
+        fs::create_symlink("video7", link, ec);
+        const auto a = resolveRecordCamera(cams, {pin("dashcam", link.c_str())});
+        fs::remove(link, ec);
+        fs::create_symlink("video9", link, ec);                 // replugged: now /dev/video9
+        const auto b = resolveRecordCamera(cams, {pin("dashcam", link.c_str())});
+        fs::remove(link, ec);
+        fs::create_symlink("meta", link, ec);                   // e.g. the ...-index1 metadata node
+        const auto c = resolveRecordCamera(cams, {pin("dashcam", link.c_str())});
+        fs::remove(link, ec);                                   // unplugged: no link at all
+        const auto d = resolveRecordCamera(cams, {pin("dashcam", link.c_str())});
+        check(a.cam == &cams[0], "stable-link pin resolves to the camera's current node");
+        check(b.cam == &cams[1], "... and follows it when the node number changes");
+        check(c.cam == nullptr && has(c, "not a USB video capture"), "link to a non-capture node: refused, with the reason");
+        check(d.cam == nullptr && has(d, "not present"), "link gone (camera unplugged): waits");
+        fs::remove_all(dir, ec);
     }
     return failures;
 }
@@ -713,12 +960,17 @@ int main(int argc, char* argv[]) {
     dashcam::config::AppConfig cfg;
     const std::string configsDir = dashcam::config::resolveStorageDir(
         dashcam::config::kDefaultConfigsDir, dashcam::config::kFallbackConfigsName, log);
-    if (!dashcam::config::ConfigReader::loadOrCreate(configsDir + "/dashcam.xml", cfg, log))
-        log(LogLevel::WARN, "config load/create failed; using defaults");
+    const bool configOk =
+        dashcam::config::ConfigReader::loadOrCreate(configsDir + "/dashcam.xml", cfg, log);
+    if (!configOk) log(LogLevel::WARN, "config load/create failed; using defaults");
 
     const std::string logDir = dashcam::config::resolveStorageDir(
         dashcam::config::kDefaultLogDir, dashcam::config::kFallbackLogName, log);
     dashcam::log::init(logDir, makeLogParams(cfg.log));
+    if (!configOk)          // said again now that the log file exists
+        log(LogLevel::ERROR, "config " + configsDir + "/dashcam.xml could not be read — defaults, "
+                             "no camera pin: recording only while exactly one recordable USB "
+                             "camera is present");
 
     const auto& r = cfg.recording;
     const uint64_t quota = gbToBytes(r.maxFootageGB);
@@ -927,10 +1179,10 @@ int main(int argc, char* argv[]) {
 
         std::vector<cameraInfo> cams;
         getCameraList(cams, recLog);
-        const RecordChoice rc = resolveRecordCamera(cams, cfg.cameras);
+        const RecordChoice rc = resolveRecordCamera(cams, cfg.cameras, configOk);
         for (const auto& n : rc.notes)
             if (notesSeen.insert(n).second) log(LogLevel::WARN, n);
-        if (!rc.cam) { scheduleRetry("no recordable USB camera found"); return false; }
+        if (!rc.cam) { scheduleRetry(rc.why.empty() ? "no recordable USB camera found" : rc.why); return false; }
 
         const auto& f = rc.cam->videoFormats[static_cast<size_t>(rc.fmt)];
         rec::RecordingFormat fmt;

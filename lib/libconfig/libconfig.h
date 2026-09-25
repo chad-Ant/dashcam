@@ -252,7 +252,7 @@ struct CameraConfig {
     std::string type;       ///< Interface type: "CSI" or "USB".  XML attribute.
 
     ConfigVar<bool>        enabled     {"Enabled",     true,  "Include this camera at startup"};
-    ConfigVar<std::string> device      {"Device",      "",    "Device node (e.g. /dev/video2); empty = auto-detect"};
+    ConfigVar<std::string> device      {"Device",      "",    "Device node (e.g. /dev/video2) or, better, its stable udev link (/dev/v4l/by-id/... follows the camera, /dev/v4l/by-path/... the USB port); empty = auto-detect"};
     ConfigVar<int>         sensorId    {"SensorId",    0,     0, 7,   1, "Argus sensor-id for CSI cameras; ignored for USB"};
     ConfigVar<int>         formatIndex {"FormatIndex", 0,     0, 255, 1, "Index into cameraInfo::videoFormats to activate"};
 

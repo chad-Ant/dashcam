@@ -49,13 +49,19 @@ static bool test_load_real_file() {
     check(eq(cfg.overlay.fontSize, 14.0f),         "overlay.fontSize == 14.0");
     check(cfg.overlay.fontFace == "Monospace Bold","overlay.fontFace == \"Monospace Bold\"");
 
-    // Camera list — the file defines two cameras (csi0 CSI, usb0 USB).
+    // Camera list — the file defines two cameras (csi0 CSI, and the pinned
+    // v0.4 dashcam camera: a stable by-id link, FormatIndex 4, a comment inside).
     check(cfg.cameras.size() == 2, "cameras list has 2 entries");
     if (cfg.cameras.size() == 2) {
         check(cfg.cameras[0].name == "csi0" && cfg.cameras[0].type == "CSI", "cam[0] = csi0/CSI");
-        check(cfg.cameras[1].name == "usb0" && cfg.cameras[1].type == "USB", "cam[1] = usb0/USB");
+        check(cfg.cameras[1].name == "dashcam" && cfg.cameras[1].type == "USB", "cam[1] = dashcam/USB");
         check(cfg.cameras[0].device == "/dev/video0", "cam[0].device == \"/dev/video0\"");
         check(!cfg.cameras[0].attributeInfo.empty(),  "cam[0] has discovered attributeInfo");
+        check((std::string)cfg.cameras[1].device ==
+                  "/dev/v4l/by-id/usb-Image+_UGREEN_Camera_4K_LL-0000000001-video-index0",
+              "cam[1].device == the UGREEN's by-id link");
+        check(cfg.cameras[1].formatIndex == 4 && (bool)cfg.cameras[1].enabled,
+              "cam[1] enabled, FormatIndex 4 (1080p30)");
     }
 
     // System defaults

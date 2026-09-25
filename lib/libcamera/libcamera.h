@@ -182,6 +182,22 @@ struct cameraInfo {
 ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
                          const dashcam::log::LogCallback& log = {});
 
+/**
+ * @brief Resolve a configured camera device to the node it names now.
+ *
+ * Follows udev's stable links — @c /dev/v4l/by-id/... (the camera model and
+ * serial) or @c /dev/v4l/by-path/... (the USB port) — to the current
+ * @c /dev/videoN, which can change when several cameras enumerate or one is
+ * replugged.  Resolve again at every (re)start.
+ *
+ * @param[in] device  Configured path; a plain @c /dev/videoN works too.
+ *                    Surrounding whitespace is ignored ("" if nothing else).
+ * @return The canonical node, or the (trimmed) @p device when it cannot be
+ *         resolved (e.g. the link is missing because the camera is unplugged),
+ *         so it simply matches no discovered camera.
+ */
+std::string resolveDeviceNode(const std::string& device);
+
 // ─── interface ───────────────────────────────────────────────────────────────
 
 /**

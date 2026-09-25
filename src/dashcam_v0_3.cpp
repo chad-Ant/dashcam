@@ -491,9 +491,11 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     CameraConfiguration cc;
     std::string cabinDev;
     bool cabinEnabled = true;
+    // Configured devices are compared as the node they name now, so a stable
+    // /dev/v4l/by-id|by-path link follows the camera when /dev/videoN changes.
     for (const auto& cfg : configs) {
         if (cfg.type == "USB" && cfg.name == "cabin") {
-            cabinDev = (std::string)cfg.device;
+            cabinDev = resolveDeviceNode((std::string)cfg.device);
             cabinEnabled = (bool)cfg.enabled;
             break;
         }
@@ -504,7 +506,7 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
         -> const dashcam::config::CameraConfig* {
         for (const auto& cfg : configs)
             if (cfg.type == type && !std::string(cfg.device).empty() &&
-                (std::string)cfg.device == camera.address)
+                resolveDeviceNode((std::string)cfg.device) == camera.address)
                 return &cfg;
         return nullptr;
     };
@@ -514,8 +516,9 @@ resolveCameraConfiguration(const std::vector<cameraInfo>& cams,
     };
     auto findCamera = [&](const std::string& device, CAMERA_TYPE type)
         -> const cameraInfo* {
+        const std::string node = resolveDeviceNode(device);
         for (const auto& camera : cams)
-            if (camera.type == type && camera.address == device)
+            if (camera.type == type && camera.address == node)
                 return &camera;
         return nullptr;
     };

@@ -454,4 +454,15 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
     return ERROR_CODE::NONE;
 }
 
+std::string resolveDeviceNode(const std::string& device) {
+    // A long by-id path is easily wrapped onto its own line in the XML: the
+    // surrounding whitespace is never part of a device name.
+    const auto first = device.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const std::string path = device.substr(first, device.find_last_not_of(" \t\r\n") - first + 1);
+    std::error_code ec;
+    const std::filesystem::path node = std::filesystem::canonical(path, ec);
+    return ec ? path : node.string();
+}
+
 } // namespace dashcam::camera
