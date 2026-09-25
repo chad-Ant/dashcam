@@ -662,11 +662,11 @@ int main(int argc, char* argv[]) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
                       "settings: footage=%s segment=%d s quota=%s floor=%.1f GB stall=%d ms "
-                      "firstFrame=%d ms retry=%d s recordFps=%d exposure=%s config=%s/dashcam.xml",
+                      "firstFrame=%d ms retry=%d s sync=%d ms recordFps=%d exposure=%s config=%s/dashcam.xml",
                       std::string(cfg.system.footagePath).c_str(), (int)r.segmentSec,
                       quotaText.c_str(),
                       (double)(float)r.minFreeGB, (int)r.stallTimeoutMs, (int)r.firstFrameTimeoutMs,
-                      (int)r.retryIntervalSec, (int)r.recordFps,
+                      (int)r.retryIntervalSec, (int)r.syncIntervalMs, (int)r.recordFps,
                       frameRateExposure ? ("framerate (target luma " +
                                            std::to_string((int)r.targetLuma) + ")").c_str()
                                         : "camera",
@@ -697,10 +697,11 @@ int main(int argc, char* argv[]) {
     UvcExposureControl exposure;
     uint64_t           lastLumaSeq = 0;
     // Every session end hands exposure back to the camera (a no-op after an
-    // unplug), so a stopped dashcam never leaves the camera in manual mode.
+    // unplug), so a stopped dashcam never leaves the camera in manual mode —
+    // first, because recorder.stop() can end in _exit(3) on a wedged disk.
     auto stopRecording = [&]() {
-        recorder.stop();
         exposure.close();
+        recorder.stop();
     };
 
     // ── clock: NTP first, GPS fallback ───────────────────────────────────────
@@ -846,6 +847,7 @@ int main(int argc, char* argv[]) {
         opts.eosTimeoutMs        = kEosTimeoutMs;
         opts.stallTimeoutMs      = static_cast<uint32_t>((int)r.stallTimeoutMs);
         opts.firstFrameTimeoutMs = static_cast<uint32_t>((int)r.firstFrameTimeoutMs);
+        opts.syncIntervalMs      = static_cast<uint32_t>((int)r.syncIntervalMs);
 
         const bool mjpeg = f.pixelFormat == V4L2_PIX_FMT_MJPEG;
         recorder.setLumaTap(frameRateExposure && mjpeg);

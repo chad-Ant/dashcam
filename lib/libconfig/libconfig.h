@@ -354,6 +354,7 @@ struct RecordingConfig {
     ConfigVar<int>   stallTimeoutMs      {"StallTimeoutMs",      5000,   0,    60000,   100,  "Restart recording when no frame arrives for this long (ms); 0 = off"};
     ConfigVar<int>   firstFrameTimeoutMs {"FirstFrameTimeoutMs", 15000,  1000, 120000,  100,  "Restart recording when the first frame has not arrived this long after start (ms)"};
     ConfigVar<int>   retryIntervalSec    {"RetryIntervalSec",    3,      1,    60,      1,    "Delay between recording restart attempts (s) after the first immediate retry"};
+    ConfigVar<int>   syncIntervalMs      {"SyncIntervalMs",      1000,   0,    60000,   100,  "Force the open segment and sidecar to disk (fdatasync) this often, so a power cut loses at most about this much footage; 0 = leave it to Linux writeback (5-30 s at risk)"};
     ConfigVar<std::string> exposureMode  {"ExposureMode",        "framerate",                     "framerate = software auto-exposure that never exceeds the frame time (holds 30 fps in low light; darker, noisier night footage); camera = the camera's own auto-exposure (brighter at night, frame rate may drop). MJPEG cameras only"};
     ConfigVar<int>   targetLuma          {"TargetLuma",          120,    40,   220,     1,    "ExposureMode=framerate: target mean brightness (0-255) of the lower two-thirds of the frame"};
 };

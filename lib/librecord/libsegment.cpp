@@ -2,9 +2,11 @@
 
 #include <linux/videodev2.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <climits>
@@ -43,6 +45,13 @@ static int64_t wallNowMs() {
 static std::string baseName(const std::string& path) {
     const auto sep = path.find_last_of('/');
     return sep == std::string::npos ? path : path.substr(sep + 1);
+}
+
+// Directory holding @p path (its entry must be synced for a new file's NAME to
+// survive a power cut; fdatasync on the file alone does not cover it).
+static std::string dirOf(const std::string& path) {
+    const auto sep = path.find_last_of('/');
+    return sep == std::string::npos ? "." : (sep == 0 ? "/" : path.substr(0, sep));
 }
 
 // Text of the first ERROR waiting on @p pipeline's bus ("" when none).
@@ -304,7 +313,11 @@ void SegmentedRecorder::handleMessage(GstMessage* msg) {
 
 void SegmentedRecorder::onFragmentOpened(const std::string& location, int64_t rtNs) {
     doLog(log_, LogLevel::INFO, "segment opened: %s", location.c_str());
-    if (!assEnabled_) return;
+    const bool durable = opts_.syncIntervalMs > 0;
+    if (!assEnabled_) {
+        if (durable) queueSync(dirOf(location), true);
+        return;
+    }
 
     closeSidecar();
     assPath_ = location;
@@ -325,6 +338,10 @@ void SegmentedRecorder::onFragmentOpened(const std::string& location, int64_t rt
     }
     detail::writeAssHeader(assFile_, cfg, videoW_, videoH_);
     fragStartRtNs_ = rtNs;
+    if (durable) {
+        setSyncSidecar(assPath_);
+        queueSync(dirOf(location), true);        // both new names: segment + sidecar
+    }
 
     // The fragment-opened message arrives up to one GOP after the fragment's
     // first frame; replay what was sampled since then into the new sidecar.
@@ -341,6 +358,8 @@ void SegmentedRecorder::onFragmentClosed(const std::string& location) {
         std::lock_guard<std::mutex> lock(stateMutex_);
         if (seq) openSeqs_.erase(*seq);
     }
+    // The muxer has written the index: make the finished file durable.
+    queueSync(location);
     fragmentClosed_.store(true);
     doLog(log_, LogLevel::INFO, "segment closed: %s", location.c_str());
 }
@@ -349,6 +368,136 @@ void SegmentedRecorder::closeSidecar() {
     if (!assFile_.is_open()) return;
     assFile_.flush();
     assFile_.close();
+    if (opts_.syncIntervalMs > 0) {
+        setSyncSidecar("");
+        queueSync(assPath_);                     // its final contents
+    }
+}
+
+// ─── durability: the sync thread ──────────────────────────────────────────────
+
+void SegmentedRecorder::queueSync(const std::string& path, bool directory) {
+    if (opts_.syncIntervalMs == 0 || path.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(syncMu_);
+        syncJobs_.emplace_back(path, directory);
+    }
+    syncCv_.notify_one();
+}
+
+void SegmentedRecorder::setSyncSidecar(const std::string& path) {
+    std::lock_guard<std::mutex> lock(syncMu_);
+    syncAssPath_ = path;
+}
+
+void SegmentedRecorder::stopSyncThread() {
+    if (!syncThread_.joinable()) return;
+    const std::string current = currentFile();   // after a forced teardown there is
+    {                                            // no close message: sync it anyway
+        std::lock_guard<std::mutex> lock(syncMu_);
+        if (!current.empty()) syncJobs_.emplace_back(current, false);
+        syncStop_ = true;
+    }
+    syncCv_.notify_all();
+    syncThread_.join();                          // inside stop()'s hard deadline
+}
+
+void SegmentedRecorder::syncLoop() {
+    using clock = std::chrono::steady_clock;
+    const auto every  = std::chrono::milliseconds(opts_.syncIntervalMs);
+    const int64_t slowMs = std::max<int64_t>(250, opts_.syncIntervalMs / 2);
+    auto next = clock::now() + every;
+
+    // Descriptors live only on this thread.  fdatasync through our own
+    // O_RDONLY descriptor flushes the file (fsync is per inode), whatever
+    // descriptor filesink / the sidecar stream wrote through.
+    int mkvFd = -1, assFd = -1;
+    std::string mkvPath, assPath;
+
+    // Rate-limited reporting: a disk that errors or cannot keep up makes the
+    // loss window longer than configured — say so, at most once a minute.
+    int slowCount = 0, failCount = 0;
+    int64_t slowMax = 0;
+    std::string lastErr;
+    auto lastReport = clock::now() - std::chrono::minutes(1);
+
+    auto syncOne = [&](int fd, bool directory) {
+        const int64_t t0 = steadyNowNs();
+        if ((directory ? ::fsync(fd) : ::fdatasync(fd)) != 0) {
+            ++failCount;
+            lastErr = std::strerror(errno);
+        } else if (!directory) {
+            syncedFiles_.fetch_add(1, std::memory_order_relaxed);
+        }
+        const int64_t ms = (steadyNowNs() - t0) / 1000000;
+        if (ms > slowMs) { ++slowCount; slowMax = std::max(slowMax, ms); }
+    };
+    // A file that does not exist (yet, or any more) is not a failure; any other
+    // open error means that file is not being made durable — report it.
+    auto openFailed = [&](const std::string& path) {
+        if (errno == ENOENT) return;
+        ++failCount;
+        lastErr = "open " + baseName(path) + ": " + std::strerror(errno);
+    };
+    auto track = [&](int& fd, std::string& open, const std::string& want) {
+        if (want == open) return;
+        if (fd >= 0) ::close(fd);
+        fd   = want.empty() ? -1 : ::open(want.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0 && !want.empty()) openFailed(want);
+        open = fd >= 0 ? want : std::string();   // not created yet: retry next round
+    };
+
+    std::unique_lock<std::mutex> lk(syncMu_);
+    for (;;) {
+        syncCv_.wait_until(lk, next, [&] { return syncStop_ || !syncJobs_.empty(); });
+        auto jobs = std::move(syncJobs_);
+        syncJobs_.clear();
+        const std::string wantAss = syncAssPath_;
+        const bool stopping = syncStop_;
+        lk.unlock();
+
+        for (const auto& [path, directory] : jobs) {
+            // A closed file we were tracking: sync it through our descriptor.
+            if (!directory && path == mkvPath && mkvFd >= 0) {
+                syncOne(mkvFd, false); ::close(mkvFd); mkvFd = -1; mkvPath.clear(); continue;
+            }
+            if (!directory && path == assPath && assFd >= 0) {
+                syncOne(assFd, false); ::close(assFd); assFd = -1; assPath.clear(); continue;
+            }
+            const int fd = ::open(path.c_str(), (directory ? O_DIRECTORY : 0) | O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) { syncOne(fd, directory); ::close(fd); }
+            else         openFailed(path);
+        }
+
+        if (!stopping && clock::now() >= next) {
+            // The segment being written is whatever format-location named last.
+            track(mkvFd, mkvPath, currentFile());
+            track(assFd, assPath, wantAss);
+            if (mkvFd >= 0) syncOne(mkvFd, false);
+            if (assFd >= 0) syncOne(assFd, false);
+            syncCount_.fetch_add(1);
+            next += every;                                    // keep the cadence...
+            if (next <= clock::now()) next = clock::now() + every;   // ...but never burst
+        }
+
+        if ((slowCount || failCount) && clock::now() - lastReport >= std::chrono::minutes(1)) {
+            if (failCount)
+                doLog(log_, LogLevel::ERROR, "disk sync failed %d time(s) (%s) — footage may not "
+                      "survive a power cut", failCount, lastErr.c_str());
+            if (slowCount)
+                doLog(log_, LogLevel::WARN, "disk sync slow %d time(s), up to %lld ms (interval %u ms) "
+                      "— a power cut can lose more than the interval", slowCount,
+                      static_cast<long long>(slowMax), opts_.syncIntervalMs);
+            slowCount = failCount = 0;
+            slowMax = 0;
+            lastReport = clock::now();
+        }
+
+        if (stopping) break;
+        lk.lock();
+    }
+    for (int* fd : {&mkvFd, &assFd})
+        if (*fd >= 0) { syncOne(*fd, false); ::close(*fd); *fd = -1; }
 }
 
 // ─── watchdog + sidecar sampling (worker thread) ──────────────────────────────
@@ -416,6 +565,9 @@ void SegmentedRecorder::workerLoop() {
     // its poll interval (up to 2 s at the lowest subtitle rate).
     const auto types = static_cast<GstMessageType>(
         GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT | GST_MESSAGE_APPLICATION);
+    // With durability on, each sample goes to the page cache at once (a cheap
+    // write) and the sync thread pushes it to disk; otherwise flush every 5 s.
+    const bool durable = opts_.syncIntervalMs > 0;
     auto nextFlush = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
     while (!stopFlag_.load()) {
@@ -438,9 +590,13 @@ void SegmentedRecorder::workerLoop() {
         checkWatchdog();
         if (assEnabled_) takeSample(durNs, staleMs);
 
-        if (std::chrono::steady_clock::now() >= nextFlush) {
-            if (assFile_.is_open()) assFile_.flush();
-            nextFlush = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        if (assFile_.is_open()) {
+            if (durable) {
+                assFile_.flush();
+            } else if (std::chrono::steady_clock::now() >= nextFlush) {
+                assFile_.flush();
+                nextFlush = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            }
         }
     }
     if (bus) gst_object_unref(bus);
@@ -575,6 +731,14 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     stopFlag_.store(false);
     fragStartRtNs_ = -1;
     ring_.clear();
+    syncCount_.store(0);
+    syncedFiles_.store(0);
+    {
+        std::lock_guard<std::mutex> lock(syncMu_);
+        syncStop_ = false;
+        syncAssPath_.clear();
+        syncJobs_.clear();
+    }
 
     // pipeline_ is published under stateMutex_ so deletableBelowSeq() sees a
     // consistent session.
@@ -602,6 +766,8 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     }
 
     healthy_.store(true);
+    // The sync thread first: the worker may hand it work as soon as it runs.
+    if (opts.syncIntervalMs > 0) syncThread_ = std::thread(&SegmentedRecorder::syncLoop, this);
     worker_ = std::thread(&SegmentedRecorder::workerLoop, this);
     doLog(log_, LogLevel::INFO, "segmented recording started on %s (%ux%u %s @%.1f, %u s segments)",
           devicePath.c_str(), fmt.width, fmt.height, mjpeg ? "MJPEG" : "H264",
@@ -670,6 +836,7 @@ void SegmentedRecorder::teardown() {
         gst_object_unref(bus);
     }
     closeSidecar();
+    stopSyncThread();
 }
 
 bool SegmentedRecorder::stop() {

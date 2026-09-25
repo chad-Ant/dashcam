@@ -5,7 +5,8 @@
 //     covering each segment's start), EOS before the first frame (no abort),
 //     stall watchdog, mid-stream source error still finalises, loop-overwrite
 //     retention safety, luma tap for software auto-exposure, splitNow, and
-//     stop()'s hard deadline covering a worker blocked on sidecar I/O.
+//     stop()'s hard deadline covering a worker blocked on sidecar I/O, and the
+//     periodic disk sync.
 //   Part B (first USB camera; SKIPPED when none):
 //     1. Strict precompressed gate: a raw format must be REJECTED.
 //     2. UVC compressed passthrough + ASS sidecar + live-stream tap.
@@ -711,6 +712,48 @@ static void testStopDeadlineCoversWorker() {
     fs::remove_all(dir);
 }
 
+// ─── A12: periodic disk sync (power-cut durability) ───────────────────────────
+
+static void testDurableSync() {
+    std::cout << "\n--- A12: periodic disk sync ---\n";
+    for (uint32_t interval : {500u, 0u}) {
+        const std::string tag = interval ? "sync 500 ms" : "sync off";
+        const std::string dir = makeTempDir("sync");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(dashcam::log::getCallback());
+        rec::RecorderTestHook::setSource(r, kMjpegSrc);
+        auto o = segOpts(dir, 2);                         // rotations mid-run
+        o.syncIntervalMs = interval;
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), tag + ": start");
+        feedClockOnly(r, 4500);
+        const uint64_t syncs  = r.syncCount();
+        const uint64_t synced = r.syncedFileCount();
+        check(r.isRecording(), tag + ": healthy while syncing");
+        check(r.stop(), tag + ": stop finalised");
+        if (interval) {
+            check(syncs >= 7 && syncs <= 10, tag + ": ~2 sync rounds per second (" + std::to_string(syncs) + " in 4.5 s)");
+            // Each round syncs the open segment and its sidecar (the very first
+            // round may run before either exists).
+            check(synced >= 2 * syncs - 2, tag + ": segment + sidecar really synced each round (" +
+                  std::to_string(synced) + " file syncs in " + std::to_string(syncs) + " rounds)");
+        } else {
+            check(syncs == 0 && synced == 0, tag + ": no sync rounds, no file syncs");
+        }
+        const uint64_t frames = r.framesReceived();
+        int total = 0;
+        bool ok = true;
+        const auto segs = listSegments(dir);
+        for (const auto& [seq, files] : segs) {
+            const MkvInfo mi = probeMkv(files.first);
+            total += mi.frames;
+            ok = ok && mi.ok && readAss(files.second).exists;
+        }
+        check(segs.size() >= 2 && ok, tag + ": " + std::to_string(segs.size()) + " playable segments with sidecars");
+        check((uint64_t)total == frames, tag + ": gapless (" + std::to_string(total) + "/" + std::to_string(frames) + ")");
+        fs::remove_all(dir);
+    }
+}
+
 static void runPartA() {
     std::cout << "=== Part A: hardware-free ===\n";
     testGoldenSingleFile();
@@ -728,6 +771,7 @@ static void runPartA() {
     testLumaTap();
     testSplitNow();
     testStopDeadlineCoversWorker();
+    testDurableSync();
 }
 
 // ─── Part B6: live segmented recording on the real camera ─────────────────────

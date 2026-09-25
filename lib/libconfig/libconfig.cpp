@@ -256,6 +256,7 @@ static void parseRecording(pugi::xml_node node, RecordingConfig& r,
     readVar(node, r.stallTimeoutMs,      log);
     readVar(node, r.firstFrameTimeoutMs, log);
     readVar(node, r.retryIntervalSec,    log);
+    readVar(node, r.syncIntervalMs,      log);
     readVar(node, r.exposureMode,        log);
     readVar(node, r.targetLuma,          log);
 }
@@ -435,6 +436,7 @@ static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
     writeVar(n, r.stallTimeoutMs);
     writeVar(n, r.firstFrameTimeoutMs);
     writeVar(n, r.retryIntervalSec);
+    writeVar(n, r.syncIntervalMs);
     writeVar(n, r.exposureMode);
     writeVar(n, r.targetLuma);
 }

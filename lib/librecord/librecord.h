@@ -78,6 +78,7 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -398,6 +399,15 @@ struct SegmentOptions {
     uint32_t eosTimeoutMs        = 4000; ///< stop(): wait this long for the EOS to finalise.
     uint32_t stallTimeoutMs      = 5000; ///< Unhealthy after this long without a frame; 0 = off.
     uint32_t firstFrameTimeoutMs = 15000;///< Unhealthy when no first frame arrives in time.
+    /// Force the open segment and its sidecar out of the page cache to disk
+    /// (fdatasync) this often, so a power cut — the normal way a car dashcam
+    /// stops — loses at most about this much footage instead of the ~5-30 s
+    /// Linux writeback would.  (MJPEG: every frame is a keyframe.  H.264: add
+    /// one camera GOP, which splitmuxsink holds in memory until it completes.)
+    /// Closed segments and new directory entries are synced too, all on a
+    /// dedicated thread so a slow disk never stalls sampling or the watchdog.
+    /// 0 = off (leave it to writeback).
+    uint32_t syncIntervalMs      = 1000;
     /// stop() still not finished eosTimeoutMs + 3 s after it was called — the
     /// worker stuck in a sidecar write, or the teardown in a D-state write or a
     /// wedged V4L2 ioctl: log an error and _exit(3) so the outer restart loop
@@ -486,6 +496,8 @@ public:
     bool consumeFragmentClosed();
 
     std::string currentFile() const;   ///< Segment being written ("" before the first).
+    uint64_t    syncCount() const { return syncCount_.load(); }  ///< Periodic fdatasync rounds so far.
+    uint64_t    syncedFileCount() const { return syncedFiles_.load(); }  ///< Successful file fdatasyncs.
 
     /// Close the open segment now and continue in a new one (gapless), e.g.
     /// after the system clock was corrected so the next file is named right.
@@ -528,6 +540,18 @@ private:
     std::atomic<int64_t> lastBufferNs_{0};      ///< steady_clock ns of the newest frame.
     int64_t              playingAtNs_ = 0;      ///< steady_clock ns when PLAYING was requested.
     std::atomic<bool>    fragmentClosed_{false};
+    std::atomic<uint64_t> syncCount_{0};
+    std::atomic<uint64_t> syncedFiles_{0};
+
+    // durability: a dedicated sync thread owns every sync descriptor, so a
+    // slow or stuck disk never blocks the worker's bus handling, watchdog or
+    // sidecar sampling.  The worker and teardown only hand it work.
+    std::thread             syncThread_;
+    std::mutex              syncMu_;              ///< Guards the three fields below.
+    std::condition_variable syncCv_;
+    bool                    syncStop_ = false;
+    std::string             syncAssPath_;         ///< Sidecar being written ("" = none).
+    std::deque<std::pair<std::string, bool>> syncJobs_;  ///< One-shot (path, isDirectory).
 
     mutable std::mutex   stateMutex_;           ///< Guards the fields below.
     std::string          lastError_;
@@ -552,6 +576,10 @@ private:
     int64_t runningTimeNs() const;               ///< Pipeline clock − base time; -1 if unknown.
     void setError(const std::string& why);
     void closeSidecar();
+    void syncLoop();                             ///< The sync thread.
+    void queueSync(const std::string& path, bool directory = false);
+    void setSyncSidecar(const std::string& path);
+    void stopSyncThread();                       ///< Final syncs, then join.
     void teardown();                             ///< EOS/finalise + NULL; stop()'s body.
 
     static gchar*            onFormatLocation(GstElement* smx, guint fragmentId,

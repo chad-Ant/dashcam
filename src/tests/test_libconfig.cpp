@@ -98,6 +98,7 @@ static bool test_roundtrip() {
     src.recording.stallTimeoutMs      = 2500;
     src.recording.firstFrameTimeoutMs = 9000;
     src.recording.retryIntervalSec    = 5;
+    src.recording.syncIntervalMs      = 2500;
     src.recording.exposureMode        = std::string("camera");
     src.recording.targetLuma          = 90;
     src.system.footagePath  = "/mnt/ssd/footage";
@@ -213,6 +214,7 @@ static bool test_roundtrip() {
     check(dst.recording.stallTimeoutMs      == 2500,   "recording.stallTimeoutMs round-trip");
     check(dst.recording.firstFrameTimeoutMs == 9000,   "recording.firstFrameTimeoutMs round-trip");
     check(dst.recording.retryIntervalSec    == 5,      "recording.retryIntervalSec round-trip");
+    check(dst.recording.syncIntervalMs      == 2500,   "recording.syncIntervalMs round-trip");
     check((std::string)dst.recording.exposureMode == "camera", "recording.exposureMode round-trip");
     check(dst.recording.targetLuma          == 90,     "recording.targetLuma round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
