@@ -78,6 +78,7 @@
 #include <memory>
 #include <mutex>
 #include <linux/videodev2.h>
+#include <map>
 #include <set>
 #include <string>
 #include <system_error>
@@ -817,11 +818,20 @@ public:
 
     /// The same pass as a self-contained job (copies only — no reference to
     /// this object), for the retention thread: a directory scan and deletes
-    /// can block on a failing disk and must not hold up the supervisor.
+    /// can block on a failing disk and must not hold up the supervisor.  The
+    /// job keeps the directory LOCKED until it ends — a dup of the lock fd
+    /// (flock belongs to the open file description), so even after release()
+    /// no other dashcam_v0_4, and no later claim of ours, can start recording
+    /// under a pass that may delete anything it scans.  Empty when no
+    /// directory is held.
     std::function<rec::RetentionResult()> retentionPass(uint64_t watermark) const {
+        if (lockFd_ < 0) return {};
+        const int held = ::fcntl(lockFd_, F_DUPFD_CLOEXEC, 0);
+        if (held < 0) return {};
+        auto hold = std::shared_ptr<int>(new int(held), [](int* fd) { ::close(*fd); delete fd; });
         rec::RetentionPolicy p = policy_;
         p.dir = dir_;
-        return [p, watermark, log = log_] {
+        return [p, watermark, log = log_, hold] {
             return rec::enforceRetention(p, watermark, [] { return g_run != 0; }, log);
         };
     }
@@ -884,8 +894,10 @@ private:
         const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (fd < 0) { whyNot = "cannot open " + path + ": " + std::strerror(errno); return -1; }
         if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-            whyNot = errno == EWOULDBLOCK ? "another dashcam_v0_4 is recording into " + dir
-                                          : "cannot lock " + path + ": " + std::strerror(errno);
+            whyNot = errno == EWOULDBLOCK
+                         ? "locked: another dashcam_v0_4 records into " + dir +
+                               ", or a cleanup pass of ours still runs there"
+                         : "cannot lock " + path + ": " + std::strerror(errno);
             ::close(fd);
             return -1;
         }
@@ -965,6 +977,12 @@ static int selfTestStorage() {
 // posts a pass and collects its result.  A pass still running when the next
 // is due is not queued again.  At shutdown a pass stuck on a dead disk is left
 // behind (detached) instead of blocking the exit — passes hold only copies.
+//
+// NEVER start a session in a directory while a pass there runs (idleFor): a
+// pass posted while no session ran has an unlimited watermark and may delete
+// ANY segment it scans — including the one a new session just opened.  And a
+// bounded watermark is no substitute: a pass that deletes every segment resets
+// the numbering (next SEQ = highest existing + 1) below its own watermark.
 class RetentionRunner {
 public:
     using Pass = std::function<rec::RetentionResult()>;
@@ -973,15 +991,23 @@ public:
     RetentionRunner(const RetentionRunner&)            = delete;
     RetentionRunner& operator=(const RetentionRunner&) = delete;
 
-    /// Start @p pass; false (nothing queued) while a previous pass still runs.
-    bool post(Pass pass) {
+    /// Start @p pass over @p dir; false (nothing queued) while a previous pass
+    /// still runs.
+    bool post(Pass pass, const std::string& dir) {
         std::lock_guard<std::mutex> lk(sh_->m);
         if (sh_->busy || sh_->stop) return false;
         sh_->busy      = true;
         sh_->since     = std::chrono::steady_clock::now();
+        sh_->dir       = dir;
         sh_->job       = std::move(pass);
         sh_->cv.notify_one();
         return true;
+    }
+    /// Wait at most @p ms until no pass over @p dir is running; true then.
+    bool idleFor(const std::string& dir, int ms) {
+        std::unique_lock<std::mutex> lk(sh_->m);
+        return sh_->cv.wait_for(lk, std::chrono::milliseconds(ms),
+                                [&] { return !sh_->busy || sh_->dir != dir; });
     }
     /// A finished pass's result, once.
     bool poll(rec::RetentionResult& out) {
@@ -1022,6 +1048,7 @@ private:
         std::condition_variable               cv;
         bool                                  stop = false, busy = false, hasResult = false;
         std::chrono::steady_clock::time_point since{};
+        std::string                           dir;         ///< Directory of the running pass.
         Pass                                  job;
         rec::RetentionResult                  result{};
     };
@@ -1038,6 +1065,7 @@ private:
             sh->job  = nullptr;
             lk.unlock();
             const rec::RetentionResult r = job();
+            job = nullptr;                                 // releases the directory lock it held
             lk.lock();
             sh->result    = r;
             sh->hasResult = true;
@@ -1047,6 +1075,64 @@ private:
         }
     }
 };
+
+// One RetentionRunner per directory, so a pass stuck on one disk (say the
+// preferred, gone dead) never starves retention on the other (the fallback).
+// Supervisor thread only.
+class Retention {
+public:
+    bool post(const std::string& dir, RetentionRunner::Pass pass) {
+        if (!pass) return false;
+        auto& r = runners_[dir];
+        if (!r) r = std::make_unique<RetentionRunner>();
+        return r->post(std::move(pass), dir);
+    }
+    /// Wait at most @p ms until no pass over @p dir runs; true then.
+    bool idleFor(const std::string& dir, int ms) {
+        const auto it = runners_.find(dir);
+        return it == runners_.end() || it->second->idleFor(dir, ms);
+    }
+    bool poll(rec::RetentionResult& out) {
+        for (auto& [dir, r] : runners_)
+            if (r->poll(out)) return true;
+        return false;
+    }
+    int64_t busyMs() const {
+        int64_t ms = 0;
+        for (const auto& [dir, r] : runners_) ms = std::max(ms, r->busyMs());
+        return ms;
+    }
+    void stop() {
+        for (auto& [dir, r] : runners_) r->stop();
+    }
+
+private:
+    std::map<std::string, std::unique_ptr<RetentionRunner>> runners_;
+};
+
+// Where a new session may record — never under a running cleanup pass (see
+// RetentionRunner): the directory acquire() picks, once no pass runs there
+// (beforeStart may post one, e.g. when space is low); else, after waitMs, the
+// other directory — the pass keeps its directory locked, so acquire() moves
+// on.  Recording elsewhere beats recording nowhere; the preferred directory
+// is taken back once it is free.  "" (with why) = nowhere right now.
+static std::string pickStartDir(Storage& storage, Retention& retention, int waitMs,
+                                const std::function<void(const std::string&)>& beforeStart,
+                                std::string& why) {
+    std::string dir = storage.acquire(why);
+    if (dir.empty()) return dir;
+    if (beforeStart) beforeStart(dir);
+    if (retention.idleFor(dir, waitMs)) return dir;
+    const std::string busy = dir;
+    storage.release();
+    std::string whyNot;
+    dir = storage.acquire(whyNot);
+    if (!dir.empty() && dir != busy && retention.idleFor(dir, 0)) return dir;
+    storage.release();
+    why = "cleanup pass still running in " + busy + " and no other footage directory is usable" +
+          (whyNot.empty() ? std::string() : " (" + whyNot + ")");
+    return "";
+}
 
 // ─── supervisor heartbeat: the last line of recovery ─────────────────────────
 
@@ -1176,11 +1262,15 @@ static int selfTestSupervision() {
             rec::RetentionResult r{};
             r.deleted = 3;
             return r;
-        });
+        }, "/footage");
         check(posted && msSince(t0) < 50, "retention pass posted without waiting for it");
-        check(!rr.post([] { return rec::RetentionResult{}; }), "a second pass is not queued while one runs");
+        check(!rr.post([] { return rec::RetentionResult{}; }, "/footage"), "a second pass is not queued while one runs");
         rec::RetentionResult res{};
         check(!rr.poll(res) && !rr.waitIdle(100), "no result while the pass is stuck");
+        t0 = clk::now();
+        check(!rr.idleFor("/footage", 150) && msSince(t0) >= 140,
+              "no session may start in the pass's directory while it runs (waited, then refused)");
+        check(rr.idleFor("/fallback", 150), "... another directory (e.g. the fallback) is free at once");
         gate->store(true);
         check(rr.waitIdle(1000) && rr.poll(res) && res.deleted == 3 && !rr.poll(res),
               "its result is collected once when it finishes");
@@ -1188,11 +1278,109 @@ static int selfTestSupervision() {
         rr.post([gate2] {
             while (!gate2->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             return rec::RetentionResult{};
-        });
+        }, "/footage");
         t0 = clk::now();
         rr.stop();                                           // pass stuck on a dead disk
         check(msSince(t0) < 1500, "shutdown does not wait for a stuck pass");
         gate2->store(true);
+    }
+    {
+        // The hazard idleFor() guards against: a pass posted while no session
+        // runs (unlimited watermark, as deletableBelowSeq() of a stopped
+        // recorder) that scans after a new segment appeared deletes it.
+        char td[] = "/tmp/v04_selftest_race_XXXXXX";
+        if (::mkdtemp(td)) {
+            const std::string dir = td;
+            auto seg = [&](uint64_t seq) {
+                return dir + "/" + rec::segmentFileName(kPrefix, seq, 1790000000 + (time_t)seq);
+            };
+            for (uint64_t q = 1; q <= 3; ++q) std::ofstream(seg(q)) << std::string(4096, 'x');
+            rec::RetentionPolicy pol;
+            pol.dir      = dir;
+            pol.prefix   = kPrefix;
+            pol.maxBytes = 1;                                // over quota: delete what it may
+            auto gate = std::make_shared<std::atomic<bool>>(false);
+            RetentionRunner rr;
+            rr.post([gate, pol] {
+                while (!gate->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                return rec::enforceRetention(pol, UINT64_MAX, [] { return true; }, nullptr);
+            }, dir);
+            check(!rr.idleFor(dir, 100), "cleanup running where a session would start: start deferred");
+            std::ofstream(seg(4)) << "open segment";         // had the session started anyway...
+            gate->store(true);
+            rr.waitIdle(2000);
+            check(!fs::exists(seg(4)), "... its new segment would have been deleted (why the start must wait)");
+            check(rr.idleFor(dir, 100), "cleanup finished: the start may go ahead");
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        } else {
+            check(false, "race temp dir");
+        }
+    }
+    {
+        // tryStart's decision (pickStartDir) with a cleanup pass that outlives
+        // its deadline (waitMs stands in for the 3 s): no session starts under
+        // it — the recording goes to the other directory — and the busy
+        // directory stays locked against everyone until the pass ends.
+        char ta[] = "/tmp/v04_selftest_gate_pref_XXXXXX";
+        char tb[] = "/tmp/v04_selftest_gate_fb_XXXXXX";
+        if (::mkdtemp(ta) && ::mkdtemp(tb)) {
+            const std::string A = ta, B = tb;
+            for (uint64_t q = 1; q <= 3; ++q)
+                std::ofstream(A + "/" + rec::segmentFileName(kPrefix, q, 1790000000 + (time_t)q)) << "old";
+            rec::RetentionPolicy pol;
+            pol.prefix   = kPrefix;
+            pol.maxBytes = 1;                                  // wipe what it may
+            auto noLog = [](LogLevel, const std::string&) {};
+            Storage   st(A, pol, noLog, B, probeDir);
+            Retention ret;
+            auto gate = std::make_shared<std::atomic<bool>>(false);
+            std::string why;
+            const auto t0 = clk::now();
+            const std::string d1 = pickStartDir(st, ret, 200, [&](const std::string& d) {
+                // the pre-start pass of a stopped recorder: unlimited watermark
+                auto pass = st.retentionPass(UINT64_MAX);
+                ret.post(d, [gate, pass] {
+                    while (!gate->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    return pass();
+                });
+            }, why);
+            check(d1 == B && msSince(t0) < 1500,
+                  "cleanup outlives its deadline: the session starts in the other directory, not under it");
+            check(!st.preferredBack(), "... the busy directory is not 'back' while its pass runs");
+            {
+                std::string whyNot;
+                Storage other(A, pol, noLog, "/proc/v04_selftest_unwritable", probeDir);
+                check(other.acquire(whyNot).empty(), "... and no other instance can take it (the pass holds its lock)");
+            }
+            gate->store(true);
+            check(ret.idleFor(A, 2000) && st.preferredBack(), "pass done: the preferred directory is back");
+            st.release();
+            // Nowhere else to go: no start at all (then retry), never under the pass.
+            auto gate2 = std::make_shared<std::atomic<bool>>(false);
+            Storage lone(A, pol, noLog, "/proc/v04_selftest_unwritable", probeDir);
+            std::string why2;
+            const std::string d2 = pickStartDir(lone, ret, 200, [&](const std::string& d) {
+                auto pass = lone.retentionPass(UINT64_MAX);
+                ret.post(d, [gate2, pass] {
+                    while (!gate2->load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    return pass();
+                });
+            }, why2);
+            check(d2.empty() && why2.find("cleanup pass still running") != std::string::npos,
+                  "no other directory usable: no start, retry later");
+            gate2->store(true);
+            ret.idleFor(A, 2000);
+            const std::string d3 = pickStartDir(lone, ret, 200, nullptr, why2);
+            check(d3 == A, "once the pass is done the start goes ahead there");
+            lone.release();
+            ret.stop();
+            std::error_code ec;
+            fs::remove_all(A, ec);
+            fs::remove_all(B, ec);
+        } else {
+            check(false, "gate temp dirs");
+        }
     }
     {
         std::atomic<int> fired{0};
@@ -1343,7 +1531,7 @@ int main(int argc, char* argv[]) {
     // Directory probes are bounded: a footage filesystem that stopped
     // answering counts as unusable instead of stalling the supervisor.
     Storage   storage(cfg.system.footagePath, policy, log, fallbackFootageDir(), BoundedProbe{});
-    RetentionRunner retention;             // deletes run off the supervisor
+    Retention retention;                   // deletes run off the supervisor, one runner per dir
     FailureLog failures(log);
 
     rec::SegmentedRecorder recorder;
@@ -1469,7 +1657,8 @@ int main(int argc, char* argv[]) {
     // disk): runRetention() only posts a pass; collectRetention() logs results.
     auto runRetention = [&]() {
         nextRetention = std::chrono::steady_clock::now() + kRetentionEvery;
-        if (!storage.dir().empty()) retention.post(storage.retentionPass(recorder.deletableBelowSeq()));
+        if (!storage.dir().empty())
+            retention.post(storage.dir(), storage.retentionPass(recorder.deletableBelowSeq()));
     };
     bool retentionSlowWarned = false;
     auto collectRetention = [&]() {
@@ -1507,14 +1696,15 @@ int main(int argc, char* argv[]) {
 
     auto tryStart = [&]() -> bool {
         std::string why;
-        const std::string dir = storage.acquire(why);
+        // Never under a running cleanup pass (see pickStartDir).
+        const std::string dir = pickStartDir(storage, retention, kPreStartRetentionMs,
+            [&](const std::string& d) {
+                const int64_t freeNow = freeBytes(d);
+                if (freeNow >= 0 && static_cast<uint64_t>(freeNow) < kHardFloorBytes)
+                    runRetention();                    // make room first
+            }, why);
+        collectRetention();
         if (dir.empty()) { scheduleRetry(why); return false; }
-        const int64_t freeNow = freeBytes(dir);
-        if (freeNow >= 0 && static_cast<uint64_t>(freeNow) < kHardFloorBytes) {
-            runRetention();                            // make room first — boundedly
-            retention.waitIdle(kPreStartRetentionMs);
-            collectRetention();
-        }
 
         std::vector<cameraInfo> cams;
         getCameraList(cams, recLog);
@@ -1672,6 +1862,16 @@ int main(int argc, char* argv[]) {
     heartbeat.stop();
     log(LogLevel::INFO, "dashcam v0.4 stopped (" + std::to_string(sessions) + " recording session" +
                         (sessions == 1 ? "" : "s") + ")");
-    dashcam::log::shutdown();
+    // Bounded log teardown: spdlog's shutdown joins its worker, which a
+    // stalled console pipe can hold forever.  The footage is final: exit 0.
+    auto logDone = std::make_shared<std::promise<void>>();
+    std::future<void> logFinished = logDone->get_future();
+    try {
+        std::thread([logDone] { dashcam::log::shutdown(); logDone->set_value(); }).detach();
+    } catch (const std::system_error&) {
+        dashcam::log::shutdown();
+        return 0;
+    }
+    if (logFinished.wait_for(std::chrono::seconds(2)) != std::future_status::ready) ::_exit(0);
     return 0;
 }
