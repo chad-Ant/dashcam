@@ -1,11 +1,14 @@
 @echo off
 setlocal enabledelayedexpansion
 
-rem Host tests for lib\SwitchFunctions.cpp, built with MSVC.
+rem Host tests for the MKR Zero firmware logic, built with MSVC:
+rem   switch_tests      lib\SwitchFunctions.cpp
+rem   imu_tests         lib\IMUFunctions.cpp lifecycle and fault accounting
+rem   can_probe_tests   lib\CANSniffFunctions.cpp map probe (MCP2515 model)
 rem
-rem   RunTests.cmd        build and run
+rem   RunTests.cmd        build and run every suite
 rem
-rem Exit code is the number of failing checks, so this is usable as a gate.
+rem Exit code is the total number of failing checks, so this is usable as a gate.
 rem
 rem There is a Makefile beside this file for g++ / clang++ - use that on the
 rem Orin Nano or any Linux box. This script exists because the Windows machine
@@ -13,10 +16,11 @@ rem this firmware is normally built from has no g++ at all: arduino-cli ships
 rem only arm-none-eabi, which cross-compiles and cannot run what it produces.
 rem Tests that cannot be executed where the code is written do not get run.
 rem
-rem THIS DIRECTORY IS FIRST ON THE INCLUDE PATH ON PURPOSE. lib\SwitchFunctions.h
-rem includes <Arduino.h> with angle brackets, so .\Arduino.h shadows the real
-rem one and the module under test compiles UNMODIFIED - no #ifdef, no test-only
-rem build of the firmware, and no second copy of the logic to drift out of sync.
+rem THIS DIRECTORY IS FIRST ON THE INCLUDE PATH ON PURPOSE. The modules under
+rem test include <Arduino.h>, <Wire.h>, <SPI.h>, <CAN.h> and <SdFat.h> with angle
+rem brackets, so the stand-ins here shadow the real ones and every module
+rem compiles UNMODIFIED - no #ifdef, no test-only build of the firmware, and no
+rem second copy of the logic to drift out of sync.
 rem
 rem NOTE: keep this file plain ASCII - cmd.exe parses it in the OEM codepage.
 
@@ -52,18 +56,31 @@ for %%I in ("%TESTS%\..\..\lib") do set "LIBDIR=%%~fI"
 
 cd /d "%TESTS%"
 
-cl /nologo /std:c++14 /W4 /EHsc /I"%TESTS%" /I"%LIBDIR%" ^
-   arduino_stub.cpp switch_tests.cpp "%LIBDIR%\SwitchFunctions.cpp" ^
-   /Fe:switch_tests.exe
-if errorlevel 1 (
-    del /q *.obj 2>nul
-    echo Build failed.
-    exit /b 1
-)
+set "CL_FLAGS=/nologo /std:c++14 /W4 /EHsc /I"%TESTS%" /I"%LIBDIR%""
+set "RC=0"
 
-echo.
-.\switch_tests.exe
-set "RC=%ERRORLEVEL%"
+cl %CL_FLAGS% arduino_stub.cpp switch_tests.cpp "%LIBDIR%\SwitchFunctions.cpp" /Fe:switch_tests.exe
+if errorlevel 1 goto :buildfail
+
+cl %CL_FLAGS% arduino_stub.cpp imu_tests.cpp "%LIBDIR%\IMUFunctions.cpp" /Fe:imu_tests.exe
+if errorlevel 1 goto :buildfail
+
+cl %CL_FLAGS% arduino_stub.cpp mcp2515_model.cpp can_probe_tests.cpp ^
+   "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
+   /Fe:can_probe_tests.exe
+if errorlevel 1 goto :buildfail
 
 del /q *.obj 2>nul
+echo.
+
+rem Every suite runs even after one fails, so a single run reports everything.
+for %%T in (switch_tests imu_tests can_probe_tests) do (
+    .\%%T.exe
+    set /a RC+=!ERRORLEVEL!
+)
 exit /b %RC%
+
+:buildfail
+del /q *.obj 2>nul
+echo Build failed.
+exit /b 1

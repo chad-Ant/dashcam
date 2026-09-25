@@ -279,6 +279,28 @@ void loop(){
         }
     }
 
+    // A retired part stays retired until a bring-up runs — imuInitTick() no
+    // longer revives it by itself, and that revival was a driver bug. This
+    // sketch exists to show faults, so say so once, then recover the way
+    // mkr_zero.ino does, instead of going quiet at the one moment that matters.
+    static bool     retiredShown = false;
+    static uint32_t lastRetry    = 0;
+    if (isIMUDegraded(gDev)){
+        if (!retiredShown){
+            retiredShown = true;
+            Serial.print(F("  RETIRED  faults "));   Serial.print(gDev.faults);
+            Serial.print(F("  ioerr "));             Serial.print(gDev.ioErrors);
+            Serial.print(F("  implausible "));       Serial.print(gDev.implausible);
+            Serial.println(F("  - reconfiguring"));
+        }
+        if ((millis() - lastRetry) >= IMU_RETRY_MS){
+            lastRetry = millis();
+            (void)recoverIMU(gDev);
+        }
+    } else {
+        retiredShown = false;
+    }
+
     static uint32_t lastPoll = 0;
     if (imuIsReady(gDev) && (millis() - lastPoll) >= IMU_POLL_MS){
         lastPoll = millis();

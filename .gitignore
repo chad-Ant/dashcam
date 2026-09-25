@@ -9,9 +9,11 @@ docs/*
 testlogs/*
 
 # Host test binaries. The sources are the deliverable; these are rebuilt by
-# peripherals/mkr_zero/tests/host/RunTests.cmd or its Makefile on every run.
+# the tests/host Makefiles (or mkr_zero's RunTests.cmd) on every run.
 peripherals/*/tests/host/*.exe
 peripherals/*/tests/host/*.obj
 peripherals/*/tests/host/switch_tests
+peripherals/*/tests/host/imu_tests
+peripherals/*/tests/host/can_probe_tests
 # dashcam_v0_4 records here when the footage mount is unusable.
 footage_fallback/

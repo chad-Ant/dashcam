@@ -4,6 +4,8 @@
 
 #include <string.h>
 
+HostSerial Serial;
+
 // ─── pin state ───────────────────────────────────────────────────────────────
 
 static const uint32_t PIN_COUNT = 32u;

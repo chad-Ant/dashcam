@@ -248,17 +248,62 @@ void canSniffResetCounters() { gFrames = 0; gMatches = 0; gIdsSeenMask = 0; }
 
 // ─── boot-time source decision ────────────────────────────────────────────────
 
-void canProbeArm(CanProbeState &p)
+// Defined with the mode state machine below; the probe borrows both.
+static bool          applyFilterSet(const uint16_t *ids, uint8_t count);
+static CanModeStatus failToConfig(CanModeStatus why);
+
+/// A host CMD_SET_CAN_FILTER landed during this sniff session. The host
+/// outranks the map, so the probe's verdict must not replace that filter set.
+static bool gHostFilters = false;
+
+bool canProbeArm(CanProbeState &p)
 {
     p.stage        = CanProbeStage::Probing;
     p.startMs      = 0;
     p.clockStarted = false;
     canSniffResetCounters();
+
+    // ACCEPT ALL while the map is unproven — the probe cannot work otherwise.
+    //
+    // Entering SNIFF programs the MAP's filters, and they reject every ID the
+    // map does not name in hardware. The probe's clock waits for the first
+    // frame, and with the map's filters in place a map for another vehicle on a
+    // busy bus admits NOTHING: the frame count stayed at zero, the window never
+    // opened, and the fallback to OBD2 never came — a simulated probe was still
+    // pending after an hour. "Is the bus alive?" has to be asked of every ID;
+    // only "is this the right map?" is a question about the map's own IDs, and
+    // the directory scan in tickCANSniff() still answers that one in software.
+    //
+    // Listen-only either way: applyFilterSet() lands back in Listen-Only, so
+    // opening the filters never makes the node bus-active.
+    gHostFilters = false;
+    if (gMode != CanMode::SNIFF) {
+        p.stage = CanProbeStage::Skipped;
+        return false;
+    }
+    if (!applyFilterSet(nullptr, 0u)) {
+        // The write goes through Configuration, so a refusal leaves the
+        // controller in a state nobody verified. Park it where every recovery
+        // path can start from, and say so: the caller resynchronises its mode
+        // and the OFF retry brings the controller back and re-arms.
+        p.stage = CanProbeStage::Skipped;
+        (void)failToConfig(CanModeStatus::NOK_FILTER);
+        return false;
+    }
+    return true;
 }
 
 void canProbeSkip(CanProbeState &p)
 {
+    const bool wasProbing = (p.stage == CanProbeStage::Probing);
     p.stage = CanProbeStage::Skipped;
+
+    // A probe skipped mid-run leaves behind the accept-all filters it opened,
+    // and nothing else would ever narrow them: a host that asks for SNIFF while
+    // already sniffing gets UNCHANGED, which reprograms nothing. Install the
+    // map's, exactly as a Sniffing verdict would (a host filter set is kept).
+    // A refusal parks the controller and canGetMode() says OFF.
+    if (wasProbing) (void)canSniffApplyMapFilters();
 }
 
 CanProbeStage canProbeTick(CanProbeState &p, uint32_t nowMs)
@@ -427,7 +472,16 @@ bool canSniffSetFilters(const uint16_t *ids, uint8_t count)
     // in OBD2 mode they are programmed for the 0x7E8 response and must not be
     // overwritten by a host that is thinking about a different bus role.
     if (gMode != CanMode::SNIFF) return false;
-    return applyFilterSet(ids, count);
+    if (!applyFilterSet(ids, count)) {
+        // The write went through Configuration, so a refusal can leave the
+        // controller receiving nothing while everything still says SNIFF.
+        // Park it in a verified state instead, as the probe's writes do; the
+        // caller adopts canGetMode() and the OFF retry brings it back.
+        (void)failToConfig(CanModeStatus::NOK_FILTER);
+        return false;
+    }
+    gHostFilters = true;
+    return true;
 }
 
 uint8_t canSniffFilterCount()   { return gFilterCount; }
@@ -522,6 +576,20 @@ static CanModeStatus failToConfig(CanModeStatus why)
     return parked ? why : CanModeStatus::NOK_CONFIG;
 }
 
+bool canSniffApplyMapFilters()
+{
+    if (gMode != CanMode::SNIFF) return false;
+    // The host outranks the map. A filter set it installed while the probe ran
+    // is an explicit choice about this capture, and the verdict is only the
+    // boot heuristic concluding — it has no business overwriting that.
+    if (gHostFilters) return true;
+    if (programSniffFilters()) return true;
+    // Same reasoning as a refused open in canProbeArm(): the write went through
+    // Configuration, so park in a verified state rather than keep claiming SNIFF.
+    (void)failToConfig(CanModeStatus::NOK_FILTER);
+    return false;
+}
+
 CanModeStatus canSetMode(CanMode mode, int csPin)
 {
     gCsPin = csPin;
@@ -607,8 +675,11 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
         break;
     }
 
-    gMode       = mode;
-    gLastModeMs = millis();
+    gMode        = mode;
+    gLastModeMs  = millis();
+    // Every transition reprograms the filters, so a host's set does not survive
+    // into the new mode and must not be protected there.
+    gHostFilters = false;
     return CanModeStatus::OK;
 }
 

@@ -479,6 +479,23 @@ struct IMUDevice{
     bool     quarantined;
 
     /**
+     * A bring-up armed by @c initializeIMU() that has not yet reached
+     * Configured — the ONLY licence @c imuInitTick() has to set @c ready.
+     *
+     * The init machine STAYS in Configured once a bring-up completes: it is a
+     * stage, not an edge.  Testing the stage alone therefore restored readiness
+     * on the very next pass after a read fault cleared it — five failed reads
+     * retired the part, the following loop() marked it ready again with its
+     * fault count wiped and nothing reconfigured, and @c isIMUDegraded() was
+     * never true long enough for recovery to run.  Set only where a bring-up is
+     * genuinely started, consumed by the edge it licenses, cleared by
+     * @c imuMarkAbsent().
+     *
+     * Member initialiser for the same reason as @c lifecycle below.
+     */
+    bool     bringUpArmed = false;
+
+    /**
      * Lifecycle latch, so quarantine survives a later @c initializeIMU().
      *
      * A separate field is needed because @c initializeIMU() resets every other

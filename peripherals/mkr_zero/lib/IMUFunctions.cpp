@@ -509,6 +509,10 @@ void imuMarkAbsent(IMUDevice &dev){
     const bool wasQuarantined = (dev.lifecycle == IMU_LIFECYCLE_QUARANTINED) || dev.quarantined;
 
     dev.ready       = false;
+    // Nothing is armed after a bare reset. The init machine may still be sitting
+    // in Configured from an earlier bring-up, and that must not make this device
+    // ready again on the next imuInitTick() — see IMUDevice::bringUpArmed.
+    dev.bringUpArmed = false;
     dev.faults      = 0u;
     dev.ioErrors    = 0u;
     dev.implausible = 0u;
@@ -566,6 +570,7 @@ IMUReturnStatus initializeIMU(IMUDevice &dev, IMUSampleMode mode){
     const uint8_t opMode = (mode == IMUSampleMode::Raw) ? OPERATION_MODE_AMG
                                                         : OPERATION_MODE_IMUPLUS;
     if (!bno055InitBegin(dev.init, opMode)) return IMUReturnStatus::NOK_INIT_FAILED;
+    dev.bringUpArmed = true;
     return IMUReturnStatus::OK;
 }
 
@@ -581,8 +586,16 @@ BNO055InitStage imuInitTick(IMUDevice &dev){
     // The edge into Configured is where the device becomes usable, and it is
     // taken once: dev.ready is false until here, so a mid-bring-up poll cannot
     // publish a reading from a part that has not finished being told what to do.
-    if ((stage == BNO055InitStage::Configured) && !dev.ready){
+    //
+    // ONCE PER ARMED BRING-UP, not whenever the stage reads Configured and the
+    // device is not ready. The stage stays Configured after the bring-up that
+    // reached it, so the old test also fired after a read fault or a frozen
+    // channel had retired the part: the next pass declared it ready again,
+    // wiped the fault count, and skipped the reconfiguration that retirement
+    // exists to trigger. Only initializeIMU() arms this edge.
+    if ((stage == BNO055InitStage::Configured) && dev.bringUpArmed){
         const uint32_t now = millis();
+        dev.bringUpArmed  = false;
         dev.ready         = true;
         dev.faults        = 0u;
         dev.accelChangeMs = now;
@@ -833,8 +846,6 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
         }
     }
 
-    dev.faults = 0u;
-
     // ── decode ───────────────────────────────────────────────────────────────
     const float ax = static_cast<float>(toInt16LE(&buf[IMU_OFF_ACCEL    ])) * IMU_SCALE_ACCEL_MS2;
     const float ay = static_cast<float>(toInt16LE(&buf[IMU_OFF_ACCEL + 2])) * IMU_SCALE_ACCEL_MS2;
@@ -872,6 +883,13 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // gained a sample. The gap flag is measured from here — see
     // noteGapIfStarved() for why the poll's own timestamp will not do.
     dev.lastGoodMs = now;
+    // And the only place the consecutive-fault run ends. It was cleared before
+    // gate 3, so a part returning impossible acceleration on every burst had
+    // its count reset to zero and bumped back to one each poll — a hundred
+    // impossible readings in a row and it never reached
+    // IMU_MAX_CONSECUTIVE_FAULTS, never retired, never got reconfigured. A run
+    // ends when a burst is ACCEPTED, not when it merely gets past some gates.
+    dev.faults = 0u;
 
     data.accelX = ax; data.accelY = ay; data.accelZ = az;
     data.accelSampleMs = now;

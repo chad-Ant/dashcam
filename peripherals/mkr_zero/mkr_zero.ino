@@ -571,6 +571,11 @@ static bool applyCanMode(CanMode want)
     // for up to a second after the source that fed them was switched off.
     initVehicleSignals(vehSignals);
     initYawEstimator(yawEst, canSniffGetMap());
+    // The OBD-II readings too, which this used to leave behind. Leaving OBD2
+    // cleared the sniffed template and nothing else, so the last polled speed
+    // and RPM went on riding out in every frame — and, with no sniffed speed,
+    // on feeding the acceleration estimator — for as long as the new mode ran.
+    initOBD2Data(obdData);
 
     if (want == CanMode::OBD2) {
         obdReady = true;
@@ -587,6 +592,25 @@ static bool applyCanMode(CanMode want)
     Serial.print("CAN: mode -> ");
     Serial.println(canModeName(want));
     return true;
+}
+
+/**
+ * @brief Arms the map probe after a successful switch into SNIFF.
+ *
+ * The probe opens the filters to accept-all (see canProbeArm()), and that write
+ * can be refused. The driver then parks the controller in Configuration and
+ * reports OFF, so adopt that: the OFF retry in loop() brings the controller
+ * back and arms again, which is the recovery every other refused transition
+ * already relies on.
+ */
+static void armCanProbe()
+{
+    if (canProbeArm(canProbe)) return;
+    canMode  = canGetMode();
+    obdReady = false;
+    Serial.print("CAN: probe could not open the filters; controller parked (");
+    Serial.print(canModeName(canMode));
+    Serial.println("), will retry");
 }
 
 // ─── Arduino entry points ─────────────────────────────────────────────────────
@@ -945,7 +969,7 @@ void setup()
             // window: the C3 link, the IMU drain and the GNSS machine all need
             // loop() passes during it, and the 8 s watchdog would fire long
             // before ten seconds elapsed.
-            canProbeArm(canProbe);
+            armCanProbe();
         } else {
             // Sniffing refused: fall back to a mode we can verify rather than
             // to a controller in an unknown state.
@@ -982,6 +1006,11 @@ void loop()
         // switch modes out from under an explicit CMD_SET_CAN_MODE would be
         // overriding a human with a guess.
         canProbeSkip(canProbe);
+        // Skipping a running probe rewrites its open filters, and a refused
+        // write parks the controller. Adopt the driver's mode first, so the
+        // transition below starts from the truth — an UNCHANGED answer to
+        // the request would otherwise leave canMode claiming SNIFF.
+        canMode = canGetMode();
         // The give-up tally is cleared too. It bounds an AUTONOMOUS retry loop;
         // a host that explicitly asks for OBD2 again is entitled to a full fresh
         // budget rather than one attempt before the old count trips it again.
@@ -1006,6 +1035,10 @@ void loop()
             // cause is not being in sniff mode, and a host that sent the command
             // in OBD2 mode would otherwise see no effect and no explanation.
             Serial.println("REFUSED (sniff mode only, or the controller declined)");
+            // A refusal by the CONTROLLER parks it (OFF); adopt that so the OFF
+            // retry brings it back. A mode refusal changed nothing, and this is
+            // then a no-op.
+            canMode = canGetMode();
         } else if (commMaster.canFilterCount == 0u) {
             // Said out loud because it is the opposite of how it sounds, and on
             // this bus it is a real capacity decision rather than a formality.
@@ -1019,6 +1052,16 @@ void loop()
                 Serial.print(commMaster.canFilterIds[i], HEX);
             }
             Serial.println();
+        }
+        // The host outranks the boot heuristic here too. A probe left running
+        // behind a host filter set would judge the map through the HOST'S
+        // filters — the same blindness the probe opens its filters to avoid —
+        // and a FellBack verdict would then replace the host's listen-only
+        // capture with bus-active OBD2. Its set is kept: canProbeSkip() leaves
+        // host filters alone.
+        if (ok && canProbe.stage == CanProbeStage::Probing) {
+            canProbeSkip(canProbe);
+            Serial.println("CAN: probe ended - the host's filters take precedence");
         }
         // Cleared whether or not it succeeded, for the same reason as the mode
         // request above: a refused command retried every pass forever produces a
@@ -1098,6 +1141,13 @@ void loop()
             Serial.print("CAN: probe passed (");
             Serial.print(canSniffMatchCount());
             Serial.println(" matching frames); sniffing this vehicle");
+            // The probe ran accept-all; now that the map is proven, narrow to
+            // its IDs so the drain spends its capacity on them.
+            if (!canSniffApplyMapFilters()) {
+                canMode  = canGetMode();
+                obdReady = false;
+                Serial.println("CAN: map filters REFUSED; controller parked, will retry");
+            }
         } else if (st == CanProbeStage::FellBack) {
             // Two different faults needing different repairs, told apart by the
             // frame count: traffic but no matches means the map is for another
@@ -1131,13 +1181,6 @@ void loop()
             vehBusEverLive = true;
             lastEcuReplyMs = millis();
         }
-        // Age each reading out on its OWN clock, every pass.  A full sweep of
-        // the pipeline takes ~10 x OBD2_TICK_TIMEOUT_MS, so without this a live
-        // RPM response certified a speed value most of a second old as current,
-        // and COMM_FLAG_OBD2_VALID then vouched for the whole payload.  Speed is
-        // the one that matters: it is fed to the acceleration estimator, and a
-        // frozen value re-fed repeatedly reads as a genuine deceleration.
-        expireStaleOBD2Fields(obdData);
         if (isOBD2LinkLost()) {
             // Defined fallback rather than silently publishing frozen readings:
             // drop the ready flag so the retry path below re-initialises, and
@@ -1203,7 +1246,13 @@ void loop()
         // all, which is exactly the fault this retry exists for — gating on OBD2
         // alone would have made a failed boot permanent.
         const bool wasOff = (canMode == CanMode::OFF);
-        obdReady      = startOBD2();
+        // From OFF, bring the controller up in Configuration — off the bus —
+        // exactly as setup() does: whichever mode follows below programs its
+        // own filters and final mode. The default bring-up ends in Normal, and
+        // that window made the node ACK-capable on a vehicle where only SNIFF
+        // may have been chosen; this path is also where a refused filter write
+        // recovers. Re-initialising a live OBD2 session keeps the default.
+        obdReady      = startOBD2(/*stayInConfig=*/wasOff);
         lastOBD2Retry = millis();
 
         // Recovering from OFF means the controller is back but no mode has been
@@ -1228,13 +1277,27 @@ void loop()
             } else if (applyCanMode(CanMode::SNIFF)) {
                 // Probe armed, for the same reason the boot arms it: this is the
                 // first time the map has met the bus, so it is still unproven.
-                canProbeArm(canProbe);
+                armCanProbe();
             } else {
                 obdReady = true;   // applyCanMode() left state untouched on failure
                 Serial.println("CAN: sniff still unavailable; OBD2 poller armed");
             }
         }
     }
+
+    // Age each OBD-II reading out on its OWN clock, EVERY pass — whatever the
+    // mode and whether or not the poller is running.  A full sweep of the
+    // pipeline takes ~10 x OBD2_TICK_TIMEOUT_MS, so without this a live RPM
+    // response certified a speed value most of a second old as current, and
+    // COMM_FLAG_OBD2_VALID then vouched for the whole payload.  Speed is the one
+    // that matters: it is fed to the acceleration estimator, and a frozen value
+    // re-fed repeatedly reads as a genuine deceleration.
+    //
+    // Outside the obdReady block on purpose.  Inside it, expiry stopped the
+    // moment polling did — a lost link or a switch to SNIFF — which is exactly
+    // when readings stop being refreshed, so the last speed and RPM were
+    // published indefinitely and the estimator kept differentiating them.
+    expireStaleOBD2Fields(obdData);
 
 #ifdef USE_GPS
     // ── 2) GPS poll, with bounded recovery ───────────────────────────────────

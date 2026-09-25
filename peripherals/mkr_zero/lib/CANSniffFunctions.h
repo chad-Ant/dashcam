@@ -193,7 +193,9 @@ const CanSignalMap *canSniffGetMap();
  *               the hardware's six repeats the last, because a slot left at 0
  *               would accept ID 0 — a real and very high priority identifier.
  * @param count  How many of @p ids are meaningful. Surplus entries are dropped.
- * @return false when not sniffing, or when the controller refused.
+ * @return false when not sniffing, or when the controller refused — then it
+ *         has been parked in Configuration and @c canGetMode() reports OFF,
+ *         which the caller must adopt.
  */
 bool canSniffSetFilters(const uint16_t *ids, uint8_t count);
 
@@ -251,10 +253,41 @@ struct CanProbeState {
     bool          clockStarted;
 };
 
-/** @brief Arms the probe and restarts the counters. */
-void canProbeArm(CanProbeState &p);
+/**
+ * @brief Arms the probe, restarts the counters and OPENS THE FILTERS.
+ *
+ * Call right after a successful @c canSetMode(SNIFF). Entering sniff mode
+ * installs the map's hardware filters, which would hide every ID the map does
+ * not name — and with them the evidence that the bus is alive at all, so a map
+ * for another vehicle on a busy bus would never start the window. The probe
+ * therefore runs ACCEPT-ALL (still listen-only); @c canSniffApplyMapFilters()
+ * narrows the filters once the verdict is Sniffing.
+ *
+ * @return false when not in sniff mode, or when the controller refused the
+ *         filter write — then it has been parked in Configuration and
+ *         @c canGetMode() reports OFF, which the caller must adopt. The probe is
+ *         left Skipped either way.
+ */
+bool canProbeArm(CanProbeState &p);
 
-/** @brief Ends the probe without a verdict. Terminal. */
+/**
+ * @brief Installs the map's filters once the probe has proven the map.
+ *
+ * A no-op returning true when a host filter set arrived during the probe — the
+ * host outranks the heuristic. Costs a receive gap, like any filter write.
+ *
+ * @return false when not in sniff mode, or when the controller refused — then
+ *         it has been parked in Configuration and @c canGetMode() reports OFF.
+ */
+bool canSniffApplyMapFilters();
+
+/**
+ * @brief Ends the probe without a verdict. Terminal.
+ *
+ * Skipping a probe that is still running closes the filters it opened, by way
+ * of @c canSniffApplyMapFilters() — so a refused write can park the controller,
+ * and the caller must adopt @c canGetMode() afterwards.
+ */
 void canProbeSkip(CanProbeState &p);
 
 /**

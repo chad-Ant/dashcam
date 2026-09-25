@@ -6,10 +6,10 @@
  * @brief Host stand-in for the Arduino API, plus a model of the 74HC165 chain.
  *
  * Resolved INSTEAD of the real Arduino.h because the Makefile puts this
- * directory first on the include path.  It provides only what
- * lib/SwitchFunctions.cpp actually uses — this is not an Arduino emulator and
- * should never grow into one.  If a future module under test needs more, add
- * the smallest thing that compiles.
+ * directory first on the include path.  It provides only what the modules
+ * under test actually use — this is not an Arduino emulator and should never
+ * grow into one.  If a future module under test needs more, add the smallest
+ * thing that compiles.
  *
  * ── WHY THERE IS A DEVICE MODEL HERE AND NOT JUST A PIN ARRAY ────────────────
  * The obvious stub records pin writes and returns canned bits, which tests the
@@ -29,8 +29,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define HIGH 1
-#define LOW  0
+/// Enumerators, not macros — as in the real core (ArduinoCore-API
+/// api/Common.h, used by arduino:samd 1.8.14). Macros would rewrite every
+/// scoped enumerator of the same name, and VehGear::LOW is one.
+enum PinStatus { LOW = 0, HIGH = 1 };
 
 #define INPUT          0x0
 #define OUTPUT         0x1
@@ -48,6 +50,26 @@ void     digitalWrite(uint32_t pin, uint32_t value);
 int      digitalRead(uint32_t pin);
 void     delayMicroseconds(uint32_t us);
 uint32_t millis();
+
+// ─── ...and the little more IMUFunctions.cpp and CANSniffFunctions.cpp use ───
+//
+// There is one thread and no interrupt source on the host, so masking is a
+// no-op. Serial swallows everything: the modules under test only narrate to it,
+// and a test asserts on state, never on console text.
+
+inline void noInterrupts() {}
+inline void interrupts()   {}
+
+#define F(s) (s)
+#define DEC 10
+#define HEX 16
+
+struct HostSerial {
+    template <typename T> void print(const T &, int = DEC) {}
+    template <typename T> void println(const T &, int = DEC) {}
+    void println() {}
+};
+extern HostSerial Serial;
 
 // ─── test control ────────────────────────────────────────────────────────────
 
