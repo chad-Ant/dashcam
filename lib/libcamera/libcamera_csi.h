@@ -2,21 +2,21 @@
  * @file libcamera_csi.h
  * @brief MIPI CSI-2 camera implementation for NVIDIA Jetson via GStreamer / Argus.
  *
- * Camera_CSI extends Camera_GST with an nvarguscamerasrc-based pipeline.
- * Recording and Cairo overlay are handled separately by dashcam::record::Recorder
- * in librecord; see librecord.h for the recording branch API.
+ * Camera_CSI extends Camera_GST with an nvarguscamerasrc-based pipeline.  It
+ * feeds inference branches (e.g. liblanedetector) and captureFrame(); it is not
+ * a recording source — librecord records a UVC camera's own compressed stream
+ * and refuses Argus's raw frames (recording them would need a software encoder).
  *
- * Typical usage:
+ * Typical usage (as dashcam_v0_2 runs its lane camera):
  * @code
  *   std::vector<cameraInfo> list;
  *   getCameraList(list);
  *   Camera_CSI cam(list[0]);
  *   cam.setAttributeDictionary(dict);
+ *   cam.setOutputResolution(1280, 720, 20.0f);         // optional VIC downscale / rate cap
  *
- *   // Recording (optional — handled by Recorder in librecord):
- *   dashcam::record::Recorder recorder;
- *   GstElement* bin = recorder.createRecordingBin("/data/clip.mkv", frNum, frDen, enc);
- *   cam.addBranch("recording", bin);
+ *   // Optional branch, e.g. an inference bin; leaky = true never stalls the tee:
+ *   cam.addBranch("lanes", laneDetector.createBin(), true);
  *
  *   cam.open();
  *   cam.setCameraVideoFormat(0);
@@ -24,7 +24,6 @@
  *
  *   while (running) cam.captureFrame(buf, size, written);
  *
- *   recorder.disconnect();   // before stop()
  *   cam.stop();
  *   cam.close();
  * @endcode

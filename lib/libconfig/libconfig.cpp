@@ -160,14 +160,6 @@ namespace {
 
 // ── section parsers ──────────────────────────────────────────────────────────
 
-static void parseEncoder(pugi::xml_node node, EncoderConfig& enc,
-                         const dashcam::log::LogCallback& log) {
-    readVar(node, enc.bitrate,     log);
-    readVar(node, enc.speedPreset, log);
-    readVar(node, enc.keyIntMax,   log);
-    readVar(node, enc.tune,        log);
-}
-
 static void parseOverlay(pugi::xml_node node, OverlayConfig& ovl,
                          const dashcam::log::LogCallback& log) {
     readVar(node, ovl.enabled,           log);
@@ -221,7 +213,6 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam,
 static void parseSystem(pugi::xml_node node, SystemConfig& sys,
                         const dashcam::log::LogCallback& log) {
     readVar(node, sys.footagePath,  log);
-    readVar(node, sys.warmupFrames, log);
 }
 
 static void parsePipeline(pugi::xml_node node, PipelineConfig& p,
@@ -248,8 +239,6 @@ static void parseRecording(pugi::xml_node node, RecordingConfig& r,
                            const dashcam::log::LogCallback& log) {
     readVar(node, r.recordFps,    log);
     readVar(node, r.queueDepth,   log);
-    readVar(node, r.recordWidth,  log);
-    readVar(node, r.recordHeight, log);
     readVar(node, r.segmentSec,          log);
     readVar(node, r.maxFootageGB,        log);
     readVar(node, r.minFreeGB,           log);
@@ -281,6 +270,23 @@ static void parseDetection(pugi::xml_node node, DetectionConfig& d,
     readVar(node, d.driverFaceModelPath, log);
     readVar(node, d.driverFaceScore,     log);
     readVar(node, d.driverFaceDetectScale, log);
+}
+
+// Settings of the removed x264 / Cairo recording path.  An older file still
+// loads (they are skipped), but say so once: tuning one does nothing.
+static void warnObsolete(pugi::xml_node root, const dashcam::log::LogCallback& log) {
+    std::string found;
+    auto note = [&](bool present, const char* what) {
+        if (present) found += (found.empty() ? "" : ", ") + std::string(what);
+    };
+    note(!root.child("Encoder").empty(), "<Encoder>");
+    note(!root.child("System").child("WarmupFrames").empty(), "System WarmupFrames");
+    note(!root.child("Recording").child("RecordWidth").empty() ||
+         !root.child("Recording").child("RecordHeight").empty(), "Recording RecordWidth/RecordHeight");
+    if (!found.empty())
+        doLog(log, dashcam::log::LogLevel::WARN,
+              "obsolete settings ignored (%s): recording is compressed passthrough, "
+              "with no encoder or rescale; remove them from the config", found.c_str());
 }
 
 static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
@@ -341,14 +347,6 @@ static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
 
 // ── section writers ──────────────────────────────────────────────────────────
 
-static void writeEncoder(pugi::xml_node parent, const EncoderConfig& enc) {
-    pugi::xml_node n = parent.append_child("Encoder");
-    writeVar(n, enc.bitrate);
-    writeVar(n, enc.speedPreset);
-    writeVar(n, enc.keyIntMax);
-    writeVar(n, enc.tune);
-}
-
 static void writeOverlay(pugi::xml_node parent, const OverlayConfig& ovl) {
     pugi::xml_node n = parent.append_child("Overlay");
     writeVar(n, ovl.enabled);
@@ -402,7 +400,6 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
 static void writeSystem(pugi::xml_node parent, const SystemConfig& sys) {
     pugi::xml_node n = parent.append_child("System");
     writeVar(n, sys.footagePath);
-    writeVar(n, sys.warmupFrames);
 }
 
 static void writePipeline(pugi::xml_node parent, const PipelineConfig& p) {
@@ -429,8 +426,6 @@ static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
     pugi::xml_node n = parent.append_child("Recording");
     writeVar(n, r.recordFps);
     writeVar(n, r.queueDepth);
-    writeVar(n, r.recordWidth);
-    writeVar(n, r.recordHeight);
     writeVar(n, r.segmentSec);
     writeVar(n, r.maxFootageGB);
     writeVar(n, r.minFreeGB);
@@ -536,7 +531,7 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
         return false;
     }
 
-    if (auto enc = root.child("Encoder"))   parseEncoder  (enc, config.encoder,   log);
+    warnObsolete(root, log);
     if (auto ovl = root.child("Overlay"))   parseOverlay  (ovl, config.overlay,   log);
     if (auto sys = root.child("System"))    parseSystem   (sys, config.system,    log);
     if (auto pl  = root.child("Pipeline"))  parsePipeline (pl,  config.pipeline,  log);
@@ -569,7 +564,6 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
 
     pugi::xml_node root = doc.append_child("DashcamConfig");
 
-    writeEncoder(root, config.encoder);
     writeOverlay(root, config.overlay);
 
     pugi::xml_node cams = root.append_child("Cameras");

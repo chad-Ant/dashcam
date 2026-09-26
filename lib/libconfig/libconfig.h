@@ -15,7 +15,7 @@
  *   - step         Suggested increment for UI sliders / human editing.
  *   - description  Human-readable one-line explanation of the parameter.
  *
- * Existing code that reads a config field (e.g. @c cfg.encoder.bitrate) does
+ * Existing code that reads a config field (e.g. @c cfg.recording.segmentSec) does
  * not need to change — @c ConfigVar<T> provides an implicit @c operator const T&
  * conversion.  Assignment via @c = silently clamps numeric values to [min, max].
  *
@@ -25,13 +25,13 @@
  *   ConfigReader::load("config/dashcam.xml", cfg, log);
  *
  *   // Existing field access still compiles:
- *   int br = cfg.encoder.bitrate;          // implicit ConfigVar<int> → int
+ *   int seg = cfg.recording.segmentSec;    // implicit ConfigVar<int> → int
  *   bool on = cfg.overlay.enabled;         // implicit ConfigVar<bool> → bool
  *
  *   // Metadata available at runtime:
- *   cfg.encoder.bitrate.minValue()         // 500
- *   cfg.encoder.bitrate.description()      // "Target bitrate in kbps"
- *   cfg.encoder.bitrate.set(99999);        // returns false; value clamped to 50000
+ *   cfg.recording.segmentSec.minValue()    // 10
+ *   cfg.recording.segmentSec.description() // "Segment length (s); ..."
+ *   cfg.recording.segmentSec.set(99999);   // returns false; value clamped to 3600
  * @endcode
  */
 
@@ -191,17 +191,6 @@ private:
 // ─── per-domain config structs ────────────────────────────────────────────────
 
 /**
- * @brief H.264 software encoder parameters (x264enc; Orin Nano has no NVENC).
- * XML section: @c \<Encoder\>
- */
-struct EncoderConfig {
-    ConfigVar<int>         bitrate    {"Bitrate",     8000,        500,  50000, 100,   "Target bitrate in kbps (x264enc, Orin Nano has no NVENC)"};
-    ConfigVar<std::string> speedPreset{"SpeedPreset", "ultrafast",                     "x264 speed preset (ultrafast/superfast/veryfast/faster/fast/medium/slow)"};
-    ConfigVar<int>         keyIntMax  {"KeyIntMax",   60,          1,    300,   1,     "Maximum frames between keyframes"};
-    ConfigVar<std::string> tune       {"Tune",        "",                              "x264 tune string (e.g. zerolatency); empty = omit"};
-};
-
-/**
  * @brief Telemetry sidecar (ASS) rendering parameters.
  * XML section: @c \<Overlay\>
  */
@@ -300,7 +289,6 @@ inline constexpr const char* kFallbackConfigsName = "config";
  */
 struct SystemConfig {
     ConfigVar<std::string> footagePath  {"FootagePath",  kDefaultFootageDir, "Directory for recorded dashcam video (USB primary feed, with overlay)"};
-    ConfigVar<int>         warmupFrames {"WarmupFrames", 9,           0, 120, 1, "Frames to discard after pipeline start before enabling recording"};
 };
 
 /**
@@ -338,14 +326,12 @@ struct LogConfig {
 };
 
 /**
- * @brief Recording-branch tuning.  Codec parameters live in EncoderConfig.
+ * @brief Recording tuning (compressed passthrough: there is no encoder to tune).
  * XML section: @c \<Recording\>
  */
 struct RecordingConfig {
     ConfigVar<int> recordFps    {"RecordFps",    30, 1, 120,  1, "Recording framerate after videorate downsample (fps); capped at the camera rate"};
     ConfigVar<int> queueDepth   {"QueueDepth",   3,  1, 32,   1, "Recording-branch queue depth (buffers)"};
-    ConfigVar<int> recordWidth  {"RecordWidth",  0,  0, 4096, 2, "Downscale the recording to this width before overlay/encoder (0 = source width; set BOTH dims; keep aspect)"};
-    ConfigVar<int> recordHeight {"RecordHeight", 0,  0, 4096, 2, "Downscale the recording to this height before overlay/encoder (0 = source height)"};
 
     // ── segmented recording + loop overwrite (dashcam_v0_4) ───────────────────
     ConfigVar<int>   segmentSec          {"SegmentSec",          180,    10,   3600,    1,    "Segment length (s); a new file starts every SegmentSec with no gap between files"};
@@ -480,7 +466,6 @@ struct NetworkConfig {
  * Root XML element: @c \<DashcamConfig\>
  */
 struct AppConfig {
-    EncoderConfig             encoder;
     OverlayConfig             overlay;
     std::vector<CameraConfig> cameras;
     SystemConfig              system;

@@ -1,11 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <DashcamConfig>
-  <Encoder>
-    <Bitrate>8000</Bitrate>
-    <SpeedPreset>ultrafast</SpeedPreset>
-    <KeyIntMax>60</KeyIntMax>
-    <Tune></Tune>
-  </Encoder>
   <Overlay>
     <Enabled>true</Enabled>
     <BackgroundOpacity>0.5</BackgroundOpacity>
@@ -48,6 +42,5 @@
   </Cameras>
   <System>
     <FootagePath>/user/output/footage</FootagePath>
-    <WarmupFrames>9</WarmupFrames>
   </System>
 </DashcamConfig>

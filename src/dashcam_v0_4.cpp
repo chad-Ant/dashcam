@@ -966,11 +966,6 @@ static int selfTestStorage() {
     return failures;
 }
 
-// ─── repeated-message damper ──────────────────────────────────────────────────
-
-// Wraps a log callback: each distinct message is logged once at its own level,
-// repeats at DEBUG.  For chatty retry loops (a missing bridge, an offline NTP
-// server) that would otherwise write the same line every few seconds forever.
 // ─── retention thread: deletes never block the supervisor ─────────────────────
 
 // Runs retention passes one at a time on its own thread; the supervisor only
@@ -1395,6 +1390,11 @@ static int selfTestSupervision() {
     return failures;
 }
 
+// ─── repeated-message damper ──────────────────────────────────────────────────
+
+// Wraps a log callback: each distinct message is logged once at its own level,
+// repeats at DEBUG.  For chatty retry loops (a missing bridge, an offline NTP
+// server) that would otherwise write the same line every few seconds forever.
 static dashcam::log::LogCallback quietRepeats(dashcam::log::LogCallback log) {
     auto seen = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
     return [log, seen](LogLevel lvl, const std::string& msg) {

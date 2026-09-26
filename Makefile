@@ -201,7 +201,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/lane_test \
            $(BUILD_DIR)/driverstate_test
 
-.PHONY: all clean run dashcam_v0_3 dashcam_v0_4 commlink_test
+.PHONY: all clean dashcam_v0_3 dashcam_v0_4 commlink_test
 
 # `all` stays the default goal even though convenience aliases precede it.
 .DEFAULT_GOAL := all

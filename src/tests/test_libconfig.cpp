@@ -34,14 +34,20 @@ static bool test_load_real_file() {
     std::cout << "\n--- Test 1: load config/dashcam.xml ---\n";
     const int before = g_fails;
 
+    std::vector<std::string> warns;
+    dashcam::log::LogCallback log = [&](dashcam::log::LogLevel lvl, const std::string& m) {
+        if (lvl == dashcam::log::LogLevel::WARN) warns.push_back(m);
+    };
     AppConfig cfg;
-    bool ok = ConfigReader::load("config/dashcam.xml", cfg);
+    bool ok = ConfigReader::load("config/dashcam.xml", cfg, log);
     check(ok, "load() returns true");
+    bool obsolete = false;
+    for (const auto& w : warns) obsolete = obsolete || w.find("obsolete") != std::string::npos;
+    check(!obsolete, "the shipped file carries no obsolete settings");
 
-    // Encoder defaults (file has no overrides for these right now)
-    check(cfg.encoder.bitrate == 8000,             "encoder.bitrate == 8000");
-    check(cfg.encoder.speedPreset == "ultrafast",  "encoder.speedPreset == \"ultrafast\"");
-    check(cfg.encoder.keyIntMax == 60,             "encoder.keyIntMax == 60");
+    // Recording defaults (the file has no <Recording> section)
+    check(cfg.recording.segmentSec == 180,         "recording.segmentSec == 180");
+    check(cfg.recording.syncIntervalMs == 1000,    "recording.syncIntervalMs == 1000");
 
     // Overlay defaults
     check(cfg.overlay.enabled == true,             "overlay.enabled == true");
@@ -66,7 +72,6 @@ static bool test_load_real_file() {
 
     // System defaults
     check(cfg.system.footagePath == "/user/output/footage", "system.footagePath == \"/user/output/footage\"");
-    check(cfg.system.warmupFrames == 9,            "system.warmupFrames == 9");
 
     // Sections/fields absent from the on-disk file keep their built-in defaults.
     check(cfg.log.queueSize == 8192,               "log.queueSize default 8192 (section may be absent)");
@@ -87,17 +92,12 @@ static bool test_roundtrip() {
 
     // Build a config with two cameras and non-default values.
     AppConfig src;
-    src.encoder.bitrate     = 12000;
-    src.encoder.speedPreset = "medium";
-    src.encoder.keyIntMax   = 120;
     src.overlay.enabled     = false;
     src.overlay.fontSize    = 18.0f;
     src.overlay.labelPadX   = 20.0f;
     src.overlay.labelPadY   = 16.0f;
     src.overlay.subtitleRateHz = 2.0f;
     src.overlay.staleTimeoutMs = 1500;
-    src.recording.recordWidth  = 1280;
-    src.recording.recordHeight = 720;
     src.recording.segmentSec          = 60;
     src.recording.maxFootageGB        = 123.0f;
     src.recording.minFreeGB           = 7.0f;
@@ -109,7 +109,6 @@ static bool test_roundtrip() {
     src.recording.targetLuma          = 90;
     src.recording.nightLuma           = 50;
     src.system.footagePath  = "/mnt/ssd/footage";
-    src.system.warmupFrames = 30;
     src.pipeline.branchQueueDepth = 5;
     src.log.queueSize     = 4096;
     src.log.rotateSizeKb  = 1024;
@@ -204,17 +203,12 @@ static bool test_roundtrip() {
     bool loaded = ConfigReader::load(tmpFile, dst);
     check(loaded, "load() round-trip returns true");
 
-    check(dst.encoder.bitrate     == 12000,   "encoder.bitrate round-trip");
-    check(dst.encoder.speedPreset == "medium", "encoder.speedPreset round-trip");
-    check(dst.encoder.keyIntMax   == 120,     "encoder.keyIntMax round-trip");
     check(dst.overlay.enabled     == false,   "overlay.enabled round-trip");
     check(eq(dst.overlay.fontSize, 18.0f),    "overlay.fontSize round-trip");
     check(eq(dst.overlay.labelPadX, 20.0f),   "overlay.labelPadX round-trip");
     check(eq(dst.overlay.labelPadY, 16.0f),   "overlay.labelPadY round-trip");
     check(eq(dst.overlay.subtitleRateHz, 2.0f), "overlay.subtitleRateHz round-trip");
     check(dst.overlay.staleTimeoutMs == 1500,   "overlay.staleTimeoutMs round-trip");
-    check(dst.recording.recordWidth  == 1280, "recording.recordWidth round-trip");
-    check(dst.recording.recordHeight == 720,  "recording.recordHeight round-trip");
     check(dst.recording.segmentSec          == 60,     "recording.segmentSec round-trip");
     check(dst.recording.maxFootageGB        == 123.0f, "recording.maxFootageGB round-trip");
     check(dst.recording.minFreeGB           == 7.0f,   "recording.minFreeGB round-trip");
@@ -226,7 +220,6 @@ static bool test_roundtrip() {
     check(dst.recording.targetLuma          == 90,     "recording.targetLuma round-trip");
     check(dst.recording.nightLuma           == 50,     "recording.nightLuma round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
-    check(dst.system.warmupFrames == 30,      "system.warmupFrames round-trip");
     check(dst.pipeline.branchQueueDepth == 5, "pipeline.branchQueueDepth round-trip");
     check(dst.log.queueSize     == 4096,      "log.queueSize round-trip");
     check(dst.log.rotateSizeKb  == 1024,      "log.rotateSizeKb round-trip");
@@ -309,6 +302,11 @@ static bool test_roundtrip() {
         check(xml.find("NtpStepClock") == std::string::npos &&
               xml.find("NtpStepThresholdSec") == std::string::npos,
               "obsolete SNTP clock-step controls are not serialized");
+        check(xml.find("<Encoder") == std::string::npos &&
+              xml.find("WarmupFrames") == std::string::npos &&
+              xml.find("RecordWidth") == std::string::npos &&
+              xml.find("RecordHeight") == std::string::npos,
+              "removed encoder/rescale/warm-up settings are not serialized");
     }
 
     check(dst.cameras.size() == 2,            "cameras count == 2");
@@ -350,7 +348,7 @@ static bool test_missing_file() {
     bool ok = ConfigReader::load("/nonexistent/path/no_such_file.xml", cfg);
     check(!ok, "load() returns false for missing file");
     // Defaults must still be intact.
-    check(cfg.encoder.bitrate == 8000, "defaults preserved after failed load");
+    check(cfg.recording.segmentSec == 180, "defaults preserved after failed load");
 
     return g_fails == before;
 }
@@ -372,7 +370,7 @@ static bool test_bad_root() {
     AppConfig cfg;
     bool ok = ConfigReader::load(tmpFile, cfg);
     check(!ok, "load() returns false for wrong root node");
-    check(cfg.encoder.bitrate == 8000, "defaults preserved after wrong-root load");
+    check(cfg.recording.segmentSec == 180, "defaults preserved after wrong-root load");
 
     fs::remove(tmpFile);
     return g_fails == before;
@@ -389,9 +387,9 @@ static bool test_clamping() {
         std::ofstream f(tmpFile);
         if (!f) { std::cerr << "  SKIP  (cannot write temp file)\n"; return true; }
         f << "<?xml version=\"1.0\"?><DashcamConfig>"
-             "<Encoder><Bitrate>999999</Bitrate><KeyIntMax>0</KeyIntMax></Encoder>"
+             "<Recording><SegmentSec>999999</SegmentSec><RetryIntervalSec>0</RetryIntervalSec></Recording>"
              "<Overlay><BackgroundOpacity>5.0</BackgroundOpacity><FontSize>200</FontSize></Overlay>"
-             "<System><WarmupFrames>-5</WarmupFrames></System>"
+             "<Pipeline><CaptureTimeoutMs>-5</CaptureTimeoutMs></Pipeline>"
              "<Log><QueueSize>1</QueueSize></Log></DashcamConfig>";
     }
 
@@ -402,11 +400,11 @@ static bool test_clamping() {
 
     AppConfig cfg;
     check(ConfigReader::load(tmpFile, cfg, log), "load clamp file");
-    check(cfg.encoder.bitrate     == 50000, "Bitrate 999999 -> clamped to max 50000");
-    check(cfg.encoder.keyIntMax   == 1,     "KeyIntMax 0 -> clamped to min 1");
+    check(cfg.recording.segmentSec       == 3600, "SegmentSec 999999 -> clamped to max 3600");
+    check(cfg.recording.retryIntervalSec == 1,    "RetryIntervalSec 0 -> clamped to min 1");
     check(eq(cfg.overlay.backgroundOpacity, 1.0f), "BackgroundOpacity 5.0 -> clamped to 1.0");
     check(eq(cfg.overlay.fontSize, 72.0f),         "FontSize 200 -> clamped to max 72");
-    check(cfg.system.warmupFrames == 0,     "WarmupFrames -5 -> clamped to min 0");
+    check(cfg.pipeline.captureTimeoutMs  == 10,   "CaptureTimeoutMs -5 -> clamped to min 10");
     check(cfg.log.queueSize       == 256,   "Log QueueSize 1 -> clamped to min 256");
     check(warns.size() >= 6,                "a WARN was logged for each clamp (>=6)");
 
@@ -431,7 +429,7 @@ static bool test_saved_xml_formatting() {
 
     check(has("default=\"0.85\""), "float default written cleanly as 0.85");
     check(has("step=\"0.05\""),    "float step written cleanly as 0.05");
-    check(has("<Bitrate type=\"int\""), "int field tagged type=int");
+    check(has("<SegmentSec type=\"int\""), "int field tagged type=int");
     // The old bug wrote floats at ~17 sig-figs (0.85000002384185791); guard against it.
     check(!has("0.850000") && !has("0.050000") && !has("0000000"),
           "no long-precision float garbage in output");
@@ -486,15 +484,15 @@ static bool test_load_or_create() {
     AppConfig cfg;
     check(ConfigReader::loadOrCreate(file, cfg), "loadOrCreate() returns true (creates)");
     check(fs::exists(file), "config file (and parent dir) created on disk");
-    check(cfg.encoder.bitrate == 8000,            "created config has default bitrate 8000");
-    check(cfg.encoder.speedPreset == "ultrafast", "created config has default speedPreset");
+    check(cfg.recording.segmentSec == 180,        "created config has default segmentSec 180");
+    check((std::string)cfg.recording.exposureMode == "auto", "created config has default exposureMode");
     check(eq(cfg.overlay.backgroundOpacity, 0.85f),"created config has default opacity 0.85");
     check(cfg.cameras.empty(),                    "created config has no cameras (pure defaults)");
 
     // A second call finds the file and loads it (no re-create).
     AppConfig cfg2;
     check(ConfigReader::loadOrCreate(file, cfg2),  "loadOrCreate() returns true when file exists");
-    check(cfg2.encoder.bitrate == 8000,            "reloaded config matches");
+    check(cfg2.recording.segmentSec == 180,        "reloaded config matches");
 
     // configDir() resolves relative to the executable, ending in .../config.
     const std::string cdir = configDir();
@@ -535,6 +533,47 @@ static bool test_resolve_storage_dir() {
     return g_fails == before;
 }
 
+// ── test 10: settings of the removed recording path load, ignored, one WARN ───
+
+static bool test_obsolete_settings() {
+    std::cout << "\n--- Test 10: obsolete settings ignored with one WARN ---\n";
+    const int before = g_fails;
+
+    const std::string tmpFile = "/tmp/libconfig_obsolete_test.xml";
+    {
+        std::ofstream f(tmpFile);
+        if (!f) { std::cerr << "  SKIP  (cannot write temp file)\n"; return true; }
+        f << "<?xml version=\"1.0\"?><DashcamConfig>"
+             "<Encoder><Bitrate>12000</Bitrate><SpeedPreset>medium</SpeedPreset></Encoder>"
+             "<System><FootagePath>/mnt/ssd/footage</FootagePath><WarmupFrames>9</WarmupFrames></System>"
+             "<Recording><RecordWidth>1280</RecordWidth><SegmentSec>60</SegmentSec></Recording>"
+             "</DashcamConfig>";
+    }
+
+    std::vector<std::string> warns;
+    dashcam::log::LogCallback log = [&](dashcam::log::LogLevel lvl, const std::string& m) {
+        if (lvl == dashcam::log::LogLevel::WARN) warns.push_back(m);
+    };
+
+    AppConfig cfg;
+    check(ConfigReader::load(tmpFile, cfg, log), "an older file with removed settings still loads");
+    check(cfg.system.footagePath == "/mnt/ssd/footage" && cfg.recording.segmentSec == 60,
+          "... and its live settings are read");
+    check(warns.size() == 1, "exactly one WARN for all of them");
+    const std::string w = warns.empty() ? std::string() : warns[0];
+    check(w.find("obsolete") != std::string::npos && w.find("<Encoder>") != std::string::npos &&
+          w.find("WarmupFrames") != std::string::npos && w.find("RecordWidth") != std::string::npos,
+          "the WARN names each obsolete setting present");
+
+    warns.clear();
+    AppConfig clean;
+    check(ConfigReader::load("config/dashcam.xml", clean, log) && warns.empty(),
+          "a current file logs no WARN");
+
+    fs::remove(tmpFile);
+    return g_fails == before;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -547,6 +586,7 @@ int main() {
     bool t7 = test_attribute_dictionary();
     bool t8 = test_load_or_create();
     bool t9 = test_resolve_storage_dir();
+    bool t10 = test_obsolete_settings();
 
     std::cout << "\n=== Results ===\n";
     std::cout << "Test 1 (load real file):    " << (t1 ? "PASS" : "FAIL") << "\n";
@@ -558,6 +598,7 @@ int main() {
     std::cout << "Test 7 (attribute dict):    " << (t7 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 8 (loadOrCreate):      " << (t8 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 9 (storage fallback):  " << (t9 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 10 (obsolete settings): " << (t10 ? "PASS" : "FAIL") << "\n";
 
-    return (t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9) ? 0 : 1;
+    return (t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10) ? 0 : 1;
 }

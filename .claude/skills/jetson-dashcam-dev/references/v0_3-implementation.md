@@ -157,8 +157,8 @@ Both anchor scenarios are verified on-device (single C270 → `RECORD-ONLY`; C27
 
 ## Config, models, storage
 
-- **Config** `dashcam.xml` (`<DashcamConfig>`): sections `<Encoder> <Overlay> <Cameras> <System>
-  <Pipeline> <Recording> <Detection> <DriverScore> <Log>`. Every field is a self-describing
+- **Config** `dashcam.xml` (`<DashcamConfig>`): sections `<Overlay> <Cameras> <System> <Pipeline>
+  <Recording> <Detection> <DriverScore> <Log> <Network>`. Every field is a self-describing
   `ConfigVar<T>` (value + default + min/max/step + description written as XML attributes; numeric
   writes clamp). Model-locked params (input dims, class counts, mean/std) stay in each detector's
   own struct so the XML can't desync them from the engine. `loadOrCreate()` self-seeds a default
