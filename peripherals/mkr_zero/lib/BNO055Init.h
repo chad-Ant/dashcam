@@ -92,6 +92,8 @@ enum class BNO055InitStatus : int8_t{
      * value the register already held.
      */
     NOK_WRITES_IGNORED = -7,
+    /// ST_RESULT could not be read or a required ACC/GYR/MCU test failed.
+    NOK_SELF_TEST_FAILED = -8,
 };
 
 /**
@@ -222,6 +224,8 @@ struct BNO055FailureRecord{
     uint8_t sysStatus  = 0;  ///< The part's own account of itself...
     uint8_t sysError   = 0;  ///< ...and its error code, if either could be read.
     uint8_t opModeSeen = 0;  ///< OPR_MODE as last read.
+    uint8_t selfTestResult = 0; ///< ST_RESULT, meaningful only when read succeeded.
+    bool selfTestReadOk = false;
 
     /// The last configuration write and its read-back — the three-way
     /// distinction between a NACKed write, a failed read-back and a write the
@@ -273,6 +277,8 @@ struct BNO055InitState{
     uint8_t  sysStatus = 0;
     uint8_t  sysError  = 0;
     uint8_t  opModeSeen = 0;   ///< OPR_MODE as last read, captured on failure.
+    uint8_t  selfTestResult = 0;
+    bool     selfTestReadOk = false;
 
     /// UNIT_SEL as the part actually reports it after configuration.
     ///

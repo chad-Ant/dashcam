@@ -78,6 +78,16 @@
 #define BNO055_P1_ACC_HG_DUR_ADDR   0x13u  ///< High-G duration.
 #define BNO055_P1_ACC_HG_THRES_ADDR 0x14u  ///< High-G threshold.
 
+// ST_RESULT: only the low four bits are defined. MAG is optional for the
+// inertial channels in both supported modes; AMG exposes its failure separately.
+#define BNO055_ST_CORE_PASSED        0x0Du  ///< ACC | GYR | MCU.
+#define BNO055_ST_MAG_PASSED         0x02u
+// Motion-interrupt bits defined in the rev 1.4 register map. Bits 4, 1 and 0
+// were reserved there (DRDY on newer firmware); never use them as an integrity
+// signature. We write them zero but verify only the portable motion bits.
+#define BNO055_INT_MOTION_MASK       0xECu
+#define BNO055_INT_HIGH_G            0x20u
+
 // ─── operating modes (OPR_MODE, low nibble) ───────────────────────────────────
 
 #define OPERATION_MODE_CONFIG       0x00u

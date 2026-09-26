@@ -86,7 +86,7 @@ struct VehicleSignals {
 
     // ---- CAN sniffing only ----
     /**
-     * EPS motor assist torque, raw counts 0-511, @c VEH_TORQUE_INVALID if none.
+     * EPS motor assist torque, raw counts 0-1023, @c VEH_TORQUE_INVALID if none.
      *
      * NOT a steering angle, and not a substitute for one: it is an unsigned
      * MAGNITUDE that rises for either direction of turn and returns to exactly

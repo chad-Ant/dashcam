@@ -13,7 +13,7 @@ static_assert(BNO055_I2C_ADDRESS_ALT != SEGLED_ADDRESS,
 
 // ─── the data burst ───────────────────────────────────────────────────────────
 //
-// Registers 0x08 to 0x35 are contiguous and cover everything this driver reads.
+// Registers 0x08 to 0x37 are contiguous and cover everything this driver reads.
 // One transaction instead of five: the addressing overhead of the extra four
 // costs more than the fourteen bytes of quaternion and magnetometer that come
 // along unused, and the whole burst is then a single coherent instant rather
@@ -26,7 +26,7 @@ static_assert(BNO055_I2C_ADDRESS_ALT != SEGLED_ADDRESS,
 /// whole High-G mechanism. INT_STA carries the latched threshold crossing, and
 /// including it here means the latch is read on EVERY poll at no extra
 /// transaction — which is what lets the interrupt work with no wire to the INT
-/// pin at all. ST_RESULT at 0x36 comes along in between and is discarded.
+/// pin at all. ST_RESULT at 0x36 validates the sensor's self-test passes.
 #define IMU_BURST_LEN     48u
 
 #define IMU_OFF_ACCEL      0u                   ///< 0x08, 6 bytes.
@@ -38,7 +38,8 @@ static_assert(BNO055_I2C_ADDRESS_ALT != SEGLED_ADDRESS,
 #define IMU_OFF_GRAVITY   38u                   ///< 0x2E, 6 bytes.
 #define IMU_OFF_TEMP      44u                   ///< 0x34, 1 byte, signed degC.
 #define IMU_OFF_CALIB     45u                   ///< 0x35, 1 byte, four 2-bit fields.
-#define IMU_OFF_INT_STA   47u                   ///< 0x37, 1 byte. 0x36 is skipped.
+#define IMU_OFF_ST_RESULT 46u                   ///< 0x36, 1 byte, power-on self-test result.
+#define IMU_OFF_INT_STA   47u                   ///< 0x37, 1 byte.
 
 // ─── scale factors, from the datasheet, with UNIT_SEL = 0 ─────────────────────
 //
@@ -96,6 +97,8 @@ static bool regWrite8Imu(IMUDevice &dev, uint8_t reg, uint8_t value){
 
 // ─── fault accounting ─────────────────────────────────────────────────────────
 
+static void retire(IMUDevice &dev);
+
 /**
  * @brief Records a failed read and retires the part once failures pile up.
  *
@@ -109,7 +112,7 @@ static void noteFault(IMUDevice &dev){
     // Saturating rather than wrapping: 65535 reads as "a lot, stopped counting",
     // where a wrapped 3 would read as a nearly clean run.
     if (dev.ioErrors < 0xFFFFu) dev.ioErrors++;
-    if (dev.faults >= IMU_MAX_CONSECUTIVE_FAULTS) dev.ready = false;
+    if (dev.faults >= IMU_MAX_CONSECUTIVE_FAULTS) retire(dev);
 }
 
 /**
@@ -123,63 +126,66 @@ static void noteFault(IMUDevice &dev){
 static void noteImplausible(IMUDevice &dev){
     if (dev.implausible < 0xFFFFu) dev.implausible++;
     if (dev.faults < 0xFFu) dev.faults++;
-    if (dev.faults >= IMU_MAX_CONSECUTIVE_FAULTS) dev.ready = false;
+    if (dev.faults >= IMU_MAX_CONSECUTIVE_FAULTS) retire(dev);
+}
+
+/** @brief True while the part is driving its INT line high (pull-down: unwired reads low). */
+static bool intLineHigh(const IMUDevice &dev)
+{
+    return dev.init.highGArmed && digitalRead(IMU_HIGHG_INT_PIN) == HIGH;
 }
 
 /**
- * @brief Records a High-G latch and clears it so the next impact can arm.
+ * @brief Writes RST_INT (CLK_SEL preserved), with retries.
  *
- * Called immediately after the burst, before any validation gate — see the call
- * site for why that ordering is not incidental.
+ * A failed clear leaves INT asserted — no further rising edge can occur and no
+ * later latch is distinguishable from the stale one — so it disarms the pin
+ * backstop rather than letting @c highGArmed go on claiming it is live.
  *
- * @param intSta  The INT_STA byte from this burst.
+ * The write is a masked one in effect: a bare RST_INT zeroes the whole register,
+ * CLK_SEL included, which would switch the part back to its internal oscillator
+ * the first time anyone enabled the crystal, on a path that runs only when an
+ * impact is detected. The bit is preserved from what bring-up settled on.
+ *
+ * @return true when the latch was cleared.
  */
-static void noteHighG(IMUDevice &dev, uint8_t intSta, uint32_t now)
+static bool clearHighGLatch(IMUDevice &dev)
 {
-    // ── INT_STA IS CLEARED ON READ ───────────────────────────────────────────
-    //
-    // Datasheet 3.8.1, settled from docs/BST_BNO055_DS000-1509603.pdf: "All bits
-    // in this register are cleared on read." The burst that produced @p intSta
-    // has therefore ALREADY consumed the event, and this function is the only
-    // place it still exists. That is exactly why the call site handles it before
-    // any validation gate — the ordering was written on the suspicion that this
-    // might be true, and it is.
-    //
-    // A DURATION-BASED "STUCK LATCH" DETECTOR STOOD HERE AND HAS BEEN REMOVED.
-    // It disarmed the backstop when INT_STA read set continuously for longer
-    // than a real impact could last. On a clear-on-read register that condition
-    // cannot arise from a stuck latch, because every poll clears it — so the
-    // check could never detect the fault it was written for, and bench
-    // measurement confirmed it: the flag was observed set for exactly one poll
-    // interval and never longer. What it COULD still do is fire during a
-    // genuinely sustained impact that re-triggers on every poll for half a
-    // second, disarming the backstop in the middle of the event it exists to
-    // catch. A test that cannot pass and can only misfire is worse than no test.
-    //
-    // The write below still matters, and only for the INT PIN: the pin latches
-    // high and is released by RST_INT, so a failed write leaves it asserted and
-    // no further rising edge can occur. The register path is unaffected, which
-    // is why a failed clear degrades the OPTIONAL pin shortcut rather than
-    // losing events.
-    bool     fired  = (intSta & IMU_INT_STA_HIGH_G) != 0u;
-    uint32_t whenMs = now;
+    const uint8_t trigger = (uint8_t)(IMU_SYS_TRIGGER_RST_INT |
+                                      (dev.init.externalCrystal ? IMU_SYS_TRIGGER_CLK_SEL : 0u));
+    for (uint8_t attempt = 0; attempt < IMU_HIGHG_CLEAR_RETRIES; ++attempt){
+        if (regWrite8Imu(dev, BNO055_SYS_TRIGGER_ADDR, trigger)) return true;
+    }
+    dev.init.highGArmed = false;
+    if (dev.highGClearFails < 0xFFu) dev.highGClearFails++;
+    return false;
+}
 
-    // Snapshot the ISR flags with interrupts masked. Reading a flag and its
-    // timestamp separately allows an edge to land between the two, which would
-    // pair a stale time with a fresh event — on a field whose whole job is
-    // saying WHEN an impact happened.
+static void countRejected(IMUDevice &dev)
+{
+    if (dev.highGRejected < 0xFFFFu) dev.highGRejected++;
+}
+
+/**
+ * @brief Takes the pending INT edge, if any, with its time.
+ *
+ * With interrupts masked: reading the flag and its timestamp separately allows
+ * an edge to land between the two, pairing a stale time with a fresh event — on
+ * a field whose whole job is saying WHEN an impact happened.
+ */
+static bool takePinEdge(uint32_t &whenMs)
+{
     noInterrupts();
-    const bool     pin   = gPinEvent;
-    const uint32_t pinMs = gPinEventMs;
+    const bool pin = gPinEvent;
+    whenMs    = gPinEventMs;
     gPinEvent = false;
     interrupts();
+    return pin;
+}
 
-    if (pin){
-        fired  = true;
-        whenMs = pinMs;
-    }
-    if (!fired) return;
-
+/** @brief Records a confirmed impact: counts it once per hold and (re)arms the hold. */
+static void recordHighG(IMUDevice &dev, uint32_t whenMs, uint32_t now, bool clearLatch)
+{
     if (!dev.highGActive){
         dev.highGAtMs = whenMs;
         if (dev.highGCount < 0xFFFFu) dev.highGCount++;
@@ -187,34 +193,150 @@ static void noteHighG(IMUDevice &dev, uint8_t intSta, uint32_t now)
     dev.highGActive  = true;
     dev.highGUntilMs = now + IMU_HIGHG_HOLD_MS;
 
-    // Clearing the latch, and CHECKING that it cleared.
-    //
-    // Two defects lived in the single line this replaces. The return was
-    // discarded, so a failed clear left INT asserted — after which no further
-    // rising edge can occur and no later latch is distinguishable from the stale
-    // one, while @c highGArmed went on claiming the backstop was live. That is
-    // silent loss of the one signal designed to survive things going wrong.
-    //
-    // And the write was a bare RST_INT, which zeroes the whole register —
-    // including CLK_SEL. With the external crystal currently disabled that is
-    // harmless, but it would have switched the part back to its internal
-    // oscillator the first time anyone enabled it, on a path that runs only when
-    // an impact is detected. The bit is preserved from what bring-up settled on.
-    const uint8_t trigger = (uint8_t)(IMU_SYS_TRIGGER_RST_INT |
-                                      (dev.init.externalCrystal ? IMU_SYS_TRIGGER_CLK_SEL : 0u));
+    // Clearing the latch so the next impact can raise a fresh edge — degraded,
+    // not fatal, when it fails: the register path keeps working.
+    if (clearLatch) (void)clearHighGLatch(dev);
+}
 
-    bool cleared = false;
-    for (uint8_t attempt = 0; attempt < IMU_HIGHG_CLEAR_RETRIES && !cleared; ++attempt){
-        cleared = regWrite8Imu(dev, BNO055_SYS_TRIGGER_ADDR, trigger);
+/**
+ * @brief Decides whether this poll carries a High-G event, and records it.
+ *
+ * Called on EVERY poll the part was polled: after the integrity gate and before
+ * the data gates when a burst arrived (a latch the comparator raised in hardware
+ * is not disproved by a bad temperature byte beside it), and with
+ * @p busAnswered false on a NACK, where only the line can speak.
+ *
+ * ── THREE KINDS OF EVIDENCE, AND WHAT EACH IS WORTH ─────────────────────────
+ *
+ *  - INT_STA bit 5 in a SOUND burst: the part saying so. Believed at once.
+ *    INT_STA is clear-on-read (datasheet 3.8.1), so this burst has already
+ *    consumed it and this is the only place it still exists.
+ *  - The INT LINE held high with no such bit: the part may be holding a latch
+ *    whose INT_STA was eaten by a corrupt read — or the line may be stuck or
+ *    flickering (a short, a loose contact), which the part is not driving at
+ *    all. A real latch has two properties a fault lacks, and each is tested:
+ *      1. It HOLDS until RST_INT. A line seen high is a candidate; if it drops,
+ *         or a fresh edge shows it dropped and rose again, before anything
+ *         cleared it, it was not a latch — rejected. Probing on first sight
+ *         turned every flicker into a "release" and so into an event.
+ *      2. It RELEASES on RST_INT. A candidate still high one poll later is
+ *         probed: RST_INT is written, and the next poll decides. Low, or an edge
+ *         since (it let go and a still-running impact latched again), is a real
+ *         latch, recorded with its original time. Still high through a sound
+ *         read with no bit 5 is stuck: counted as rejected and ignored until
+ *         seen low. Believing a held line outright turned a stuck line into a
+ *         High-G flag held forever and an RST_INT write on every poll.
+ *    A corrupt read or a NACK leaves a probe undecided; nothing but a line seen
+ *    low or a sound read decides it.
+ *  - An INT EDGE on its own: never enough. The contact glitches that corrupt
+ *    reads glitch this line too (bench, 2026-09-26). An edge only times an
+ *    event the other two confirm; unconfirmed, it is counted as rejected.
+ *
+ * ── INT_STA IS CLEARED ON READ ─────────────────────────────────────────────
+ * A duration-based "stuck latch" detector once stood here and was removed: on a
+ * clear-on-read register the condition it tested cannot arise, and bench runs
+ * saw the flag set for exactly one poll, never longer. It could only misfire
+ * during a genuinely sustained impact. Sustained impacts re-latch INT_STA on
+ * every poll, which is why the stuck-LINE probe above only ever concludes
+ * "stuck" from a sound read that carries no bit 5.
+ */
+static void noteHighG(IMUDevice &dev, uint8_t intSta, bool burstSound, bool busAnswered, uint32_t now)
+{
+    // The edge BEFORE the line, and an edge landing in between merged when the
+    // line reads high: it is the edge that raised it. Line first let a latch
+    // arriving between the two read as a low line plus a naked edge — one
+    // impact counted as rejected here and again as an event on the next poll.
+    uint32_t pinMs = 0u;
+    bool pin = takePinEdge(pinMs);
+    const bool line = intLineHigh(dev);
+    if (line){
+        uint32_t lateMs = 0u;
+        if (takePinEdge(lateMs) && !pin){ pin = true; pinMs = lateMs; }
     }
-    if (!cleared){
-        // Degraded, not fatal: sample data is unaffected and the peaks still
-        // work. What is gone is the hardware backstop, and saying so is the
-        // point — a consumer weighing an incident needs to know the latch it
-        // would have relied on has stopped arming.
-        dev.init.highGArmed = false;
-        if (dev.highGClearFails < 0xFFu) dev.highGClearFails++;
+
+    // Trust comes back once the line is seen low, or an edge proves it went low.
+    if (dev.intLineDistrusted && (!line || pin)) dev.intLineDistrusted = false;
+
+    const bool registerFired = burstSound && (intSta & IMU_INT_STA_HIGH_G) != 0u;
+
+    if (registerFired){
+        // An open line episode began earlier than any edge still pending.
+        const bool open = dev.lineCandidate || dev.lineProbe;
+        dev.lineCandidate = false;
+        dev.lineProbe     = false;
+        recordHighG(dev, open ? dev.lineSinceMs : (pin ? pinMs : now), now, true);
+        return;
     }
+
+    if (dev.lineProbe){
+        if (!line || pin){
+            // RST_INT released it — and a fresh edge means it let go and a
+            // still-running impact latched again: real either way. Only that
+            // new latch needs clearing, and only a bus that answers can.
+            dev.lineProbe = false;
+            recordHighG(dev, dev.lineSinceMs, now, line && busAnswered);
+        } else if (burstSound){
+            // Cleared, still high, and a sound read says nothing latched: the
+            // part is not what is driving this line.
+            dev.lineProbe         = false;
+            dev.intLineDistrusted = true;
+            countRejected(dev);
+        }
+        // Still high on a corrupt read or a NACK: undecided — one probe is the
+        // whole test, so no second RST_INT.
+        return;
+    }
+
+    bool pinUsed = false;
+    if (dev.lineCandidate){
+        dev.lineCandidate = false;
+        if (!line || pin){
+            // Nothing wrote RST_INT, and a latch cannot let go without it:
+            // whatever raised this line dropped it by itself.
+            countRejected(dev);
+            pinUsed = true;       // the bounce's edge may open a fresh candidate below
+        } else if (busAnswered){
+            // Held a whole poll: now worth a probe.
+            if (clearHighGLatch(dev)) dev.lineProbe = true;
+            else countRejected(dev);          // cannot be confirmed with the backstop down
+            return;
+        } else {
+            dev.lineCandidate = true;         // held, but no bus to probe with yet
+            return;
+        }
+    }
+
+    if (line && !dev.intLineDistrusted){
+        // High with no register evidence: a candidate, not yet an impact.
+        dev.lineCandidate = true;
+        dev.lineSinceMs   = pin ? pinMs : now;
+        return;
+    }
+
+    if (pin && !pinUsed) countRejected(dev);  // a naked edge is not an impact
+    if (!burstSound && (intSta & IMU_INT_STA_HIGH_G) != 0u) countRejected(dev);
+}
+
+/**
+ * @brief Retires the part, settling any open INT-line episode first.
+ *
+ * Recovery re-initialises the part and wipes the episode, and it can run in the
+ * same loop pass. A probe whose line has let go is a confirmed latch and is
+ * recorded now; anything still undecided can no longer be confirmed and is
+ * counted as rejected — never dropped in silence.
+ */
+static void retire(IMUDevice &dev)
+{
+    if (dev.ready){
+        if (dev.lineProbe && !intLineHigh(dev)){
+            recordHighG(dev, dev.lineSinceMs, millis(), false);
+        } else if (dev.lineProbe || dev.lineCandidate){
+            countRejected(dev);
+        }
+        dev.lineProbe     = false;
+        dev.lineCandidate = false;
+    }
+    dev.ready = false;
 }
 
 // ─── peak ring ────────────────────────────────────────────────────────────────
@@ -531,6 +653,10 @@ void imuMarkAbsent(IMUDevice &dev){
 
     dev.highGCount      = 0u;
     dev.highGClearFails = 0u;
+    // highGRejected is boot-cumulative: recovery must not erase the evidence.
+    dev.lineCandidate     = false;
+    dev.lineProbe         = false;
+    dev.intLineDistrusted = false;
     dev.highGActive  = false;
     dev.highGUntilMs = millis();
     dev.highGAtMs    = 0u;
@@ -597,6 +723,14 @@ BNO055InitStage imuInitTick(IMUDevice &dev){
         const uint32_t now = millis();
         dev.bringUpArmed  = false;
         dev.ready         = true;
+        // Any INT-pin edge from before this instant belongs to the bring-up —
+        // the reset, the INT_EN/INT_MSK writes, or the contact glitch that got
+        // the part retired in the first place — not to an impact on a part
+        // that is only now configured. imuMarkAbsent() cleared it when the
+        // bring-up began; this clears what arrived during it.
+        noInterrupts();
+        gPinEvent = false;
+        interrupts();
         dev.faults        = 0u;
         dev.accelChangeMs = now;
         dev.gyroChangeMs  = now;
@@ -697,13 +831,14 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
 
     uint8_t buf[IMU_BURST_LEN];
     if (!readBurst(dev, IMU_BURST_START, buf, IMU_BURST_LEN)){
+        noteHighG(dev, 0u, false, false, now);
         noteFault(dev);
         expireChannels(dev, data, now);
         publishPresence(dev, data);
         return dev.ready ? IMUReturnStatus::DATA_STALE : IMUReturnStatus::NOK_LINK_LOST;
     }
 
-    // ── High-G latch, BEFORE any validation gate ─────────────────────────────
+    // ── High-G: integrity first, then the per-channel plausibility gates ─────
     //
     // Ordering is load-bearing and this used to be wrong. The latch was handled
     // after the temperature and gravity checks, both of which discard the burst
@@ -717,12 +852,57 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // notification because the byte next to it looked wrong is exactly backwards
     // for the one signal that is supposed to survive things going wrong.
     //
-    // There is a second reason, which could not be settled from the datasheet on
-    // hand: if INT_STA turns out to be cleared BY READING, then the burst above
-    // has already consumed the event and a later return loses it permanently.
-    // Handling it here is correct whether or not that is true, which is the
-    // better position to be in than being right about the register.
-    noteHighG(dev, buf[IMU_OFF_INT_STA], now);
+    // INT_STA is clear-on-read (datasheet 3.8.1). The physical INT latch is
+    // independent and stays asserted until RST_INT, even if this burst is bad.
+    //
+    // ── gate 0: is this a sound read of a RUNNING part at all? ──────────────
+    //
+    // The one check that DOES come first, because it is about the latch's own
+    // byte and the burst it rides in, not about a neighbour. The ordering above
+    // protects an impact from a bad temperature byte; it was never meant to let
+    // a read that is garbage end to end raise one — and on the car it did, 21
+    // times in 5 minutes, every one alongside an implausible burst and none
+    // with any motion behind it. Three signatures, all in bytes already read:
+    //
+    //  - INT_STA with an unexpected defined motion-interrupt bit. Reserved
+    //    bits are not evidence of corruption; newer firmware uses them for DRDY.
+    //  - ST_RESULT missing ACC, GYR or MCU passes. Its upper bits are reserved
+    //    and must be ignored. A MAG-only failure disables only the raw magnetic
+    //    channel, not the independent accelerometer/gyroscope.
+    //  - Accelerometer AND gyroscope exactly zero. The register file of a part
+    //    that has just come out of reset, in CONFIG, not converting. The fusion-
+    //    idle exemption below exists for the GRAVITY reading zero while the raw
+    //    channels are live; with the raw channels zero too, this burst was
+    //    being published as a genuine 0 g, 0 deg/s sample (seen on the bench,
+    //    2026-09-26). Real data cannot do it: at rest gravity alone puts ~981
+    //    counts on the accelerometer, and even free fall leaves noise in the
+    //    LSBs of all six axes.
+    //
+    // A burst failing any of them is charged as implausible, so a part that
+    // keeps doing it is retired and gets reconfigured — which a part that
+    // really did reset needs anyway. Only its register High-G evidence is
+    // rejected; a held, configured INT pin still confirms a real latch.
+    {
+        const uint8_t intSta  = buf[IMU_OFF_INT_STA];
+        const uint8_t st      = buf[IMU_OFF_ST_RESULT];
+
+        const bool intStaSound = (intSta & BNO055_INT_MOTION_MASK &
+                                  (uint8_t)~IMU_INT_STA_HIGH_G) == 0u;
+        const bool stSound = (st & BNO055_ST_CORE_PASSED) == BNO055_ST_CORE_PASSED;
+        bool zeroed = true;
+        for (uint8_t i = 0u; i < IMU_FREEZE_BYTES_PER_CHANNEL && zeroed; i++){
+            if (buf[IMU_OFF_ACCEL + i] != 0u || buf[IMU_OFF_GYRO + i] != 0u) zeroed = false;
+        }
+
+        const bool sound = intStaSound && stSound && !zeroed;
+        noteHighG(dev, intSta, sound, true, now);
+        if (!sound){
+            noteImplausible(dev);
+            expireChannels(dev, data, now);
+            publishPresence(dev, data);
+            return dev.ready ? IMUReturnStatus::DATA_STALE : IMUReturnStatus::NOK_LINK_LOST;
+        }
+    }
 
     // ── gate 1: temperature ──────────────────────────────────────────────────
     // A transaction that SUCCEEDS can still deliver the wrong bytes, and the
@@ -839,7 +1019,7 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
             // leaves it blank; retiring is what makes isIMUDegraded() true and
             // gets the part reconfigured, which is the only thing that might
             // actually bring it back.
-            dev.ready = false;
+            retire(dev);
             expireChannels(dev, data, now);
             publishPresence(dev, data);
             return IMUReturnStatus::NOK_LINK_LOST;
@@ -962,6 +1142,7 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
         data.magX = mx; data.magY = my; data.magZ = mz;
         data.magSampleMs = now;
         data.magValid    = true;
+        if ((buf[IMU_OFF_ST_RESULT] & BNO055_ST_MAG_PASSED) == 0u) invalidateMagnetic(data);
 
         // No fusion in AMG, so there is nothing to publish and nothing to
         // pretend. The linear-acceleration peak is NAN rather than zero for the
@@ -979,6 +1160,7 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     // calibration, and withholding good accelerometer data because the fusion is
     // still settling would be the wrong trade for a dashcam.
     if (fusion && (fusionIdle || !fusionTrustworthy(data))) return IMUReturnStatus::PARTIAL;
+    if (!fusion && !data.magValid) return IMUReturnStatus::PARTIAL;
     return IMUReturnStatus::OK;
 }
 

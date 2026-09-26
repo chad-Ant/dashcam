@@ -61,18 +61,8 @@ done
 # running) or 004f (bootloader).  Never a bare ttyACM guess: the ESP32-C3
 # bridge is a ttyACM too.
 if [ "$PORT" = "auto" ]; then
-    PORT=""
-    for tty in /sys/class/tty/ttyACM*; do
-        [ -e "$tty" ] || continue
-        dev=$(readlink -f "$tty/device/..")
-        vid=$(cat "$dev/idVendor" 2>/dev/null || true)
-        pid=$(cat "$dev/idProduct" 2>/dev/null || true)
-        if [ "$vid" = "2341" ] && { [ "$pid" = "804f" ] || [ "$pid" = "004f" ]; }; then
-            PORT="/dev/$(basename "$tty")"
-            break
-        fi
-    done
-    [ -n "$PORT" ] || { echo "no MKR Zero (USB 2341:804f/004f) found — check the USB cable (data, not charge-only) or double-tap RESET"; exit 1; }
+    source "$SKETCH_DIR/find_port.sh"
+    PORT=$(find_mkr_zero_port) || exit 1
     echo "upload port: $PORT"
 fi
 

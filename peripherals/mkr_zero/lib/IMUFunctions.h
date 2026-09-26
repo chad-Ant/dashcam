@@ -461,6 +461,26 @@ struct IMUDevice{
     /// this should be 0; a non-zero value with highGArmed false is the record of
     /// why the hardware impact detector stopped working.
     uint8_t  highGClearFails;
+    /// High-G evidence thrown away because it arrived with a burst that failed
+    /// the integrity gate — an INT_STA latch in a burst that was not a sound
+    /// read of a running part, or an INT-pin edge that coincided with one. The
+    /// car drives of 2026-09-26 produced 21 false High-G events in 5 minutes
+    /// this way (breadboard contacts under vibration); each is counted here
+    /// instead. Saturating, cumulative for the entire boot, including recovery
+    /// and mode switches. Counts rejected evidence, not distinct real impacts.
+    uint16_t highGRejected = 0u;
+    /// The INT line was seen high with no INT_STA evidence; it must still be
+    /// high, with no fresh edge, on the next poll before it is probed — a real
+    /// latch holds until RST_INT. See noteHighG().
+    bool     lineCandidate = false;
+    /// RST_INT was written to test a candidate that held; the next poll decides
+    /// whether it let go.
+    bool     lineProbe = false;
+    uint32_t lineSinceMs = 0u;     ///< When the episode began: the event time if confirmed.
+    /// The INT line stayed high through a successful RST_INT and a sound read
+    /// with no latch: not the part's doing (stuck/shorted). Ignored until seen
+    /// low. Console flag INTSTUCK.
+    bool     intLineDistrusted = false;
     bool     highGActive;      ///< Currently inside the republication hold.
     uint32_t highGUntilMs;     ///< Deadline for that hold.
     uint32_t highGAtMs;        ///< When the latch was first seen.
@@ -577,16 +597,27 @@ void initIMUData(IMUData &data);
 /**
  * @brief Reads one sample (non-blocking).
  *
- * ONE 46-byte burst covers accelerometer, magnetometer, gyroscope, Euler
- * angles, quaternion, linear acceleration, gravity, temperature and calibration
- * — registers 0x08 to 0x35 are contiguous.  Reading them separately would cost
+ * ONE 48-byte burst covers accelerometer, magnetometer, gyroscope, Euler
+ * angles, quaternion, linear acceleration, gravity, temperature, calibration,
+ * self-test and interrupt status — registers 0x08 to 0x37 are contiguous.
+ * Reading them separately would cost
  * five transactions and their addressing overhead for the same bytes; the
  * quaternion and, in fusion mode, the magnetometer come along unused and are
  * cheaper to discard than to avoid.
  *
- * TWO PLAUSIBILITY GATES stand between a successful transaction and a published
- * reading, because on this project a successful transaction has already proved
- * not to mean a valid one:
+ * AN INTEGRITY GATE runs first, before the High-G latch is taken: the burst's
+ * own ST_RESULT byte must carry the ACC/GYR/MCU passes, INT_STA may carry no
+ * unexpected defined motion bit, and accelerometer + gyroscope must not be exactly
+ * zero (a part that has just reset). A burst failing it is charged as
+ * implausible. Register High-G evidence from a bad burst is discarded, but a
+ * held INT pin can still confirm a latch once it has held for a poll and then
+ * released on RST_INT. An edge alone cannot. Rejected
+ * evidence is counted in @c IMUDevice::highGRejected. Added 2026-09-26 after corrupt
+ * reads on the car raised 21 false High-G events in 5 minutes.
+ *
+ * TWO PLAUSIBILITY GATES then stand between a successful transaction and a
+ * published reading, because on this project a successful transaction has
+ * already proved not to mean a valid one:
  *
  *   - TEMPERATURE against the part's own -40..+85 C rating.  Carried forward
  *     from the previous driver, where it caught 100 % of a failing sensor's

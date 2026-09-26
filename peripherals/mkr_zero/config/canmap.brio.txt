@@ -28,13 +28,31 @@ pedal,0x17C,7,8,u,1
 brake_switch,0x17C,32,1,u,1
 brake_pressed,0x17C,53,1,u,1
 
-# Selector position. Byte 5 is exactly opendbc's GEAR_SHIFTER enum.
-gear,0x191,47,8,u,1
+# Selector position: opendbc GEAR_SHIFTER, the LOW FIVE BITS of byte 5 (44|5).
+# Bit 5 is SHIFTER_POSITION_VALID and bits 6-7 are unrelated, so reading the
+# whole byte (47|8 until 2026-09-26) would turn D=4 into 0x24 the day any of
+# them sets. None did in a 2026-09-26 drive log (byte 5 was only ever 1, 2, 3
+# or 4), so the old row decoded correctly - this one keeps doing so. Byte 0's
+# low nibble carries the same selector one-hot (P=1 R=2 N=4 D=8), which agreed
+# with this field on every frame of that log.
+gear,0x191,44,5,u,1
 
-# EPS motor assist torque: 9-bit UNSIGNED magnitude spanning a byte boundary.
-# Rises for either direction of turn, exactly 0 when effort stops. NOT an angle
-# - this vehicle publishes none anywhere on its bus.
-steer_torque,0x1AB,0,9,u,1
+# EPS motor assist torque (opendbc STEER_MOTOR_TORQUE, 1|10): 10-bit UNSIGNED
+# magnitude spanning a byte boundary. Was 0|9, which dropped the top bit; byte
+# 0 read 0x00 on every frame of the 2026-09-26 drive log (max 202), so the two
+# rows decode identically on this car and the change only restores range.
+# Rises for either direction of turn, exactly 0 when effort stops - no sign
+# and no hands-on bit anywhere in the frame. It is ASSIST output, which the EPS
+# tapers with speed: relative effort, not driver torque in Nm. On that drive:
+# ~9 driving straight, ~43 in turns (p95 112), up to 202 turning at a standstill.
+#
+# NOT an angle - this vehicle publishes none anywhere on its bus. Confirmed
+# again on 2026-09-26: no 0x14A/0x156 STEERING_SENSORS and no 0x18F
+# STEER_STATUS (signed driver torque), and no field of the 39 IDs on the bus
+# correlates with turn curvature. The angle sensor on small Hondas belongs to
+# VSA, which the Brio does not have. For heading change use the wheel-derived
+# yaw rate (yawscale below); road-wheel angle is atan(2.405 m * yaw / speed).
+steer_torque,0x1AB,1,10,u,1
 
 # Indicator lamps. Byte 0 carries exactly three values across the whole census -
 # 0x00, 0x20, 0x40, never 0x60 - so bits 5 and 6 are two mutually exclusive
@@ -91,6 +109,16 @@ wheel_fl,0x1D0,7,15,u,0.01
 wheel_fr,0x1D0,8,15,u,0.01
 wheel_rl,0x1D0,25,15,u,0.01
 wheel_rr,0x1D0,42,15,u,0.01
+
+# Parking brake - FOUND, deliberately NOT a row. 0x1A6 byte 0 bit 2 (opendbc
+# SCM_BUTTONS PARKING_BRAKE_ON) read 1 on 99 % of the Park frames and 0 on every
+# Drive frame of the 2026-09-26 log. Adding it costs a filter slot, and the six
+# are taken - the same trade-off as the hazard row above. If it is wanted:
+#
+# parking_brake,0x1A6,2,1,u,1
+#
+# Brake PRESSURE is not on this bus: 0x1A4 is present at 50 Hz but reads all
+# zeros apart from its counter/checksum (the Brio is ABS-only, no VSA).
 
 # Raw selector codes. Manufacturer-specific; omit to keep the built-in default.
 gearmap,P=1,R=2,N=3,D=4,L=7,S=0x0A

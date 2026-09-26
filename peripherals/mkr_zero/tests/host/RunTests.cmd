@@ -65,6 +65,9 @@ if errorlevel 1 goto :buildfail
 cl %CL_FLAGS% arduino_stub.cpp imu_tests.cpp "%LIBDIR%\IMUFunctions.cpp" /Fe:imu_tests.exe
 if errorlevel 1 goto :buildfail
 
+cl %CL_FLAGS% arduino_stub.cpp bno_init_tests.cpp "%LIBDIR%\BNO055Init.cpp" /Fe:bno_init_tests.exe
+if errorlevel 1 goto :buildfail
+
 cl %CL_FLAGS% arduino_stub.cpp mcp2515_model.cpp can_probe_tests.cpp ^
    "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
    /Fe:can_probe_tests.exe
@@ -74,7 +77,7 @@ del /q *.obj 2>nul
 echo.
 
 rem Every suite runs even after one fails, so a single run reports everything.
-for %%T in (switch_tests imu_tests can_probe_tests) do (
+for %%T in (switch_tests imu_tests can_probe_tests bno_init_tests) do (
     .\%%T.exe
     set /a RC+=!ERRORLEVEL!
 )

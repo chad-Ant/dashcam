@@ -49,6 +49,7 @@ void     pinMode(uint32_t pin, uint32_t mode);
 void     digitalWrite(uint32_t pin, uint32_t value);
 int      digitalRead(uint32_t pin);
 void     delayMicroseconds(uint32_t us);
+void     delay(uint32_t ms);
 uint32_t millis();
 
 // ─── ...and the little more IMUFunctions.cpp and CANSniffFunctions.cpp use ───
@@ -81,6 +82,11 @@ uint32_t hostPinMode(uint32_t pin);
 
 /// Resets pins, counters and the chain model. Call before every test.
 void hostReset();
+
+/// Runs @p fn once, on the next digitalRead() of @p pin, just before or just
+/// after the level is sampled — an interrupt landing mid-read. Cleared by
+/// hostReset().
+void hostOnNextRead(uint32_t pin, bool beforeSample, void (*fn)());
 
 /**
  * @brief Sets the sixteen parallel inputs, in the driver's raw-word layout.

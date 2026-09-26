@@ -229,6 +229,7 @@ const char *bno055InitStatusName(BNO055InitStatus status)
         case BNO055InitStatus::NOK_MODE_FAILED:      return "mode-failed";
         case BNO055InitStatus::NOK_SYSTEM_ERROR:     return "system-error";
         case BNO055InitStatus::NOK_WRITES_IGNORED:   return "writes-ignored";
+        case BNO055InitStatus::NOK_SELF_TEST_FAILED: return "self-test-failed";
         default:                                     return "unknown";
     }
 }
@@ -254,6 +255,8 @@ bool bno055InitBegin(BNO055InitState &state, uint8_t opMode)
     state.lastStatus  = BNO055InitStatus::OK;
     state.nextStepMs  = millis();
     state.stepRetries = 0u;
+    state.selfTestResult = 0u;
+    state.selfTestReadOk = false;
 
     // Cleared per ATTEMPT, not per boot.  Leaving them set was a real defect and
     // not a cosmetic one: fallBackToInternalClock() refuses to act when
@@ -317,6 +320,8 @@ void bno055InitFail(BNO055InitState &state, BNO055InitStatus why)
         r.sysStatus  = state.sysStatus;
         r.sysError   = state.sysError;
         r.opModeSeen = state.opModeSeen;
+        r.selfTestResult = state.selfTestResult;
+        r.selfTestReadOk = state.selfTestReadOk;
 
         r.lastRegAddr    = state.lastRegAddr;
         r.lastRegWrote   = state.lastRegWrote;
@@ -611,20 +616,13 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             // pin. Both are set, and the difference is why the wire is optional:
             // with INT_EN alone the latch still appears in INT_STA over I2C, so
             // the feature works unwired and the pin only removes poll latency.
-            if (ok){
-                uint8_t en = 0u;
-                ok = regRead8(state.address, BNO055_P1_INT_EN_ADDR, en);
-                if (ok) ok = configWrite(state, BNO055_P1_INT_EN_ADDR,
-                                         (uint8_t)(en | BNO055_INT_BIT_ACC_HIGH_G),
-                                         BNO055_INT_BIT_ACC_HIGH_G);
-            }
-            if (ok){
-                uint8_t msk = 0u;
-                ok = regRead8(state.address, BNO055_P1_INT_MSK_ADDR, msk);
-                if (ok) ok = configWrite(state, BNO055_P1_INT_MSK_ADDR,
-                                         (uint8_t)(msk | BNO055_INT_BIT_ACC_HIGH_G),
-                                         BNO055_INT_BIT_ACC_HIGH_G);
-            }
+            // Own these registers outright. Preserving an unexpected enable
+            // would contradict the poller's High-G-only integrity check.
+            // Ignore reserved read-back bits, but verify every motion enable.
+            if (ok) ok = configWrite(state, BNO055_P1_INT_EN_ADDR,
+                                     BNO055_INT_BIT_ACC_HIGH_G, BNO055_INT_MOTION_MASK);
+            if (ok) ok = configWrite(state, BNO055_P1_INT_MSK_ADDR,
+                                     BNO055_INT_BIT_ACC_HIGH_G, BNO055_INT_MOTION_MASK);
 
             // UNCONDITIONAL, and its result outranks everything above.
             const bool backToPage0 = configWrite(state, BNO055_PAGE_ID_ADDR, 0x00u, 0xFFu);
@@ -796,6 +794,13 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             // more here than the GNSS machine's Done.  A mode register that
             // reads back correctly only proves the write landed; SYS_STATUS is
             // the part saying the algorithm is actually running.
+            state.selfTestReadOk = regRead8(state.address, BNO055_ST_RESULT_ADDR,
+                                             state.selfTestResult);
+            if (!state.selfTestReadOk ||
+                (state.selfTestResult & BNO055_ST_CORE_PASSED) != BNO055_ST_CORE_PASSED){
+                bno055InitFail(state, BNO055InitStatus::NOK_SELF_TEST_FAILED);
+                break;
+            }
             if (err != 0u || stat == BNO055_SYS_STATUS_ERROR){
                 bno055InitFail(state, BNO055InitStatus::NOK_SYSTEM_ERROR);
                 break;

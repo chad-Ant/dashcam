@@ -14,6 +14,12 @@ static uint8_t  g_mode[PIN_COUNT];
 static uint8_t  g_level[PIN_COUNT];
 static uint32_t g_millis;
 
+// One-shot hook on the next digitalRead() of one pin, run just before or just
+// after the level is sampled: an interrupt landing inside the driver's window.
+static uint32_t g_hookPin = 0xFFFFFFFFu;
+static bool     g_hookBefore = false;
+static void   (*g_hookFn)() = nullptr;
+
 // ─── 74HC165 chain model ─────────────────────────────────────────────────────
 //
 // Sixteen stages in one word, laid out so bit 15 is the stage feeding Q7 and
@@ -46,6 +52,7 @@ void hostReset()
     g_present    = true;
     g_loadPulses = 0u;
     g_clocks     = 0u;
+    g_hookFn     = nullptr;
 
     // PL idles HIGH on the real board via its pull-up; start there so the first
     // digitalWrite(LOW) is a genuine falling edge.
@@ -59,6 +66,7 @@ uint32_t fakeChainClocks()             { return g_clocks; }
 
 void hostSetMillis(uint32_t ms) { g_millis = ms; }
 uint32_t millis()               { return g_millis; }
+void delay(uint32_t ms)          { g_millis += ms; }
 
 uint32_t hostPinMode(uint32_t pin)
 {
@@ -107,7 +115,27 @@ void digitalWrite(uint32_t pin, uint32_t value)
     }
 }
 
+// One-shot hook on the next digitalRead() of one pin (declared above).
+
+void hostOnNextRead(uint32_t pin, bool beforeSample, void (*fn)())
+{
+    g_hookPin = pin; g_hookBefore = beforeSample; g_hookFn = fn;
+}
+
+static int sampleLevel(uint32_t pin);
+
 int digitalRead(uint32_t pin)
+{
+    if (pin != g_hookPin || g_hookFn == nullptr) return sampleLevel(pin);
+    void (*fn)() = g_hookFn;
+    g_hookFn = nullptr;
+    if (g_hookBefore) fn();
+    const int level = sampleLevel(pin);
+    if (!g_hookBefore) fn();
+    return level;
+}
+
+static int sampleLevel(uint32_t pin)
 {
     if (pin >= PIN_COUNT) return LOW;
 

@@ -720,7 +720,7 @@ struct __attribute__((packed)) Telemetry {
     uint8_t vehFlags;
     uint8_t pedalGas;      ///< Accelerator, raw 0-255; x0.5 = percent.
     /**
-     * EPS motor assist torque, raw 0-511. @c 0xFFFF when unavailable.
+     * EPS motor assist torque, raw 0-1023 (10 bits). @c 0xFFFF when unavailable.
      *
      * NOT a steering angle - an unsigned MAGNITUDE that rises for either
      * direction of turn and returns to exactly zero when effort stops.  The

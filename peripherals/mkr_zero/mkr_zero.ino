@@ -325,6 +325,8 @@ static void printIMUFailureRecord()
 
     Serial.print(F("     sysStatus=0x")); Serial.print(r.sysStatus, HEX);
     Serial.print(F(" sysErr=0x"));        Serial.println(r.sysError, HEX);
+    Serial.print(F("     ST_RESULT=0x")); Serial.print(r.selfTestResult, HEX);
+    Serial.print(F(" readOk=")); Serial.println(r.selfTestReadOk ? 1 : 0);
 
     // The three-way distinction a bare "config-failed" cannot make: a NACKed
     // write, a failed read-back, or a write the part accepted and ignored.
@@ -1789,6 +1791,10 @@ void loop()
         // while this survived whatever the loop was doing at the time.
         if (imuData.highGEvent) Serial.print(" HIGH-G");
         else if (!imuData.highGArmed && imuIsReady(imuDev)) Serial.print(" nohg");
+        // The INT line stayed high through a successful RST_INT with nothing
+        // latched: a wiring fault on that line, not an impact. Named so a stuck
+        // line reads as what it is instead of as silence.
+        if (imuDev.intLineDistrusted) Serial.print(" INTSTUCK");
         Serial.print(" mode=");
         Serial.print(imuData.fusionMode ? "fus" : "amg");
         Serial.print(" cal=");
@@ -1831,6 +1837,11 @@ void loop()
         // look clean. This only climbs, so one glance answers "were there any?".
         Serial.print(" hg=");
         Serial.print(imuDev.highGCount);
+        // Boot-cumulative rejected High-G evidence: corrupt register flags or
+        // unconfirmed pin edges. These are not necessarily distinct impacts;
+        // recovery preserves the count so intermittent faults stay visible.
+        Serial.print(" hgrej=");
+        Serial.print(imuDev.highGRejected);
         // c3= is the LINK, stream= is the session on top of it.  They are
         // different failures: a bridge that is attached but not asking for
         // telemetry is healthy, one that has been unplugged is not, and
