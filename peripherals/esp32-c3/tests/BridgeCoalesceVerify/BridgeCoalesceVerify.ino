@@ -68,7 +68,7 @@ static void blankPayload(TelemetryPayload &p)
     // Stamped like a running master's, on this board's clock — which is the one
     // CommLink compares it against. A fixed 0 would read as a master that
     // rebooted between groups more than a couple of seconds apart, and poll()
-    // closes the accumulator and stops at a reboot (CommLink::takeEndedSession()).
+    // closes the accumulator and stops at a reboot (see CommLink::endedSession()).
     p.masterMillis    = millis();
     p.imuAccelPeak    = NAN;
     p.imuGyroPeak     = NAN;
