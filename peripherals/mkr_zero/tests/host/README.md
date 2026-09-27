@@ -15,8 +15,8 @@ board, no serial port.
 |---|---|---|
 | `switch_tests` | `lib/SwitchFunctions.cpp` | 61 |
 | `imu_tests` | `lib/IMUFunctions.cpp`: lifecycle, integrity, confirmed High-G (incl. INT-line candidate → release probe → stuck verdict, flicker, re-latch, retirement, mid-sample edge, High-G record surviving recovery and the mode-switch snapshot reset, episodes settled on every re-init), channel-level faults | 540 |
-| `can_probe_tests` | `lib/CANSniffFunctions.cpp`: the map probe and filter ownership | 89 |
-| `bno_init_tests` | **real** `lib/BNO055Init.cpp`: self-test checks, masked read-back, exact interrupt setup | 451 |
+| `can_probe_tests` | `lib/CANSniffFunctions.cpp`: the map probe, filter ownership, receive-overrun counting | 98 |
+| `bno_init_tests` | **real** `lib/BNO055Init.cpp`: self-test checks, masked read-back, exact interrupt setup, High-G threshold per accelerometer range | 586 |
 | `port_tests.py` | shared MKR USB selector: product identity and ambiguity | 5 cases |
 
 All currently passing.
@@ -89,7 +89,8 @@ was reintroduced into a copy of the source and the suite re-run.
 | a refused probe open marks OFF without parking the chip | refused open only |
 | **none — unmutated control** | **none** |
 
-IMU hardening follow-up (2026-09-26, 41 mutants): `make mutations` reproduces these
+IMU hardening follow-up (2026-09-26, 41 mutants; 2026-09-27 adds the High-G
+range and CAN overrun rows below, 45 in all): `make mutations` reproduces these
 regressions in temporary source copies, leaving the checkout untouched. A
 mutant must compile successfully and fail assertions; compilation errors do
 not count as caught bugs. Unmodified controls must pass first.
@@ -137,6 +138,10 @@ not count as caught bugs. Unmodified controls must pass first.
 | bring-up skips self-test validation | failed/missing self-test is named and latched |
 | interrupt read-back verifies only High-G | unexpected defined enable bits disable the backstop |
 | interrupt setup preserves other enables | INT_EN and INT_MSK must be written exactly 0x20 |
+| AMG High-G threshold counted at ±4 g | AMG must write 32 (2 g at ±16 g), not 128 (8 g) |
+| fixed High-G byte in every mode | the threshold must follow the range in both modes |
+| CAN overruns cleared uncounted | each latched overrun is one counted event |
+| CAN overrun count reset by the probe | the count is boot-cumulative, like hgrej |
 | **none — unmutated control** | **none** |
 
 The model refuses a filter write the way the silicon does when its request for
@@ -148,7 +153,7 @@ pass whether or not the driver parked anything.)
 The earlier hardening tests incorrectly REQUIRED reserved bits to be zero and
 treated an unconfirmed pin edge as an impact. Those expectations were corrected:
 mutation testing measures a suite's sensitivity, not the truth of its contract.
-The current script covers 17 mutations; the older switch/CAN tables above record
+The current script covers 45 mutations; the older switch/CAN tables above record
 separate historical checks, not additional mutations run by this script.
 
 Cases carrying a `REGRESSION` comment are the ones anchored to a real defect

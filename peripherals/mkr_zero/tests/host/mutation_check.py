@@ -1,4 +1,4 @@
-"""Reintroduce IMU regressions in temporary copies; never edit the checkout.
+"""Reintroduce IMU, BNO055 bring-up and CAN regressions in temporary copies; never edit the checkout.
 
 Requires Python 3, make and a hosted C++11 compiler. A compile failure is NOT a
 killed mutant: every mutant must build and then fail the corresponding suite.
@@ -12,6 +12,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 MKR = HERE.parents[1]
 IMU = "IMUFunctions.cpp"
 INIT = "BNO055Init.cpp"
+CAN = "CANSniffFunctions.cpp"
+OVR = "gOverruns = (gOverruns > 0xFFFFFFFFu - events) ? 0xFFFFFFFFu : gOverruns + events;"
 CORE = "(st & BNO055_ST_CORE_PASSED) == BNO055_ST_CORE_PASSED"
 
 # name, source, suite, exact unique old text, replacement
@@ -105,6 +107,12 @@ MUTATIONS = [
     ("bring-up skips self-test", INIT, "bno_init_tests", "!state.selfTestReadOk ||\n                (state.selfTestResult & BNO055_ST_CORE_PASSED) != BNO055_ST_CORE_PASSED", "false"),
     ("interrupt verification only High-G", INIT, "bno_init_tests", "BNO055_INT_BIT_ACC_HIGH_G, BNO055_INT_MOTION_MASK);", "BNO055_INT_BIT_ACC_HIGH_G, BNO055_INT_BIT_ACC_HIGH_G);", 2),
     ("interrupt enables preserved", INIT, "bno_init_tests", "BNO055_INT_BIT_ACC_HIGH_G, BNO055_INT_MOTION_MASK);", "0xECu, BNO055_INT_MOTION_MASK);", 2),
+    ("AMG High-G counted at 4 g", INIT, "bno_init_tests", "bno055HighGThresholdLsb(IMU_HIGHG_THRESHOLD_MG, accRange)", "bno055HighGThresholdLsb(IMU_HIGHG_THRESHOLD_MG, ACCEL_RANGE_4G)"),
+    ("fixed High-G byte", INIT, "bno_init_tests", "bno055HighGThresholdLsb(IMU_HIGHG_THRESHOLD_MG, accRange)", "(uint8_t)128u"),
+    ("CAN overruns cleared uncounted", CAN, "can_probe_tests", OVR, "(void)events;"),
+    ("CAN overrun count reset with the probe", CAN, "can_probe_tests",
+     "void canSniffResetCounters() { gFrames = 0; gMatches = 0; gIdsSeenMask = 0; }",
+     "void canSniffResetCounters() { gFrames = 0; gMatches = 0; gIdsSeenMask = 0; gOverruns = 0; }"),
 ]
 
 
@@ -122,7 +130,7 @@ def main():
         for source in HERE.iterdir():
             if source.suffix in (".cpp", ".h") or source.name == "Makefile":
                 shutil.copy2(source, tests / source.name)
-        for suite in ("imu_tests", "bno_init_tests"):
+        for suite in ("imu_tests", "bno_init_tests", "can_probe_tests"):
             build = run(["make", "-B", suite], tests)
             assert build.returncode == 0, build.stdout
             control = run([str(tests / suite)], tests)

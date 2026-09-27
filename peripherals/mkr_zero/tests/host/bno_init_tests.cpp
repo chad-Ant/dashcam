@@ -82,7 +82,19 @@ static BNO055InitState run(uint8_t st, uint8_t mode, bool nack = false,
 }
 
 int main() {
+    // ACC_HG_THRES counts in the range's full scale / 256: one byte, four forces.
+    CHECK(bno055HighGThresholdLsb(2000u, ACCEL_RANGE_4G)  == 128u);
+    CHECK(bno055HighGThresholdLsb(2000u, ACCEL_RANGE_8G)  == 64u);
+    CHECK(bno055HighGThresholdLsb(2000u, ACCEL_RANGE_16G) == 32u);
+    CHECK(bno055HighGThresholdLsb(2000u, ACCEL_RANGE_2G)  == 255u);   // 256 saturates
+    CHECK(bno055HighGThresholdLsb(1000u, ACCEL_RANGE_16G) == 16u);
+    CHECK(bno055HighGThresholdLsb(1500u, ACCEL_RANGE_4G)  == 96u);
+    CHECK(bno055HighGThresholdLsb(0u,    ACCEL_RANGE_4G)  == 0u);
+
     for (uint8_t mode : {uint8_t(OPERATION_MODE_IMUPLUS), uint8_t(OPERATION_MODE_AMG)}) {
+        // IMU_HIGHG_THRESHOLD_MG (2 g) in the range each mode runs at: fusion
+        // locks ±4 g, AMG programs ±16 g. A fixed 128 was 8 g in AMG.
+        const uint8_t wantThres = (mode == OPERATION_MODE_AMG) ? 32u : 128u;
         for (unsigned upper = 0; upper < 16u; ++upper) {
             for (uint8_t lower : {uint8_t(0x0Fu), uint8_t(0x0Du)}) {
                 const uint8_t st = static_cast<uint8_t>((upper << 4) | lower);
@@ -91,6 +103,9 @@ int main() {
                 CHECK(s.selfTestReadOk && s.selfTestResult == st && selfTestReads > 0u);
                 CHECK(regs[1][BNO055_P1_INT_EN_ADDR] == 0x20u);
                 CHECK(regs[1][BNO055_P1_INT_MSK_ADDR] == 0x20u);
+                CHECK(regs[1][BNO055_P1_ACC_HG_THRES_ADDR] == wantThres);
+                CHECK(mode != OPERATION_MODE_AMG ||
+                      (regs[1][BNO055_P1_ACC_CONFIG_ADDR] & 0x03u) == ACCEL_RANGE_16G);
             }
         }
         for (uint8_t st : {uint8_t(0x0Eu), uint8_t(0x0Bu), uint8_t(0x07u), uint8_t(0x00u)}) {

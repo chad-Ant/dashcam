@@ -107,6 +107,8 @@ static CanSignalMap  gDefaultMap;
 static const CanSignalMap *gMap = nullptr;
 static uint32_t gFrames  = 0;
 static uint32_t gMatches = 0;
+/// Receive-buffer overrun EVENTS for the whole boot; see canSniffOverrunCount().
+static uint32_t gOverruns = 0;
 
 /**
  * Last millis() at which each indicator lamp was seen LIT.
@@ -222,6 +224,7 @@ const CanSignalMap *canSniffGetMap()
 
 uint32_t canSniffFrameCount() { return gFrames; }
 uint32_t canSniffMatchCount() { return gMatches; }
+uint32_t canSniffOverrunCount() { return gOverruns; }
 
 /// One bit per directory entry, set the first time that ID is decoded. This is
 /// what turns "twenty frames arrived" into "twenty frames arrived from the IDs
@@ -913,11 +916,20 @@ uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
         v.hazard = (gHazardLitMs != 0u) && ((t - gHazardLitMs) <= CAN_TURN_HOLD_MS);
     }
 
-    // Overruns are cleared but not reported here: this is the production path,
-    // and an overrun costs one frame of a 50-100 Hz signal that will repeat
-    // within 20 ms. The census sketch is where the count matters.
+    // Overruns: counted, then cleared. They used to be cleared uncounted, on the
+    // grounds that one lost frame of a 50-100 Hz signal repeats within 20 ms —
+    // true of one, but the drain is polled once per loop() pass and the
+    // controller holds two frames, so any long step in the pass loses a burst,
+    // and nobody could say how often. Each set flag is one EVENT (the flags
+    // latch, they do not count), so the total is a lower bound on frames lost.
+    // With BUKT a full RXB0 rolls over into RXB1, so here it is mostly RX1OVR;
+    // RX0OVR is counted too.
     const uint8_t eflg = rawRead(REG_EFLG);
-    if (eflg & 0xC0u) rawBitModify(REG_EFLG, 0xC0u, 0x00u);
+    if (eflg & 0xC0u) {
+        const uint32_t events = ((eflg & 0x40u) ? 1u : 0u) + ((eflg & 0x80u) ? 1u : 0u);
+        gOverruns = (gOverruns > 0xFFFFFFFFu - events) ? 0xFFFFFFFFu : gOverruns + events;
+        rawBitModify(REG_EFLG, 0xC0u, 0x00u);
+    }
 
     return decoded;
 }

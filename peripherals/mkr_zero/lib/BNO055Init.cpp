@@ -576,6 +576,13 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             // bring-ups look like counterfeit silicon.
             bool ok = configWrite(state, BNO055_PAGE_ID_ADDR, 0x01u, 0xFFu);
 
+            // The range the accelerometer runs at, and so the one the High-G
+            // threshold is counted in: the ±4 g the fusion modes lock it to, or
+            // the ±16 g programmed below for AMG. One variable feeds both writes,
+            // so they cannot disagree.
+            const uint8_t accRange = (state.opMode == OPERATION_MODE_AMG) ? ACCEL_RANGE_16G
+                                                                          : ACCEL_RANGE_4G;
+
             // The accelerometer RANGE, and only in AMG.
             //
             // This was missing, and its absence made a documented claim false:
@@ -593,14 +600,18 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
                 uint8_t cfg = 0u;
                 ok = regRead8(state.address, BNO055_P1_ACC_CONFIG_ADDR, cfg);
                 if (ok){
-                    cfg = (uint8_t)((cfg & ~BNO055_ACC_RANGE_MASK) | ACCEL_RANGE_16G);
+                    cfg = (uint8_t)((cfg & ~BNO055_ACC_RANGE_MASK) | accRange);
                     ok  = configWrite(state, BNO055_P1_ACC_CONFIG_ADDR, cfg,
                                       BNO055_ACC_RANGE_MASK);
                 }
             }
 
+            // Converted per range: the register's LSB scales with it, and the
+            // single byte once written in both modes was 2 g in fusion and 8 g
+            // in AMG.
             if (ok) ok = configWrite(state, BNO055_P1_ACC_HG_THRES_ADDR,
-                                     IMU_HIGHG_THRESHOLD_LSB, 0xFFu);
+                                     bno055HighGThresholdLsb(IMU_HIGHG_THRESHOLD_MG, accRange),
+                                     0xFFu);
             if (ok) ok = configWrite(state, BNO055_P1_ACC_HG_DUR_ADDR,
                                      IMU_HIGHG_DURATION_LSB, 0xFFu);
             // Read-modify-write: ACC_INT_Settings also holds the any-motion and

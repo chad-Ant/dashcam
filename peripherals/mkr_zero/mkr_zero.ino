@@ -1714,6 +1714,11 @@ void loop()
             Serial.print(canSniffMatchCount());
             Serial.print("/");
             Serial.print(canSniffFrameCount());
+            // Boot-cumulative receive overruns: each is at least one frame the
+            // two-deep buffer had to drop because this loop drained it too late.
+            // Climbing between lines means the drain is losing frames.
+            Serial.print(" ovf=");
+            Serial.print(canSniffOverrunCount());
         }
         // Three states, not two. obdReady only says the CONTROLLER came up;
         // printing that as "/up" claims a working diagnostic link on a vehicle

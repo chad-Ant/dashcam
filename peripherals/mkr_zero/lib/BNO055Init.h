@@ -402,6 +402,21 @@ const char *bno055InitStageName(BNO055InitStage stage);
 const char *bno055InitStatusName(BNO055InitStatus status);
 
 /**
+ * @brief ACC_HG_THRES for a threshold of @p mg at accelerometer range
+ *        @p accRange (ACCEL_RANGE_2G ... ACCEL_RANGE_16G).
+ *
+ * The register's LSB is the range's full scale over 256 — 7.81, 15.63, 31.25
+ * and 62.5 mg at ±2, 4, 8 and 16 g — so the same byte means a different force
+ * in every range. Rounded to the nearest count and saturated at 255.
+ */
+inline uint8_t bno055HighGThresholdLsb(uint32_t mg, uint8_t accRange)
+{
+    const uint32_t fullScaleMg = 2000UL << (accRange & 0x03u);
+    const uint32_t lsb = (mg * 256UL + fullScaleMg / 2UL) / fullScaleMg;
+    return (uint8_t)(lsb > 255UL ? 255UL : lsb);
+}
+
+/**
  * @brief Reads the four 2-bit calibration counters. Cheap: one register.
  *
  * Meaningful only once @c bno055InitReady().  In IMUPLUS the magnetometer is

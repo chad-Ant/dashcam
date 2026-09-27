@@ -644,8 +644,10 @@ static void testArmedReporting()
     uint8_t liveThres = 0xFFu;
     const bool thresRead = page1Read(gDev.init.address, BNO055_P1_ACC_HG_THRES_ADDR, liveThres);
     note("ACC_HG_THRES_in_fusion", thresRead ? (long)liveThres : -1L);
-    note("ACC_HG_THRES_configured", (long)IMU_HIGHG_THRESHOLD_LSB);
-    check(thresRead && liveThres == IMU_HIGHG_THRESHOLD_LSB,
+    // Fusion locks the accelerometer to ±4 g: the threshold is counted in that range.
+    const uint8_t fusionThres = bno055HighGThresholdLsb(IMU_HIGHG_THRESHOLD_MG, ACCEL_RANGE_4G);
+    note("ACC_HG_THRES_configured", (long)fusionThres);
+    check(thresRead && liveThres == fusionThres,
           "the High-G threshold survived entry into IMUPLUS");
 
     check(gData.highGArmed == (gDev.ready && gDev.init.highGArmed),

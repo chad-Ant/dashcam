@@ -344,6 +344,41 @@ static void test_arm_outside_sniff_is_refused()
     CHECK(canGetMode() == CanMode::OFF);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// frame loss is counted, not cleared in silence
+// ═════════════════════════════════════════════════════════════════════════════
+
+static void test_overruns_are_counted()
+{
+    begin("loss: an overrun is counted once, cleared, and kept across the probe's reset");
+
+    CHECK(enterSniff());
+    CHECK(canProbeArm(g_p));                      // accept-all: every frame reaches a buffer
+    const uint32_t before = canSniffOverrunCount();
+
+    // Five frames before one drain: RXB0, then BUKT rollover into RXB1, then
+    // three with nowhere to go — all on RX1OVR, which latches ONE event.
+    for (unsigned k = 0; k < 5u; ++k) (void)fakeCanFrame(kMapIds[k % kMapN]);
+    CHECK(fakeCanOverflowed() == 3u);
+    (void)tickCANSniff(g_v, g_y);
+    CHECK(canSniffOverrunCount() == before + 1u);  // a lower bound: 3 frames, 1 event
+
+    // Cleared by that drain: a pass that loses nothing adds nothing.
+    for (unsigned k = 0; k < 2u; ++k) (void)fakeCanFrame(kMapIds[k]);
+    (void)tickCANSniff(g_v, g_y);
+    CHECK(canSniffOverrunCount() == before + 1u);
+
+    // Loss on a later pass is a second event.
+    for (unsigned k = 0; k < 3u; ++k) (void)fakeCanFrame(kMapIds[k]);
+    (void)tickCANSniff(g_v, g_y);
+    CHECK(canSniffOverrunCount() == before + 2u);
+
+    // Boot-cumulative: re-arming restarts the probe's counters, not this one.
+    CHECK(canProbeArm(g_p));
+    CHECK(canSniffFrameCount() == 0u);
+    CHECK(canSniffOverrunCount() == before + 2u);
+}
+
 // ─── runner ──────────────────────────────────────────────────────────────────
 
 int main()
@@ -361,6 +396,8 @@ int main()
     test_arm_outside_sniff_is_refused();
     test_refused_host_filters_park_off();
     test_host_filter_refused_outside_sniff_changes_nothing();
+
+    test_overruns_are_counted();
 
     printf("can_probe_tests: %d checks, %d failed\n", g_checks, g_fails);
     return g_fails;

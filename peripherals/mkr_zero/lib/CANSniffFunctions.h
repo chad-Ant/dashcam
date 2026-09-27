@@ -302,6 +302,18 @@ uint32_t canSniffFrameCount();
 uint32_t canSniffMatchCount();
 
 /**
+ * @brief Receive-buffer overrun events since boot (saturating).
+ *
+ * Each event is at least one frame lost: the MCP2515's overrun flags latch
+ * rather than count, and the drain reads and clears them once per pass, so this
+ * is a LOWER BOUND on frames lost. Boot-cumulative — @c canSniffResetCounters()
+ * leaves it alone, because loss does not stop mattering when the probe restarts.
+ * Compare its rate with @c canSniffFrameCount()'s to judge whether the loop's
+ * drain keeps up with the bus.
+ */
+uint32_t canSniffOverrunCount();
+
+/**
  * @brief How many DISTINCT map IDs have been seen since the counters were reset.
  *
  * The probe's second condition. A match count alone can be satisfied entirely by

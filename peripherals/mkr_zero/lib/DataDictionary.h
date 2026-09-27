@@ -415,16 +415,16 @@
 /// forever, so an absent wire produces no false events.
 #define IMU_HIGHG_INT_PIN                            6U
 
-/// High-G threshold, as the register wants it.
+/// High-G threshold in milli-g: the physical trigger level, the same in every
+/// IMU mode.
 ///
-/// At the ±4 g the fusion modes lock the accelerometer to, 1 LSB is 15.63 mg,
-/// so 128 is very close to 2.0 g.
-///
-/// ⚠️ THE LSB SCALES WITH THE SELECTED RANGE, so this byte does NOT mean 2 g in
-/// every mode. AMG selects ±16 g, where 1 LSB is 62.5 mg and 128 is 8 g — a
-/// threshold that ignores the pothole strikes the 2 g figure was chosen to
-/// catch. Production is fixed to IMUPLUS so the 2 g reading is the operative
-/// one, but anything presenting AMG as supported has to program this per mode.
+/// NOT a register value. ACC_HG_THRES counts in an LSB that scales with the
+/// accelerometer range (7.81 / 15.63 / 31.25 / 62.5 mg at ±2 / 4 / 8 / 16 g),
+/// so bring-up converts this for the range in force — bno055HighGThresholdLsb():
+/// 128 at the ±4 g the fusion modes lock the accelerometer to, 32 at the ±16 g
+/// AMG selects. A fixed byte of 128 used to be written in both, which in AMG is
+/// 8 g — a threshold that ignores the pothole strikes 2 g was chosen to catch,
+/// on a mode reachable from the "amg" build and from the host's IMU mode command.
 ///
 /// 2 g rather than something smaller because GRAVITY COUNTS. The interrupt
 /// watches the raw accelerometer, in which the vertical axis reads a steady 1 g
@@ -434,7 +434,7 @@
 /// continuously on a parked car. 2 g leaves a full 1 g of headroom above
 /// gravity, which ordinary driving does not reach: hard braking is around
 /// 0.8 g and a sharp pothole strike is well past 2 g.
-#define IMU_HIGHG_THRESHOLD_LSB                      128U
+#define IMU_HIGHG_THRESHOLD_MG                       2000U
 
 /// High-G duration, as the register wants it: the event must persist for
 /// (value + 1) × 2 ms.
