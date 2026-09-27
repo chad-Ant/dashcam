@@ -249,6 +249,8 @@ static void parseRecording(pugi::xml_node node, RecordingConfig& r,
     readVar(node, r.exposureMode,        log);
     readVar(node, r.targetLuma,          log);
     readVar(node, r.nightLuma,           log);
+    readVar(node, r.focusMode,           log);
+    readVar(node, r.focusAbsolute,       log);
 }
 
 static void parseDetection(pugi::xml_node node, DetectionConfig& d,
@@ -436,6 +438,8 @@ static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {
     writeVar(n, r.exposureMode);
     writeVar(n, r.targetLuma);
     writeVar(n, r.nightLuma);
+    writeVar(n, r.focusMode);
+    writeVar(n, r.focusAbsolute);
 }
 
 static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {

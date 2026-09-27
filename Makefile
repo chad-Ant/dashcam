@@ -49,6 +49,7 @@ LD_ALSA  := -lasound
 
 LIBCAM_CORE_SRCS := lib/libcamera/libcamera.cpp
 LIBCAM_EXPO_SRCS := lib/libcamera/libcamera_exposure.cpp
+LIBCAM_FOCUS_SRCS := lib/libcamera/libcamera_focus.cpp
 
 LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
                lib/libcamera/libcamera_gst.cpp \
@@ -118,7 +119,7 @@ V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
 
 # dashcam_v0_4: recording-only app — one UVC camera, compressed passthrough into
 # gapless segments with loop overwrite; no inference, no network (no TRT/OpenCV)
-V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCFG_SRCS) \
+V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCAM_FOCUS_SRCS) $(LIBCFG_SRCS) \
                 $(LIBREC_SRCS) $(LIBNET_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) $(LIBTIME_SRCS) \
                 src/dashcam_v0_4.cpp)
 

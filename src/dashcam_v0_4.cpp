@@ -37,6 +37,12 @@
 // framerate = never hand over; camera = always the camera.
 // MJPEG cameras only.
 //
+// Focus (FocusMode=camera, the default): the camera's own autofocus, untouched.
+// FocusMode=fixed turns continuous autofocus off and holds the lens at
+// FocusAbsolute while recording (libcamera_focus) — behind a windshield,
+// autofocus hunts on rain, wipers, dirt on the glass and night lights. The
+// focus state found is handed back when the session ends, beside exposure.
+//
 // Clock (no RTC battery: the Jetson boots with the last shutdown time): a
 // background thread asks an NTP server and, while NTP has not succeeded in
 // the last hour, GPS UTC from the ESP32-C3 bridge is the fallback
@@ -54,6 +60,7 @@
 #include "bridge_overlay.h"
 #include "libcamera.h"
 #include "libcamera_exposure.h"
+#include "libcamera_focus.h"
 #include "libcommlink.h"
 #include "libconfig.h"
 #include "liblog.h"
@@ -494,6 +501,29 @@ static bool stopSession(const std::function<void()>& restoreCamera,
     }
     stopRecorder();
     return restored.wait_for(std::chrono::milliseconds(budgetMs)) == std::future_status::ready;
+}
+
+// ─── --self-test: fixed focus lands on the camera's own grid ──────────────────
+
+static int selfTestFocus() {
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+    std::printf("dashcam_v0_4 self-test (focus)\n");
+    check(snapFocusPosition(250, 0, 1023, 1) == 250, "in range, step 1: written as configured");
+    check(snapFocusPosition(-5, 0, 1023, 1) == 0 && snapFocusPosition(5000, 0, 1023, 1) == 1023,
+          "outside the range: clamped to its ends");
+    check(snapFocusPosition(253, 0, 250, 5) == 250 && snapFocusPosition(248, 0, 1020, 5) == 245,
+          "snapped down onto the step grid");
+    check(snapFocusPosition(27, 3, 250, 10) == 23, "the grid starts at the minimum, not at 0");
+    check(snapFocusPosition(7, 0, 100, 0) == 7, "a step below 1 counts as 1");
+    check(snapFocusPosition(0x7fffffff, 0, 0x7fffffff, 2) == 0x7ffffffe &&
+          snapFocusPosition(-2147483647 - 1, -2147483647 - 1, 0x7fffffff, 7) == -2147483647 - 1,
+          "extreme range: no overflow");
+    check(snapFocusPosition(10, 50, 40, 1) == 50, "an inverted range degrades to its minimum");
+    return failures;
 }
 
 // ─── --self-test: session stop ordering and bounds ────────────────────────────
@@ -1459,7 +1489,7 @@ private:
 
 int main(int argc, char* argv[]) {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
-        const int failures = selfTestCameras() + selfTestStorage() + selfTestStopSession() +
+        const int failures = selfTestCameras() + selfTestStorage() + selfTestFocus() + selfTestStopSession() +
                              selfTestSupervision();
         std::printf("RESULT: %s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures,
                     failures == 1 ? "" : "s");
@@ -1502,19 +1532,28 @@ int main(int argc, char* argv[]) {
     if (frameRateExposure) exposureText += " (target luma " + std::to_string((int)r.targetLuma) +
                                            (nightModeEnabled ? ", night below " + std::to_string((int)r.nightLuma)
                                                              : std::string()) + ")";
+    std::string focusMode = r.focusMode;
+    if (focusMode != "camera" && focusMode != "fixed") {
+        log(LogLevel::WARN, "FocusMode '" + focusMode + "' unknown (camera|fixed) — using camera");
+        focusMode = "camera";
+    }
+    const bool fixedFocus = focusMode == "fixed";
+    const std::string focusText = fixedFocus ? "fixed at " + std::to_string((int)r.focusAbsolute)
+                                             : std::string("camera");
     {
         char quotaBuf[32];
         std::snprintf(quotaBuf, sizeof(quotaBuf), "%.1f GB", (double)(float)r.maxFootageGB);
         const std::string quotaText = quota ? quotaBuf : "off";
-        char buf[512];
+        char buf[640];
         std::snprintf(buf, sizeof(buf),
                       "settings: footage=%s segment=%d s quota=%s floor=%.1f GB stall=%d ms "
-                      "firstFrame=%d ms retry=%d s sync=%d ms recordFps=%d exposure=%s config=%s/dashcam.xml",
+                      "firstFrame=%d ms retry=%d s sync=%d ms recordFps=%d exposure=%s focus=%s "
+                      "config=%s/dashcam.xml",
                       std::string(cfg.system.footagePath).c_str(), (int)r.segmentSec,
                       quotaText.c_str(),
                       (double)(float)r.minFreeGB, (int)r.stallTimeoutMs, (int)r.firstFrameTimeoutMs,
                       (int)r.retryIntervalSec, (int)r.syncIntervalMs, (int)r.recordFps,
-                      exposureText.c_str(),
+                      exposureText.c_str(), focusText.c_str(),
                       configsDir.c_str());
         log(LogLevel::INFO, buf);
     }
@@ -1543,13 +1582,14 @@ int main(int argc, char* argv[]) {
     recorder.setOverlayConfig(cfg.overlay);
 
     UvcExposureControl exposure;
+    UvcFocusControl    focus;                 // FocusMode=fixed only
     uint64_t           lastLumaSeq = 0;
     // (monotonic s, camera frames) samples: the camera's real frame rate over
     // the last ~2 s — night mode's "light is back" test.
     std::deque<std::pair<double, uint64_t>> fpsWindow;
-    // Every session end finalises the footage and hands exposure back to the
-    // camera (a no-op after an unplug), so a stopped dashcam never leaves the
-    // camera in manual mode.  The two run side by side (stopSession): the
+    // Every session end finalises the footage and hands exposure and focus back
+    // to the camera (a no-op after an unplug), so a stopped dashcam never leaves
+    // the camera in manual mode.  The two run side by side (stopSession): the
     // footage never waits on a camera control write, and the camera is still
     // restored when recorder.stop() ends in _exit(3) on a wedged disk.  A camera
     // still not answering kCameraRestoreMs after the footage is final is wedged
@@ -1557,10 +1597,10 @@ int main(int argc, char* argv[]) {
     // the launcher's restart loop, like a wedged teardown; on SIGINT/SIGTERM with
     // 0 — the footage is final, which is all the graceful exit promises.
     auto stopRecording = [&]() {
-        if (!stopSession([&exposure] { exposure.close(); }, [&recorder] { recorder.stop(); },
-                         kCameraRestoreMs)) {
+        if (!stopSession([&exposure, &focus] { exposure.close(); focus.close(); },
+                         [&recorder] { recorder.stop(); }, kCameraRestoreMs)) {
             const bool shuttingDown = !g_run;
-            const std::string why = "camera not answering the exposure hand-back " +
+            const std::string why = "camera not answering the exposure/focus hand-back " +
                                     std::to_string(kCameraRestoreMs) + " ms after the footage was "
                                     "finalised — " + (shuttingDown ? "exiting (shutdown)"
                                                                    : "exiting for the restart loop");
@@ -1771,6 +1811,15 @@ int main(int argc, char* argv[]) {
                 exposure.enableNightMode(night);
             }
             fpsWindow.clear();
+        }
+        if (fixedFocus) {
+            // Warned once (a camera without focus controls would repeat it at
+            // every restart), then quietly: recording does not depend on it.
+            std::string whyNot;
+            if (!focus.open(rc.cam->address, (int)r.focusAbsolute, recLog, whyNot)) {
+                const std::string msg = "focus: left to the camera — " + whyNot;
+                log(notesSeen.insert(msg).second ? LogLevel::WARN : LogLevel::DEBUG, msg);
+            }
         }
         runRetention();
         return true;

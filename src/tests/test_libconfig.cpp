@@ -108,6 +108,8 @@ static bool test_roundtrip() {
     src.recording.exposureMode        = std::string("camera");
     src.recording.targetLuma          = 90;
     src.recording.nightLuma           = 50;
+    src.recording.focusMode           = std::string("fixed");
+    src.recording.focusAbsolute       = 250;
     src.system.footagePath  = "/mnt/ssd/footage";
     src.pipeline.branchQueueDepth = 5;
     src.log.queueSize     = 4096;
@@ -219,6 +221,8 @@ static bool test_roundtrip() {
     check((std::string)dst.recording.exposureMode == "camera", "recording.exposureMode round-trip");
     check(dst.recording.targetLuma          == 90,     "recording.targetLuma round-trip");
     check(dst.recording.nightLuma           == 50,     "recording.nightLuma round-trip");
+    check((std::string)dst.recording.focusMode == "fixed", "recording.focusMode round-trip");
+    check(dst.recording.focusAbsolute       == 250,    "recording.focusAbsolute round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
     check(dst.pipeline.branchQueueDepth == 5, "pipeline.branchQueueDepth round-trip");
     check(dst.log.queueSize     == 4096,      "log.queueSize round-trip");
