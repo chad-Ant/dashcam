@@ -9,7 +9,7 @@
 | Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
 | I2C hang | `8ebb9be` | `vendor/Wire` bounds every bus wait at 25 ms. On expiry it resets the SERCOM, and `i2cBusBegin()` recovers the bus. Proven on the rig: BusFaultInjection 10/10, twice. The control run hung until the watchdog. | — |
 | AMG mode | `7882f4e` | AMG came up broken: it restored the IMUPLUS calibration profile at ±16 g, which raises SYS_ERR 0x09. The profile is now restored, and saved, in fusion modes only. Verified on the rig. | — |
-| **I2C bus errors** | `1e93aeb` | A glitch that the controller sees as a START or STOP mid-transfer now fails that transfer, resets the controller, counts it (`i2cerr=`) and recovers the bus. Before, it returned a garbage byte as data, or left every later transfer refused while the lines read idle. **Not run on hardware yet.** | **the rig proof below** |
+| I2C bus errors | `1e93aeb` | A glitch that the controller sees as a START or STOP mid-transfer now fails that transfer, resets the controller, counts it (`i2cerr=`) and recovers the bus. Before, it returned a garbage byte as data, or left every later transfer refused while the lines read idle. **Proven on the rig 2026-09-27:** BusFaultInjection 15/15, twice (results below). Production flashed; `i2cto=0 i2cerr=0` at rest. | a drive: `i2cerr=` before and after the wiring rework |
 | Build scripts | `c232b6d` | `check_core.sh` holds the arduino:samd 1.8.14 check. `install_map.sh` and the BusFaultInjection script now apply it too. | — |
 | liblog | `07a61d4` | `liblog.h` includes `<cstdint>`, so the tree builds with GCC 13 without `-include cstdint`. | — |
 
@@ -53,7 +53,27 @@ Two coders work on this branch:
 - Treat its firmware changes as unproven until you have run them. It compiled them with a different compiler, and
   none of that code has run on a real bus.
 
-## Next build (Jetson coder): prove the bus-error fix on the rig
+## Done 2026-09-27 (Jetson coder): the bus-error fix proven on the rig
+
+BusFaultInjection, built instrumented with the command below, passed **15 of 15** on the boot run and on a
+rerun (`a`):
+
+- **T1b:** `endTransmission=4 in 16 us, timeouts +0, bus errors +1`, as predicted.
+- **C7:** the premise holds on this silicon. With the stock path, the bus read Ready 3/3 while CHIP_ID failed 3/3
+  (`state busy`): the dead bus.
+- **T7/T8:** a glitch START makes the next read fail in 18–19 µs as one bus error. The bus then comes back by
+  itself, and CHIP_ID `0xA0` and the GNSS both answer.
+- **T9/T9b:** SDA glitched mid-read gives 0 bytes in 873–953 µs, one bus error and no bytes, then recovery.
+- **T0–T6b:** unchanged from 2026-09-27. T5 took 25.02 ms and T5b 25.41 ms; both recover.
+- **Longest completed bus wait:** 682–756 µs against the 25 ms deadline.
+- **No SKIP lines.**
+
+Production (IMUPLUS, 121,684 B) was re-flashed afterwards. At rest it shows `imu=up`, `cal=33`, `gps=up`,
+`i2cto=0 i2cerr=0`, `ovf=0`.
+
+The procedure below is kept for reruns after a Wire change.
+
+## Rig procedure: the bus-error proof
 
 **Why.** The fault on this harness is contact that flickers, not a wedge. The 2026-09-26 corrupt reads came from
 breadboard contacts. On the SAMD21, a flicker that lands as a START or STOP mid-transfer is a **bus error**:
@@ -148,6 +168,73 @@ compile-checked from these parts:
 - **Build:** `arduino-cli compile` with `ARDUINO_DIRECTORIES_USER` pointing at a sketchbook whose
   `hardware/arduino/samd` is the core, and `--build-property runtime.tools.{arm-none-eabi-gcc-7-2017q4,CMSIS-4.5.0,CMSIS-Atmel-1.2.0,ctags}.path=...`.
   A wrapper that adds those flags to `compile` lets `build_and_upload.sh` itself run unmodified.
+
+## Environment (the Jetson rig, as of 2026-09-27)
+
+Collected from the machine, not from memory: `/etc/nv_tegra_release`, `dpkg-query`, `arduino-cli core/lib list`,
+and the tools' own `--version`. Re-collect after an upgrade.
+
+**Hardware**
+- **Jetson:** NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super. 6 cores, 7.4 GB RAM, 937 GB NVMe
+  root. No RTC coin cell, so the clock comes from NTP or GPS. It runs on **its own battery** in the car.
+- **Camera:** UGREEN Camera 4K, USB UVC, `eba4:6579`, `/dev/video0`. It records 1080p30 MJPEG (`FormatIndex 4`),
+  pinned by `/dev/v4l/by-id`. Controls are standard UVC only (focus, exposure, gain, backlight compensation).
+  Frames from the evening of 2026-09-26 are upright.
+- **Telemetry master:** Arduino MKR Zero (SAMD21G18A), **powered from the car's OBD2 port**, with USB to the Jetson
+  as the dev console.
+  - **CAN:** MKR CAN Shield, an MCP2515 with a 16 MHz crystal, 500 kbit/s, sniffing the Honda Brio (map `brio`,
+    id 0x0B, on the SD card).
+  - **I2C:** at 400 kHz. BNO055 IMU at 0x29 on a **breadboard**, INT pin not wired. SparkFun u-blox GNSS at 0x42
+    over ESLOV.
+  - **SD card:** on SPI1, holding the CAN map and the IMU calibration profile.
+- **Bridge:** Seeed XIAO ESP32-C3. It talks to the MKR over UART1 at 115200 and to the Jetson over native USB CDC.
+
+**Jetson host**
+- JetPack 6.2.3 (`nvidia-jetpack 6.2.3+b81`), L4T R36.5.2, kernel 5.15.199-tegra, Ubuntu 22.04.5 LTS.
+- CUDA 12.6.11, TensorRT 10.3.0.30 (`libnvinfer10`, built for CUDA 12.5), GCC 11.4.0, Python 3.10.12.
+- GStreamer 1.20.3, v4l-utils 1.22.1, Docker 29.8.1.
+- Host Python's `cv2` is broken (numpy mismatch). Use the container.
+
+**Dev container** `l4t-ml-gpio:latest`
+- Built 2026-09-25 from `docker_dev/Dockerfile`, base `dustynv/l4t-ml:r36.4.0`. The repo is mounted at
+  `/user/dashcam`. It builds everything: plain `make` gives a timestamped `bin/build_<ts>/`.
+- GCC 11.4.0, Python 3.10.12, CUDA 12.6 (nvcc), OpenCV 4.10.0-dev, NumPy 1.26.4, PyTorch 2.6.0, GStreamer 1.20.3.
+- spdlog 1.9.2, fmt 8.1.1, pugixml 1.12.1, pyserial 3.5.
+
+**Firmware toolchains (inside the container)**
+- **arduino-cli:** 1.5.1.
+- **MKR Zero:**
+  - Core `arduino:samd` **1.8.14**, pinned; `check_core.sh` refuses anything else. On aarch64 it is installed by
+    `docker_dev/install_samd_aarch64.py`, because arduino-cli cannot install it there.
+  - arm-none-eabi-gcc **7.2.1** (package `7-2017q4`), CMSIS 4.5.0, CMSIS-Atmel 1.2.0, bossac 1.7.0-arduino3.
+  - Build and flash with `peripherals/mkr_zero/build_and_upload.sh [auto] [amg]`.
+- **ESP32-C3:**
+  - Core `esp32:esp32` **3.2.0**, esptool 5.4.0.
+  - FQBN `esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app,CPUFreq=160,FlashMode=qio,FlashFreq=80,FlashSize=4M,DebugLevel=none,UploadSpeed=921600`.
+- **Arduino libraries**, pinned in the Dockerfile and installed `--no-deps`:
+  - Time 1.6.1
+  - SparkFun u-blox GNSS Arduino Library 2.2.29
+  - Servo 1.3.0
+  - RTCZero 1.6.0
+  - Adafruit BusIO 1.17.4
+  - Adafruit GFX Library 1.12.6
+  - Adafruit SSD1306 2.5.17
+  - Adafruit LED Backpack Library 1.5.1
+- **Vendored** in `peripherals/mkr_zero/vendor`:
+  - Wire: the arduino:samd 1.8.14 copy, patched with the `busOwner` fix, bounded transfers and bus errors. See its
+    README.
+  - CAN 0.3.1, patched.
+  - SdFat 2.3.1.
+  - BNO055 1.2.1.
+
+**Protocol and firmware versions**
+- MKR↔C3 `CommProtocol` and C3↔Jetson `HostProtocol` are both at version **0x07** (180-byte telemetry payload).
+- The C3 bridge firmware reports **1.0**.
+- The MKR production image is this branch's HEAD, IMUPLUS, 121,684 bytes.
+- `dashcam-v04.service` runs the newest `bin/build_*/dashcam_v0_4` it finds at start.
+
+**Where the cloud sandbox differs** (see "Cloud sessions" above): arm-none-eabi-gcc 13.2 and host g++ 13 instead of
+7.2.1 and 11.4.0, no CUDA, and no hardware.
 
 ## Tests
 
