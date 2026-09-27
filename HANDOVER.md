@@ -16,7 +16,48 @@ The MKR firmware was **not compiled for SAMD21**. The cloud sandbox these commit
 download arduino-cli or the core. Build both variants on the Jetson before flashing:
 `peripherals/mkr_zero/build_and_upload.sh` and `... amg`.
 
-## Next build: the I2C hang fix
+## Update 2026-09-27 (Jetson session): verified, hang fix built, AMG repaired
+
+**The three commits above, checked on the Jetson.**
+- Host suites: switch 61, imu 540, can_probe 98, bno_init 586 (602 after the AMG fix below), bridge 79. Mutations 45/45.
+- Both SAMD variants compile. The Jetson tree builds; the v0.4 `--self-test`, `config_test`, `bridge_overlay_test` and `record_test` pass.
+- **Console:** IMUPLUS is flashed, and `ovf=` shows on the console.
+- **Focus:** the UGREEN exposes `focus_automatic_continuous` and `focus_absolute` (0–1023, standard UVC). The value for the road still has to be picked.
+
+**I2C hang fix: done (uncommitted), proven on the rig.**
+- `vendor/Wire` bounds every master-mode flag wait at `DASHCAM_WIRE_WAIT_US` (25 ms). On expiry it resets the SERCOM and counts the abandon.
+- `i2cBusBegin()` runs the full recovery whenever that count changes. The console shows `i2cto=`.
+- **Proof:** `helper_scripts/BusFaultInjection` (ported to the BNO055, built on the Jetson by its new `build_and_upload.sh`) passed 10 of 10, twice:
+  - **T1b**, SDA wedged: fails in 7 µs.
+  - **T5**, SCL held low before a read's START: fails in 25.02 ms, one abandon counted.
+  - **T5b**, SCL pulled low mid-read from a TC5 interrupt: fails in 25.3 ms.
+  - **T6 / T6b**: the bus recovers by itself, including from a BNO055 left mid-byte; CHIP_ID and the GNSS both answer.
+  - **Control `c`**, the T5 injection through the core's waits: hung until the watchdog, `RCAUSE=0x20`.
+- **Recovery bug fixed:** T6b showed `i2cBusRecover()` stopped at the first high SDA, which can be a data bit of a slave mid-read. It now always clocks at least nine times.
+- **Stretch margin:** the longest legitimate wait was 760 µs against the 25 ms deadline (the SMBus tTIMEOUT).
+- **Finding:** an SDA-low wedge never hung the stock driver (lost arbitration sets MB). The hang is a slave holding **SCL** low.
+- **Docs:** see `vendor/Wire/README.md`, patch 2.
+
+**AMG was broken, found while flashing both variants.**
+- **Symptom:** the `amg` build, or a host `CMD_SET_IMU_MODE` raw, left the IMU down, retrying forever.
+- **Not new:** it predates ee952e1; a build from fe844a7 failed the same way.
+- **Cause:** restoring the IMUPLUS calibration profile under AMG's ±16 g makes the part raise SYS_ERR 0x09 while it otherwise runs AMG (SYS_STATUS 6). VerifyOpMode rejects any SYS_ERR. A register-level probe on the rig isolated it: the full AMG setup gives err 0x09, the same setup without the restore gives 0x00, IMUPLUS gives 0x00.
+- **Fix (uncommitted):**
+  - the profile is restored in fusion modes only;
+  - calibration saves happen in fusion mode only;
+  - a SYS_ERR failure now latches the OPR_MODE actually read (it showed a stale 0);
+  - the "fusion not trustworthy" console message is fusion-only.
+- **Tests:** bno_init_tests model the part's reaction (602 checks); 2 new mutants, 47/47 caught.
+- **On the rig:** AMG comes up and stays up (`mode=amg`), and IMUPLUS is restored.
+
+**Still open:**
+- the drive (`i2cto=`, `ovf=`, `hg=`);
+- the harness wiring;
+- the parked block test for the engine-on IMU faults;
+- the night plate-exposure test;
+- the focus value.
+
+## Next build: the I2C hang fix (DONE, see the update above)
 
 **Why this one.** The SAMD core's I2C driver waits on bus flags with no timeout
 (`SERCOM::startTransmissionWIRE`, `SERCOM::readDataWIRE`). See `peripherals/mkr_zero/vendor/Wire/README.md`,
@@ -77,8 +118,8 @@ removes what triggers it, and also removes the corrupt reads behind 2026-09-26's
 ## Tests
 
 ```bash
-make -C peripherals/mkr_zero/tests/host check        # switch 61, imu 540, can_probe 98, bno_init 586
-make -C peripherals/mkr_zero/tests/host mutations    # 45 mutants, all must be caught
+make -C peripherals/mkr_zero/tests/host check        # switch 61, imu 540, can_probe 98, bno_init 602
+make -C peripherals/mkr_zero/tests/host mutations    # 47 mutants, all must be caught
 make -C peripherals/esp32-c3/tests/host check        # bridge 79
 make                                                 # every target, inside the l4t-ml-gpio container
 B=$(ls -td bin/build_* | head -1)                    # the build just made; run from the repo root
