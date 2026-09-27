@@ -272,10 +272,15 @@ void writeAssSample(std::ostream& out, int64_t posNs, int64_t durNs,
         out << "Dialogue: 0," << t0 << "," << t1
                  << ",BL,,0,0,0,,LAT --\\NLON --\\NALT --\n";
     } else {
-        std::snprintf(buf, sizeof(buf), "LAT %.6f %c\\NLON %.6f %c\\NALT %.1f m",
+        // Altitude is NaN on a fix without a 3-D solution: dashed on its own,
+        // like heading, rather than printed as "nan" or replaced by a stale one.
+        char altBuf[32];
+        if (std::isnan(od.altitudeM)) std::snprintf(altBuf, sizeof(altBuf), "ALT --");
+        else                          std::snprintf(altBuf, sizeof(altBuf), "ALT %.1f m", od.altitudeM);
+        std::snprintf(buf, sizeof(buf), "LAT %.6f %c\\NLON %.6f %c\\N%s",
                       std::abs(od.latitude),  od.latitude  >= 0.0 ? 'N' : 'S',
                       std::abs(od.longitude), od.longitude >= 0.0 ? 'E' : 'W',
-                      od.altitudeM);
+                      altBuf);
         out << "Dialogue: 0," << t0 << "," << t1 << ",BL,,0,0,0,," << buf << "\n";
     }
 

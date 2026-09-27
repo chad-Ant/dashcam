@@ -125,6 +125,9 @@ V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_S
 # timesync_test: NTP-first / GPS-fallback clock decisions + clock-jump detection (no privileges)
 TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests/test_timesync.cpp)
 
+# bridge_overlay_test: ESP32-C3 telemetry -> recording overlay mapping (src/bridge_overlay.h, no hardware)
+BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) src/tests/test_bridge_overlay.cpp)
+
 # exposure_test: frame-rate-priority auto-exposure loop (pure logic, no camera)
 EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests/test_exposure.cpp)
 
@@ -172,7 +175,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
                                          $(LIBDSTATE_SRCS) src/tests/test_libdriverstate.cpp) \
                     $(call make_cu_objs, $(LIBDSTATE_CU_SRCS))
 
-ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(SCAN_OBJS) \
+ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
@@ -189,6 +192,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/dashcam_v0_4 \
            $(BUILD_DIR)/exposure_test \
            $(BUILD_DIR)/timesync_test \
+           $(BUILD_DIR)/bridge_overlay_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
@@ -262,6 +266,9 @@ $(BUILD_DIR)/exposure_test: $(EXPO_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/timesync_test: $(TIMESYNC_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/bridge_overlay_test: $(BRIDGE_OVL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)

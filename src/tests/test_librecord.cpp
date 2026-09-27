@@ -287,6 +287,14 @@ static void testGoldenSingleFile() {
     check(f.find(",BL,,0,0,0,,LAT 10.772500 N\\NLON 106.658100 E\\NALT 52.3 m\n") != std::string::npos,
           "fresh BL line unchanged");
     check(f.find(",ADAS,,") == std::string::npos, "no ADAS banner by default");
+    // A 2-D fix: position live, altitude NaN → "ALT --", not "ALT nan m".
+    rec::OverlayData od2d;
+    od2d.positionValid = true;
+    od2d.altitudeM = std::nan("");
+    std::ostringstream twoD;
+    rec::detail::writeAssSample(twoD, 0, 200'000'000LL, od2d, 0, false, false, false, false);
+    check(twoD.str().find(",BL,,0,0,0,,LAT 10.772500 N\\NLON 106.658100 E\\NALT --\n") != std::string::npos,
+          "fix without altitude: ALT dashed on its own");
     // v0.4's clock-only snapshot: no source valid (the defaults) → all dashed.
     const rec::OverlayData none;
     const auto st = rec::detail::assStaleness(none, 0, 2000);

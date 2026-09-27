@@ -51,6 +51,7 @@
 // name="cabin" type="USB"> device is the last resort: it is recorded (with a
 // warning) only when no other USB camera can record, and never when that entry
 // is disabled.
+#include "bridge_overlay.h"
 #include "libcamera.h"
 #include "libcamera_exposure.h"
 #include "libcommlink.h"
@@ -123,6 +124,9 @@ static constexpr int         kSupervisorStuckMs = 30000;
 // Before starting a session on a nearly full disk, wait this long at most for
 // the retention pass (it runs on its own thread).
 static constexpr int         kPreStartRetentionMs = 3000;
+// A bridge sample older than this no longer describes the vehicle: every
+// vehicle field on the overlay is dashed (same window as dashcam v0.3).
+static constexpr int         kBridgeFreshnessMs = 1000;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1627,8 +1631,12 @@ int main(int argc, char* argv[]) {
         log(LogLevel::INFO, "time: NTP disabled (<Network><TimeSyncEnabled>)");
     }
 
-    // GPS time comes from the ESP32-C3 bridge (MKR Zero GPS).  Optional: without
-    // the bridge the link retries quietly in its own thread.
+    // The ESP32-C3 bridge (MKR Zero: CAN, GNSS, IMU) feeds the overlay's vehicle
+    // fields — speed, acceleration, position, heading — and, when enabled, GPS
+    // time. Optional: without the bridge the link retries quietly in its own
+    // thread and those fields stay dashed; recording never depends on it.
+    // Opened whatever the time settings say: gating it on GPS time (as it was)
+    // left the overlay without vehicle data whenever the fallback was off.
     dashcam::commlink::CommLink bridge;
     if (clockSet && (bool)net.gpsTimeFallback) {
         bridge.setTelemetryCallback([&timeKeeper](const dashcam::commlink::Telemetry& t) {
@@ -1637,11 +1645,14 @@ int main(int argc, char* argv[]) {
             u.hour = t.hour; u.minute = t.minute; u.second = t.second;
             timeKeeper.offerGps(u, (t.flags & hostproto::TLM_FLAG_TIME_VALID) != 0);
         });
+    }
+    {
         dashcam::commlink::CommLinkConfig bcfg;          // by-id discovery, auto-stream
         auto bridgeLog = quietRepeats(recLog);
         if (!bridge.open(bcfg, bridgeLog))
-            bridgeLog(LogLevel::INFO, "time: GPS bridge (ESP32-C3) not present — retrying in the background");
-        bridge.start();
+            bridgeLog(LogLevel::INFO, "telemetry bridge (ESP32-C3) not present — retrying in the background");
+        if (!bridge.start())
+            bridgeLog(LogLevel::ERROR, "telemetry bridge: RX thread failed to start — overlay vehicle fields stay dashed");
     }
 
     std::set<std::string> notesSeen;   // resolver warnings are logged once each
@@ -1804,12 +1815,14 @@ int main(int argc, char* argv[]) {
             stopRecording();
             scheduleRetry(why.empty() ? "recording stopped" : why);
         } else {
+            // Vehicle fields from the bridge, each gated on its own source
+            // (src/bridge_overlay.h); a silent bridge or a dead source renders
+            // as dashes, never as a stale value. No ADAS in v0.4.
             rec::OverlayData od;
-            od.timestampMs   = epochMs();
-            // No GPS/IMU/ECU yet: every per-source validity flag stays false, so
-            // speed, acceleration, heading and position render as dashes and
-            // only the clock is live.
-            od.adasValid     = false;
+            od.timestampMs = epochMs();
+            dashcam::app::applyBridgeTelemetry(od, bridge.telemetry(),
+                                               !bridge.isStale(kBridgeFreshnessMs), od.timestampMs);
+            od.adasValid   = false;
             recorder.setOverlayData(od);
 
             if (!startConfirmed && recorder.framesReceived() > 0) {
