@@ -1,4 +1,4 @@
-#include "libcamera.h"   // AttributeDictionary (declared here, defined in libconfig.cpp)
+#include "libcamera.h"   // AttributeDictionary (libcamera_attributes.cpp)
 #include "libconfig.h"
 #include <cassert>
 #include <cmath>

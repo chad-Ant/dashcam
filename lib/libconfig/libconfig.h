@@ -294,8 +294,8 @@ struct SystemConfig {
 /**
  * @brief Camera GStreamer pipeline timing and queue tuning.
  *
- * libcamera cannot depend on libconfig (that would be circular — libconfig.cpp
- * includes libcamera.h), so the app (dashcam_v0_2 / v0_3) copies these values into a
+ * libcamera and libconfig are independent of each other (neither includes the
+ * other), so the app (dashcam_v0_2 / v0_3) copies these values into a
  * dashcam::camera::PipelineParams and calls Camera_GST::setPipelineParams().
  * XML section: @c \<Pipeline\>
  */

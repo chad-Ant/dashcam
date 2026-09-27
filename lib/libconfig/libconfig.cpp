@@ -1,4 +1,3 @@
-#include "libcamera.h"
 #include "libconfig.h"
 #include <algorithm>
 #include <climits>
@@ -130,24 +129,6 @@ static void writeVar(pugi::xml_node parent, const dashcam::config::ConfigVar<T>&
         n.append_attribute("default").set_value(v.defaultValue().c_str());
         n.text().set(static_cast<const std::string&>(v).c_str());
     }
-}
-
-} // namespace
-
-// ─── parseValueType (AttributeDictionary) ────────────────────────────────────
-
-namespace {
-
-dashcam::camera::AttributeValueType parseValueType(const char* str) {
-    using dashcam::camera::AttributeValueType;
-    if (!str || !*str) return AttributeValueType::String;
-    std::string s(str);
-    if (s == "int")            return AttributeValueType::Int;
-    if (s == "float")          return AttributeValueType::Float;
-    if (s == "bool")           return AttributeValueType::Bool;
-    if (s == "bool_from_zero") return AttributeValueType::BoolFromZero;
-    if (s == "range_string")   return AttributeValueType::RangeString;
-    return AttributeValueType::String;
 }
 
 } // namespace
@@ -632,55 +613,3 @@ std::string resolveStorageDir(const std::string& preferred,
 }
 
 } // namespace dashcam::config
-
-// ─── dashcam::camera (AttributeDictionary) ────────────────────────────────────
-
-namespace dashcam::camera {
-
-const AttributeEntry* AttributeDictionary::resolve(const std::string& alias,
-                                                    const std::string& cameraType) const {
-    auto toLower = [](std::string s) {
-        std::transform(s.begin(), s.end(), s.begin(),
-                       [](unsigned char c){ return std::tolower(c); });
-        return s;
-    };
-    const std::string needle = toLower(alias);
-    for (const auto& e : entries) {
-        if (e.type != "any" && e.type != cameraType) continue;
-        for (const auto& a : e.aliases) {
-            if (toLower(a) == needle) return &e;
-        }
-    }
-    return nullptr;
-}
-
-bool AttributeDictionary::load(const std::string& filePath, AttributeDictionary& dict,
-                                const dashcam::log::LogCallback& log) {
-    dict.entries.clear();
-    pugi::xml_document doc;
-    if (!doc.load_file(filePath.c_str())) {
-        // Reuse file-local doLog via the anonymous namespace helper.
-        if (log) log(dashcam::log::LogLevel::ERROR,
-                     ("cannot parse '" + filePath + "'").c_str());
-        return false;
-    }
-    pugi::xml_node root = doc.child("CameraAttributeDictionary");
-    if (!root) {
-        if (log) log(dashcam::log::LogLevel::ERROR,
-                     ("missing <CameraAttributeDictionary> root in '" + filePath + "'").c_str());
-        return false;
-    }
-    for (auto node : root.children("Attribute")) {
-        AttributeEntry e;
-        e.gstProperty = node.attribute("gstProperty").as_string();
-        e.type        = node.attribute("type").as_string("any");
-        e.valueType   = parseValueType(node.attribute("valueType").as_string());
-        for (auto alias : node.children("Alias"))
-            e.aliases.push_back(alias.text().as_string());
-        if (!e.gstProperty.empty())
-            dict.entries.push_back(std::move(e));
-    }
-    return true;
-}
-
-} // namespace dashcam::camera

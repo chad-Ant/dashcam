@@ -50,8 +50,10 @@ LD_ALSA  := -lasound
 LIBCAM_CORE_SRCS := lib/libcamera/libcamera.cpp
 LIBCAM_EXPO_SRCS := lib/libcamera/libcamera_exposure.cpp
 LIBCAM_FOCUS_SRCS := lib/libcamera/libcamera_focus.cpp
+LIBCAM_ATTR_SRCS := lib/libcamera/libcamera_attributes.cpp
 
 LIBCAM_SRCS := lib/libcamera/libcamera.cpp \
+               lib/libcamera/libcamera_attributes.cpp \
                lib/libcamera/libcamera_gst.cpp \
                lib/libcamera/libcamera_csi.cpp \
                lib/libcamera/libcamera_usb.cpp
@@ -136,7 +138,7 @@ EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests
 SCAN_OBJS := $(call make_objs, $(LIBCAM_CORE_SRCS) src/tests/scan_cameras.cpp)
 
 # config_test: XML config round-trip tests
-CFG_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCFG_SRCS) $(LIBCAM_CORE_SRCS) src/tests/test_libconfig.cpp)
+CFG_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCFG_SRCS) $(LIBCAM_ATTR_SRCS) src/tests/test_libconfig.cpp)
 
 # midi_test: WAV playback smoke test
 MIDI_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBMIDI_SRCS) src/tests/midi_test.cpp)

@@ -71,9 +71,8 @@ namespace dashcam::camera {
  * @brief Tunable GStreamer pipeline timing and queue depths.
  *
  * Defaults preserve the historical hardcoded values.  The application copies
- * these from dashcam::config::PipelineConfig (libcamera cannot depend on
- * libconfig — that would be circular) and installs them via
- * Camera_GST::setPipelineParams() before start().
+ * these from dashcam::config::PipelineConfig (libcamera does not depend on
+ * libconfig) and installs them via Camera_GST::setPipelineParams() before start().
  */
 struct PipelineParams {
     uint32_t captureTimeoutMs     = 1000;  ///< captureFrame() max wait for a frame.
