@@ -13,7 +13,47 @@
 | Build scripts | `c232b6d` | `check_core.sh` holds the arduino:samd 1.8.14 check. `install_map.sh` and the BusFaultInjection script now apply it too. | — |
 | liblog | `07a61d4` | `liblog.h` includes `<cstdint>`, so the tree builds with GCC 13 without `-include cstdint`. | — |
 
-## Next build: prove the bus-error fix on the rig
+## Who does what: read before handing work across
+
+Two coders work on this branch:
+- The **cloud session** runs in a virtual machine that holds this repository and nothing else. It wrote this file.
+- The **Jetson coder** works on the Jetson, with the MKR rig, the camera and the car.
+
+**What the cloud session cannot do:**
+- **Touch hardware.** It has no MKR Zero, BNO055, GNSS, MCP2515 or CAN bus, ESP32-C3, UGREEN camera, Jetson GPU,
+  serial console or car. It cannot flash or run firmware, watch a console, measure a line, look at footage or
+  drive.
+- **See what happened on the car.** It sees the car's logs, the SD card, the deployed `/user/output` configs and
+  the Jetson's files only when someone commits them or pastes them into the conversation.
+- **Build or run anything that needs CUDA or a camera.**
+  - CUDA: `liblanedetector` and `libdriverstate`, and so `dashcam_v0_2` and `dashcam_v0_3`, do not build there.
+  - Camera: `record_test` Part B, `csi_test` and `usb_test` cannot run.
+- **Build the binary you flash.** It compiles the MKR firmware with GCC 13.2 against the core cloned from git
+  (recipe below), not with the Jetson's 7.2.1. That is a compile check, not the shipped image. It has not built
+  the ESP32-C3 firmware at all; only the C3 host tests run there.
+- **Know timing or electrical behaviour.** Anything at register level (bus states, clock stretching, what a glitch
+  does) is reasoned from the datasheet and stays a hypothesis until the rig runs it. `1e93aeb` is exactly that
+  case.
+- **Keep anything between sessions.** The machine is rebuilt every session: installed toolchains are gone, and
+  only pushed commits survive.
+- **Count on the network.** `downloads.arduino.cc` is blocked. GitHub and apt worked on 2026-09-27, but that
+  depends on the environment's settings, not on anything the session controls.
+
+**Cloud sessions, this one included, leave hardware tests to the Jetson coder.**
+- Deliver the code, the host tests, and the rig procedure: which test, which command, what a pass looks like, and
+  what each failure means.
+- Never report a hardware result that nobody measured.
+- Mark every change that still needs the rig as "not run on hardware" in the status table.
+
+**Jetson coder: be careful what you hand to a cloud session.**
+- Give it work it can finish and check by itself: code with host tests, reviews, refactors, docs and compile checks.
+  Do not ask it to flash, measure, run on the car or check footage.
+- Put the hardware facts it needs into the handover: console lines, test output, measured numbers, failure
+  records. It cannot go and look for them.
+- Treat its firmware changes as unproven until you have run them. It compiled them with a different compiler, and
+  none of that code has run on a real bus.
+
+## Next build (Jetson coder): prove the bus-error fix on the rig
 
 **Why.** The fault on this harness is contact that flickers, not a wedge. The 2026-09-26 corrupt reads came from
 breadboard contacts. On the SAMD21, a flicker that lands as a START or STOP mid-transfer is a **bus error**:
@@ -59,7 +99,7 @@ the console should read `i2cto=0 i2cerr=0`.
 **Also.** Fix the harness wiring (solder or crimp the I2C lines). The firmware now contains both a wedge and a
 glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the rework measures that directly.
 
-## After flashing: one drive answers the rest
+## After flashing (Jetson coder): one drive answers the rest
 
 - **High-G:** `hg=` counts confirmed events, `hgrej=` rejected evidence. Tune `IMU_HIGHG_THRESHOLD_MG` /
   `IMU_HIGHG_DURATION_LSB` from that data, not before.
@@ -89,10 +129,11 @@ glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the 
   altitude, or the 52.3 m placeholder. v0.4 uses `src/bridge_overlay.h`. Skipped on request.
 - **Unused libraries:** `libstereocam` and `libsigndetector` are in the tree, but no target builds them.
 
-## Cloud sessions can compile the MKR firmware now
+## Cloud sessions: compile-checking the MKR firmware
 
-The sandbox still blocks `downloads.arduino.cc`, but GitHub clones, GitHub release downloads and apt all work.
-`1e93aeb` was compile-checked from these parts:
+This is a compile check only (see "Who does what"). The sandbox blocks `downloads.arduino.cc`, so the toolchain is
+put together from GitHub and apt, and has to be rebuilt every session (a few minutes). `1e93aeb` was
+compile-checked from these parts:
 
 - **Toolchain:** apt `gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib`, i.e. GCC 13.2.
   The Jetson builds with 7.2.1, so image sizes differ (130,676 B here); this is a compile check, not the flashed
@@ -121,4 +162,9 @@ $B/record_test                                       # Part A needs GStreamer ba
 ```
 
 The Wire changes have no host test: they are register-level SAMD21 code, proven only on the rig
-(BusFaultInjection).
+(BusFaultInjection). Running that is the Jetson coder's job.
+
+Where each test can run:
+- **Anywhere, cloud included:** the host suites, `mutations`, `--self-test`, `config_test`,
+  `bridge_overlay_test` and `record_test` Part A.
+- **Jetson only:** CUDA targets, `record_test` Part B, and everything on the rig or the car.
