@@ -1,6 +1,7 @@
 #ifndef LIBLOG_H
 #define LIBLOG_H
 
+#include <cstdint>
 #include <functional>
 #include <string>
 
