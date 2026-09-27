@@ -20,6 +20,10 @@ grep -q ')CANMAP"' "$MAP" && { echo "map text contains the raw-string delimiter"
   printf 'static const char kMapText[] = R"CANMAP('; cat "$MAP"; printf ')CANMAP";\n'; } > "$HERE/canmap_text.h"
 trap 'rm -f "$HERE/canmap_text.h"' EXIT
 
+# vendor/Wire needs arduino:samd 1.8.14 exactly (see check_core.sh).
+source "$MKR/check_core.sh"
+require_samd_core || exit 1
+
 if [ "$PORT" = "auto" ]; then
     source "$MKR/find_port.sh"
     PORT=$(find_mkr_zero_port) || exit 1

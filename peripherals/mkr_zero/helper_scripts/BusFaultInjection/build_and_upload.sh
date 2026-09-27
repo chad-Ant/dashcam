@@ -12,6 +12,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MKR="$(cd "$HERE/../.." && pwd)"
 PORT="${1:-}"
+# vendor/Wire needs arduino:samd 1.8.14 exactly (see check_core.sh).
+source "$MKR/check_core.sh"
+require_samd_core || exit 1
 if [ "$PORT" = "auto" ]; then
     source "$MKR/find_port.sh"
     PORT=$(find_mkr_zero_port) || exit 1

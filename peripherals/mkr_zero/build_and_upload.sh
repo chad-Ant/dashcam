@@ -32,20 +32,11 @@ CAN_DIR="$SKETCH_DIR/vendor/CANBus"
 SDFAT_DIR="$SKETCH_DIR/vendor/SdFat"
 
 FQBN="arduino:samd:mkrzero"
-CORE_REQUIRED="1.8.14"
 
-command -v arduino-cli >/dev/null || { echo "arduino-cli is not available on PATH"; exit 1; }
-
-# vendor/Wire patches that exact core's Wire and uses its private SERCOM API:
-# refuse to build against any other core (as BuildAndUpload.cmd does).
-CORE_FOUND=$(arduino-cli core list | awk '$1 == "arduino:samd" { print $2 }')
-if [ "$CORE_FOUND" != "$CORE_REQUIRED" ]; then
-    echo "ERROR: arduino:samd $CORE_REQUIRED is required, found \"$CORE_FOUND\"."
-    echo "       vendor/Wire is a patched copy of that core's Wire library — see"
-    echo "       vendor/Wire/README.md.  On the Jetson (aarch64) the core is installed"
-    echo "       by docker_dev/install_samd_aarch64.py (arduino-cli alone cannot)."
-    exit 1
-fi
+# vendor/Wire patches arduino:samd 1.8.14's Wire and uses its private SERCOM
+# API: refuse to build against any other core (as BuildAndUpload.cmd does).
+source "$SKETCH_DIR/check_core.sh"
+require_samd_core || exit 1
 
 PORT=""
 EXTRA=()
