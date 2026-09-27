@@ -107,7 +107,7 @@ GPSReturnStatus preallocateGPS_I2C(SFE_UBLOX_GNSS &myGNSS){
     //   setPacketCfgPayloadSize() allocates payloadCfg directly.
     //   assumeAutoPVT() calls initPacketUBXNAVPVT() and then only writes flags.
     // Neither sends a byte, so this is safe to call before the bus is known good
-    // and cannot hang in the SAMD driver's undeadlined waits.
+    // and cannot stall on it.
     if (!myGNSS.setPacketCfgPayloadSize(MAX_PAYLOAD_SIZE)) return GPSReturnStatus::NOK_OUT_OF_MEMORY;
 
     // false, not true: this claims the RAM without asserting that automatic PVT
@@ -187,7 +187,8 @@ void gpsInitFail(GPSInitState &state, GPSReturnStatus why){
  *
  * The bring-up used to be a straight-line function holding the CPU for as long
  * as the receiver took to answer twelve exchanges — up to 3 s even with bounded
- * deadlines, and unbounded if the bus wedged mid-way.  Nothing else ran during
+ * deadlines, and (before vendor/Wire bounded the transfers) unbounded if the
+ * bus wedged mid-way.  Nothing else ran during
  * that: not the C3 link, not the IMU drain, not the watchdog feed in loop().
  * Two separate defects came out of it.  A hang repeated identically on every
  * boot because the same stage ran at the same point under the same armed
@@ -432,9 +433,10 @@ static bool fixFlagsUsable(SFE_UBLOX_GNSS &myGNSS, const GPSData &data){
  *
  * Bring-up is not the only moment the bus can be wedged.  A slave that browns
  * out or resets mid-drive holds SDA from that instant on, and every poll after
- * it walks into @c SERCOM::startTransmissionWIRE()'s
- * @code while (!isBusIdleWIRE() && !isBusOwnerWIRE()); @endcode
- * — a wait with no deadline, living in the core where no vendoring reaches.
+ * it would transact on a held bus. With the stock core that meant SERCOM's
+ * flag waits, which have no deadline, and a watchdog reset; vendor/Wire now
+ * bounds them (DASHCAM_WIRE_WAIT_US), so it costs a stalled, abandoned
+ * transfer per poll instead — still worth skipping.
  *
  * Guarding only the bring-up entry points left the watchdog as the sole answer
  * for the steady state, and a reset is not the behaviour this system is required

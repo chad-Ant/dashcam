@@ -825,11 +825,11 @@ IMUReturnStatus getIMUData(IMUDevice &dev, IMUData &data){
     }
 
     // Checked on EVERY poll, not just at bring-up. A slave that browns out or
-    // resets mid-drive holds SDA from that moment, and the read below goes
-    // straight into SERCOM::startTransmissionWIRE()'s undeadlined
-    // `while (!isBusIdleWIRE() && !isBusOwnerWIRE());`. Without this the only
-    // thing that ends the hang is the watchdog, and a reboot is not the required
-    // response to a peripheral fault — staying up and logging it is.
+    // resets mid-drive holds SDA from that moment, and the read below would
+    // transact on it: a stalled, abandoned transfer with the bounded vendor/Wire,
+    // a hang only the watchdog ended with the stock core's undeadlined waits. A
+    // reboot is not the required response to a peripheral fault — staying up
+    // and logging it is — so the bus is checked before every transfer.
     //
     // A stuck bus is charged to NO fault counter. The bus is shared, so counting
     // it against the IMU would retire a healthy sensor for a fault that is not

@@ -14,8 +14,9 @@
  * arrangement has no way to express the one ordering that actually matters:
  * WHOEVER touches the bus first must unwedge it first.  A boolean cannot,
  * because by the time it is consulted the caller is already about to transact,
- * and any probe used to detect a stuck bus can itself hang forever inside the
- * SAMD core's unbounded flag waits.
+ * and any probe used to detect a stuck bus is itself a transfer on it: with the
+ * stock core one that could hang forever, with vendor/Wire's bounded transfers
+ * a 25 ms stall.
  *
  * So every entry point — GNSS bring-up, IMU bring-up, address probes, the
  * bring-up scan — goes through @c i2cBusBegin(), which is idempotent and
@@ -50,13 +51,13 @@
 /**
  * @brief Arms the SAMD21 watchdog, in early-warning-free normal mode.
  *
- * Containment, NOT the fix.  The SAMD core's I2C driver waits on its bus flags
- * in loops with no deadline (@c SERCOM::startTransmissionWIRE,
- * @c SERCOM::readDataWIRE), and those live in the core rather than in any
- * library, so no amount of vendoring reaches them.  @c i2cBusBegin() refuses to
- * transact on a bus whose lines are not idle, which closes the common cases —
- * but a device that grabs SDA in the microseconds after that check still hangs
- * the CPU, and only a watchdog ends that.
+ * The backstop, no longer the only containment for the bus.  The SAMD core's
+ * I2C driver waits on its bus flags in loops with no deadline
+ * (@c SERCOM::startTransmissionWIRE, @c SERCOM::readDataWIRE); vendor/Wire now
+ * bypasses those for master transfers and polls the same flags against
+ * DASHCAM_WIRE_WAIT_US, so a slave that wedges the bus mid-transfer costs one
+ * failed transfer and a recovery (see @c i2cWireTimeouts()) instead of a reset.
+ * The watchdog still ends any other hang.
  *
  * Call BEFORE the first I2C transaction.  Every path that can block for longer
  * than the period must call @c watchdogFeed().
@@ -107,6 +108,9 @@ uint8_t resetCauseRaw(void);
 /// eighteen also covers a slave with more than one byte queued, and costs
 /// 180 us on a bus that is broken anyway.
 #define I2C_RECOVER_CLOCKS     18u
+/// Clocks always issued before a high SDA counts as released: a byte plus the
+/// ACK slot, where a slave still transmitting a read sees our NACK and stops.
+#define I2C_RECOVER_MIN_CLOCKS  9u
 
 /** @brief Bitmask of @c I2C_STUCK_* from the last @c i2cBusRecover(). */
 uint8_t i2cStuckLines(void);
@@ -147,13 +151,26 @@ const char *i2cStuckReason(void);
  * the implementation for the measured evidence).  @c RCAUSE is the one thing
  * that does persist, and it answers "did the last run hang?" — not "where".
  *
- * The definitive fix is bounding the SAMD core's undeadlined SERCOM waits, which
- * would remove the hang rather than contain it; that needs the core's SERCOM
- * vendored, not just Wire.
+ * The I2C hang itself is now removed rather than contained: vendor/Wire bounds
+ * the core's SERCOM flag waits (DASHCAM_WIRE_BOUNDED), so a wedged transfer
+ * fails and is recovered instead of reaching the watchdog. A watchdog reset,
+ * and so this quarantine, now means a hang somewhere else.
  *
  * Idempotent and NOT consumed: every caller sees the same answer all boot.
  */
 bool bootAfterHang(void);
+
+/**
+ * @brief Master transfers vendor/Wire abandoned at its deadline this boot.
+ *
+ * Each stalled for at least DASHCAM_WIRE_WAIT_US - a wedge, or a slave
+ * stretching the clock longer than the deadline (neither device documents a
+ * maximum). Each one reset the SERCOM, and the next @c i2cBusBegin() ran the
+ * full bus recovery. Before the transfers were bounded, the wedge case was a
+ * watchdog reset and a boot without IMU and GNSS. 0 when built against a Wire
+ * without the bounds.
+ */
+uint32_t i2cWireTimeouts(void);
 
 /** Lifecycle of the shared bus. */
 enum class I2CBusState{
@@ -177,8 +194,9 @@ enum class I2CBusState{
  * Safe to call from every client's initialiser; that is the intent.
  *
  * @return @c I2CBusState::Ready when the bus is usable, @c Stuck when the lines
- *         could not be freed (transacting anyway risks hanging in the SAMD
- *         driver's unbounded waits).
+ *         could not be freed (transacting anyway costs a stalled, abandoned
+ *         transfer at vendor/Wire's deadline — and was a hang with the stock
+ *         core's unbounded waits).
  */
 I2CBusState i2cBusBegin(void);
 

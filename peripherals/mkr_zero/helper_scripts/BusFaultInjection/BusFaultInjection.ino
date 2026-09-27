@@ -13,19 +13,27 @@
  * that lands mid-transaction, leaving a slave part-way through shifting out a
  * byte, still driving SDA and waiting for clocks that never come.
  *
- * So this sketch bit-bangs a real read transaction against the LSM6DSOX —
+ * So this sketch bit-bangs a real read transaction against the BNO055 —
  * START, address+R, ACK — and then simply stops clocking. The register pointer
- * is parked on WHO_AM_I first, whose value 0x6C has bit 7 = 0, so the very
- * first data bit the slave presents is a zero: it holds SDA low and the bus is
- * genuinely stuck, by the slave, exactly as after an unclean reset.
+ * is parked on GYR_ID first, whose value 0x0F has bit 7 = 0, so the very first
+ * data bit the slave presents is a zero: it holds SDA low and the bus is
+ * genuinely stuck, by the slave, exactly as after an unclean reset. (CHIP_ID,
+ * parked on before, reads 0xA0: its first bit is a 1, so the BNO055 let go of
+ * SDA and the wedge never took.)
  *
- * Deliberately NOT tested: attempting a Wire transaction while wedged. The SAMD
- * driver waits on its bus flags in unbounded loops, so that would hang the board
- * rather than report anything. Avoiding that hang is the whole reason recovery
- * runs before the first transaction.
+ * TRANSFERS ON A WEDGED BUS (vendor/Wire, DASHCAM_WIRE_BOUNDED)
+ * ------------------------------------------------------------
+ * T1b makes a real Wire transfer on the SDA-wedged bus. T5 holds SCL low
+ * under the controller while it reads — the wedge the core's unbounded SERCOM
+ * waits could not survive (a slave stretching forever never lets MB or SB set).
+ * Both must fail within the deadline and leave the bus recoverable, with no
+ * watchdog reset. The 'c' command repeats T5 through the core's own waits in an
+ * instrumented build, to show the hang the bounds remove: it ENDS IN A WATCHDOG
+ * RESET by design.
  *
  * Commands:  a = full automatic test    w = wedge only
- *            r = recover only           h = help
+ *            r = recover only           c = control (stock waits: hangs, resets)
+ *            h = help
  */
 
 #include <Wire.h>
@@ -44,8 +52,14 @@ static constexpr unsigned long SERIAL_READY_TIMEOUT_MS = 2000;
 /// Names kept from the LSM6DSOX this replaced so the bit-banged wedge below
 /// reads unchanged; only the part behind them is different.
 static constexpr uint8_t SOX_ADDR   = BNO055_I2C_ADDRESS_DEFAULT;  ///< 0x29.
-static constexpr uint8_t SOX_WHOAMI = 0x00u;                       ///< CHIP_ID.
-static constexpr uint8_t SOX_ID     = 0xA0u;
+static constexpr uint8_t SOX_WHOAMI = 0x03u;   ///< GYR_ID (page 0): first data bit 0.
+static constexpr uint8_t SOX_ID     = 0x0Fu;   ///< Its fixed value.
+static constexpr uint8_t BNO_PAGE_ID  = 0x07u; ///< Register map page select.
+static constexpr uint8_t BNO_CHIP_ID  = 0x00u; ///< Page 0, reads 0xA0.
+
+/// Longest a transfer on a wedged bus may take: the deadline plus slack for the
+/// SERCOM reset in the abort path.
+static constexpr uint32_t WEDGED_XFER_MAX_US = 2u * DASHCAM_WIRE_WAIT_US;
 
 /// Half-bit period for the bit-banged transaction (~100 kHz).
 static constexpr uint32_t HALF_BIT_US = 5u;
@@ -101,8 +115,16 @@ static void report(const char *name, bool ok, const char *detail)
  */
 static bool wedgeBus(void)
 {
-    // Park the register pointer on WHO_AM_I using the normal driver, so the
-    // aborted read below returns 0x6C and its first bit is a guaranteed zero.
+    // GYR_ID lives on page 0. A production bring-up leaves page 0 selected,
+    // but the BNO055 keeps its state across a reflash, so select it anyway.
+    Wire.beginTransmission(SOX_ADDR);
+    if (Wire.write(BNO_PAGE_ID) != 1 || Wire.write((uint8_t)0x00u) != 1) {
+        (void)Wire.endTransmission(true); return false;
+    }
+    if (Wire.endTransmission(true) != 0) return false;
+
+    // Park the register pointer on GYR_ID using the normal driver, so the
+    // aborted read below returns 0x0F and its first bit is a guaranteed zero.
     Wire.beginTransmission(SOX_ADDR);
     if (Wire.write(SOX_WHOAMI) != 1) { (void)Wire.endTransmission(true); return false; }
     if (Wire.endTransmission(true) != 0) return false;
@@ -148,7 +170,7 @@ static bool wedgeBus(void)
     }
 
     // ABORT HERE. With SCL low the slave has already presented data bit 7 of
-    // 0x6C, which is 0 — so it is driving SDA low and waiting for a clock edge
+    // 0x0F, which is 0 — so it is driving SDA low and waiting for a clock edge
     // that this sketch will never send. Release both lines and walk away; SCL
     // floats high, SDA stays down, held by the slave.
     if (!releaseSclAndWait()) return false;
@@ -165,6 +187,190 @@ static void sampleLines(bool &sdaHigh, bool &sclHigh)
     delayMicroseconds(10);
     sdaHigh = (digitalRead(PIN_WIRE_SDA) == HIGH);
     sclHigh = (digitalRead(PIN_WIRE_SCL) == HIGH);
+}
+
+// ── SCL held low: the wedge the core's waits could not survive ───────────────
+//
+// A slave that stretches SCL forever never lets the controller set MB or SB, so
+// SERCOM::readDataWIRE() / startTransmissionWIRE() spin until the watchdog. No
+// BNO055 will do that on demand, so the controller is made to see it: the SCL
+// pad is taken off SERCOM2 and driven low by the port while the peripheral stays
+// enabled and mid-request. The controller can no longer clock, which is the
+// state a stretching slave leaves it in.
+
+static void holdSclLow(void)
+{
+    const EPortType port = g_APinDescription[PIN_WIRE_SCL].ulPort;
+    const uint32_t  pin  = g_APinDescription[PIN_WIRE_SCL].ulPin;
+    PORT->Group[port].OUTCLR.reg = (1ul << pin);               // latch low first
+    PORT->Group[port].DIRSET.reg = (1ul << pin);
+    PORT->Group[port].PINCFG[pin].reg &= (uint8_t)~PORT_PINCFG_PMUXEN;  // port owns the pad now
+}
+
+static void releaseScl(void)
+{
+    const EPortType port = g_APinDescription[PIN_WIRE_SCL].ulPort;
+    const uint32_t  pin  = g_APinDescription[PIN_WIRE_SCL].ulPin;
+    PORT->Group[port].DIRCLR.reg = (1ul << pin);               // back to the pull-ups
+}
+
+/// Reads one register through the normal path; true when it returned @p want.
+/// (Defined before T5b, which uses it too.)
+static bool readRegIs(uint8_t reg, uint8_t want)
+{
+    Wire.beginTransmission(SOX_ADDR);
+    if (Wire.write(reg) != 1) { (void)Wire.endTransmission(true); return false; }
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(SOX_ADDR, (size_t)1, true) != 1) return false;
+    return Wire.read() == want;
+}
+
+/**
+ * @brief T5: a read with SCL held low must fail within the deadline, count one
+ *        abandoned transfer, and leave the bus recoverable and working.
+ * @param control Route through the core's unbounded waits instead (instrumented
+ *        builds only). Expected to hang until the watchdog resets the board.
+ */
+static void sclStallTest(bool control)
+{
+    if (i2cBusBegin() != I2CBusState::Ready) {
+        report("T5 SCL held low", false, "bus not Ready before the test");
+        return;
+    }
+#ifdef DASHCAM_WIRE_INSTRUMENT
+    dashcamWireCoreWaits = control;
+#else
+    if (control) {
+        Serial.println("control needs an instrumented build (build_and_upload.sh adds DASHCAM_WIRE_INSTRUMENT)");
+        return;
+    }
+#endif
+    // Point the BNO055 at CHIP_ID, then read with SCL held low. The pause lets
+    // the pointer write's STOP reach the wire: endTransmission() returns once
+    // the command is synchronised, not once the STOP is clocked out, and
+    // pulling SCL low under it would leave the bus in no defined state.
+    Wire.beginTransmission(SOX_ADDR);
+    (void)Wire.write(BNO_CHIP_ID);
+    (void)Wire.endTransmission(true);
+    delayMicroseconds(200);
+
+    const uint32_t toBefore = i2cWireTimeouts();
+    holdSclLow();
+    const uint32_t t0 = micros();
+    const size_t got = Wire.requestFrom(SOX_ADDR, (size_t)6, true);
+    const uint32_t tookUs = micros() - t0;
+    releaseScl();
+#ifdef DASHCAM_WIRE_INSTRUMENT
+    dashcamWireCoreWaits = false;
+#endif
+    const uint32_t aborted = i2cWireTimeouts() - toBefore;
+    {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "got %u bytes in %lu us, timeouts +%lu",
+                 (unsigned)got, (unsigned long)tookUs, (unsigned long)aborted);
+        report(control ? "C1 stock waits returned (expected a hang)"
+                       : "T5 SCL held low before a read's START: fails within the deadline",
+               !control && (got == 0u) && (aborted == 1u) &&
+               (tookUs >= DASHCAM_WIRE_WAIT_US) && (tookUs < WEDGED_XFER_MAX_US),
+               detail);
+    }
+    if (control) return;
+
+    // The manager sees the new abandon and runs the full recovery on its own.
+    const I2CBusState st = i2cBusBegin();
+    const bool chip = readRegIs(BNO_CHIP_ID, 0xA0u);
+    const bool gnss = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
+    char detail[80];
+    snprintf(detail, sizeof(detail), "state=%d, CHIP_ID %s, gnss=%d",
+             (int)st, chip ? "0xA0" : "WRONG", (int)gnss);
+    report("T6 bus recovers by itself and both devices answer",
+           (st == I2CBusState::Ready) && chip && gnss, detail);
+}
+
+// ── T5b: SCL pulled low PART-WAY THROUGH a long read ─────────────────────────
+//
+// T5 stalls the address phase. This one lets the read start and pulls SCL low
+// while bytes are flowing, from a TC5 one-shot interrupt, so the per-byte waits
+// (readBounded) expire with the controller the bus OWNER and the BNO055 part-way
+// through a byte — the case i2cBusBegin()'s forced recovery exists for: a slave
+// left mid-byte that must be clocked out before the bus is usable again.
+
+static volatile bool tc5Fired = false;
+
+void TC5_Handler(void)
+{
+    TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+    TC5->COUNT16.CTRLA.bit.ENABLE = 0;      // one shot
+    holdSclLow();
+    tc5Fired = true;
+}
+
+/** @brief Arms TC5 to call holdSclLow() in @p us microseconds (48 MHz / 16). */
+static void armSclStall(uint32_t us)
+{
+    PM->APBCMASK.reg |= PM_APBCMASK_TC5;
+    GCLK->CLKCTRL.reg = (uint16_t)(GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN_GCLK0 |
+                                   GCLK_CLKCTRL_ID(GCM_TC4_TC5));
+    while (GCLK->STATUS.bit.SYNCBUSY) { }
+    TC5->COUNT16.CTRLA.reg = TC_CTRLA_SWRST;
+    while (TC5->COUNT16.CTRLA.bit.SWRST || TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+    TC5->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16 | TC_CTRLA_WAVEGEN_MFRQ | TC_CTRLA_PRESCALER_DIV16;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+    TC5->COUNT16.CC[0].reg = (uint16_t)(us * 3u);   // 3 counts per us
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+    TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+    TC5->COUNT16.INTENSET.reg = TC_INTENSET_MC0;
+    NVIC_ClearPendingIRQ(TC5_IRQn);
+    NVIC_SetPriority(TC5_IRQn, 0);
+    NVIC_EnableIRQ(TC5_IRQn);
+    tc5Fired = false;
+    TC5->COUNT16.CTRLA.bit.ENABLE = 1;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+}
+
+static void midReadStallTest(void)
+{
+    if (i2cBusBegin() != I2CBusState::Ready) {
+        report("T5b SCL low mid-read", false, "bus not Ready before the test");
+        return;
+    }
+    // 64 bytes from GYR_ID take ~1.5 ms at 400 kHz; the stall lands ~400 us in,
+    // about a quarter of the way.
+    Wire.beginTransmission(SOX_ADDR);
+    (void)Wire.write(SOX_WHOAMI);
+    (void)Wire.endTransmission(true);
+    delayMicroseconds(200);
+
+    const uint32_t toBefore = i2cWireTimeouts();
+    armSclStall(400u);
+    const uint32_t t0 = micros();
+    const size_t got = Wire.requestFrom(SOX_ADDR, (size_t)64, true);
+    const uint32_t tookUs = micros() - t0;
+    NVIC_DisableIRQ(TC5_IRQn);
+    TC5->COUNT16.CTRLA.bit.ENABLE = 0;
+    const bool fired = tc5Fired;
+    releaseScl();
+    const uint32_t aborted = i2cWireTimeouts() - toBefore;
+    {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "stall %s, got %u bytes in %lu us, timeouts +%lu",
+                 fired ? "injected" : "MISSED (read finished first)",
+                 (unsigned)got, (unsigned long)tookUs, (unsigned long)aborted);
+        report("T5b SCL held low mid-read: fails within the deadline",
+               fired && (got == 0u) && (aborted == 1u) &&
+               (tookUs >= DASHCAM_WIRE_WAIT_US) && (tookUs < WEDGED_XFER_MAX_US),
+               detail);
+    }
+
+    // The forced recovery must clock the mid-byte BNO055 free on its own.
+    const I2CBusState st = i2cBusBegin();
+    const bool chip = readRegIs(BNO_CHIP_ID, 0xA0u);
+    const bool gnss = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
+    char detail[96];
+    snprintf(detail, sizeof(detail), "state=%d lines=\"%s\", CHIP_ID %s, gnss=%d",
+             (int)st, i2cStuckReason(), chip ? "0xA0" : "WRONG", (int)gnss);
+    report("T6b bus recovers from a slave left mid-byte",
+           (st == I2CBusState::Ready) && chip && gnss, detail);
 }
 
 static void runFullTest(void)
@@ -206,6 +412,24 @@ static void runFullTest(void)
     }
     if (!wedged) {
         Serial.println("Could not wedge the bus; recovery result below is meaningless.");
+    }
+
+    // ---- 1b: a real transfer on the wedged bus fails, and fails bounded -----
+    // Pins straight back to SERCOM2, deliberately WITHOUT recovery.
+    if (wedged) {
+        Wire.begin();
+        Wire.setClock(IMU_I2C_CLOCK_HZ);
+        const uint32_t toBefore = i2cWireTimeouts();
+        const uint32_t tb = micros();
+        Wire.beginTransmission(GPS_DEFAULT_I2C_ADDRESS);
+        const uint8_t rc = Wire.endTransmission(true);
+        const uint32_t tookUs = micros() - tb;
+        char detail[96];
+        snprintf(detail, sizeof(detail), "endTransmission=%u in %lu us, timeouts +%lu",
+                 (unsigned)rc, (unsigned long)tookUs,
+                 (unsigned long)(i2cWireTimeouts() - toBefore));
+        report("T1b transfer on the wedged bus fails within the deadline",
+               (rc != 0u) && (tookUs < WEDGED_XFER_MAX_US), detail);
     }
 
     // ---- 2: recover ---------------------------------------------------------
@@ -287,6 +511,20 @@ static void runFullTest(void)
         report("T4 IMU re-inits and reads 1 g after recovery", sane, detail);
     }
 
+    // ---- 5: SCL held low under a read: the hang the bounds remove -----------
+    sclStallTest(false);
+    midReadStallTest();
+
+#ifdef DASHCAM_WIRE_INSTRUMENT
+    // The stretch margin, measured: the longest bounded wait that COMPLETED this
+    // boot (IMU bring-up and reads, GNSS probes) against the 25 ms deadline.
+    Serial.print("longest completed bus wait: ");
+    Serial.print(dashcamWireLongestWaitUs);
+    Serial.print(" us (deadline ");
+    Serial.print((unsigned long)DASHCAM_WIRE_WAIT_US);
+    Serial.println(" us)");
+#endif
+
     Serial.println();
     Serial.print("RESULT: ");
     Serial.print(passCount);
@@ -294,7 +532,7 @@ static void runFullTest(void)
     Serial.print(failCount);
     Serial.println(" failed");
     Serial.println(failCount == 0 ? "ALL TESTS PASSED" : "FAILURES PRESENT");
-    Serial.println("(a = run again, w = wedge only, r = recover only, h = help)");
+    Serial.println("(a = run again, w = wedge only, r = recover only, c = control, h = help)");
 }
 
 // ── the unrecoverable case: SDA physically shorted to GND ────────────────────
@@ -314,7 +552,7 @@ static void runFullTest(void)
 static uint32_t timedCall(const char *label, bool &okOut, bool expectedFalse)
 {
     const uint32_t t0 = micros();
-    const bool result = i2cProbeAddress(IMU_ACCEL_I2C_ADDRESS);
+    const bool result = i2cProbeAddress(SOX_ADDR);
     const uint32_t elapsed = micros() - t0;
     okOut = (result == !expectedFalse);
     Serial.print("    ");
@@ -616,6 +854,11 @@ void setup()
         // bounded; the timeout is the guarantee
     }
 
+    // Read directly: resetCauseName() only knows it once watchdogArm() ran.
+    const uint8_t rcause = PM->RCAUSE.reg;
+    Serial.print("BOOT: RCAUSE=0x");
+    Serial.print(rcause, HEX);
+    Serial.println((rcause & PM_RCAUSE_WDT) ? " (WATCHDOG - the previous run hung)" : "");
     runFullTest();
 }
 
@@ -643,6 +886,13 @@ void loop()
             Serial.println((int)st);
         } else if (command == 'l' || command == 'L') {
             monitorLines();
+        } else if (command == 'c' || command == 'C') {
+            Serial.println("CONTROL: T5 through the core's unbounded SERCOM waits.");
+            Serial.println("Expect silence, then a watchdog reset (~8 s) and 'BOOT: RCAUSE ... WATCHDOG'.");
+            Serial.flush();
+            watchdogArm(8000UL);
+            sclStallTest(true);
+            Serial.println("CONTROL DID NOT HANG - the injection does not reproduce the stall");
         } else if (command == '1') {
             testStuckPhase1();
         } else if (command == '2') {
@@ -650,6 +900,7 @@ void loop()
         } else if (command == 'h' || command == 'H') {
             Serial.println("a = full wedge/recover test (no hardware needed)");
             Serial.println("w = wedge only, r = recover only");
+            Serial.println("c = control: T5 via the core's unbounded waits (instrumented build; ends in a watchdog reset)");
             Serial.println("l = live SDA/SCL level monitor (find the jumper contact)");
             Serial.println("1 = stuck-bus phase 1 -- SHORT SDA (D11) to GND first");
             Serial.println("2 = stuck-bus phase 2 -- REMOVE the short first");

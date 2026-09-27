@@ -32,9 +32,28 @@ extern "C" {
 volatile uint32_t dashcamWireQty1Total      = 0;
 volatile uint32_t dashcamWireQty1Filtered   = 0;
 volatile uint8_t  dashcamWireQty1AddrFilter = 0xFFu;   // matches no real address
+volatile bool     dashcamWireCoreWaits      = false;   // control experiment only
+volatile uint32_t dashcamWireLongestWaitUs  = 0;       // longest completed bounded wait
 #endif
 
 using namespace arduino;
+
+// The core's SERCOM class keeps its register pointer private, so the bounded
+// waits below find this instance's registers by which core SERCOM object it is.
+static Sercom *registersOf(SERCOM *s)
+{
+  if (s == &sercom0) return SERCOM0;
+  if (s == &sercom1) return SERCOM1;
+  if (s == &sercom2) return SERCOM2;
+  if (s == &sercom3) return SERCOM3;
+#if defined(SERCOM4)
+  if (s == &sercom4) return SERCOM4;
+#endif
+#if defined(SERCOM5)
+  if (s == &sercom5) return SERCOM5;
+#endif
+  return nullptr;
+}
 
 TwoWire::TwoWire(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
 {
@@ -42,10 +61,14 @@ TwoWire::TwoWire(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
   this->_uc_pinSDA=pinSDA;
   this->_uc_pinSCL=pinSCL;
   transmissionBegun = false;
+  hw = registersOf(s);
+  clockHz = TWI_CLOCK;
+  timeouts = 0;
 }
 
 void TwoWire::begin(void) {
   //Master Mode
+  clockHz = TWI_CLOCK;
   sercom->initMasterWIRE(TWI_CLOCK);
   sercom->enableWIRE();
 
@@ -63,6 +86,7 @@ void TwoWire::begin(uint8_t address, bool enableGeneralCall) {
 }
 
 void TwoWire::setClock(uint32_t baudrate) {
+  clockHz = baudrate;
   sercom->disableWIRE();
   sercom->initMasterWIRE(baudrate);
   sercom->enableWIRE();
@@ -94,10 +118,14 @@ size_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
 
   rxBuffer.clear();
 
-  if(sercom->startTransmissionWIRE(address, WIRE_READ_FLAG))
+  if(startBounded(address, WIRE_READ_FLAG) == Xfer::Ok)
   {
-    // Read first data
-    rxBuffer.store_char(sercom->readDataWIRE());
+    // Read first data. Every read below is bounded (DASHCAM_WIRE_BOUNDED): a
+    // byte that never arrives abandons the whole transfer, which reports 0
+    // bytes so no caller can mistake a partial buffer for a register image.
+    uint8_t data = 0;
+    if (readBounded(data) != Xfer::Ok) { rxBuffer.clear(); return 0; }
+    rxBuffer.store_char(data);
 
     // ---- DASHCAM PATCH (see Wire.h, DASHCAM_SAMD_WIRE_REQUESTFROM1_FIX) ------
     // Upstream reads:
@@ -121,7 +149,8 @@ size_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
     {
       sercom->prepareAckBitWIRE();                          // Prepare Acknowledge
       sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_READ); // Prepare the ACK command for the slave
-      rxBuffer.store_char(sercom->readDataWIRE());          // Read data and send the ACK
+      if (readBounded(data) != Xfer::Ok) { rxBuffer.clear(); return 0; }  // bounded (see above)
+      rxBuffer.store_char(data);                            // Read data and send the ACK
     }
     sercom->prepareNackBitWIRE();                           // Prepare NACK to stop slave transmission
     //sercom->readDataWIRE();                               // Clear data register to send NACK
@@ -163,8 +192,14 @@ uint8_t TwoWire::endTransmission(bool stopBit)
 {
   transmissionBegun = false ;
 
-  // Start I2C transmission
-  if ( !sercom->startTransmissionWIRE( txAddress, WIRE_WRITE_FLAG ) )
+  // Start I2C transmission. Bounded (DASHCAM_WIRE_BOUNDED): a timeout has
+  // already reset the SERCOM, so there is no STOP to send - return 4.
+  const Xfer started = startBounded( txAddress, WIRE_WRITE_FLAG );
+  if ( started == Xfer::Timeout )
+  {
+    return 4 ;  // Other error: bus wedged, transfer abandoned
+  }
+  if ( started != Xfer::Ok )
   {
     sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
     return 2 ;  // Address error
@@ -174,19 +209,144 @@ uint8_t TwoWire::endTransmission(bool stopBit)
   while( txBuffer.available() )
   {
     // Trying to send data
-    if ( !sercom->sendDataMasterWIRE( txBuffer.read_char() ) )
+    const Xfer sent = sendBounded( txBuffer.read_char() );
+    if ( sent == Xfer::Timeout )
+    {
+      return 4 ;  // Other error: bus wedged, transfer abandoned
+    }
+    if ( sent != Xfer::Ok )
     {
       sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
       return 3 ;  // Nack or error
     }
   }
-  
+
   if (stopBit)
   {
     sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
-  }   
+  }
 
   return 0;
+}
+
+// ---- DASHCAM: bounded master transfers (DASHCAM_WIRE_BOUNDED) ----------------
+//
+// The core's SERCOM::startTransmissionWIRE, sendDataMasterWIRE and readDataWIRE
+// spin on INTFLAG.MB / INTFLAG.SB with no deadline. A slave that holds SCL low
+// mid-transfer - a BNO055 whose own controller has wedged, a contact glitch -
+// never lets either flag set, and the MKR sat in that loop until the 8 s
+// watchdog reset it; the next boot then quarantines the IMU AND the GNSS
+// (lib/I2CBus.h, bootAfterHang). Seen on the car, 2026-09-26 20:47.
+//
+// These are the same register sequences, polled against DASHCAM_WIRE_WAIT_US.
+// Deliberate differences from the core, each a fix:
+//  - a deadline on every flag wait; on expiry abortTransfer() resets the SERCOM
+//    and counts it, and lib/I2CBus.cpp recovers the bus before the next use;
+//  - no recursive restart on lost arbitration in the write address phase (the
+//    core recursed without bound): lost arbitration is reported as a failure
+//    and the caller retries, as it does for any other failed transfer.
+// Only the waits that depend on the bus are bounded. SYNCBUSY waits (enable,
+// reset, command synchronisation) depend on the peripheral clock alone.
+
+bool TwoWire::waitFlags(uint8_t mask)
+{
+  const uint32_t t0 = micros();
+  while ((hw->I2CM.INTFLAG.reg & mask) == 0u)
+  {
+    if ((uint32_t)(micros() - t0) > DASHCAM_WIRE_WAIT_US) return false;
+  }
+#ifdef DASHCAM_WIRE_INSTRUMENT
+  const uint32_t took = micros() - t0;
+  if (took > dashcamWireLongestWaitUs) dashcamWireLongestWaitUs = took;
+#endif
+  return true;
+}
+
+void TwoWire::abortTransfer(void)
+{
+  timeouts++;
+  // No STOP: on a wedged bus it would not complete. Reset the controller so its
+  // own state (bus owner, pending command) is clean; the slave is freed by the
+  // GPIO clock-out in i2cBusRecover(), which the changed timeoutCount() triggers.
+  sercom->disableWIRE();
+  sercom->initMasterWIRE(clockHz);
+  sercom->enableWIRE();
+}
+
+TwoWire::Xfer TwoWire::startBounded(uint8_t address, SercomWireReadWriteFlag flag)
+{
+#ifdef DASHCAM_WIRE_INSTRUMENT
+  if (dashcamWireCoreWaits)
+    return sercom->startTransmissionWIRE(address, flag) ? Xfer::Ok : Xfer::Nack;
+#endif
+  if (hw == nullptr)   // not a known SERCOM: the core's own path, unbounded
+    return sercom->startTransmissionWIRE(address, flag) ? Xfer::Ok : Xfer::Nack;
+
+  // Same early refusal as the core: another master holds the bus, or the last
+  // owner never sent its STOP.
+  if (!sercom->isBusOwnerWIRE())
+  {
+    if (sercom->isBusBusyWIRE() || (sercom->isArbLostWIRE() && !sercom->isBusIdleWIRE()))
+      return Xfer::Nack;
+  }
+
+  // Send start and address (7-bit address + R/W)
+  hw->I2CM.ADDR.bit.ADDR = (uint32_t)((address << 0x1ul) | flag);
+
+  if (flag == WIRE_WRITE_FLAG)
+  {
+    if (!waitFlags(SERCOM_I2CM_INTFLAG_MB)) { abortTransfer(); return Xfer::Timeout; }
+    if (!sercom->isBusOwnerWIRE()) return Xfer::Nack;   // arbitration lost
+  }
+  else
+  {
+    // SB: address ACKed, first byte in. MB alone: address NACKed (or lost).
+    if (!waitFlags(SERCOM_I2CM_INTFLAG_SB | SERCOM_I2CM_INTFLAG_MB)) { abortTransfer(); return Xfer::Timeout; }
+    if (!hw->I2CM.INTFLAG.bit.SB)
+    {
+      hw->I2CM.CTRLB.bit.CMD = 3;   // STOP, as the core does on a NACKed read address
+      return Xfer::Nack;
+    }
+  }
+
+  return hw->I2CM.STATUS.bit.RXNACK ? Xfer::Nack : Xfer::Ok;
+}
+
+TwoWire::Xfer TwoWire::sendBounded(uint8_t data)
+{
+#ifdef DASHCAM_WIRE_INSTRUMENT
+  if (dashcamWireCoreWaits)
+    return sercom->sendDataMasterWIRE(data) ? Xfer::Ok : Xfer::Nack;
+#endif
+  if (hw == nullptr)
+    return sercom->sendDataMasterWIRE(data) ? Xfer::Ok : Xfer::Nack;
+
+  hw->I2CM.DATA.bit.DATA = data;
+
+  const uint32_t t0 = micros();
+  while (!hw->I2CM.INTFLAG.bit.MB)
+  {
+    // As the core: a bus error or lost arbitration may mean MB never sets.
+    if (hw->I2CM.STATUS.bit.BUSERR || hw->I2CM.STATUS.bit.ARBLOST) return Xfer::Nack;
+    if ((uint32_t)(micros() - t0) > DASHCAM_WIRE_WAIT_US) { abortTransfer(); return Xfer::Timeout; }
+  }
+#ifdef DASHCAM_WIRE_INSTRUMENT
+  { const uint32_t took = micros() - t0; if (took > dashcamWireLongestWaitUs) dashcamWireLongestWaitUs = took; }
+#endif
+
+  return hw->I2CM.STATUS.bit.RXNACK ? Xfer::Nack : Xfer::Ok;
+}
+
+TwoWire::Xfer TwoWire::readBounded(uint8_t &out)
+{
+#ifdef DASHCAM_WIRE_INSTRUMENT
+  if (dashcamWireCoreWaits) { out = sercom->readDataWIRE(); return Xfer::Ok; }
+#endif
+  if (hw == nullptr) { out = sercom->readDataWIRE(); return Xfer::Ok; }
+
+  if (!waitFlags(SERCOM_I2CM_INTFLAG_SB | SERCOM_I2CM_INTFLAG_MB)) { abortTransfer(); return Xfer::Timeout; }
+  out = hw->I2CM.DATA.bit.DATA;
+  return Xfer::Ok;
 }
 
 uint8_t TwoWire::endTransmission()

@@ -183,8 +183,9 @@ enum class GPSInitStage : uint8_t{
      *
      * Distinct from @c Failed, and the distinction is the whole point.  Failed
      * retries, which is correct for a receiver that merely refused a setting —
-     * and catastrophic after a hang, because the retry re-enters the same
-     * unbounded SERCOM wait, the watchdog resets the board, and the reboot loop
+     * and catastrophic after a hang, because the retry re-enters whatever hung
+     * (the I2C transfers are bounded now, so something other than the bus),
+     * the watchdog resets the board, and the reboot loop
      * resumes at the retry interval.  Nothing moves out of this state except a
      * non-watchdog reset.
      */

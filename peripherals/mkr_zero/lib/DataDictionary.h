@@ -524,8 +524,9 @@
 
 /// Watchdog period (ms), rounded up to the next supported WDT period.
 ///
-/// Generous on purpose. It exists to end a hang inside the SAMD core's unbounded
-/// I2C waits, not to police loop timing — a loop pass is under 30 ms even with
+/// Generous on purpose. It exists to end a hang — since vendor/Wire bounds the
+/// I2C master transfers (DASHCAM_WIRE_WAIT_US), a hang somewhere other than the
+/// bus — not to police loop timing — a loop pass is under 30 ms even with
 /// both sensors polling, so 8 s cannot fire on a healthy system. Tightening it
 /// buys nothing and risks a reboot loop during a slow bring-up, which is a worse
 /// failure than the hang it guards against.

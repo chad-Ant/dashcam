@@ -272,8 +272,8 @@ static VehiclePower vehiclePowerState()
  * @brief BNO055 High-G interrupt handler. Timestamps an impact, nothing more.
  *
  * Does NOT touch I2C, and must not: the poll it would race is very likely
- * already inside Wire, and a nested transaction on a bus whose driver has
- * unbounded waits is a hang rather than a corrupted read.
+ * already inside Wire, and a nested transaction would corrupt the one in
+ * flight (with the stock core's unbounded waits it could also hang).
  *
  * The library reads the same latch over I2C on the next poll regardless, so
  * this handler is not what makes High-G work — it only makes the timestamp the
@@ -823,8 +823,9 @@ void setup()
     // question about interleaved chip selects.
     //
     // NOT skipped on a quarantined boot. The quarantine exists for the shared
-    // I2C bus, whose SERCOM waits are unbounded; SdFat's begin() is bounded by
-    // its own card-init timeout and fails fast on an empty slot.
+    // I2C bus (whose transfers vendor/Wire now bounds, but a watchdog boot still
+    // quarantines it); SdFat's begin() is bounded by its own card-init timeout
+    // and fails fast on an empty slot.
     //
     // Non-fatal by design. A rig with no card is still a working telemetry node.
     // config.txt is gone, not merely unread. It was parsed into an SDConfig that
@@ -1848,6 +1849,10 @@ void loop()
         // recovery preserves the count so intermittent faults stay visible.
         Serial.print(" hgrej=");
         Serial.print(imuDev.highGRejected);
+        // Boot-cumulative I2C transfers abandoned at vendor/Wire's deadline: a
+        // wedge (which used to end in a watchdog reset) or a stretch past it.
+        Serial.print(" i2cto=");
+        Serial.print(i2cWireTimeouts());
         // c3= is the LINK, stream= is the session on top of it.  They are
         // different failures: a bridge that is attached but not asking for
         // telemetry is healthy, one that has been unplugged is not, and

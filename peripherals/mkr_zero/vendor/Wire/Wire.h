@@ -28,10 +28,14 @@
  * Arduino SAMD Boards core version 1.8.14 (the version this project pins).
  * Licence unchanged: LGPL 2.1 or later, notice above retained verbatim.
  *
- * Sole modification: TwoWire::requestFrom() initialises `busOwner` at its
- * declaration.  Upstream leaves it indeterminate on the quantity==1 path, which
- * is undefined behaviour on every single-byte register read.  See the comment
- * at the patch site in Wire.cpp.
+ * Modifications (see README.md):
+ *  1. TwoWire::requestFrom() initialises `busOwner` at its declaration.
+ *     Upstream leaves it indeterminate on the quantity==1 path, which is
+ *     undefined behaviour on every single-byte register read.
+ *  2. Master transfers wait on the bus flags against a deadline instead of the
+ *     core's unbounded SERCOM loops (startTransmissionWIRE, sendDataMasterWIRE,
+ *     readDataWIRE). A slave that wedges the bus mid-transfer now costs one
+ *     failed transfer instead of a watchdog reset; see DASHCAM_WIRE_BOUNDED.
  *
  * This marker is how the project proves it compiled against THIS copy and not
  * the core's stock one.  Shared I2C code #errors when it is absent, so an
@@ -39,6 +43,29 @@
  * silently reintroducing the bug.  Do not define it anywhere else.
  */
 #define DASHCAM_SAMD_WIRE_REQUESTFROM1_FIX 1
+
+/*
+ * Marker for modification 2: every master-mode flag wait is bounded by
+ * DASHCAM_WIRE_WAIT_US. On expiry the transfer fails (endTransmission() returns
+ * 4, requestFrom() returns 0), the SERCOM is reset, and timeoutCount() rises —
+ * lib/I2CBus.cpp watches that count and runs the full bus recovery (clock out
+ * the slave, STOP) before the next transaction.
+ */
+#define DASHCAM_WIRE_BOUNDED 1
+
+/*
+ * Longest wait for one bus event (address phase, one byte): the SMBus clock-low
+ * timeout (tTIMEOUT, 25-35 ms), whose minimum this is. Neither device's
+ * datasheet bounds its clock stretching - the BNO055 and the u-blox M8 both
+ * stretch - so a slave that stretches longer than this is treated as wedged
+ * too; the instrumented build records the longest wait actually seen
+ * (dashcamWireLongestWaitUs) so the margin is measured, not assumed. Far below
+ * the 8 s watchdog, so a wedge is contained by the transfer failing, not by a
+ * reset.
+ */
+#ifndef DASHCAM_WIRE_WAIT_US
+#define DASHCAM_WIRE_WAIT_US 25000UL
+#endif
 
 #ifdef DASHCAM_WIRE_INSTRUMENT
 #include <stdint.h>
@@ -55,6 +82,14 @@
 extern volatile uint32_t dashcamWireQty1Total;      ///< All quantity==1 requests.
 extern volatile uint32_t dashcamWireQty1Filtered;   ///< Those to dashcamWireQty1AddrFilter.
 extern volatile uint8_t  dashcamWireQty1AddrFilter; ///< 7-bit address to watch.
+/*
+ * Control experiment only: route transfers through the core's UNBOUNDED SERCOM
+ * waits again, so a fault-injection test can show the hang the bounds remove.
+ * Never set outside helper_scripts/BusFaultInjection's control command.
+ */
+extern volatile bool dashcamWireCoreWaits;
+/// Longest single bounded wait that completed (us): the stretch margin, measured.
+extern volatile uint32_t dashcamWireLongestWaitUs;
 #endif
 
 #include "api/HardwareI2C.h"
@@ -103,7 +138,24 @@ class TwoWire : public HardwareI2C
 
     void onService(void);
 
+    /// Master transfers abandoned at DASHCAM_WIRE_WAIT_US - a wedge, or a stretch
+    /// longer than the deadline (each one also reset the SERCOM). Cumulative for
+    /// the boot; lib/I2CBus.cpp recovers the bus whenever it changes.
+    uint32_t timeoutCount(void) const { return timeouts; }
+
   private:
+    /// Outcome of one bounded bus step.
+    enum class Xfer : uint8_t { Ok, Nack, Timeout };
+    Xfer startBounded(uint8_t address, SercomWireReadWriteFlag flag);
+    Xfer sendBounded(uint8_t data);
+    Xfer readBounded(uint8_t &out);
+    bool waitFlags(uint8_t mask);
+    void abortTransfer(void);
+
+    Sercom *hw;                 ///< This SERCOM's registers (the core keeps its pointer private).
+    uint32_t clockHz;           ///< Last clock set, so an abort can re-init at the same speed.
+    volatile uint32_t timeouts; ///< See timeoutCount().
+
     SERCOM * sercom;
     uint8_t _uc_pinSDA;
     uint8_t _uc_pinSCL;

@@ -170,7 +170,8 @@ enum class BNO055InitStage : uint8_t{
      * Abandoned for this boot because the previous run hung.  TERMINAL.
      *
      * Same reasoning as @c GPSInitStage::Quarantined: retrying after a hang
-     * re-enters the SAMD core's unbounded I2C wait, the watchdog resets the
+     * re-enters whatever hung (the I2C transfers themselves are bounded now,
+     * vendor/Wire), the watchdog resets the
      * board, and the reboot loop resumes at the retry interval — slowed, not
      * broken.  Nothing leaves this state except a non-watchdog reset.
      */

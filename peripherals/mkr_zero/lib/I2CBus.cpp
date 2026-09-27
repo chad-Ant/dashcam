@@ -249,8 +249,18 @@ I2CBusState i2cBusRecover(void){
     // case; doubling it costs 180 us on a bus that is already broken and covers
     // a slave that has more than one byte queued. The bound still guarantees
     // termination however badly the slave behaves.
+    //
+    // At least NINE, whatever SDA shows. A slave part-way through a READ is
+    // presenting its data bits on SDA, and a 1 among them reads exactly like a
+    // release; it lets go only after an ACK slot it sees as a NACK (SDA left
+    // high by us on its ninth clock). Stopping at the first high left the BNO055
+    // mid-byte, and it pulled SDA low again under the STOP (BusFaultInjection
+    // T5b/T6b, 2026-09-27: a read abandoned mid-transfer by vendor/Wire's
+    // deadline). Clocking an idle bus is harmless: no START, no STOP, ignored.
     for (uint8_t i = 0u; i < I2C_RECOVER_CLOCKS; i++){
-        if (digitalRead(PIN_WIRE_SDA) == HIGH) { sdaEverHigh = true; break; }
+        const bool sdaHigh = (digitalRead(PIN_WIRE_SDA) == HIGH);
+        if (sdaHigh) sdaEverHigh = true;
+        if (sdaHigh && i >= I2C_RECOVER_MIN_CLOCKS) break;
 
         driveLow(PIN_WIRE_SCL);
         delayMicroseconds(5);
@@ -364,12 +374,39 @@ static bool linesIdle(void){
     return false;
 }
 
+#ifdef DASHCAM_WIRE_BOUNDED
+/// Wire's abandoned-transfer count at the last recovery this module ran.
+static uint32_t seenWireTimeouts = 0u;
+#endif
+
+uint32_t i2cWireTimeouts(void){
+#ifdef DASHCAM_WIRE_BOUNDED
+    return Wire.timeoutCount();
+#else
+    return 0u;
+#endif
+}
+
 I2CBusState i2cBusBegin(void){
+#ifdef DASHCAM_WIRE_BOUNDED
+    // A transfer that ran past its deadline was abandoned inside Wire, which
+    // reset the SERCOM but cannot free the slave: it may still be part-way
+    // through a byte, and one presenting a 1 leaves both lines reading idle, so
+    // linesIdle() below would wave it through. Any new abandon therefore gets
+    // the full recovery - clock the slave out, STOP, reopen - whatever the
+    // lines say, and without the Stuck-state rate limit.
+    const uint32_t wireTimeouts = Wire.timeoutCount();
+    if (wireTimeouts != seenWireTimeouts){
+        seenWireTimeouts = wireTimeouts;
+        return i2cBusRecover();
+    }
+#endif
     // Cached Ready is not proof the bus is still usable.  A device that browns
     // out or resets mid-drive can hold SDA at any time AFTER a successful
-    // bring-up, and every later caller would then walk into the SAMD driver's
-    // unbounded flag waits on the strength of a stale flag.  Re-checking costs
-    // two register reads, against a hang that only a watchdog can end.
+    // bring-up, and every later caller would then transact on a held bus on the
+    // strength of a stale flag: a stalled, abandoned transfer each with the
+    // bounded vendor/Wire, a hang only the watchdog ended with the stock core.
+    // Re-checking costs two register reads.
     if (busState == I2CBusState::Ready){
         if (linesIdle()) return busState;
         busState = I2CBusState::Stuck;   // fall through to the rate-limited retry
