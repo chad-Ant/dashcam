@@ -1,9 +1,5 @@
 #include "libcamera_focus.h"
-
-#include <fcntl.h>
-#include <linux/videodev2.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include "libcamera_v4l2.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -24,45 +20,29 @@ int snapFocusPosition(int wanted, int min, int max, int step) {
 UvcFocusControl::~UvcFocusControl() { close(); }
 
 bool UvcFocusControl::setCtrl(unsigned id, int value) {
-    struct v4l2_control c;
-    std::memset(&c, 0, sizeof(c));
-    c.id    = id;
-    c.value = value;
-    return ::ioctl(fd_, VIDIOC_S_CTRL, &c) == 0;
+    return v4l2::setControl(fd_, id, value);
 }
 
 bool UvcFocusControl::open(const std::string& device, int position,
                            dashcam::log::LogCallback log, std::string& why) {
     close();
     log_ = std::move(log);
-    const int fd = ::open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) { why = "cannot open " + device + ": " + std::strerror(errno); return false; }
+    // Owned locally until everything is in place: every early return closes it.
+    v4l2::Fd fd = v4l2::openNode(device, O_RDWR);
+    if (!fd.valid()) { why = "cannot open " + device + ": " + std::strerror(errno); return false; }
 
-    auto query = [fd](unsigned id, struct v4l2_queryctrl& q) {
-        std::memset(&q, 0, sizeof(q));
-        q.id = id;
-        return ::ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && !(q.flags & V4L2_CTRL_FLAG_DISABLED);
-    };
-    auto get = [fd](unsigned id, int& value) {
-        struct v4l2_control c;
-        std::memset(&c, 0, sizeof(c));
-        c.id = id;
-        if (::ioctl(fd, VIDIOC_G_CTRL, &c) != 0) return false;
-        value = c.value;
-        return true;
-    };
     struct v4l2_queryctrl qAuto, qAbs;
-    if (!query(V4L2_CID_FOCUS_AUTO, qAuto) || !query(V4L2_CID_FOCUS_ABSOLUTE, qAbs)) {
-        ::close(fd);
+    if (!v4l2::queryControl(fd.get(), V4L2_CID_FOCUS_AUTO, qAuto) ||
+        !v4l2::queryControl(fd.get(), V4L2_CID_FOCUS_ABSOLUTE, qAbs)) {
         why = device + " has no autofocus / absolute focus control (fixed-focus lens?)";
         return false;
     }
 
     // What to hand back: the state as found, not the default — someone may have
     // set the lens by hand (v4l2-ctl) before this ran.
-    fd_ = fd;
-    if (!get(V4L2_CID_FOCUS_AUTO, prevAuto_)) prevAuto_ = qAuto.default_value;
-    prevAbsOk_ = get(V4L2_CID_FOCUS_ABSOLUTE, prevAbs_);
+    int prevAuto = 1, prevAbs = 0;
+    if (!v4l2::getControl(fd.get(), V4L2_CID_FOCUS_AUTO, prevAuto)) prevAuto = qAuto.default_value;
+    const bool prevAbsOk = v4l2::getControl(fd.get(), V4L2_CID_FOCUS_ABSOLUTE, prevAbs);
 
     const int pos = snapFocusPosition(position, qAbs.minimum, qAbs.maximum, qAbs.step);
     if (pos != position && log_)
@@ -74,21 +54,21 @@ bool UvcFocusControl::open(const std::string& device, int position,
 
     // Autofocus off FIRST: many cameras refuse (EBUSY) or ignore an absolute
     // focus write while their own autofocus is running.
-    if (!setCtrl(V4L2_CID_FOCUS_AUTO, 0)) {
+    if (!v4l2::setControl(fd.get(), V4L2_CID_FOCUS_AUTO, 0)) {
         why = device + ": cannot turn autofocus off: " + std::strerror(errno);
-        ::close(fd_);
-        fd_ = -1;
         return false;
     }
-    if (!setCtrl(V4L2_CID_FOCUS_ABSOLUTE, pos)) {
+    if (!v4l2::setControl(fd.get(), V4L2_CID_FOCUS_ABSOLUTE, pos)) {
         why = device + ": cannot set focus to " + std::to_string(pos) + ": " + std::strerror(errno);
-        setCtrl(V4L2_CID_FOCUS_AUTO, prevAuto_);           // leave it as found
-        ::close(fd_);
-        fd_ = -1;
+        v4l2::setControl(fd.get(), V4L2_CID_FOCUS_AUTO, prevAuto);   // leave it as found
         return false;
     }
-    device_   = device;
-    position_ = pos;
+    fd_        = fd.release();
+    device_    = device;
+    position_  = pos;
+    prevAuto_  = prevAuto;
+    prevAbs_   = prevAbs;
+    prevAbsOk_ = prevAbsOk;
     if (log_)
         log_(LogLevel::INFO, "focus: fixed at " + std::to_string(pos) + " on " + device +
                              " (autofocus off; range " + std::to_string(qAbs.minimum) + ".." +

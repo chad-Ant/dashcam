@@ -1,9 +1,5 @@
 #include "libcamera_exposure.h"
-
-#include <fcntl.h>
-#include <linux/videodev2.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include "libcamera_v4l2.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -186,43 +182,33 @@ NightModeSwitch::Mode NightModeSwitch::update(double nowSec, bool atCeiling, flo
 UvcExposureControl::~UvcExposureControl() { close(); }
 
 bool UvcExposureControl::setCtrl(unsigned id, int value) {
-    struct v4l2_control c;
-    std::memset(&c, 0, sizeof(c));
-    c.id    = id;
-    c.value = value;
-    return ::ioctl(fd_, VIDIOC_S_CTRL, &c) == 0;
+    return v4l2::setControl(fd_, id, value);
 }
 
 bool UvcExposureControl::open(const std::string& device, float fps, int targetLuma,
                               dashcam::log::LogCallback log, std::string& why) {
     close();
     log_ = std::move(log);
-    const int fd = ::open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) { why = "cannot open " + device + ": " + std::strerror(errno); return false; }
+    // Owned locally until manual mode is on: every early return closes it.
+    v4l2::Fd fd = v4l2::openNode(device, O_RDWR);
+    if (!fd.valid()) { why = "cannot open " + device + ": " + std::strerror(errno); return false; }
 
-    auto query = [fd](unsigned id, struct v4l2_queryctrl& q) {
-        std::memset(&q, 0, sizeof(q));
-        q.id = id;
-        return ::ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && !(q.flags & V4L2_CTRL_FLAG_DISABLED);
-    };
     struct v4l2_queryctrl qAuto, qExp, qGain;
-    if (!query(V4L2_CID_EXPOSURE_AUTO, qAuto) || !query(V4L2_CID_EXPOSURE_ABSOLUTE, qExp) ||
-        !query(V4L2_CID_GAIN, qGain)) {
-        ::close(fd);
+    if (!v4l2::queryControl(fd.get(), V4L2_CID_EXPOSURE_AUTO, qAuto) ||
+        !v4l2::queryControl(fd.get(), V4L2_CID_EXPOSURE_ABSOLUTE, qExp) ||
+        !v4l2::queryControl(fd.get(), V4L2_CID_GAIN, qGain)) {
         why = device + " lacks manual exposure / exposure time / gain controls";
         return false;
     }
+    if (!v4l2::setControl(fd.get(), V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL)) {
+        why = device + ": cannot switch to manual exposure: " + std::strerror(errno);
+        return false;
+    }
 
-    fd_          = fd;
+    fd_          = fd.release();
     device_      = device;
     autoMode_    = qAuto.default_value;          // the camera's own AE mode
     gainDefault_ = qGain.default_value;
-    if (!setCtrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL)) {
-        why = device + ": cannot switch to manual exposure: " + std::strerror(errno);
-        ::close(fd_);
-        fd_ = -1;
-        return false;
-    }
 
     FrameRateExposure::Limits lim;
     lim.exposureMin = std::max(1, qExp.minimum);

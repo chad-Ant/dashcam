@@ -1,4 +1,5 @@
 #include "libcamera.h"
+#include "libcamera_v4l2.h"
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -8,21 +9,20 @@
 #include <filesystem>
 #include <fstream>
 #include <system_error>
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <linux/videodev2.h>
+#include <unistd.h>   // readlink
 
 namespace dashcam::camera {
 
-struct ScopedFd {
-    int fd;
-    explicit ScopedFd(int fd) : fd(fd) {}
-    ~ScopedFd() { if (fd >= 0) ::close(fd); }
-    ScopedFd(const ScopedFd&)            = delete;  // non-copyable: prevents double-close
-    ScopedFd& operator=(const ScopedFd&) = delete;
-    operator int() const { return fd; }
-};
+using v4l2::xioctl;
+
+/// N of a "videoN" node name; -1 for anything else (video, videoX, video1a).
+static long videoNodeIndex(const std::string& name) {
+    if (name.size() <= 5 || name.compare(0, 5, "video") != 0) return -1;
+    for (size_t j = 5; j < name.size(); ++j) {
+        if (!std::isdigit(static_cast<unsigned char>(name[j]))) return -1;
+    }
+    return std::strtol(name.c_str() + 5, nullptr, 10);
+}
 
 /**
  * @brief Enumerate discrete pixel formats supported by a V4L2 capture device.
@@ -43,7 +43,7 @@ static void queryPixelFormats(int fd, cameraInfo& info) {
     fmtdesc.index = 0;
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-    while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+    while (xioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
         if (fmtdesc.index >= MAX_VIDEO_FORMATS) {
             break;
         }
@@ -73,7 +73,7 @@ static void queryResolutions(int fd, const cameraVideoFormat& info, std::vector<
     frmsize.index = 0;
     frmsize.pixel_format = info.pixelFormat;
 
-    while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+    while (xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
         if (frmsize.index >= MAX_VIDEO_FORMATS) {
             break;
         }
@@ -108,7 +108,7 @@ static void queryFrameRates(int fd, const cameraVideoFormat& info, std::vector<c
     frmival.width  = info.width;
     frmival.height = info.height;
 
-    while (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
+    while (xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
         if (frmival.index >= MAX_VIDEO_FORMATS) {
             break;
         }
@@ -205,7 +205,7 @@ static void populateCameraAttributes(int fd, cameraInfo& info) {
     memset(&queryctrl, 0, sizeof(queryctrl));
     queryctrl.id = V4L2_CTRL_FLAG_NEXT_CTRL;
 
-    while (ioctl(fd, VIDIOC_QUERYCTRL, &queryctrl) == 0) {
+    while (xioctl(fd, VIDIOC_QUERYCTRL, &queryctrl) == 0) {
         if (info.attributes.size() >= MAX_ATTRIBUTES) {
             break;
         }
@@ -270,7 +270,7 @@ static void populateCameraAttributes(int fd, cameraInfo& info) {
                 memset(&querymenu, 0, sizeof(querymenu));
                 querymenu.id    = queryctrl.id;
                 querymenu.index = i;
-                if (ioctl(fd, VIDIOC_QUERYMENU, &querymenu) == -1) {
+                if (xioctl(fd, VIDIOC_QUERYMENU, &querymenu) == -1) {
                     continue;
                 }
                 // INTEGER_MENU entries carry a 64-bit integer value, not a name string.
@@ -344,38 +344,24 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
     cameraList.clear();
 
     // Enumerate /dev/videoN nodes via the filesystem so we're not limited to video0..15.
-    std::vector<std::filesystem::path> videoPaths;
+    struct VideoNode {
+        std::filesystem::path path;
+        long                  index;
+    };
+    std::vector<VideoNode> videoNodes;
     std::error_code ec;
     for (auto it = std::filesystem::directory_iterator("/dev", ec);
          !ec && it != std::filesystem::directory_iterator();
          it.increment(ec)) {
-        const std::string name = it->path().filename().string();
-        if (name.size() <= 5 || name.substr(0, 5) != "video") {
-            continue;
-        }
-        bool allDigits = true;
-        for (size_t j = 5; j < name.size(); ++j) {
-            if (!std::isdigit(static_cast<unsigned char>(name[j]))) {
-                allDigits = false;
-                break;
-            }
-        }
-        if (allDigits) {
-            videoPaths.push_back(it->path());
-        }
+        const long index = videoNodeIndex(it->path().filename().string());
+        if (index >= 0) videoNodes.push_back({it->path(), index});
     }
     // Sort by the numeric suffix, not lexicographically: path ordering would
     // put video10 before video2, which scrambles the CSI sensor-id assignment
     // below on systems with more than 9 video nodes (4 UVC cameras plus their
-    // metadata nodes get there easily).  The suffix is all digits — verified
-    // during the scan above.
-    auto videoIndex = [](const std::filesystem::path& p) {
-        return std::strtoul(p.filename().string().c_str() + 5, nullptr, 10);
-    };
-    std::sort(videoPaths.begin(), videoPaths.end(),
-              [&videoIndex](const std::filesystem::path& a, const std::filesystem::path& b) {
-                  return videoIndex(a) < videoIndex(b);
-              });
+    // metadata nodes get there easily).
+    std::sort(videoNodes.begin(), videoNodes.end(),
+              [](const VideoNode& a, const VideoNode& b) { return a.index < b.index; });
 
     // Argus sensor-id is a dense 0-based index over ACTIVE camera modules.
     // Device-tree module indices are not dense when a module is disabled or
@@ -389,12 +375,13 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
     };
     std::vector<CsiModule> csiModules;
 
-    for (const auto& devicePath : videoPaths) {
-        ScopedFd fd(::open(devicePath.c_str(), O_RDONLY | O_NONBLOCK));
-        if (fd < 0) continue;
+    for (const auto& node : videoNodes) {
+        const std::filesystem::path& devicePath = node.path;
+        const v4l2::Fd fd = v4l2::openNode(devicePath.string(), O_RDONLY);
+        if (!fd.valid()) continue;
 
         struct v4l2_capability cap;
-        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) continue;
+        if (xioctl(fd.get(), VIDIOC_QUERYCAP, &cap) == -1) continue;
 
         // device_caps is only valid when V4L2_CAP_DEVICE_CAPS is advertised.
         // Older drivers leave device_caps zero and report capabilities only
@@ -407,7 +394,7 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
         info.address = devicePath.string();
         std::string driverName(reinterpret_cast<const char*>(cap.driver));
 
-        uint32_t parsedDevId = static_cast<uint32_t>(std::strtoul(devicePath.filename().string().c_str() + 5, nullptr, 10));
+        const uint32_t parsedDevId = static_cast<uint32_t>(node.index);
 
         if (driverName == "tegra-video" || driverName == "vi") {
             info.type = CAMERA_TYPE::CSI;
@@ -429,8 +416,8 @@ ERROR_CODE getCameraList(std::vector<cameraInfo>& cameraList,
             info.deviceId = parsedDevId;
         }
 
-        populateCameraAttributes(fd, info);
-        populateCameraVideoFormats(fd, info, log);
+        populateCameraAttributes(fd.get(), info);
+        populateCameraVideoFormats(fd.get(), info, log);
         cameraList.push_back(info);
     }
 
