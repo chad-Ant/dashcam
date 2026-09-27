@@ -1108,8 +1108,9 @@ void loop()
             commMaster.imuModeAppliedMs = millis();
             // The snapshot describes a sensor that no longer exists in that
             // configuration, so it is cleared rather than left to age out. Its
-            // peaks were folded against the OTHER mode's rail.
-            initIMUData(imuData);
+            // peaks were folded against the OTHER mode's rail. The High-G record
+            // is republished, not cleared: imuHighGCount only ever climbs.
+            resetIMUData(imuDev, imuData);
             Serial.println("bring-up restarted (~700 ms blind)");
         } else {
             Serial.println("REFUSED (driver declined)");

@@ -258,10 +258,11 @@ struct IMUData{
      */
     bool highGEvent;
 
-    /// @c millis() the High-G latch was first seen. Meaningless unless
-    /// @c highGEvent. Read from the INT pin when one is wired and from the poll
-    /// that noticed the latch otherwise — the second is later, but it is the
-    /// event's own timestamp either way, not the frame's.
+    /// @c millis() the most recent High-G latch was first seen. Valid whenever
+    /// @c highGCount is non-zero (kept across recovery); the telemetry builder
+    /// turns it into imuHighGMs, an age. Read from the INT pin when one is wired
+    /// and from the poll that noticed the latch otherwise — the second is later,
+    /// but it is the event's own timestamp either way, not the frame's.
     uint32_t highGMs;
 
     /**
@@ -452,11 +453,13 @@ struct IMUDevice{
     uint16_t missedPolls;
     uint32_t lastPollMs;
 
-    /// Cumulative High-G latches since bring-up, saturating. The published flag
-    /// lasts IMU_HIGHG_HOLD_MS, so a soak watching the console can miss every
-    /// one and still look clean — this only ever climbs, so one glance answers
-    /// "were there any?".
-    uint16_t highGCount;
+    /// Cumulative High-G latches for the whole boot, saturating — carried
+    /// across recovery, mode changes and quarantine like highGRejected, because
+    /// imuHighGCount promises the host a count that only climbs. The published
+    /// flag lasts IMU_HIGHG_HOLD_MS, so a soak watching the console can miss
+    /// every one and still look clean; one glance at this answers "were there
+    /// any?".
+    uint16_t highGCount = 0u;
     /// Times the latch could not be cleared. Each one disarms the backstop, so
     /// this should be 0; a non-zero value with highGArmed false is the record of
     /// why the hardware impact detector stopped working.
@@ -481,9 +484,11 @@ struct IMUDevice{
     /// with no latch: not the part's doing (stuck/shorted). Ignored until seen
     /// low. Console flag INTSTUCK.
     bool     intLineDistrusted = false;
-    bool     highGActive;      ///< Currently inside the republication hold.
-    uint32_t highGUntilMs;     ///< Deadline for that hold.
-    uint32_t highGAtMs;        ///< When the latch was first seen.
+    /// The republication hold. Like the count, it survives recovery: it runs
+    /// to its own deadline even while the part is being re-initialised.
+    bool     highGActive = false;
+    uint32_t highGUntilMs = 0u;    ///< Deadline for that hold.
+    uint32_t highGAtMs = 0u;       ///< When the latch was first seen (kept across recovery).
     /// Deadline form, not elapsed-time form: the gap notice is HELD until
     /// @c gapFlagUntilMs and then latched off.  Deriving it from "counter
     /// nonzero and the timestamp looks recent" republished a long-finished gap
@@ -595,6 +600,18 @@ IMUReturnStatus recoverIMU(IMUDevice &dev);
 void initIMUData(IMUData &data);
 
 /**
+ * @brief Clears a snapshot for a new bring-up of a device that has been running.
+ *
+ * The channel data is reset exactly as @c initIMUData() does — after a mode
+ * switch it describes a configuration that no longer exists. The High-G record
+ * is not: the count, the last latch's time and a hold still running belong to
+ * the vehicle and are carried in @c IMUDevice across recovery, so they are
+ * republished from there. @c initIMUData() alone published imuHighGCount 0
+ * until the next poll, and a 10 Hz frame taken in that window read N, 0, N.
+ */
+void resetIMUData(IMUDevice &dev, IMUData &data);
+
+/**
  * @brief Reads one sample (non-blocking).
  *
  * ONE 48-byte burst covers accelerometer, magnetometer, gyroscope, Euler
@@ -645,10 +662,15 @@ bool isIMUDegraded(const IMUDevice &dev);
 /**
  * @brief Puts the device into a valid "nothing fitted" state WITHOUT touching the bus.
  *
- * ONE EXCEPTION, deliberate: a quarantine is CARRIED ACROSS rather than cleared.
- * Without that this would be a public way around @c imuQuarantine() — resetting
- * the struct would put a device that hung the board back into the polling and
- * recovery paths.
+ * CARRIED ACROSS rather than cleared, each deliberately:
+ *  - a quarantine. Without that this would be a public way around
+ *    @c imuQuarantine() — resetting the struct would put a device that hung the
+ *    board back into the polling and recovery paths.
+ *  - @c highGRejected, and the High-G record: @c highGCount, @c highGAtMs and a
+ *    hold still running. They describe the vehicle, not the part, and the
+ *    sketch recovers in the same loop pass that retires. So a HIGH-G flag can
+ *    be published, for the rest of its 500 ms hold, while the device is absent
+ *    or being re-initialised (IMU_PRESENT and HIGHG_ARMED clear).
  */
 void imuMarkAbsent(IMUDevice &dev);
 

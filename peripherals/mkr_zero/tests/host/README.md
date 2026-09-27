@@ -14,7 +14,7 @@ board, no serial port.
 | suite | module under test | checks |
 |---|---|---|
 | `switch_tests` | `lib/SwitchFunctions.cpp` | 61 |
-| `imu_tests` | `lib/IMUFunctions.cpp`: lifecycle, integrity, confirmed High-G (incl. INT-line candidate → release probe → stuck verdict, flicker, re-latch, retirement, mid-sample edge), channel-level faults | 502 |
+| `imu_tests` | `lib/IMUFunctions.cpp`: lifecycle, integrity, confirmed High-G (incl. INT-line candidate → release probe → stuck verdict, flicker, re-latch, retirement, mid-sample edge, High-G record surviving recovery and the mode-switch snapshot reset, episodes settled on every re-init), channel-level faults | 540 |
 | `can_probe_tests` | `lib/CANSniffFunctions.cpp`: the map probe and filter ownership | 89 |
 | `bno_init_tests` | **real** `lib/BNO055Init.cpp`: self-test checks, masked read-back, exact interrupt setup | 451 |
 | `port_tests.py` | shared MKR USB selector: product identity and ambiguity | 5 cases |
@@ -89,7 +89,7 @@ was reintroduced into a copy of the source and the suite re-run.
 | a refused probe open marks OFF without parking the chip | refused open only |
 | **none — unmutated control** | **none** |
 
-IMU hardening follow-up (2026-09-26, 34 mutants): `make mutations` reproduces these
+IMU hardening follow-up (2026-09-26, 41 mutants): `make mutations` reproduces these
 regressions in temporary source copies, leaving the checkout untouched. A
 mutant must compile successfully and fail assertions; compilation errors do
 not count as caught bugs. Unmodified controls must pass first.
@@ -119,12 +119,19 @@ not count as caught bugs. Unmodified controls must pass first.
 | RST_INT omitted | latch is counted and physically released |
 | NACK drops a glitch edge uncounted | rejection is counted even with no later good read |
 | NACK counts a held latch as rejected | one real event must not read as both hg and hgrej |
-| retirement drops an open episode silently | an undecided candidate/probe is counted as rejected |
-| retirement ignores a released probe | a probe that let go on the retiring poll is the impact |
+| open episode dropped silently (retire / re-init) | an undecided candidate/probe is counted as rejected |
+| re-init drops an open episode | a host mode switch or calibration re-init settles it first |
+| released probe ignored (retire / re-init) | a probe that let go before the part stopped being polled is the impact |
 | line sampled before the edge snapshot | a latch landing mid-sample: counted as rejected and as an event, timed late |
 | mid-sample edge not merged | a latch landing just before the sample keeps its edge time |
 | bring-up retains a pin edge | configuration edges are not impacts or runtime rejects |
 | recovery clears hgrej | counter survives re-init/mode changes and saturates |
+| recovery zeroes the High-G count | imuHighGCount must climb for the whole boot |
+| recovery cancels the High-G hold | an impact that retires the part stays published 500 ms through same-pass recovery |
+| recovery erases the last latch time | imuHighGMs keeps pointing at the last real latch |
+| mode-switch snapshot reset drops the High-G record | the published count must not read N, 0, N across a host mode switch |
+| snapshot reset copies the hold without its deadline | resetIMUData must not revive an expired hold |
+| High-G hold never expires | the hold ends on its own deadline wherever it is published |
 | MAG-only failure retires AMG | accel/gyro stay valid; MAG becomes NaN, status PARTIAL |
 | failed MAG still published | magnetic validity and all three values are cleared |
 | bring-up skips self-test validation | failed/missing self-test is named and latched |

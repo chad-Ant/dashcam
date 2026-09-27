@@ -954,6 +954,12 @@ static void test_retirement_settles_an_open_episode()
     CHECK(!g_dev.ready && g_clearWrites == 1u);
     CHECK(g_dev.highGCount == 1u && g_dev.highGAtMs == edge && g_data.highGEvent);
     CHECK(g_dev.highGRejected == 0u);
+    // REVIEW (fda019c): the sketch runs recoverIMU() in this same loop pass
+    // whenever the part is degraded, and recovery wiped the hold and the count
+    // — so this impact reached telemetry for one 10 ms poll, not 500 ms.
+    CHECK(recoverIMU(g_dev) == IMUReturnStatus::OK);
+    (void)pass();
+    CHECK(g_data.highGEvent && g_data.highGCount == 1u && g_data.highGMs == edge);
 
     begin("int: a probe still undecided when the part retires is counted as rejected");
     CHECK(bringUp());
@@ -964,6 +970,41 @@ static void test_retirement_settles_an_open_episode()
     g_busFails = true;
     for (unsigned i = 0; i < IMU_MAX_CONSECUTIVE_FAULTS; ++i) (void)pass();
     CHECK(!g_dev.ready && g_dev.highGCount == 0u && g_dev.highGRejected == 1u);
+}
+
+static void test_reinit_settles_an_open_episode()
+{
+    // REVIEW (2026-09-26): retire() settled an open episode, but a re-init that
+    // is not a retirement — a host mode switch, the re-init after a failed
+    // calibration capture — went straight to imuMarkAbsent(), which wiped it.
+    begin("int: a probe that let go is recorded when a host mode switch re-initialises the part");
+    CHECK(bringUp());
+    digitalWrite(IMU_HIGHG_INT_PIN, HIGH);
+    const uint32_t edge = g_t;
+    imuNoteHighGPin(edge);
+    (void)pass(); (void)pass();                       // candidate, probe: the line lets go
+    CHECK(g_dev.lineProbe && digitalRead(IMU_HIGHG_INT_PIN) == LOW);
+    CHECK(setIMUSampleMode(g_dev, IMUSampleMode::Raw) == IMUReturnStatus::OK);
+    resetIMUData(g_dev, g_data);
+    CHECK(g_dev.highGCount == 1u && g_dev.highGAtMs == edge && g_dev.highGRejected == 0u);
+    CHECK(g_data.highGCount == 1u && g_data.highGEvent);
+    CHECK(!g_dev.lineProbe && !g_dev.lineCandidate);
+
+    begin("int: a candidate open at a re-init is counted as rejected");
+    CHECK(bringUp());
+    digitalWrite(IMU_HIGHG_INT_PIN, HIGH);
+    (void)pass();                                     // candidate
+    CHECK(g_dev.lineCandidate);
+    CHECK(setIMUSampleMode(g_dev, IMUSampleMode::Raw) == IMUReturnStatus::OK);
+    CHECK(g_dev.highGCount == 0u && g_dev.highGRejected == 1u && !g_dev.lineCandidate);
+
+    begin("int: a probe still undecided at a re-init is counted as rejected");
+    CHECK(bringUp());
+    digitalWrite(IMU_HIGHG_INT_PIN, HIGH);
+    (void)pass(); (void)pass();                       // candidate, probe
+    digitalWrite(IMU_HIGHG_INT_PIN, HIGH);            // still high
+    CHECK(initializeIMU(g_dev) == IMUReturnStatus::OK);   // mkr_zero.ino's calibration-failure re-init
+    CHECK(g_dev.highGCount == 0u && g_dev.highGRejected == 1u && !g_dev.lineProbe);
 }
 
 static uint32_t g_hookEdgeMs = 0;
@@ -1003,6 +1044,80 @@ static void test_edge_landing_mid_sample_is_counted_once()
     (void)pass();
     CHECK(g_dev.highGCount == 1u && g_dev.highGAtMs == g_hookEdgeMs);
     CHECK(g_dev.highGRejected == 0u);
+}
+
+static void test_high_g_record_survives_recovery()
+{
+    // REVIEW (fda019c): an impact that also knocks the connector is followed by
+    // bad reads, retirement and — in the same loop pass — recoverIMU(). Recovery
+    // cancelled the 500 ms hold (the impact was published for one 10 ms poll, so
+    // a 10 Hz frame caught it about one time in ten) and zeroed the count, which
+    // the telemetry documents as climbing for the whole boot: a consumer holding
+    // count 7 saw 0 and then 1, and missed that impact entirely.
+    begin("high-g: an impact that retires the part stays published for its whole hold through recovery");
+    CHECK(bringUp());
+    g_burst.intSta = 0x20u;
+    (void)pass();
+    const uint32_t at = g_dev.highGAtMs;
+    CHECK(g_dev.highGCount == 1u && g_data.highGEvent);
+    g_busFails = true;
+    for (unsigned i = 0; i < IMU_MAX_CONSECUTIVE_FAULTS; ++i) (void)pass();
+    CHECK(!g_dev.ready);
+    CHECK(recoverIMU(g_dev) == IMUReturnStatus::OK);  // the sketch's same-pass recovery
+    g_busFails = false;
+    bool heldThrough = true;
+    while (g_t + IMU_POLL_MS < at + IMU_HIGHG_HOLD_MS) {
+        (void)pass();
+        heldThrough = heldThrough && g_data.highGEvent && g_data.highGCount == 1u && g_data.highGMs == at;
+    }
+    CHECK(heldThrough);
+    while (g_t < at + IMU_HIGHG_HOLD_MS) (void)pass();
+    CHECK(!g_data.highGEvent && g_data.highGCount == 1u);      // its own deadline, then clear
+    for (int i = 0; i < 2 * kBringUpTicks && !imuIsReady(g_dev); ++i) (void)pass();
+    CHECK(imuIsReady(g_dev));
+    g_burst.intSta = 0x20u;
+    (void)pass();
+    CHECK(g_dev.highGCount == 2u && g_data.highGCount == 2u);  // still climbing
+
+    begin("high-g: the count and the last latch time are boot-cumulative across recovery and mode changes");
+    CHECK(bringUp());
+    g_burst.intSta = 0x20u;
+    (void)pass();
+    const uint32_t at2 = g_dev.highGAtMs;
+    CHECK(bringUp());
+    CHECK(g_dev.highGCount == 1u && g_dev.highGAtMs == at2);
+    CHECK(setIMUSampleMode(g_dev, IMUSampleMode::Raw) == IMUReturnStatus::OK);
+    CHECK(g_dev.highGCount == 1u && g_dev.highGAtMs == at2);
+    for (int i = 0; i < 2 * kBringUpTicks; ++i) (void)pass();
+    CHECK(g_data.highGCount == 1u && g_data.highGMs == at2);
+
+    // REVIEW (2026-09-26): the sketch clears its snapshot after a host mode
+    // switch. initIMUData() alone published count 0 until the next poll, so a
+    // 10 Hz frame taken in between read N, 0, N — backwards, which uint16
+    // delta arithmetic turns into ~65536 phantom impacts. resetIMUData() is
+    // what the sketch calls; the published record must never go backwards.
+    begin("high-g: the snapshot reset after a host mode switch republishes the record, mid-hold too");
+    CHECK(bringUp());
+    g_burst.intSta = 0x20u;
+    (void)pass();
+    const uint32_t at3 = g_dev.highGAtMs;
+    CHECK(g_data.accelValid && g_data.highGEvent);
+    CHECK(setIMUSampleMode(g_dev, IMUSampleMode::Raw) == IMUReturnStatus::OK);
+    resetIMUData(g_dev, g_data);                      // mkr_zero.ino, CMD_SET_IMU_MODE
+    CHECK(!g_data.accelValid);                        // the old mode's channel data is gone
+    CHECK(g_data.highGCount == 1u && g_data.highGMs == at3 && g_data.highGEvent);  // the record is not
+    while (g_t < at3 + IMU_HIGHG_HOLD_MS) (void)pass();
+    CHECK(!g_data.highGEvent && g_data.highGCount == 1u);
+
+    begin("high-g: the snapshot reset does not revive a hold that has already expired");
+    CHECK(bringUp());
+    g_burst.intSta = 0x20u;
+    (void)pass();
+    g_t += IMU_HIGHG_HOLD_MS;                         // deadline passed, no poll since
+    hostSetMillis(g_t);
+    CHECK(g_dev.highGActive);                         // not yet expired by a poll...
+    resetIMUData(g_dev, g_data);
+    CHECK(!g_data.highGEvent && g_data.highGCount == 1u);   // ...but not published either
 }
 
 static void test_rejection_count_is_boot_cumulative()
@@ -1065,6 +1180,8 @@ int main()
     test_nack_decides_a_released_probe();
     test_retirement_settles_an_open_episode();
     test_edge_landing_mid_sample_is_counted_once();
+    test_high_g_record_survives_recovery();
+    test_reinit_settles_an_open_episode();
     test_rejection_count_is_boot_cumulative();
 
     printf("imu_tests: %d checks, %d failed\n", g_checks, g_fails);

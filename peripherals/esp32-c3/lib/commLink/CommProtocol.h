@@ -551,7 +551,8 @@ struct __attribute__((packed)) TelemetryPayload {
      */
     uint16_t imuHighGMs;
     /**
-     * Cumulative High-G latches since the master booted. Wraps at 65535.
+     * Cumulative High-G latches since the master booted — kept across IMU
+     * recovery and mode changes. Saturates at 65535; never wraps.
      *
      * THE FIELD THAT MAKES THE EVENT UNMISSABLE. @c COMM_FLAG_IMU_HIGH_G is held
      * for a fixed window and then clears, so a host reading a decimated stream —

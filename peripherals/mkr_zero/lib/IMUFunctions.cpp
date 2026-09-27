@@ -318,24 +318,30 @@ static void noteHighG(IMUDevice &dev, uint8_t intSta, bool burstSound, bool busA
 }
 
 /**
- * @brief Retires the part, settling any open INT-line episode first.
+ * @brief Settles an open INT-line episode before the part stops being polled.
  *
- * Recovery re-initialises the part and wipes the episode, and it can run in the
- * same loop pass. A probe whose line has let go is a confirmed latch and is
- * recorded now; anything still undecided can no longer be confirmed and is
- * counted as rejected — never dropped in silence.
+ * Retirement and every re-initialisation — recovery, a host mode switch, the
+ * re-init after a failed calibration capture — end the episode, and recovery
+ * can run in the same loop pass as the retirement. A probe whose line has let
+ * go is a confirmed latch and is recorded now; anything still undecided can no
+ * longer be confirmed and is counted as rejected — never dropped in silence.
+ * No bus access: the line is a pin, and nothing here writes RST_INT.
  */
+static void settleLineEpisode(IMUDevice &dev)
+{
+    if (dev.lineProbe && !intLineHigh(dev)){
+        recordHighG(dev, dev.lineSinceMs, millis(), false);
+    } else if (dev.lineProbe || dev.lineCandidate){
+        countRejected(dev);
+    }
+    dev.lineProbe     = false;
+    dev.lineCandidate = false;
+}
+
+/** @brief Retires the part, settling any open INT-line episode first. */
 static void retire(IMUDevice &dev)
 {
-    if (dev.ready){
-        if (dev.lineProbe && !intLineHigh(dev)){
-            recordHighG(dev, dev.lineSinceMs, millis(), false);
-        } else if (dev.lineProbe || dev.lineCandidate){
-            countRejected(dev);
-        }
-        dev.lineProbe     = false;
-        dev.lineCandidate = false;
-    }
+    if (dev.ready) settleLineEpisode(dev);
     dev.ready = false;
 }
 
@@ -555,6 +561,24 @@ static void noteGapIfStarved(IMUDevice &dev, uint32_t now){
     dev.gapFlagUntilMs = now + IMU_PEAK_WINDOW_MS;
 }
 
+/**
+ * @brief Expires the High-G hold on its deadline and mirrors the record into
+ *        the snapshot — the one place, after initIMUData()'s boot-time zeroes,
+ *        that the published High-G fields are written.
+ *
+ * On the same deadline discipline as the gap flag, and for the same reason: a
+ * signed difference, so a deadline carried across the millis() rollover still
+ * expires.
+ */
+static void publishHighG(IMUDevice &dev, IMUData &data, uint32_t now){
+    if (dev.highGActive && (static_cast<int32_t>(now - dev.highGUntilMs) >= 0)){
+        dev.highGActive = false;
+    }
+    data.highGEvent = dev.highGActive;
+    data.highGMs    = dev.highGAtMs;
+    data.highGCount = dev.highGCount;
+}
+
 /** @brief Ages out any channel past its freshness window, without touching the bus. */
 static void expireChannels(IMUDevice &dev, IMUData &data, uint32_t now){
     noteGapIfStarved(dev, now);
@@ -580,13 +604,12 @@ static void expireChannels(IMUDevice &dev, IMUData &data, uint32_t now){
     }
     data.dataGap = dev.gapFlagActive;
 
-    // The High-G hold, on the same deadline discipline and for the same reason.
-    if (dev.highGActive && (static_cast<int32_t>(now - dev.highGUntilMs) >= 0)){
-        dev.highGActive = false;
-    }
-    data.highGEvent = dev.highGActive;
-    data.highGMs    = dev.highGAtMs;
-    data.highGCount = dev.highGCount;
+    publishHighG(dev, data, now);
+}
+
+void resetIMUData(IMUDevice &dev, IMUData &data){
+    initIMUData(data);
+    publishHighG(dev, data, millis());
 }
 
 /**
@@ -651,15 +674,18 @@ void imuMarkAbsent(IMUDevice &dev){
     dev.gapFlagUntilMs = millis();
     dev.eulerAndroid  = false;
 
-    dev.highGCount      = 0u;
     dev.highGClearFails = 0u;
     // highGRejected is boot-cumulative: recovery must not erase the evidence.
+    // Neither may it erase the High-G record: the count, the last latch's time
+    // and a hold still running are about the VEHICLE, not the part. The sketch
+    // recovers in the same loop pass that retires, so wiping the hold published
+    // an impact that also shook the connector for one 10 ms poll — a 10 Hz
+    // frame is only certain to see a flag held for 100 ms, which is why the hold
+    // is 500 ms. Zeroing the count broke imuHighGCount's contract of climbing
+    // for the whole boot (a host at 7 saw 0 then 1, and missed it).
     dev.lineCandidate     = false;
     dev.lineProbe         = false;
     dev.intLineDistrusted = false;
-    dev.highGActive  = false;
-    dev.highGUntilMs = millis();
-    dev.highGAtMs    = 0u;
     // Any pin edge from before this reset describes a device that is being
     // re-initialised, so it belongs to nothing.
     noInterrupts();
@@ -691,6 +717,7 @@ IMUReturnStatus initializeIMU(IMUDevice &dev, IMUSampleMode mode){
         return IMUReturnStatus::NOK_INIT_FAILED;
     }
 
+    settleLineEpisode(dev);   // imuMarkAbsent() wipes it; a re-init must not lose an impact
     imuMarkAbsent(dev);
 
     const uint8_t opMode = (mode == IMUSampleMode::Raw) ? OPERATION_MODE_AMG
