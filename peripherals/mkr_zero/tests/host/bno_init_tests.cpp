@@ -12,6 +12,12 @@ static uint8_t regs[2][128];
 static uint8_t page, selfTest, reservedBits, stuckReg, stuckBits;
 static bool failSelfTestRead;
 static unsigned selfTestReads;
+// Calibration restore, as the part reacts to it (AmgProbe on the rig,
+// 2026-09-27): offsets restored with the accelerometer at ±16 g make AMG raise
+// SYS_ERR 0x09 while it otherwise runs; IMUPLUS is unaffected.
+static bool offsetsWritten;
+static unsigned calibWrites;
+static uint8_t forcedSysErr;
 TwoWire Wire;
 
 I2CBusState i2cBusBegin() { return I2CBusState::Ready; }
@@ -24,11 +30,14 @@ bool bno055Identify(BNO055Device &d, uint8_t addr) {
     d.address = addr; d.chipId = BNO055_EXPECTED_CHIP_ID; d.pageId = page;
     return true;
 }
-bool bno055CalibWrite(const BNO055InitState &, const uint8_t *) { return true; }
+bool bno055CalibWrite(const BNO055InitState &, const uint8_t *) {
+    offsetsWritten = true; ++calibWrites; return true;
+}
 
 static void resetRegisters() {
     memset(regs, 0, sizeof(regs));
     page = 0;
+    offsetsWritten = false;   // RST_SYS puts the offsets back to zero
     regs[0][BNO055_CHIP_ID_ADDR] = BNO055_EXPECTED_CHIP_ID;
     // Deliberately dirty interrupt enables: setup must replace, not OR them.
     regs[1][BNO055_P1_INT_EN_ADDR] = 0xCCu;
@@ -60,18 +69,25 @@ extern "C" int bno055BusWrite(unsigned char, unsigned char reg, unsigned char *b
     regs[page][reg] = *buf;
     if (page == 0 && reg == BNO055_OPR_MODE_ADDR) {
         regs[0][BNO055_SYS_STATUS_ADDR] = *buf == OPERATION_MODE_IMUPLUS ? 5u : 6u;
+        const bool amgAt16g = *buf == OPERATION_MODE_AMG &&
+                              (regs[1][BNO055_P1_ACC_CONFIG_ADDR] & 0x03u) == ACCEL_RANGE_16G;
+        regs[0][BNO055_SYS_ERR_ADDR] = forcedSysErr ? forcedSysErr
+                                     : (amgAt16g && offsetsWritten) ? 0x09u : 0x00u;
     }
     return 0;
 }
 
 static BNO055InitState run(uint8_t st, uint8_t mode, bool nack = false,
-                          uint8_t badReg = 0, uint8_t badBits = 0) {
+                          uint8_t badReg = 0, uint8_t badBits = 0,
+                          const uint8_t *profile = nullptr, uint8_t sysErr = 0) {
     hostReset(); hostSetMillis(1000u);
     resetRegisters();
     selfTest = st; reservedBits = 0x13u; stuckReg = badReg; stuckBits = badBits;
     failSelfTestRead = nack; selfTestReads = 0;
+    calibWrites = 0; forcedSysErr = sysErr;
     BNO055InitState s;
     CHECK(bno055InitBegin(s, mode));
+    if (profile != nullptr) bno055InitSetCalibProfile(s, profile);
     for (unsigned i = 0; i < 100u; ++i) {
         hostSetMillis(s.nextStepMs + 1000u);
         bno055InitTick(s);
@@ -124,6 +140,33 @@ int main() {
     for (uint8_t reg : {uint8_t(BNO055_P1_INT_EN_ADDR), uint8_t(BNO055_P1_INT_MSK_ADDR)}) {
         const BNO055InitState s = run(0x0F, OPERATION_MODE_IMUPLUS, false, reg, 0x04u);
         CHECK(s.stage == BNO055InitStage::Configured && !s.highGArmed);
+    }
+    // The stored calibration profile is restored in fusion modes only. Restoring
+    // it in AMG raised SYS_ERR 0x09 on the part, VerifyOpMode rejected that, and
+    // the IMU retried forever: down on the "amg" build and after CMD_SET_IMU_MODE.
+    static const uint8_t profile[BNO055_CALIB_BYTES] = {   // the rig's, as restored
+        0xDC, 0xFF, 0x07, 0x00, 0x3F, 0x00,  0, 0, 0, 0, 0, 0,
+        0xFD, 0xFF, 0x01, 0x00, 0x00, 0x00,  0xE8, 0x03,  0xE0, 0x01 };
+    {
+        const BNO055InitState s = run(0x0F, OPERATION_MODE_IMUPLUS, false, 0, 0, profile);
+        CHECK(s.stage == BNO055InitStage::Configured);
+        CHECK(s.calibOffered && s.calibRestored && calibWrites == 1u);
+    }
+    {
+        const BNO055InitState s = run(0x0F, OPERATION_MODE_AMG, false, 0, 0, profile);
+        CHECK(s.stage == BNO055InitStage::Configured && s.highGArmed);
+        CHECK(!s.calibOffered && !s.calibRestored && calibWrites == 0u);
+        CHECK(regs[0][BNO055_SYS_ERR_ADDR] == 0u);
+    }
+    // A SYS_ERR failure is latched with the OPR_MODE actually read. It showed a
+    // stale 0 ("the mode never switched") on a part that had switched.
+    {
+        const BNO055InitState s = run(0x0F, OPERATION_MODE_IMUPLUS, false, 0, 0, nullptr, 0x0Au);
+        CHECK(s.stage == BNO055InitStage::Failed);
+        CHECK(s.lastStatus == BNO055InitStatus::NOK_SYSTEM_ERROR);
+        CHECK(s.firstFailure.valid && s.firstFailure.failedAt == BNO055InitStage::VerifyOpMode);
+        CHECK(s.firstFailure.opModeSeen == OPERATION_MODE_IMUPLUS);
+        CHECK(s.firstFailure.sysError == 0x0Au);
     }
     printf("bno_init_tests: %u checks, %u failed\n", checks, failures);
     return failures ? 1 : 0;

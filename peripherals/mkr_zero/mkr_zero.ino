@@ -1492,7 +1492,11 @@ void loop()
     const bool imuQuiet = !isnan(imuData.linAccelPeakMs2) &&
                           imuData.linAccelPeakMs2 < IMU_CALIB_SAVE_QUIET_MS2;
 
+    // Fusion only: the profile calibrates the fusion algorithm and is restored
+    // only in fusion modes (BNO055Init RestoreCalib). One captured in AMG, at
+    // ±16 g, would be restored into IMUPLUS later.
     if (imuIsReady(imuDev) && sdReady() && !imuData.highGEvent && imuQuiet &&
+        imuSampleMode(imuDev) == IMUSampleMode::Fusion &&
         imuData.calibGyro >= 3u && imuData.calibAccel >= 3u &&
         (lastCalibSaveMs == 0 || isTimeout(IMU_CALIB_SAVE_INTERVAL_MS, lastCalibSaveMs))) {
 
@@ -1640,8 +1644,11 @@ void loop()
     // part is up and publishing linear acceleration whose calibration has not
     // converged. Those values are not wrong-looking, merely not yet right, and
     // nothing downstream could otherwise tell.
+    // Fusion modes only: AMG runs no fusion, reports no calibration, and so
+    // would announce "converging" for the whole session.
     const bool imuFusionUnready =
-        imuIsReady(imuDev) && (imuData.calibGyro < IMU_CALIB_MIN_GYRO);
+        imuIsReady(imuDev) && imuSampleMode(imuDev) == IMUSampleMode::Fusion &&
+        (imuData.calibGyro < IMU_CALIB_MIN_GYRO);
     if (imuFusionUnready != prevIMUDegraded) {
         prevIMUDegraded = imuFusionUnready;
         if (imuFusionUnready) {

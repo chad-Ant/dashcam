@@ -16,7 +16,7 @@ board, no serial port.
 | `switch_tests` | `lib/SwitchFunctions.cpp` | 61 |
 | `imu_tests` | `lib/IMUFunctions.cpp`: lifecycle, integrity, confirmed High-G (incl. INT-line candidate → release probe → stuck verdict, flicker, re-latch, retirement, mid-sample edge, High-G record surviving recovery and the mode-switch snapshot reset, episodes settled on every re-init), channel-level faults | 540 |
 | `can_probe_tests` | `lib/CANSniffFunctions.cpp`: the map probe, filter ownership, receive-overrun counting | 98 |
-| `bno_init_tests` | **real** `lib/BNO055Init.cpp`: self-test checks, masked read-back, exact interrupt setup, High-G threshold per accelerometer range | 586 |
+| `bno_init_tests` | **real** `lib/BNO055Init.cpp`: self-test checks, masked read-back, exact interrupt setup, High-G threshold per accelerometer range, calibration restored in fusion modes only | 602 |
 | `port_tests.py` | shared MKR USB selector: product identity and ambiguity | 5 cases |
 
 All currently passing.
@@ -90,7 +90,8 @@ was reintroduced into a copy of the source and the suite re-run.
 | **none — unmutated control** | **none** |
 
 IMU hardening follow-up (2026-09-26, 41 mutants; 2026-09-27 adds the High-G
-range and CAN overrun rows below, 45 in all): `make mutations` reproduces these
+range and CAN overrun rows below, 45, then the two AMG calibration rows, 47 in
+all): `make mutations` reproduces these
 regressions in temporary source copies, leaving the checkout untouched. A
 mutant must compile successfully and fail assertions; compilation errors do
 not count as caught bugs. Unmodified controls must pass first.
@@ -138,6 +139,8 @@ not count as caught bugs. Unmodified controls must pass first.
 | bring-up skips self-test validation | failed/missing self-test is named and latched |
 | interrupt read-back verifies only High-G | unexpected defined enable bits disable the backstop |
 | interrupt setup preserves other enables | INT_EN and INT_MSK must be written exactly 0x20 |
+| AMG restores the calibration profile | the part raises SYS_ERR 0x09 and AMG never comes up |
+| SYS_ERR failure latches a stale OPR_MODE | the failure record must show the mode actually read |
 | AMG High-G threshold counted at ±4 g | AMG must write 32 (2 g at ±16 g), not 128 (8 g) |
 | fixed High-G byte in every mode | the threshold must follow the range in both modes |
 | CAN overruns cleared uncounted | each latched overrun is one counted event |

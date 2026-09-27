@@ -536,7 +536,18 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
             break;
 
         case BNO055InitStage::RestoreCalib:
-            state.calibOffered  = (state.calibProfile != nullptr);
+            // FUSION MODES ONLY. The stored profile is captured in IMUPLUS and
+            // exists to calibrate the fusion algorithm, which AMG does not run.
+            // Restoring it under AMG's ±16 g range made the part raise SYS_ERR
+            // 0x09 (fusion algorithm configuration error) while it was otherwise
+            // running AMG correctly (SYS_STATUS 6), and VerifyOpMode rejects any
+            // SYS_ERR — so AMG never reached Configured and retried forever,
+            // leaving the IMU down on the "amg" build and after a host
+            // CMD_SET_IMU_MODE raw. Measured 2026-09-27 on the rig: the full AMG
+            // setup with the restore gives err 0x09, the same setup without it
+            // err 0x00, and IMUPLUS with it err 0x00.
+            state.calibOffered  = (state.calibProfile != nullptr) &&
+                                  (state.opMode != OPERATION_MODE_AMG);
             state.calibRestored = false;
             if (state.calibOffered) {
                 state.calibRestored = bno055CalibWrite(state, state.calibProfile);
@@ -791,6 +802,10 @@ BNO055InitStage bno055InitTick(BNO055InitState &state)
                 bno055InitFail(state, BNO055InitStatus::NOK_MODE_FAILED);
                 break;
             }
+
+            // Kept current on this path too: a SYS_ERR failure below is latched
+            // with it, and a stale 0 read "the mode never switched" when it had.
+            state.opModeSeen = mode;
 
             uint8_t err = 0u, stat = 0u;
             if (!regRead8(state.address, BNO055_SYS_ERR_ADDR, err) ||
