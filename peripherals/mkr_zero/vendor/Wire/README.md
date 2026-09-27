@@ -103,6 +103,9 @@ polled against `DASHCAM_WIRE_WAIT_US` (25 ms per bus event).
   slave out, then STOP.
 - **Lost arbitration** in the write address phase is reported as a failure.
   The core recursed on it without bound.
+- **Bus errors** end the transfer the same way as a timeout (reset, count,
+  recovery), counted separately in `busErrorCount()` (console `i2cerr=`). See
+  "Bus errors" below.
 - **Register pointer:** the register block is found by matching the `SERCOM`
   object against `sercom0`…`sercom5`, because the core keeps its pointer
   private. An unknown SERCOM falls back to the core's own unbounded path.
@@ -136,6 +139,54 @@ device's datasheet bounds its clock stretching, which is why the deadline is the
 SMBus clock-low timeout (tTIMEOUT, 25–35 ms) rather than a device figure.
 Transfers the write path makes (`sendBounded`) share the same wait structure
 but were not injected on hardware.
+
+### Bus errors (added 2026-09-27, after the rig run above)
+
+A flickering contact does not wedge the bus. It puts a START or STOP where none
+belongs, which the SAMD21 reports as a bus error. This bus has one master, so
+"lost arbitration" is the same event. The datasheet describes it this way:
+
+- `INTFLAG.SB` is set only when a byte is received with no bus error and no
+  lost arbitration.
+- A bus error while the controller owns the bus sets `STATUS.BUSERR`,
+  `STATUS.ARBLOST` and `INTFLAG.MB`.
+- After a bus error the controller no longer owns the bus. Its bus state stays
+  BUSY until it sees a STOP. The inactive-bus timeout that would also end it is
+  off in the core, and with one master nobody else sends that STOP.
+
+The core's `readDataWIRE()` returns on SB **or MB**, and patch 2 copied that
+exactly. A glitch mid-read therefore caused three problems:
+
+- **A garbage byte counted as data.** `requestFrom()` took `DATA`'s leftover
+  for a byte. Mid-read that gave a short count. On the last byte of a read it
+  gave the **full** count, so the caller got a register image with a garbage
+  last byte.
+- **A dead bus.** Every later transfer was refused at the early "another master
+  holds the bus" check. Both lines read idle, so `i2cBusBegin()` saw a healthy
+  bus, and nothing was counted. The IMU and GNSS stayed down until a power cycle.
+- **A write reported as successful.** `sendBounded()` read `RXNACK` after an MB
+  that a bus error had set, so a glitch on a write's last byte returned success.
+
+Changes:
+
+- `readBounded()` requires SB. MB without SB is a bus error.
+- `startBounded()` and `sendBounded()` treat `BUSERR`/`ARBLOST` (and loss of
+  ownership) as bus errors. Writing `ADDR` clears both bits, so they always
+  belong to the current transfer.
+- The early refusal is a bus error too: with one master, "busy" is the
+  controller's stale view after a glitch.
+
+Each bus error goes through `abortTransfer()`: reset (which forces the bus
+state IDLE), count, and return failure. `lib/I2CBus.cpp` recovers the bus on
+either count. A NACK is unaffected: it sets `RXNACK` with neither error bit, and
+remains a cheap failure for probes and scans.
+
+**Proof, still to run on the rig:** BusFaultInjection T7–T9. T7 stages a START
+with no STOP on the idle bus. C7 (instrumented) shows the stock driver refusing
+every transfer while the manager calls the bus Ready. T7/T8 show one bus error
+followed by recovery. T9 glitches SDA under a high SCL mid-read and expects
+0 bytes and one bus error. If the controller does not reach the state a test
+needs, the test prints SKIP instead of passing or failing.
 
 ## Test-only instrumentation
 
@@ -193,8 +244,12 @@ never tested with.
 - **Slave mode:** unchanged; this project never uses it.
 - **Anything outside Wire:** a hang elsewhere still ends in the watchdog reset,
   and therefore in the quarantine.
-- **The wiring:** the patch contains a wedge, it does not prevent one. Soldered
-  I2C wiring removes the contact glitches behind the 2026-09-26 corrupt reads.
+- **The wiring:** the patch contains a wedge or a glitch, it does not prevent
+  one. Soldered I2C wiring removes the contact glitches behind the 2026-09-26
+  corrupt reads.
+- **A glitch that flips a data bit:** SDA changing while SCL is low is legal
+  I2C, so a contact fault there corrupts a byte with no bus error to detect.
+  Only the callers' own checks (the IMU's corrupt-read gating) catch those.
 
 `DASHCAM_WIRE_BOUNDED` is not `#error`-enforced, unlike the fix-1 marker.
 `lib/I2CBus.cpp` compiles its recovery hook only when the marker is present,

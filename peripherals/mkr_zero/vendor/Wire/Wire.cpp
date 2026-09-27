@@ -64,6 +64,7 @@ TwoWire::TwoWire(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
   hw = registersOf(s);
   clockHz = TWI_CLOCK;
   timeouts = 0;
+  busErrors = 0;
 }
 
 void TwoWire::begin(void) {
@@ -121,8 +122,9 @@ size_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
   if(startBounded(address, WIRE_READ_FLAG) == Xfer::Ok)
   {
     // Read first data. Every read below is bounded (DASHCAM_WIRE_BOUNDED): a
-    // byte that never arrives abandons the whole transfer, which reports 0
-    // bytes so no caller can mistake a partial buffer for a register image.
+    // byte that never arrives, or a bus error in place of one, abandons the
+    // whole transfer, which reports 0 bytes so no caller can mistake a partial
+    // buffer for a register image.
     uint8_t data = 0;
     if (readBounded(data) != Xfer::Ok) { rxBuffer.clear(); return 0; }
     rxBuffer.store_char(data);
@@ -192,12 +194,12 @@ uint8_t TwoWire::endTransmission(bool stopBit)
 {
   transmissionBegun = false ;
 
-  // Start I2C transmission. Bounded (DASHCAM_WIRE_BOUNDED): a timeout has
-  // already reset the SERCOM, so there is no STOP to send - return 4.
+  // Start I2C transmission. Bounded (DASHCAM_WIRE_BOUNDED): a timeout or a
+  // bus error has already reset the SERCOM, so there is no STOP to send - 4.
   const Xfer started = startBounded( txAddress, WIRE_WRITE_FLAG );
-  if ( started == Xfer::Timeout )
+  if ( started == Xfer::Timeout || started == Xfer::BusError )
   {
-    return 4 ;  // Other error: bus wedged, transfer abandoned
+    return 4 ;  // Other error: bus wedged or glitched, transfer abandoned
   }
   if ( started != Xfer::Ok )
   {
@@ -210,9 +212,9 @@ uint8_t TwoWire::endTransmission(bool stopBit)
   {
     // Trying to send data
     const Xfer sent = sendBounded( txBuffer.read_char() );
-    if ( sent == Xfer::Timeout )
+    if ( sent == Xfer::Timeout || sent == Xfer::BusError )
     {
-      return 4 ;  // Other error: bus wedged, transfer abandoned
+      return 4 ;  // Other error: bus wedged or glitched, transfer abandoned
     }
     if ( sent != Xfer::Ok )
     {
@@ -242,9 +244,21 @@ uint8_t TwoWire::endTransmission(bool stopBit)
 // Deliberate differences from the core, each a fix:
 //  - a deadline on every flag wait; on expiry abortTransfer() resets the SERCOM
 //    and counts it, and lib/I2CBus.cpp recovers the bus before the next use;
+//  - a bus error ends the transfer the same way (counted separately). This bus
+//    has ONE master, so lost arbitration is never another master winning: it
+//    is the controller seeing a START or STOP where none belongs - a glitch on
+//    SDA or SCL, the breadboard contacts of 2026-09-26. The SAMD21 then sets
+//    STATUS.BUSERR/ARBLOST and INTFLAG.MB, never SB (SB means a byte "received
+//    successfully, no arbitration lost or bus error"), and gives up the bus.
+//    The core, and this file until 2026-09-27, read the MB as "byte arrived":
+//    requestFrom() returned DATA's leftover as data - short-counted mid-read,
+//    but at the FULL count when it hit the last byte - and the controller was
+//    left believing another master held the bus, so every later transfer was
+//    refused at the early check below with both lines reading idle and nothing
+//    counted: a dead bus i2cBusBegin() could not see (helper_scripts/
+//    BusFaultInjection C7 stages it with the core's own path);
 //  - no recursive restart on lost arbitration in the write address phase (the
-//    core recursed without bound): lost arbitration is reported as a failure
-//    and the caller retries, as it does for any other failed transfer.
+//    core recursed without bound): it is a bus error, as above.
 // Only the waits that depend on the bus are bounded. SYNCBUSY waits (enable,
 // reset, command synchronisation) depend on the peripheral clock alone.
 
@@ -262,15 +276,28 @@ bool TwoWire::waitFlags(uint8_t mask)
   return true;
 }
 
-void TwoWire::abortTransfer(void)
+// STATUS.BUSERR / ARBLOST for THIS transfer: writing ADDR (every start) clears
+// both, and an abort's reset clears everything, so neither is left over from an
+// earlier transfer. (Were BUSERR ever to survive from a glitch on the idle bus,
+// the cost is one aborted transfer and a recovery, for a real glitch.)
+bool TwoWire::lostBus(void) const
 {
-  timeouts++;
-  // No STOP: on a wedged bus it would not complete. Reset the controller so its
-  // own state (bus owner, pending command) is clean; the slave is freed by the
-  // GPIO clock-out in i2cBusRecover(), which the changed timeoutCount() triggers.
+  return hw->I2CM.STATUS.bit.BUSERR || hw->I2CM.STATUS.bit.ARBLOST;
+}
+
+TwoWire::Xfer TwoWire::abortTransfer(Xfer why)
+{
+  if (why == Xfer::BusError) busErrors++;
+  else                       timeouts++;
+  // No STOP: on a wedged bus it would not complete, and after a bus error the
+  // controller no longer owns the bus to send one. Reset the controller so its
+  // own state (bus state, pending command) is clean - enableWIRE() forces the
+  // bus state IDLE; the slave is freed by the GPIO clock-out in i2cBusRecover(),
+  // which the changed count triggers.
   sercom->disableWIRE();
   sercom->initMasterWIRE(clockHz);
   sercom->enableWIRE();
+  return why;
 }
 
 TwoWire::Xfer TwoWire::startBounded(uint8_t address, SercomWireReadWriteFlag flag)
@@ -282,12 +309,17 @@ TwoWire::Xfer TwoWire::startBounded(uint8_t address, SercomWireReadWriteFlag fla
   if (hw == nullptr)   // not a known SERCOM: the core's own path, unbounded
     return sercom->startTransmissionWIRE(address, flag) ? Xfer::Ok : Xfer::Nack;
 
-  // Same early refusal as the core: another master holds the bus, or the last
-  // owner never sent its STOP.
+  // The core's early refusal: the controller thinks another master holds the
+  // bus, or that the last owner never sent its STOP. With one master that view
+  // is stale - a glitch the controller took for a START - and nothing on this
+  // bus will ever send the STOP that clears it (the inactive-bus timeout is
+  // off), so the core's plain refusal repeats for every transfer, all boot.
+  // Fail this one as a bus error: the reset returns the bus state to IDLE and
+  // the next i2cBusBegin() clocks out whichever slave the glitch confused.
   if (!sercom->isBusOwnerWIRE())
   {
     if (sercom->isBusBusyWIRE() || (sercom->isArbLostWIRE() && !sercom->isBusIdleWIRE()))
-      return Xfer::Nack;
+      return abortTransfer(Xfer::BusError);
   }
 
   // Send start and address (7-bit address + R/W)
@@ -295,15 +327,16 @@ TwoWire::Xfer TwoWire::startBounded(uint8_t address, SercomWireReadWriteFlag fla
 
   if (flag == WIRE_WRITE_FLAG)
   {
-    if (!waitFlags(SERCOM_I2CM_INTFLAG_MB)) { abortTransfer(); return Xfer::Timeout; }
-    if (!sercom->isBusOwnerWIRE()) return Xfer::Nack;   // arbitration lost
+    if (!waitFlags(SERCOM_I2CM_INTFLAG_MB)) return abortTransfer(Xfer::Timeout);
+    if (lostBus() || !sercom->isBusOwnerWIRE()) return abortTransfer(Xfer::BusError);
   }
   else
   {
-    // SB: address ACKed, first byte in. MB alone: address NACKed (or lost).
-    if (!waitFlags(SERCOM_I2CM_INTFLAG_SB | SERCOM_I2CM_INTFLAG_MB)) { abortTransfer(); return Xfer::Timeout; }
+    // SB: address ACKed, first byte in. MB alone: address NACKed, or a bus error.
+    if (!waitFlags(SERCOM_I2CM_INTFLAG_SB | SERCOM_I2CM_INTFLAG_MB)) return abortTransfer(Xfer::Timeout);
     if (!hw->I2CM.INTFLAG.bit.SB)
     {
+      if (lostBus()) return abortTransfer(Xfer::BusError);
       hw->I2CM.CTRLB.bit.CMD = 3;   // STOP, as the core does on a NACKed read address
       return Xfer::Nack;
     }
@@ -327,13 +360,16 @@ TwoWire::Xfer TwoWire::sendBounded(uint8_t data)
   while (!hw->I2CM.INTFLAG.bit.MB)
   {
     // As the core: a bus error or lost arbitration may mean MB never sets.
-    if (hw->I2CM.STATUS.bit.BUSERR || hw->I2CM.STATUS.bit.ARBLOST) return Xfer::Nack;
-    if ((uint32_t)(micros() - t0) > DASHCAM_WIRE_WAIT_US) { abortTransfer(); return Xfer::Timeout; }
+    if (lostBus()) return abortTransfer(Xfer::BusError);
+    if ((uint32_t)(micros() - t0) > DASHCAM_WIRE_WAIT_US) return abortTransfer(Xfer::Timeout);
   }
 #ifdef DASHCAM_WIRE_INSTRUMENT
   { const uint32_t took = micros() - t0; if (took > dashcamWireLongestWaitUs) dashcamWireLongestWaitUs = took; }
 #endif
 
+  // MB is set on a bus error too; RXNACK then describes nothing (the core read
+  // it anyway, so a glitch on the LAST byte of a write returned success).
+  if (lostBus()) return abortTransfer(Xfer::BusError);
   return hw->I2CM.STATUS.bit.RXNACK ? Xfer::Nack : Xfer::Ok;
 }
 
@@ -344,7 +380,11 @@ TwoWire::Xfer TwoWire::readBounded(uint8_t &out)
 #endif
   if (hw == nullptr) { out = sercom->readDataWIRE(); return Xfer::Ok; }
 
-  if (!waitFlags(SERCOM_I2CM_INTFLAG_SB | SERCOM_I2CM_INTFLAG_MB)) { abortTransfer(); return Xfer::Timeout; }
+  if (!waitFlags(SERCOM_I2CM_INTFLAG_SB | SERCOM_I2CM_INTFLAG_MB)) return abortTransfer(Xfer::Timeout);
+  // SB alone means a byte arrived. MB without SB in a read is a bus error or
+  // lost arbitration: DATA holds nothing the slave sent, and the controller has
+  // already given up the bus.
+  if (!hw->I2CM.INTFLAG.bit.SB) return abortTransfer(Xfer::BusError);
   out = hw->I2CM.DATA.bit.DATA;
   return Xfer::Ok;
 }

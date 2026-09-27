@@ -31,6 +31,16 @@
  * instrumented build, to show the hang the bounds remove: it ENDS IN A WATCHDOG
  * RESET by design.
  *
+ * GLITCHES (T7-T9)
+ * ----------------
+ * A flickering contact is a different fault from a wedge: a START or STOP where
+ * none belongs. T7 stages a START with no STOP on an idle bus; the controller
+ * then believes another master holds the bus while both lines read idle. C7
+ * (instrumented builds) shows the stock driver refusing every transfer from
+ * there on; T7/T8 show the bounded one failing one transfer as a bus error and
+ * recovering. T9 pulls SDA low under a high SCL part-way through a read: the
+ * read must come back as 0 bytes and a bus error, never as bytes.
+ *
  * Commands:  a = full automatic test    w = wedge only
  *            r = recover only           c = control (stock waits: hangs, resets)
  *            h = help
@@ -297,11 +307,41 @@ static void sclStallTest(bool control)
 
 static volatile bool tc5Fired = false;
 
+/// What the TC5 one-shot does when it fires: T5b's SCL stall, or T9's glitch.
+enum class Tc5Action : uint8_t { SclStall, SdaGlitch };
+static volatile Tc5Action tc5Action = Tc5Action::SclStall;
+/// T9: the glitch went in while SCL was high (a START/STOP, not a data bit).
+static volatile bool glitchLanded = false;
+/// T9: one-shots spent looking for a byte with a 1 bit left in it.
+static volatile uint8_t glitchTries = 0;
+static constexpr uint8_t  GLITCH_MAX_TRIES   = 24u;
+static constexpr uint32_t GLITCH_RETRY_US    = 60u;
+
+static bool sdaGlitchUnderHighScl(void);   // T9, defined below
+
+/// Fires the (stopped) TC5 one-shot again in @p us.
+static void tc5Rearm(uint32_t us)
+{
+    TC5->COUNT16.COUNT.reg = 0u;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+    TC5->COUNT16.CC[0].reg = (uint16_t)(us * 3u);
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+    TC5->COUNT16.CTRLA.bit.ENABLE = 1;
+    while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
+}
+
 void TC5_Handler(void)
 {
     TC5->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
     TC5->COUNT16.CTRLA.bit.ENABLE = 0;      // one shot
-    holdSclLow();
+    if (tc5Action == Tc5Action::SdaGlitch) {
+        glitchLanded = sdaGlitchUnderHighScl();
+        // Nothing to glitch in this byte (all zeros, or the controller is
+        // stretching SCL waiting for this very CPU): try a later byte.
+        if (!glitchLanded && ++glitchTries < GLITCH_MAX_TRIES) tc5Rearm(GLITCH_RETRY_US);
+    } else {
+        holdSclLow();
+    }
     tc5Fired = true;
 }
 
@@ -324,6 +364,8 @@ static void armSclStall(uint32_t us)
     NVIC_SetPriority(TC5_IRQn, 0);
     NVIC_EnableIRQ(TC5_IRQn);
     tc5Fired = false;
+    glitchLanded = false;
+    glitchTries = 0u;
     TC5->COUNT16.CTRLA.bit.ENABLE = 1;
     while (TC5->COUNT16.STATUS.bit.SYNCBUSY) { }
 }
@@ -342,6 +384,7 @@ static void midReadStallTest(void)
     delayMicroseconds(200);
 
     const uint32_t toBefore = i2cWireTimeouts();
+    tc5Action = Tc5Action::SclStall;
     armSclStall(400u);
     const uint32_t t0 = micros();
     const size_t got = Wire.requestFrom(SOX_ADDR, (size_t)64, true);
@@ -371,6 +414,245 @@ static void midReadStallTest(void)
              (int)st, i2cStuckReason(), chip ? "0xA0" : "WRONG", (int)gnss);
     report("T6b bus recovers from a slave left mid-byte",
            (st == I2CBusState::Ready) && chip && gnss, detail);
+}
+
+// ── T7/T8: a glitch the controller takes for a START ─────────────────────────
+//
+// The breadboard contacts behind 2026-09-26's corrupt reads do not wedge the
+// bus, they flicker it. SDA falling while SCL is high is a START to everything
+// on the bus, the controller included, and on a single-master bus nothing ever
+// sends the STOP that ends it: the controller's bus state stays BUSY - "another
+// master is talking" - while both lines read idle. The stock driver refuses
+// every transfer from then on (its early check), and i2cBusBegin()'s line check
+// sees a healthy bus. vendor/Wire now fails that transfer as a bus error and
+// resets the controller, and i2cBusBegin() recovers the bus on the new count.
+//
+// Staged from the port on the real bus: SDA low under a high SCL (the START),
+// SCL low, SDA back up under the low SCL (data, not a STOP), SCL back up (a
+// clock with SDA high). The BNO055 and the GNSS see a START and one address bit,
+// which the next real START discards. The pads go straight back to SERCOM2 by
+// PMUXEN, NOT Wire.begin(), which would reset the very state under test.
+
+static inline PortGroup &padGroup(uint8_t pinNo) { return PORT->Group[g_APinDescription[pinNo].ulPort]; }
+static inline uint32_t   padMask(uint8_t pinNo)  { return 1ul << g_APinDescription[pinNo].ulPin; }
+static inline uint32_t   padIndex(uint8_t pinNo) { return g_APinDescription[pinNo].ulPin; }
+
+/// Input buffer on for both bus pads, so padHigh() reads them while muxed.
+static void senseBusPads(void)
+{
+    padGroup(PIN_WIRE_SDA).PINCFG[padIndex(PIN_WIRE_SDA)].reg |= (uint8_t)PORT_PINCFG_INEN;
+    padGroup(PIN_WIRE_SCL).PINCFG[padIndex(PIN_WIRE_SCL)].reg |= (uint8_t)PORT_PINCFG_INEN;
+}
+
+static inline bool padHigh(uint8_t pinNo)
+{
+    return (padGroup(pinNo).IN.reg & padMask(pinNo)) != 0u;
+}
+
+/// Takes a bus pad off SERCOM2 and pulls it low from the port (latch low first).
+static inline void padDriveLow(uint8_t pinNo)
+{
+    PortGroup &g = padGroup(pinNo);
+    g.OUTCLR.reg = padMask(pinNo);
+    g.DIRSET.reg = padMask(pinNo);
+    g.PINCFG[padIndex(pinNo)].reg &= (uint8_t)~PORT_PINCFG_PMUXEN;
+}
+
+/// Lets the pad go (input first, then the pull back to UP) and hands it back to
+/// SERCOM2 with its PMUX setting untouched.
+static inline void padRelease(uint8_t pinNo)
+{
+    PortGroup &g = padGroup(pinNo);
+    g.DIRCLR.reg = padMask(pinNo);
+    g.OUTSET.reg = padMask(pinNo);
+    g.PINCFG[padIndex(pinNo)].reg |= (uint8_t)PORT_PINCFG_PMUXEN;
+}
+
+/** @brief The controller's bus state, as the core's own accessors report it. */
+static const char *controllerBusState(void)
+{
+    if (PERIPH_WIRE.isBusOwnerWIRE()) return "owner";
+    if (PERIPH_WIRE.isBusBusyWIRE())  return "busy";
+    if (PERIPH_WIRE.isBusIdleWIRE())  return "idle";
+    return "unknown";
+}
+
+/** @brief A START with no STOP on the idle bus. @return false if it was not idle. */
+static bool stagePhantomStart(void)
+{
+    if (!padHigh(PIN_WIRE_SDA) || !padHigh(PIN_WIRE_SCL)) return false;
+    padDriveLow(PIN_WIRE_SDA);          // SDA falls, SCL high: START
+    delayMicroseconds(HALF_BIT_US);
+    padDriveLow(PIN_WIRE_SCL);
+    delayMicroseconds(HALF_BIT_US);
+    padRelease(PIN_WIRE_SDA);           // SDA rises under a LOW SCL: no STOP
+    delayMicroseconds(HALF_BIT_US);
+    padRelease(PIN_WIRE_SCL);           // one clock, SDA high
+    delayMicroseconds(HALF_BIT_US * 2u);
+    return true;
+}
+
+static void phantomStartTest(void)
+{
+    if (i2cBusBegin() != I2CBusState::Ready) {
+        report("T7 glitch START", false, "bus not Ready before the test");
+        return;
+    }
+    senseBusPads();
+    delayMicroseconds(200);   // the last transfer's STOP is on the wire
+
+    if (!stagePhantomStart()) {
+        report("T7 glitch START", false, "lines not idle, nothing staged");
+        return;
+    }
+    const char *state = controllerBusState();
+    if (!PERIPH_WIRE.isBusBusyWIRE()) {
+        // The premise did not reproduce: say so rather than pass or fail on it.
+        Serial.print("SKIP  T7/T8 glitch START  -- controller bus state after it: ");
+        Serial.print(state);
+        Serial.println(" (expected busy)");
+        (void)i2cBusRecover();
+        return;
+    }
+
+#ifdef DASHCAM_WIRE_INSTRUMENT
+    // Control: the stock driver's early refusal, as every build before this one
+    // ran it. The manager calls the bus Ready (lines idle) and every read fails.
+    {
+        dashcamWireCoreWaits = true;
+        uint8_t ready = 0u, failed = 0u;
+        for (uint8_t i = 0u; i < 3u; i++) {
+            if (i2cBusBegin() != I2CBusState::Ready) continue;
+            ready++;
+            if (!readRegIs(BNO_CHIP_ID, 0xA0u)) failed++;
+        }
+        dashcamWireCoreWaits = false;
+        char detail[96];
+        snprintf(detail, sizeof(detail), "bus Ready %u/3, CHIP_ID read failed %u/3, state %s",
+                 (unsigned)ready, (unsigned)failed, controllerBusState());
+        report("C7 stock driver: refused every transfer on an idle-looking bus",
+               (ready == 3u) && (failed == 3u), detail);
+    }
+#endif
+
+    const uint32_t errBefore = i2cWireBusErrors();
+    const uint32_t toBefore  = i2cWireTimeouts();
+    const uint32_t t0 = micros();
+    const bool read = readRegIs(BNO_CHIP_ID, 0xA0u);
+    const uint32_t tookUs = micros() - t0;
+    const uint32_t errs = i2cWireBusErrors() - errBefore;
+    const uint32_t tos  = i2cWireTimeouts() - toBefore;
+    {
+        char detail[112];
+        snprintf(detail, sizeof(detail), "state %s, read %s in %lu us, bus errors +%lu, timeouts +%lu",
+                 state, read ? "SUCCEEDED" : "failed", (unsigned long)tookUs,
+                 (unsigned long)errs, (unsigned long)tos);
+        report("T7 glitch START: the next transfer fails fast as one bus error",
+               !read && (errs == 1u) && (tos == 0u) && (tookUs < WEDGED_XFER_MAX_US), detail);
+    }
+
+    // The manager sees the new abort and recovers without being asked.
+    const I2CBusState st = i2cBusBegin();
+    const bool chip = readRegIs(BNO_CHIP_ID, 0xA0u);
+    const bool gnss = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
+    char detail[80];
+    snprintf(detail, sizeof(detail), "state=%d, CHIP_ID %s, gnss=%d",
+             (int)st, chip ? "0xA0" : "WRONG", (int)gnss);
+    report("T8 bus back in service by itself; both devices answer",
+           (st == I2CBusState::Ready) && chip && gnss, detail);
+}
+
+// ── T9: a glitch in the middle of a read ─────────────────────────────────────
+//
+// SDA pulled low while SCL is high part-way through a 64-byte read: a START
+// where a data bit belongs. The controller, owning the bus, sets BUSERR/ARBLOST
+// and MB - never SB, which means a byte received cleanly - and lets go; SDA
+// released under the same high SCL is a STOP, so everyone ends idle. The stock
+// driver took that MB for a byte: requestFrom() returned a short count with a
+// leftover byte in the buffer, or the FULL count when the glitch hit the last
+// byte. The read must come back as 0 bytes and one bus error.
+//
+// Run at 100 kHz so SCL's high phase (5 us) comfortably holds the ISR's
+// edge-to-pin latency; the glitch is placed only on a high SCL with SDA
+// released (a 1 bit), and glitchLanded says whether it was.
+
+/**
+ * @brief From the TC5 one-shot: the next high SCL with SDA released gets a glitch.
+ *
+ * Only the byte in flight can be glitched: while this ISR holds the CPU the
+ * controller finishes that byte and then stretches SCL low, waiting for the
+ * ACK command the interrupted code has not issued yet. So the edge waits are
+ * short (~100 us, ten bit periods at 100 kHz) and a byte with no 1 bit left
+ * returns false for the handler to try a later one.
+ */
+static bool sdaGlitchUnderHighScl(void)
+{
+    static constexpr uint16_t EDGE_SPIN = 400u;   // ~100 us of polling
+    for (uint8_t bits = 0u; bits < 10u; bits++) {
+        uint16_t spin = 0u;
+        while (padHigh(PIN_WIRE_SCL))  { if (++spin == EDGE_SPIN) return false; }   // SCL low
+        spin = 0u;
+        while (!padHigh(PIN_WIRE_SCL)) { if (++spin == EDGE_SPIN) return false; }   // rising edge
+        if (!padHigh(PIN_WIRE_SDA)) continue;   // a 0 bit or an ACK: a low pull changes nothing
+        padDriveLow(PIN_WIRE_SDA);              // START under the high SCL
+        const bool sclHigh = padHigh(PIN_WIRE_SCL);
+        delayMicroseconds(1);
+        padRelease(PIN_WIRE_SDA);               // and a STOP, if SCL is still high
+        return sclHigh;
+    }
+    return false;
+}
+
+static void midReadGlitchTest(void)
+{
+    if (i2cBusBegin() != I2CBusState::Ready) {
+        report("T9 glitch mid-read", false, "bus not Ready before the test");
+        return;
+    }
+    senseBusPads();
+    Wire.setClock(100000UL);
+    Wire.beginTransmission(SOX_ADDR);
+    (void)Wire.write(SOX_WHOAMI);
+    (void)Wire.endTransmission(true);
+    delayMicroseconds(200);
+
+    // 64 bytes at 100 kHz take ~5.8 ms. The first try is ~300 us in (byte 2 or
+    // so), then every 60 us until a byte with a 1 bit left takes the glitch.
+    const uint32_t errBefore = i2cWireBusErrors();
+    const uint32_t toBefore  = i2cWireTimeouts();
+    tc5Action = Tc5Action::SdaGlitch;
+    armSclStall(300u);
+    const uint32_t t0 = micros();
+    const size_t got = Wire.requestFrom(SOX_ADDR, (size_t)64, true);
+    const uint32_t tookUs = micros() - t0;
+    NVIC_DisableIRQ(TC5_IRQn);
+    TC5->COUNT16.CTRLA.bit.ENABLE = 0;
+    tc5Action = Tc5Action::SclStall;
+    const bool fired = tc5Fired;
+    const bool landed = glitchLanded;
+    const uint32_t errs = i2cWireBusErrors() - errBefore;
+    const uint32_t tos  = i2cWireTimeouts() - toBefore;
+
+    char detail[112];
+    snprintf(detail, sizeof(detail), "got %u bytes in %lu us, bus errors +%lu, timeouts +%lu",
+             (unsigned)got, (unsigned long)tookUs, (unsigned long)errs, (unsigned long)tos);
+    if (!fired || !landed) {
+        Serial.print("SKIP  T9 glitch mid-read  -- ");
+        Serial.print(!fired ? "the read finished before the glitch" : "no high SCL with SDA released was caught");
+        Serial.print("; ");
+        Serial.println(detail);
+    } else {
+        report("T9 glitch mid-read: 0 bytes and one bus error, never bytes",
+               (got == 0u) && (errs == 1u) && (tos == 0u), detail);
+    }
+
+    const I2CBusState st = i2cBusBegin();
+    Wire.setClock(IMU_I2C_CLOCK_HZ);   // the recovery already did, unless it never ran
+    const bool chip = readRegIs(BNO_CHIP_ID, 0xA0u);
+    const bool gnss = i2cProbeAddress(GPS_DEFAULT_I2C_ADDRESS);
+    snprintf(detail, sizeof(detail), "state=%d, CHIP_ID %s, gnss=%d",
+             (int)st, chip ? "0xA0" : "WRONG", (int)gnss);
+    report("T9b bus back in service after the glitch", (st == I2CBusState::Ready) && chip && gnss, detail);
 }
 
 static void runFullTest(void)
@@ -420,14 +702,16 @@ static void runFullTest(void)
         Wire.begin();
         Wire.setClock(IMU_I2C_CLOCK_HZ);
         const uint32_t toBefore = i2cWireTimeouts();
+        const uint32_t errBefore = i2cWireBusErrors();
         const uint32_t tb = micros();
         Wire.beginTransmission(GPS_DEFAULT_I2C_ADDRESS);
         const uint8_t rc = Wire.endTransmission(true);
         const uint32_t tookUs = micros() - tb;
-        char detail[96];
-        snprintf(detail, sizeof(detail), "endTransmission=%u in %lu us, timeouts +%lu",
+        char detail[112];
+        snprintf(detail, sizeof(detail), "endTransmission=%u in %lu us, timeouts +%lu, bus errors +%lu",
                  (unsigned)rc, (unsigned long)tookUs,
-                 (unsigned long)(i2cWireTimeouts() - toBefore));
+                 (unsigned long)(i2cWireTimeouts() - toBefore),
+                 (unsigned long)(i2cWireBusErrors() - errBefore));
         report("T1b transfer on the wedged bus fails within the deadline",
                (rc != 0u) && (tookUs < WEDGED_XFER_MAX_US), detail);
     }
@@ -514,6 +798,10 @@ static void runFullTest(void)
     // ---- 5: SCL held low under a read: the hang the bounds remove -----------
     sclStallTest(false);
     midReadStallTest();
+
+    // ---- 7-9: glitches: a START/STOP where none belongs ---------------------
+    phantomStartTest();
+    midReadGlitchTest();
 
 #ifdef DASHCAM_WIRE_INSTRUMENT
     // The stretch margin, measured: the longest bounded wait that COMPLETED this
@@ -898,7 +1186,7 @@ void loop()
         } else if (command == '2') {
             testStuckPhase2();
         } else if (command == 'h' || command == 'H') {
-            Serial.println("a = full wedge/recover test (no hardware needed)");
+            Serial.println("a = full wedge/recover/glitch test (no hardware needed)");
             Serial.println("w = wedge only, r = recover only");
             Serial.println("c = control: T5 via the core's unbounded waits (instrumented build; ends in a watchdog reset)");
             Serial.println("l = live SDA/SCL level monitor (find the jumper contact)");

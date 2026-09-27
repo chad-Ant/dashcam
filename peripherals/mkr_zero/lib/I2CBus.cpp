@@ -375,8 +375,9 @@ static bool linesIdle(void){
 }
 
 #ifdef DASHCAM_WIRE_BOUNDED
-/// Wire's abandoned-transfer count at the last recovery this module ran.
-static uint32_t seenWireTimeouts = 0u;
+/// Wire's abandoned-transfer count (timeouts + bus errors) at the last recovery
+/// this module ran.
+static uint32_t seenWireAborts = 0u;
 #endif
 
 uint32_t i2cWireTimeouts(void){
@@ -387,17 +388,26 @@ uint32_t i2cWireTimeouts(void){
 #endif
 }
 
+uint32_t i2cWireBusErrors(void){
+#ifdef DASHCAM_WIRE_BOUNDED
+    return Wire.busErrorCount();
+#else
+    return 0u;
+#endif
+}
+
 I2CBusState i2cBusBegin(void){
 #ifdef DASHCAM_WIRE_BOUNDED
-    // A transfer that ran past its deadline was abandoned inside Wire, which
-    // reset the SERCOM but cannot free the slave: it may still be part-way
-    // through a byte, and one presenting a 1 leaves both lines reading idle, so
-    // linesIdle() below would wave it through. Any new abandon therefore gets
-    // the full recovery - clock the slave out, STOP, reopen - whatever the
-    // lines say, and without the Stuck-state rate limit.
-    const uint32_t wireTimeouts = Wire.timeoutCount();
-    if (wireTimeouts != seenWireTimeouts){
-        seenWireTimeouts = wireTimeouts;
+    // A transfer that ran past its deadline, or hit a bus error, was abandoned
+    // inside Wire, which reset the SERCOM but cannot free the slave: it may
+    // still be part-way through a byte (or, after a glitch, part-way through an
+    // address it took a stray START for), and one presenting a 1 leaves both
+    // lines reading idle, so linesIdle() below would wave it through. Any new
+    // abandon therefore gets the full recovery - clock the slave out, STOP,
+    // reopen - whatever the lines say, and without the Stuck-state rate limit.
+    const uint32_t wireAborts = Wire.timeoutCount() + Wire.busErrorCount();
+    if (wireAborts != seenWireAborts){
+        seenWireAborts = wireAborts;
         return i2cBusRecover();
     }
 #endif

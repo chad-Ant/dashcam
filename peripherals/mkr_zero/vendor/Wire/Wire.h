@@ -35,7 +35,10 @@
  *  2. Master transfers wait on the bus flags against a deadline instead of the
  *     core's unbounded SERCOM loops (startTransmissionWIRE, sendDataMasterWIRE,
  *     readDataWIRE). A slave that wedges the bus mid-transfer now costs one
- *     failed transfer instead of a watchdog reset; see DASHCAM_WIRE_BOUNDED.
+ *     failed transfer instead of a watchdog reset. A bus error (a glitch seen as
+ *     START/STOP mid-transfer) fails the transfer and resets the controller,
+ *     where the core returned a garbage byte as data or left every later
+ *     transfer refused; see DASHCAM_WIRE_BOUNDED.
  *
  * This marker is how the project proves it compiled against THIS copy and not
  * the core's stock one.  Shared I2C code #errors when it is absent, so an
@@ -46,10 +49,11 @@
 
 /*
  * Marker for modification 2: every master-mode flag wait is bounded by
- * DASHCAM_WIRE_WAIT_US. On expiry the transfer fails (endTransmission() returns
- * 4, requestFrom() returns 0), the SERCOM is reset, and timeoutCount() rises —
- * lib/I2CBus.cpp watches that count and runs the full bus recovery (clock out
- * the slave, STOP) before the next transaction.
+ * DASHCAM_WIRE_WAIT_US, and a bus error ends the transfer the same way. On
+ * either the transfer fails (endTransmission() returns 4, requestFrom() returns
+ * 0), the SERCOM is reset, and timeoutCount() or busErrorCount() rises —
+ * lib/I2CBus.cpp watches both and runs the full bus recovery (clock out the
+ * slave, STOP) before the next transaction.
  */
 #define DASHCAM_WIRE_BOUNDED 1
 
@@ -143,18 +147,27 @@ class TwoWire : public HardwareI2C
     /// the boot; lib/I2CBus.cpp recovers the bus whenever it changes.
     uint32_t timeoutCount(void) const { return timeouts; }
 
+    /// Master transfers abandoned on a bus error: an illegal START/STOP seen
+    /// mid-transfer (a contact glitch on SDA or SCL), lost arbitration - which
+    /// on this single-master bus is the same thing - or the controller still
+    /// believing the bus busy from one. Each one also reset the SERCOM, and
+    /// lib/I2CBus.cpp recovers the bus whenever it changes. Cumulative for the boot.
+    uint32_t busErrorCount(void) const { return busErrors; }
+
   private:
     /// Outcome of one bounded bus step.
-    enum class Xfer : uint8_t { Ok, Nack, Timeout };
+    enum class Xfer : uint8_t { Ok, Nack, Timeout, BusError };
     Xfer startBounded(uint8_t address, SercomWireReadWriteFlag flag);
     Xfer sendBounded(uint8_t data);
     Xfer readBounded(uint8_t &out);
     bool waitFlags(uint8_t mask);
-    void abortTransfer(void);
+    bool lostBus(void) const;
+    Xfer abortTransfer(Xfer why);
 
     Sercom *hw;                 ///< This SERCOM's registers (the core keeps its pointer private).
     uint32_t clockHz;           ///< Last clock set, so an abort can re-init at the same speed.
     volatile uint32_t timeouts; ///< See timeoutCount().
+    volatile uint32_t busErrors; ///< See busErrorCount().
 
     SERCOM * sercom;
     uint8_t _uc_pinSDA;

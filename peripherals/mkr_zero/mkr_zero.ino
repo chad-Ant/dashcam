@@ -1860,6 +1860,11 @@ void loop()
         // wedge (which used to end in a watchdog reset) or a stretch past it.
         Serial.print(" i2cto=");
         Serial.print(i2cWireTimeouts());
+        // Boot-cumulative I2C transfers abandoned on a bus error: a START/STOP
+        // glitch mid-transfer, i.e. a contact fault. The wiring's score on a
+        // drive; each one used to be a garbage byte or a dead bus.
+        Serial.print(" i2cerr=");
+        Serial.print(i2cWireBusErrors());
         // c3= is the LINK, stream= is the session on top of it.  They are
         // different failures: a bridge that is attached but not asking for
         // telemetry is healthy, one that has been unplugged is not, and

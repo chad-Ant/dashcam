@@ -152,8 +152,8 @@ const char *i2cStuckReason(void);
  * that does persist, and it answers "did the last run hang?" — not "where".
  *
  * The I2C hang itself is now removed rather than contained: vendor/Wire bounds
- * the core's SERCOM flag waits (DASHCAM_WIRE_BOUNDED), so a wedged transfer
- * fails and is recovered instead of reaching the watchdog. A watchdog reset,
+ * the core's SERCOM flag waits (DASHCAM_WIRE_BOUNDED), so a wedged or glitched
+ * transfer fails and is recovered instead of reaching the watchdog. A watchdog reset,
  * and so this quarantine, now means a hang somewhere else.
  *
  * Idempotent and NOT consumed: every caller sees the same answer all boot.
@@ -171,6 +171,19 @@ bool bootAfterHang(void);
  * without the bounds.
  */
 uint32_t i2cWireTimeouts(void);
+
+/**
+ * @brief Master transfers vendor/Wire abandoned on a bus error this boot.
+ *
+ * The controller saw a START or STOP mid-transfer (or, on this single-master
+ * bus, "lost arbitration", which is the same glitch), or still believed the bus
+ * busy from one. The usual cause is a contact glitch on SDA or SCL, so on a
+ * drive this counts wiring faults. Each one failed its transfer instead of
+ * returning a garbage byte as data, reset the SERCOM, and the next
+ * @c i2cBusBegin() ran the full bus recovery. 0 when built against a Wire
+ * without the bounds.
+ */
+uint32_t i2cWireBusErrors(void);
 
 /** Lifecycle of the shared bus. */
 enum class I2CBusState{
