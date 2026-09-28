@@ -12,6 +12,10 @@
  *
  * Ownership: IBus instances are not owned by the interface; their lifetime
  * is the caller's responsibility.
+ *
+ * Lives in lib/libbus, on its own: it is the base of libuart, libspi and libi2c,
+ * and a consumer of any of them (libcommlink, for one) should not depend on
+ * libgpio's directory to find it.
  */
 
 #ifndef IBUS_H

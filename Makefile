@@ -13,6 +13,7 @@ NVCCFLAGS := -O2 -std=c++17 -arch=sm_87 \
 
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -I/usr/local/cuda/include \
+            -Ilib/libbus \
             -Ilib/libcan \
             -Ilib/libdriverstate \
             -Ilib/libsigndetector \
