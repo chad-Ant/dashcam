@@ -13,9 +13,9 @@
 | Build scripts | `c232b6d` | `check_core.sh` holds the arduino:samd 1.8.14 check. `install_map.sh` and the BusFaultInjection script now apply it too. | — |
 | liblog | `07a61d4` | `liblog.h` includes `<cstdint>`, so the tree builds with GCC 13 without `-include cstdint`. | — |
 | libcamera: dependencies | `05f3075` | `AttributeDictionary` now lives in libcamera (`libcamera_attributes.cpp`); libconfig no longer includes libcamera. There is no behaviour change. | — |
-| libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The one intended difference is that an interrupted ioctl retries, where it used to read as "no focus control". | **not run on hardware:** `scan_cameras`, and v0.4's exposure/focus lines at start (below) |
-| libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed branches added disabled, which could never start. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. | **not run on hardware:** `camera_gst_test` on GStreamer 1.20.3 (below) |
-| libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). Every attribute write is type- and range-checked, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. | **not run on hardware:** `usb_test` Test 4b, and the CSI dictionary check (below) |
+| libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The EINTR retry is defensive only: the apps install handlers with `std::signal`, which sets SA_RESTART, so it never fires on the Jetson. **Run on the Jetson 2026-09-28:** `scan_cameras` output is byte-identical to the previous build's, and v0.4 starts, records and stops as before (results below). | — |
+| libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. **Run on the Jetson 2026-09-28:** `camera_gst_test` passes on GStreamer 1.20.3. The fix for branches that start disabled works only when the sink sees GAP events directly, so not for this project's real branches (review item C below). | the review items below |
+| libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). A write is checked against the **element's** property type and range, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. That does not check the **device's** range: the driver clamps out-of-range USB values, and those still report NONE (review item F). **Run on the Jetson 2026-09-28:** `usb_test` Test 4b reads back every control it sets, and the CSI dictionary check passes. `usb_test` changes the camera's settings and leaves them changed (review item A). | the review items below |
 
 ## Who does what: read before handing work across
 
@@ -58,34 +58,130 @@ Two coders work on this branch:
 - Treat its firmware changes as unproven until you have run them. It compiled them with a different compiler, and
   none of that code has run on a real bus.
 
-## Next (Jetson coder): run the libcamera changes on the Jetson
+## Done 2026-09-28 (Jetson coder): the libcamera pass run on the Jetson
 
-The cloud session changed libcamera on 2026-09-28 and could not run any of it against a camera or GStreamer
-1.20.3. None of it touches the recording path of `dashcam_v0_4` except the shared V4L2 helpers under its exposure
-and focus control. In the container, `make`, then from the repo root with `B=$(ls -td bin/build_* | head -1)`:
+Everything was built from `ef45a22` in the l4t-ml-gpio container with plain `make` into `bin/build_20260928_074644`.
+The build is clean with GCC 11.4; the only warnings are the two known `read()` ones. The five steps the cloud
+session asked for:
 
-1. **`$B/camera_gst_test`**, with no camera needed. Expect `RESULT: PASS`, 70 checks in about 5 s. What it adds on
-   the Jetson:
-   - It runs on GStreamer 1.20.3; the sandbox has 1.24. Branches added disabled rely on valve `drop-mode=2`
-     (transform-to-gap), which should exist since 1.20. If `start() links both branches` fails, that is why.
-   - The line `CSI: all N entries name a writable nvarguscamerasrc property ...` checks the CSI half of
-     `camera_attributes.xml` against the real Argus element. The sandbox skips it. A `bad:` list names entries
-     to fix.
-2. **`$B/usb_test`** with the UGREEN attached; stop `dashcam-v04` first, since it holds the camera.
-   - Test 4b sets brightness (a v4l2src property) and backlight compensation (a V4L2 control through
-     `extra-controls`) while running, reads each back from the device, then restores it.
-   - Gain is skipped while the camera's own auto-exposure has it inactive.
-   - Expect "device reads" equal to "set" for each control, and Tests 1-7 as before.
-3. **`$B/scan_cameras`**: the UGREEN should be listed with the same formats and controls as before
-   (discovery now uses the shared helpers).
-4. **v0.4 on the car.** After the rebuild and restart, the start log should show the same
-   `exposure: frame-rate priority on ...` line as before (and `focus: fixed at ...` if `FocusMode` is `fixed`), with
-   no new WARN.
-5. **A deployed `camera_attributes.xml`** matters only to v0.2 and v0.3. The build seeds it with `cp -n`, so a copy
-   under `/user/output/configs` keeps the old six USB entries. Those are now refused with a WARN instead of being
-   ignored silently. Replace it with `config/camera_attributes.xml`.
+1. **`camera_gst_test`: `RESULT: PASS`.** It prints 73 `ok` lines, not 70: the file has 70 `check()` calls, the
+   capture-racing-stop check runs 3 times, and the dictionary check runs once per source element found. It takes
+   about 4.5 s. It passed 8 of 8 runs, and 3 of 3 with every core busy.
+   - Valve `drop-mode` exists on 1.20.3 (0 drop-all, 1 forward-sticky-events, 2 transform-to-gap).
+     `start() links both branches` passes.
+   - CSI line: `ok    CSI: all 10 entries name a writable nvarguscamerasrc property of a fitting type, or a V4L2
+     control`. The USB line reports all 11 entries.
+   - Two `(Argus) Error FileOperationFailed: Connecting to nvargus-daemon failed` lines appear on stderr. They are
+     expected: creating nvarguscamerasrc tries the daemon, and it is not running on this Jetson (no CSI camera).
+2. **`usb_test` on the UGREEN: Tests 1–7 and 4b PASS** (8 to 10 are skipped with one camera). The Test 4b lines:
+   ```
+   brightness               set 32 (range 1..64), device reads 32, error=0 (OK)
+   gain                     set 7 (range 0..15), device reads 7, error=0 (OK)
+   backlight_compensation   set 0 (range 0..3), device reads 0, error=0 (OK)
+   ```
+   Gain was **not** skipped. uvcvideo never flags gain inactive; only `exposure_time_absolute`,
+   `white_balance_temperature`, `focus_absolute` and hue follow an auto control. **The run changed the camera's
+   settings and left them changed:** brightness 32 → 64 and gain 0 → 7. A UVC camera keeps these until it loses
+   power, and usb_test runs on the dashcam's own camera. Both were put back by hand
+   (`v4l2-ctl -d /dev/video0 --set-ctrl=brightness=32,gain=0`), and `--list-ctrls` then matched the snapshot taken
+   before the run. Cause and fix: review item A.
+3. **`scan_cameras`:** the output of the new build and of the previous one (`bin/build_20260927_102633`) is
+   byte-identical: 1 camera, 20 controls, 28 formats.
+4. **v0.4:** the new binary ran for 25 s with the service's mounts, and stopped with
+   `timeout --preserve-status -s INT`.
+   - Its start log has the same `exposure: frame-rate priority on /dev/video0 (exposure <= 32.3 ms, gain 0..15,
+     target luma 120)` line. The only WARN is the known obsolete-settings one. There is no `focus:` line, because
+     the deployed `dashcam.xml` does not set `FocusMode`.
+   - The bridge connected: `bridge fw 1.0 proto 7`.
+   - It recorded 713 frames and exited with `rc=0`, so the graceful-exit contract holds.
+   - The camera's controls were unchanged after the hand-back.
+   - The `dashcam-v04` service was already stopped when this session began, and is left stopped. Its next start
+     runs this build, the newest.
+5. **Deployed `camera_attributes.xml`:** there is nothing to replace, and the step's premise was wrong.
+   - `/user/output/configs`, i.e. `/media/jetson/backup/configs`, holds only `dashcam.xml`.
+   - The build seeds a fresh `bin/build_<ts>/config/`, so `cp -n` never keeps a stale copy. The new build's copy is
+     identical to the repo's.
+   - v0.2 and v0.3 resolve only CSI entries (v0.3 applies attributes to its CSI lane camera only), so the USB change
+     does not reach them.
+   - Only a copy placed by hand in `/user/output/configs` would be stale. If one ever appears, delete it rather
+     than replace it.
 
-Report back in this file: the `camera_gst_test` RESULT and CSI line, and usb_test's Test 4b lines.
+Also run, all PASS: `dashcam_v0_4 --self-test`, `config_test`, `bridge_overlay_test`, `exposure_test`,
+`liblog_test`, and `record_test` Part A and Part B (UGREEN). `record_test` leaves the camera's controls unchanged.
+The MKR and C3 host suites were not rerun, because this pass does not touch `peripherals/`.
+
+`bbc0caa` also changed discovery (`getCameraList()`), which v0.4 runs at every recording start. The note in the old
+step list missed that; steps 3 and 4 cover it.
+
+## Next: review items from the libcamera pass
+
+An 8-agent review of `05f3075..7697f40` checked each dimension against the GStreamer 1.20.3 and L4T R36 uvcvideo
+sources, and each finding went to a skeptic told to refute it. All the items below survived. Only item A was
+measured on the rig; the rest are latent, since no app on the car reaches them today (v0.4 does not use Camera_GST;
+v0.3 applies attributes only to its CSI lane camera, and no caller passes `initialEnabled=false`). Items A, B, D, E
+and G–J are small code or test changes the cloud session can make with `camera_gst_test`. A and B need a `usb_test`
+rerun on the Jetson.
+
+- **A. usb_test changes the camera's settings and leaves them changed (measured).**
+  - Tests 3 and 4 write brightness 128 and 100, outside the UGREEN's 1..64. The driver clamps both to 64 and
+    returns success, and neither test restores the value.
+  - Test 4b puts each control back through its own fd (`test_usb_cameras.cpp:242`). The next `extra-controls`
+    write re-sends the whole set that `Camera_GST::setExtraControl` has accumulated (`libcamera_gst.cpp:429`), so
+    gain goes back to 7.
+  - Fix: snapshot the controls the suite writes (brightness, gain, backlight_compensation) in `main()`, and restore
+    them after the last test, with the camera closed. Give Tests 3 and 4 in-range values. Correct the
+    "gain is not active" comment (`:195`).
+  - **Until then, after every usb_test:** `v4l2-ctl -d /dev/video0 --set-ctrl=brightness=32,gain=0,backlight_compensation=1`
+    (the UGREEN's values when v0.4 is not running).
+- **B. USB brightness, contrast, saturation and hue queued before `start()` are dropped.**
+  - The pre-start flush runs in NULL, before v4l2src opens the device. v4l2src applies these four properties only
+    while the device is open, and stores nothing otherwise.
+  - Test 3 passes because it checks only the error code.
+  - Fix: make the four entries `v4l2_control`. `extra-controls` is kept while closed and applied when the device
+    opens. Test 3 should read the value back with `VIDIOC_G_CTRL`.
+- **C. Branches that start disabled still cannot start, except a bare sink.**
+  - `drop-mode=2` (`libcamera_gst.cpp:744`) turns dropped buffers into GAP events.
+  - videorate unrefs GAPs, and the lane and driver inference bins start with `videorate drop-only=true` (defaults
+    20 and 2 fps). So their appsink never prerolls, and `start()` still times out.
+  - x264enc (GstVideoEncoder) queues every GAP until the next frame. On the RTP branch (`udpsink async=false`),
+    which started fine disabled with mode 1, a disabled branch now grows memory by one event per frame without
+    bound.
+  - The test's disabled branch is a bare fakesink, so it cannot see either problem.
+  - Fix: keep `drop-mode=1`, and for an `initialEnabled=false` bin set `async=false` on every GstBaseSink inside it
+    (`gst_bin_iterate_recurse`). Add a disabled `videorate drop-only=true max-rate=5 ! fakesink` branch to the
+    test. Correct `libcamera_gst.h:125` and `:485-489`.
+- **D. Extra controls are written in first-insertion order.**
+  - uvcvideo refuses `exposure_time_absolute` with EACCES while `auto_exposure` is 3.
+  - `pendingAttributes_` is a `std::map`, so aliases flush alphabetically, and `exposure...` lands before
+    `exposure_auto` / `auto_exposure=1`.
+  - Fix: have `setExtraControl` rebuild the structure with the auto controls first (`auto_exposure`,
+    `white_balance_automatic`, `focus_automatic_continuous`, `hue_automatic`).
+- **E. `white_balance_temperature` can never apply on the UGREEN.** The kernel refuses it while auto white balance
+  is on (the default), and the XML has no USB `white_balance_automatic` entry. Fix: add one, and document that it
+  must be 0.
+- **F. USB values are not checked against the device.**
+  - The v4l2src property specs span the whole int range, and `extra-controls` has no feedback.
+  - The driver clamps integers, and v4l2src drops bad menu values or missing controls with only a GStreamer
+    warning. Camera_GST reports NONE in all these cases.
+  - Fix at least the docs (`camera_attributes.xml:23-24`, `libcamera.h` around 336-340). Or check with
+    `VIDIOC_QUERYCTRL` / `VIDIOC_QUERYMENU` on the node.
+- **G. Use-after-free window.**
+  - A `setCameraAttribute()` during `start()`'s `set_state(PLAYING)` (status RUNNING, `camera_src_` set) goes
+    straight to `g_object_set(extra-controls)`.
+  - v4l2src frees the structure that `gst_v4l2_open` may be iterating.
+  - Fix: also queue while `starting_` (`libcamera_gst.cpp:556`). The comment at `:872-875` is false.
+- **H. The teardown comment "such a pipeline never streamed" (`libcamera_gst.cpp:106-113`) is false.** A branch that
+  prerolled renders during the whole `start()` wait, and its container is left unfinalised when `start()` times
+  out. That is the accepted cost of the deadlock fix; the comment should say so.
+- **I. The camera_gst_test capture-valve check can flake.** It drains one in-flight frame only (`:275`), and a
+  starved streaming thread can leave two. It was not seen in 11 runs. Fix: pull until a pull times out.
+- **J. The `aelock` / `awblock` comments are inverted** (`camera_attributes.xml:49`, `:56`). `bool_from_zero` maps
+  0 to TRUE, which means locked. This predates the pass.
+- **Races that predate the pass** (not reachable by v0.2 or v0.3, which call from one thread):
+  - `close()` in ERROR does not wait for `starting_` (`libcamera_gst.cpp:521`). It can free the pipeline under a
+    `start()` still in `get_state`. Fix: wait on `startCv_`, as `stop()` does.
+  - `teardownPipeline()` clears `branchValves_` and `branches_` without `stateMutex_` (`:200`), which races
+    `setBranchEnabled()` and `addBranch()`. Fix: swap them into locals under the lock.
 
 ## Done 2026-09-27 (Jetson coder): the bus-error fix proven on the rig
 
@@ -182,7 +278,7 @@ glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the 
 - **v0.3 overlay:** it keeps its own copy of the bridge→overlay rules. On a fix without altitude it shows the last
   altitude, or the 52.3 m placeholder. v0.4 uses `src/bridge_overlay.h`. Skipped on request.
 - **Unused libraries:** `libstereocam` and `libsigndetector` are in the tree, but no target builds them.
-- **Seen during the libcamera pass, left for the next libraries:**
+- **Seen during the libcamera pass, left for the next libraries** (the review's items are under "Next" above):
   - `libcan.cpp:319` and `libgpio.cpp:311` ignore `read()`'s return (the only two warnings in the build).
   - `Camera_GST::getCameraStatus()` drains the bus through a `const_cast` (it works, but it is a smell).
   - `cameraAttribute` stores control ranges as `float`, which is lossy past 2^24 (no such control on the UGREEN).
@@ -231,6 +327,8 @@ and the tools' own `--version`. Re-collect after an upgrade.
 - JetPack 6.2.3 (`nvidia-jetpack 6.2.3+b81`), L4T R36.5.2, kernel 5.15.199-tegra, Ubuntu 22.04.5 LTS.
 - CUDA 12.6.11, TensorRT 10.3.0.30 (`libnvinfer10`, built for CUDA 12.5), GCC 11.4.0, Python 3.10.12.
 - GStreamer 1.20.3, v4l-utils 1.22.1, Docker 29.8.1.
+- `nvargus-daemon` is not running (no CSI camera is fitted), so anything that loads nvarguscamerasrc prints two
+  `(Argus) Error ... Connecting to nvargus-daemon failed` lines. They are harmless.
 - Host Python's `cv2` is broken (numpy mismatch). Use the container.
 
 **Dev container** `l4t-ml-gpio:latest`
@@ -285,8 +383,13 @@ B=$(ls -td bin/build_* | head -1)                    # the build just made; run 
 $B/dashcam_v0_4 --self-test && $B/config_test && $B/bridge_overlay_test
 $B/camera_gst_test                                   # Camera_GST over videotestsrc: no camera needed
 $B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
-$B/usb_test                                          # a USB camera (stop dashcam-v04 first)
+$B/usb_test                                          # a USB camera (stop dashcam-v04 first; afterwards restore, item A)
+$B/scan_cameras                                      # lists the cameras, their controls and formats
 ```
+
+Until review item A is fixed, restore the UGREEN after `usb_test`:
+`v4l2-ctl -d /dev/video0 --set-ctrl=brightness=32,gain=0,backlight_compensation=1`. Compare `v4l2-ctl -d /dev/video0
+--list-ctrls` before and after.
 
 The Wire changes have no host test: they are register-level SAMD21 code, proven only on the rig
 (BusFaultInjection). Running that is the Jetson coder's job.
