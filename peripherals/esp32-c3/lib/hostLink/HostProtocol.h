@@ -1064,6 +1064,7 @@ inline const char *typeName(uint8_t type)
     case CMD_SET_DECIM:    return "CMD_SET_DECIM";
     case CMD_SET_CAN_MODE: return "CMD_SET_CAN_MODE";
     case CMD_SET_CAN_FILTER: return "CMD_SET_CAN_FILTER";
+    case CMD_SET_IMU_MODE: return "CMD_SET_IMU_MODE";
     case CMD_PING:         return "CMD_PING";
     case MSG_TELEMETRY:    return "MSG_TELEMETRY";
     case MSG_STATUS:       return "MSG_STATUS";

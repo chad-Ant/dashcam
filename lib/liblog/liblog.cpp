@@ -7,6 +7,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cstdarg>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -196,6 +197,30 @@ void emergencyExit(const LogCallback& log, const std::string& msg, int code, int
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(waitMs > 0 ? waitMs : 0));
     ::_exit(code);
+}
+
+void logPrintf(const LogCallback& cb, LogLevel lvl, const char* fmt, ...) {
+    if (!cb) return;
+    va_list ap;
+    va_start(ap, fmt);
+    va_list again;
+    va_copy(again, ap);
+    char buf[512];
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(again);
+        return;
+    }
+    if (static_cast<size_t>(n) < sizeof(buf)) {
+        va_end(again);
+        cb(lvl, buf);
+        return;
+    }
+    std::string msg(static_cast<size_t>(n), '\0');   // the rare long line: exact size
+    std::vsnprintf(&msg[0], msg.size() + 1, fmt, again);
+    va_end(again);
+    cb(lvl, msg);
 }
 
 std::string logDir() {

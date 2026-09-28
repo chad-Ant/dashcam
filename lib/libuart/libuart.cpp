@@ -7,7 +7,6 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,15 +16,7 @@
 
 namespace {
 
-static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
-                  const char* fmt, ...) {
-    if (!cb) return;
-    char buf[512];
-    va_list ap; va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    cb(lvl, buf);
-}
+using dashcam::log::logPrintf;
 
 static speed_t baudToSpeed(uint32_t baud) {
     // Standard POSIX constants.
@@ -80,26 +71,28 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
 
     speed_t speed = baudToSpeed(cfg.baudRate);
     if (speed == B0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "Uart::open: unsupported baud rate %u", cfg.baudRate);
         return false;
     }
 
-    m_fd = ::open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    // O_CLOEXEC: the apps fork helpers (nmcli), and a child that inherited the
+    // node would hold the device open after this process closed it.
+    m_fd = ::open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (m_fd < 0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "Uart::open: cannot open '%s': %s",
               device.c_str(), ::strerror(errno));
         return false;
     }
 
-    // Clear O_NONBLOCK — we manage timeouts via select().
+    // Clear O_NONBLOCK — timeouts are managed with poll() (read(), writeTimeout()).
     int flags = ::fcntl(m_fd, F_GETFL, 0);
     if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
 
     struct termios tty{};
     if (::tcgetattr(m_fd, &tty) < 0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "Uart::open: tcgetattr failed: %s", ::strerror(errno));
         ::close(m_fd); m_fd = -1;
         return false;
@@ -148,7 +141,7 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
     tty.c_cc[VTIME] = 0;
 
     if (::tcsetattr(m_fd, TCSANOW, &tty) < 0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "Uart::open: tcsetattr failed: %s", ::strerror(errno));
         ::close(m_fd); m_fd = -1;
         return false;
@@ -157,14 +150,14 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
     // Exclusive access is advisory-but-enforced for open(): other processes get
     // EBUSY.  Non-fatal if the driver rejects it — log and carry on.
     if (cfg.exclusive && ::ioctl(m_fd, TIOCEXCL) < 0) {
-        doLog(m_log, dashcam::log::LogLevel::WARN,
+        logPrintf(m_log, dashcam::log::LogLevel::WARN,
               "Uart::open: TIOCEXCL failed on '%s': %s",
               device.c_str(), ::strerror(errno));
     }
 
     ::tcflush(m_fd, TCIOFLUSH);
 
-    doLog(m_log, dashcam::log::LogLevel::INFO,
+    logPrintf(m_log, dashcam::log::LogLevel::INFO,
           "Uart::open: %s  %u %d%s%d%s%s",
           device.c_str(), cfg.baudRate,
           cfg.dataBits,
@@ -179,12 +172,12 @@ int Uart::read(uint8_t* buf, size_t len, int timeoutMs) {
     if (m_fd < 0) return -1;
 
     if (timeoutMs == 0) {
-        // Non-blocking: one shot, return whatever is already buffered.
-        int flags = ::fcntl(m_fd, F_GETFL, 0);
-        if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK);
-        ssize_t n = ::read(m_fd, buf, len);
-        if (flags >= 0) ::fcntl(m_fd, F_SETFL, flags);
-        return static_cast<int>(n < 0 ? (errno == EAGAIN ? 0 : -1) : n);
+        // Non-blocking: one shot, return whatever is already buffered.  open()
+        // set VMIN=0/VTIME=0, so read() never waits: it returns at once, with 0
+        // when nothing is buffered.  (This used to set and clear O_NONBLOCK
+        // around every read — two fcntl() calls per read for nothing.)
+        const ssize_t n = ::read(m_fd, buf, len);
+        return static_cast<int>(n < 0 ? ((errno == EAGAIN || errno == EINTR) ? 0 : -1) : n);
     }
 
     // timeoutMs < 0 blocks indefinitely; > 0 waits up to that long.  The port is
@@ -217,7 +210,7 @@ bool Uart::readLine(std::string& line, int timeoutMs) {
         if (c == '\n') return true;
         line += static_cast<char>(c);
     }
-    doLog(m_log, dashcam::log::LogLevel::WARN,
+    logPrintf(m_log, dashcam::log::LogLevel::WARN,
           "Uart::readLine: no newline within %zu bytes; discarding", kMaxLine);
     return false;
 }
@@ -237,7 +230,7 @@ bool Uart::write(const uint8_t* buf, size_t len) {
         ssize_t n = ::write(m_fd, buf + total, len - total);
         if (n < 0) {
             if (errno == EINTR) continue;
-            doLog(m_log, dashcam::log::LogLevel::ERROR,
+            logPrintf(m_log, dashcam::log::LogLevel::ERROR,
                   "Uart::write: failed after %zu/%zu bytes: %s",
                   total, len, ::strerror(errno));
             return false;
@@ -246,7 +239,7 @@ bool Uart::write(const uint8_t* buf, size_t len) {
             // Zero bytes written with bytes still outstanding means no progress
             // is being made.  Retrying cannot change that, so looping here would
             // spin this thread at 100 % CPU forever — fail instead.
-            doLog(m_log, dashcam::log::LogLevel::ERROR,
+            logPrintf(m_log, dashcam::log::LogLevel::ERROR,
                   "Uart::write: wrote 0 of %zu remaining bytes; aborting",
                   len - total);
             return false;
@@ -290,7 +283,7 @@ bool Uart::writeTimeout(const uint8_t* buf, size_t len, int timeoutMs) {
         }
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            doLog(m_log, dashcam::log::LogLevel::ERROR,
+            logPrintf(m_log, dashcam::log::LogLevel::ERROR,
                   "Uart::writeTimeout: failed after %zu/%zu bytes: %s",
                   total, len, ::strerror(errno));
             ok = false;
@@ -301,7 +294,7 @@ bool Uart::writeTimeout(const uint8_t* buf, size_t len, int timeoutMs) {
         const int64_t nowMs     = static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
         const int64_t remaining = deadlineMs - nowMs;
         if (remaining <= 0) {
-            doLog(m_log, dashcam::log::LogLevel::WARN,
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "Uart::writeTimeout: timed out after %zu/%zu bytes in %d ms",
                   total, len, timeoutMs);
             ok = false;
@@ -317,7 +310,7 @@ bool Uart::writeTimeout(const uint8_t* buf, size_t len, int timeoutMs) {
             break;
         }
         if (r == 0) {                       // deadline reached with no writability
-            doLog(m_log, dashcam::log::LogLevel::WARN,
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "Uart::writeTimeout: timed out after %zu/%zu bytes in %d ms",
                   total, len, timeoutMs);
             ok = false;

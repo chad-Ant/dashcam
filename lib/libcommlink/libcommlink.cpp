@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -18,15 +17,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
-           const char* fmt, ...) {
-    if (!cb) return;
-    char buf[512];
-    va_list ap; va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    cb(lvl, buf);
-}
+using dashcam::log::logPrintf;
 
 int64_t steadyMs() {
     using namespace std::chrono;
@@ -58,54 +49,47 @@ CommLink::~CommLink() { close(); }
 // ─── device discovery ─────────────────────────────────────────────────────────
 
 std::vector<std::string> CommLink::enumerate(const std::string& idMatch,
-                                             bool includeAcmFallback) {
+                                             bool includeAcmFallback,
+                                             const std::string& devRoot) {
     std::vector<std::string> out;
 
-    // This runs inside the RX thread's reconnect loop.  directory_iterator's
-    // increment throws on a mid-scan error (a device node disappearing as it is
-    // walked is exactly what USB does), and an escaped exception there would
-    // std::terminate the process — so every scan is contained.
-    try {
-        std::error_code ec;
+    // This runs inside the RX thread's reconnect loop, where a device node
+    // disappearing mid-scan is exactly what USB does.  The error_code forms
+    // never throw (an escaped exception would std::terminate the process), and
+    // a scan cut short keeps whatever it collected before the error.  (The
+    // throwing iterator it replaces lost every by-id match found so far.)
+    const fs::path root{devRoot.empty() ? std::string("/dev") : devRoot};
 
-        // Preferred: the stable by-id symlink, which encodes the device's own
-        // USB descriptor strings rather than the kernel's enumeration order.
-        const fs::path byId{"/dev/serial/by-id"};
-        if (fs::exists(byId, ec)) {
-            std::vector<std::string> matches;
-            for (const auto& entry : fs::directory_iterator(byId)) {
-                const std::string name = entry.path().filename().string();
-                if (!idMatch.empty() && name.find(idMatch) == std::string::npos) continue;
-                ec.clear();
-                const fs::path real = fs::canonical(entry.path(), ec);
-                matches.push_back(ec ? entry.path().string() : real.string());
-            }
-            std::sort(matches.begin(), matches.end());
-            out.insert(out.end(), matches.begin(), matches.end());
-        }
-    } catch (const std::exception&) {
-        // Fall through to the ttyACM scan with whatever was collected.
+    // Preferred: the stable by-id symlink, which encodes the device's own
+    // USB descriptor strings rather than the kernel's enumeration order.
+    std::vector<std::string> matches;
+    std::error_code ec;
+    for (fs::directory_iterator it(root / "serial" / "by-id", ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (!idMatch.empty() && name.find(idMatch) == std::string::npos) continue;
+        std::error_code rec;
+        const fs::path real = fs::canonical(it->path(), rec);
+        matches.push_back(rec ? it->path().string() : real.string());
     }
+    std::sort(matches.begin(), matches.end());
+    out.insert(out.end(), matches.begin(), matches.end());
 
     // Fallback: any CDC-ACM node.  Correct on a rig where the C3 is the only
     // ACM device; ambiguous otherwise, which is why by-id is tried first and
     // why this is opt-in — probing takes each candidate exclusively.
     if (!includeAcmFallback) return out;
 
-    try {
-        std::vector<std::string> acm;
-        for (const auto& entry : fs::directory_iterator("/dev")) {
-            const std::string name = entry.path().filename().string();
-            if (name.rfind("ttyACM", 0) != 0) continue;
-            const std::string path = entry.path().string();
-            if (std::find(out.begin(), out.end(), path) == out.end()) acm.push_back(path);
-        }
-        std::sort(acm.begin(), acm.end());
-        out.insert(out.end(), acm.begin(), acm.end());
-    } catch (const std::exception&) {
-        // Keep the by-id results.
+    std::vector<std::string> acm;
+    ec.clear();
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.rfind("ttyACM", 0) != 0) continue;
+        const std::string path = it->path().string();
+        if (std::find(out.begin(), out.end(), path) == out.end()) acm.push_back(path);
     }
-
+    std::sort(acm.begin(), acm.end());
+    out.insert(out.end(), acm.begin(), acm.end());
     return out;
 }
 
@@ -118,27 +102,26 @@ bool CommLink::open(const CommLinkConfig& cfg, const dashcam::log::LogCallback& 
     m_log = log;
 
     if (m_cfg.decimation == 0) {
-        doLog(m_log, dashcam::log::LogLevel::WARN,
+        logPrintf(m_log, dashcam::log::LogLevel::WARN,
               "CommLink::open: decimation 0 is invalid; using 1");
         m_cfg.decimation = 1;
     }
     // The bridge drops the host after 5 s of frame silence, so a keepalive
     // slower than that would make the link flap even on a healthy cable.
     if (m_cfg.keepaliveMs <= 0 || m_cfg.keepaliveMs > 4000) {
-        doLog(m_log, dashcam::log::LogLevel::WARN,
+        logPrintf(m_log, dashcam::log::LogLevel::WARN,
               "CommLink::open: keepaliveMs %d out of range; using 1000",
               m_cfg.keepaliveMs);
         m_cfg.keepaliveMs = 1000;
     }
 
-    if (::pipe(m_pipe) != 0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
-              "CommLink::open: pipe() failed: %s", ::strerror(errno));
+    // Both ends non-blocking (a drain never stalls the RX thread, a wake never
+    // stalls the caller) and close-on-exec (the apps fork helpers such as nmcli).
+    if (::pipe2(m_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
+              "CommLink::open: pipe2() failed: %s", ::strerror(errno));
         return false;
     }
-    // Non-blocking read end so drains never stall the RX thread.
-    const int flags = ::fcntl(m_pipe[0], F_GETFL, 0);
-    if (flags >= 0) ::fcntl(m_pipe[0], F_SETFL, flags | O_NONBLOCK);
 
     m_decimation.store(m_cfg.decimation);
     m_helloOk.store(false);
@@ -160,12 +143,23 @@ bool CommLink::open(const CommLinkConfig& cfg, const dashcam::log::LogCallback& 
 }
 
 bool CommLink::openPort() {
+    // Logged after m_portMtx is released: the log callback is application
+    // code, and one that asks the link anything (isOpen(), devicePath()) would
+    // otherwise deadlock on this non-recursive mutex.
+    std::string opened;
+    if (!openPortLocked(opened)) return false;
+    if (!opened.empty())
+        logPrintf(m_log, dashcam::log::LogLevel::INFO, "CommLink: bridge port open: %s", opened.c_str());
+    return true;
+}
+
+bool CommLink::openPortLocked(std::string& opened) {
     std::lock_guard<std::mutex> lk(m_portMtx);
-    if (m_uart.isOpen()) return true;
+    if (m_uart.isOpen()) return true;   // already open: nothing new to report
 
     std::vector<std::string> candidates;
     if (!m_cfg.device.empty()) candidates.push_back(m_cfg.device);
-    else                        candidates = enumerate(m_cfg.idMatch, m_cfg.allowAcmFallback);
+    else candidates = enumerate(m_cfg.idMatch, m_cfg.allowAcmFallback, m_cfg.devRoot);
 
     if (candidates.empty()) return false;
 
@@ -207,8 +201,7 @@ bool CommLink::openPort() {
         // The RX thread sends CMD_HELLO on the next pass; it cannot be sent from
         // here because sendFrame() takes m_portMtx, which this function holds.
         m_announcePending.store(true);
-        doLog(m_log, dashcam::log::LogLevel::INFO,
-              "CommLink: bridge port open: %s", path.c_str());
+        opened = path;
         return true;
     }
 
@@ -216,12 +209,15 @@ bool CommLink::openPort() {
 }
 
 void CommLink::closePort() {
-    std::lock_guard<std::mutex> lk(m_portMtx);
-    if (!m_uart.isOpen()) return;
-    m_uart.close();
-    doLog(m_log, dashcam::log::LogLevel::WARN,
-          "CommLink: bridge port closed: %s", m_devicePath.c_str());
-    m_devicePath.clear();
+    std::string closed;
+    {
+        std::lock_guard<std::mutex> lk(m_portMtx);
+        if (!m_uart.isOpen()) return;
+        m_uart.close();
+        closed.swap(m_devicePath);
+    }
+    // Outside the lock, as in openPort().
+    logPrintf(m_log, dashcam::log::LogLevel::WARN, "CommLink: bridge port closed: %s", closed.c_str());
 }
 
 bool CommLink::start() {
@@ -229,7 +225,7 @@ bool CommLink::start() {
     // open() creates the wake pipe even when the device node is absent, so this
     // only fires when open() was never called (or the pipe itself failed).
     if (m_pipe[0] < 0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "CommLink::start: call open() first");
         return false;
     }
@@ -317,7 +313,7 @@ bool CommLink::ping()          { return sendFrame(hostproto::CMD_PING,         n
 
 bool CommLink::setDecimation(uint8_t n) {
     if (n == 0) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "CommLink::setDecimation: 0 is invalid (use stopStream())");
         return false;
     }
@@ -327,7 +323,7 @@ bool CommLink::setDecimation(uint8_t n) {
 
 bool CommLink::setCanMode(uint8_t mode) {
     if (mode < 1 || mode > 3) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "CommLink::setCanMode: expected 1 (discover), 2 (sniff) or 3 (obd2)");
         return false;
     }
@@ -342,7 +338,7 @@ bool CommLink::setCanMode(uint8_t mode) {
 
 bool CommLink::setImuMode(uint8_t mode) {
     if (mode != hostproto::IMU_MODE_FUSION && mode != hostproto::IMU_MODE_RAW) {
-        doLog(m_log, dashcam::log::LogLevel::ERROR,
+        logPrintf(m_log, dashcam::log::LogLevel::ERROR,
               "CommLink::setImuMode: expected 1 (IMUPLUS fusion) or 2 (AMG raw)");
         return false;
     }
@@ -406,7 +402,7 @@ void CommLink::setConnected(bool connected) {
         std::lock_guard<std::mutex> lk(m_cbMtx);
         cb = m_connCb;
     }
-    doLog(m_log, connected ? dashcam::log::LogLevel::INFO : dashcam::log::LogLevel::WARN,
+    logPrintf(m_log, connected ? dashcam::log::LogLevel::INFO : dashcam::log::LogLevel::WARN,
           "CommLink: bridge %s", connected ? "connected" : "disconnected");
     if (cb) cb(connected);
 }
@@ -449,7 +445,7 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
     case hostproto::MSG_TELEMETRY: {
         if (static_cast<size_t>(len) != sizeof(Telemetry)) {
             std::lock_guard<std::mutex> lk(m_statsMtx); ++m_stats.malformedRx;
-            doLog(m_log, dashcam::log::LogLevel::WARN,
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "CommLink: MSG_TELEMETRY length %u, expected %zu",
                   static_cast<unsigned>(len), sizeof(Telemetry));
             return;
@@ -496,7 +492,7 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
         { std::lock_guard<std::mutex> lk(m_statsMtx); ++m_stats.logRx; }
 
         if (m_cfg.forwardBridgeLogs)
-            doLog(m_log, toLogLevel(level), "[c3] %s", text.c_str());
+            logPrintf(m_log, toLogLevel(level), "[c3] %s", text.c_str());
         if (auto cb = grab(&CommLink::m_bridgeLogCb)) cb(toLogLevel(level), text);
         break;
     }
@@ -509,7 +505,7 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
         Hello h;
         std::memcpy(&h, payload, sizeof(h));
 
-        doLog(m_log, dashcam::log::LogLevel::INFO,
+        logPrintf(m_log, dashcam::log::LogLevel::INFO,
               "CommLink: bridge fw %u.%u proto %u  boot #%u  reset reason %u  uptime %u ms",
               h.fwMajor, h.fwMinor, h.protoVersion, h.bootCount, h.resetReason,
               h.bridgeMillis);
@@ -520,7 +516,7 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
                                  h.telemetryBytes == sizeof(Telemetry) &&
                                  h.statusBytes    == sizeof(BridgeStatus));
         if (!compatible) {
-            doLog(m_log, dashcam::log::LogLevel::ERROR,
+            logPrintf(m_log, dashcam::log::LogLevel::ERROR,
                   "CommLink: PROTOCOL MISMATCH — bridge proto %u tlm %u status %u, "
                   "host proto %u tlm %zu status %zu; reflash the C3 with the matching "
                   "HostProtocol.h",
@@ -551,7 +547,7 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
     case hostproto::MSG_NACK: {
         { std::lock_guard<std::mutex> lk(m_statsMtx); ++m_stats.nacksRx; }
         if (static_cast<size_t>(len) == sizeof(hostproto::Nack)) {
-            doLog(m_log, dashcam::log::LogLevel::WARN,
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "CommLink: bridge NACKed %s (reason %u)",
                   hostproto::typeName(payload[0]), static_cast<unsigned>(payload[1]));
         }
@@ -562,7 +558,7 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
         break; // liveness only; the frame itself already refreshed the timer
 
     default:
-        doLog(m_log, dashcam::log::LogLevel::DEBUG,
+        logPrintf(m_log, dashcam::log::LogLevel::DEBUG,
               "CommLink: ignoring unknown frame type 0x%02X (%u bytes)",
               static_cast<unsigned>(type), static_cast<unsigned>(len));
         break;
@@ -630,7 +626,7 @@ void CommLink::rxLoop() {
         // exclude walk straight through it.
         if (handshakeDeadline != 0 && !m_helloOk.load() &&
             steadyMs() > handshakeDeadline) {
-            doLog(m_log, dashcam::log::LogLevel::WARN,
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "CommLink: %s did not identify itself in %d ms — trying the next candidate",
                   devicePath().c_str(), m_cfg.handshakeMs);
             m_probeCursor.fetch_add(1);
@@ -649,7 +645,7 @@ void CommLink::rxLoop() {
         const int ret = ::poll(pfds, 2, POLL_SLICE_MS);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            doLog(m_log, dashcam::log::LogLevel::ERROR,
+            logPrintf(m_log, dashcam::log::LogLevel::ERROR,
                   "CommLink: poll failed: %s", ::strerror(errno));
             closePort();
             continue;
@@ -672,7 +668,7 @@ void CommLink::rxLoop() {
                 if (m_uart.isOpen()) n = m_uart.read(buf, sizeof(buf), 0);
             }
             if (n < 0) {
-                doLog(m_log, dashcam::log::LogLevel::WARN,
+                logPrintf(m_log, dashcam::log::LogLevel::WARN,
                       "CommLink: read failed (%s) — bridge detached",
                       ::strerror(errno));
                 closePort();
@@ -694,7 +690,7 @@ void CommLink::rxLoop() {
         // Hangup/error means the node is gone; without closing here poll() would
         // return immediately forever and spin this thread at 100 % CPU.
         if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            doLog(m_log, dashcam::log::LogLevel::WARN,
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "CommLink: device hangup (revents 0x%X)",
                   static_cast<unsigned>(pfds[0].revents));
             closePort();

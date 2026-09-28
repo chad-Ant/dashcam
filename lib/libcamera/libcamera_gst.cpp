@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,33 +11,7 @@
 
 namespace {
 
-// printf-style, checked by the compiler.  Never truncates: the DEBUG pipeline
-// description and a GStreamer debug string both run past any fixed buffer.
-__attribute__((format(printf, 3, 4)))
-void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
-           const char* fmt, ...) {
-    if (!cb) return;
-    va_list ap;
-    va_start(ap, fmt);
-    va_list again;
-    va_copy(again, ap);
-    char buf[512];
-    const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n < 0) {
-        va_end(again);
-        return;
-    }
-    if (static_cast<size_t>(n) < sizeof(buf)) {
-        va_end(again);
-        cb(lvl, buf);
-        return;
-    }
-    std::string msg(static_cast<size_t>(n), '\0');
-    std::vsnprintf(&msg[0], msg.size() + 1, fmt, again);
-    va_end(again);
-    cb(lvl, msg);
-}
+using dashcam::log::logPrintf;
 
 // "<element>: <message> (<debug>)" for a bus ERROR or WARNING: which element
 // failed, and GStreamer's own detail (e.g. "reason not-negotiated").
@@ -222,7 +195,7 @@ void Camera_GST::teardownPipeline() {
 }
 
 void Camera_GST::setPipelineError() {
-    doLog(log_, dashcam::log::LogLevel::ERROR,
+    logPrintf(log_, dashcam::log::LogLevel::ERROR,
           "pipeline error on %s", info_.address.c_str());
     teardownPipeline();
     {
@@ -238,11 +211,11 @@ void Camera_GST::logFirstBusError(GstElement* pipe, const char* what) {
     GstBus* bus = pipe ? gst_element_get_bus(pipe) : nullptr;
     GstMessage* msg = bus ? gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR) : nullptr;
     if (msg) {
-        doLog(log_, dashcam::log::LogLevel::ERROR, "%s on %s: %s", what,
+        logPrintf(log_, dashcam::log::LogLevel::ERROR, "%s on %s: %s", what,
               info_.address.c_str(), describeMessage(msg).c_str());
         gst_message_unref(msg);
     } else {
-        doLog(log_, dashcam::log::LogLevel::ERROR, "%s on %s (no error on the bus)", what,
+        logPrintf(log_, dashcam::log::LogLevel::ERROR, "%s on %s (no error on the bus)", what,
               info_.address.c_str());
     }
     if (bus) gst_object_unref(bus);
@@ -270,13 +243,13 @@ void Camera_GST::checkBusErrors() {
         GstMessage* msg;
         while ((msg = gst_bus_pop_filtered(bus, drainMask)) != nullptr) {
             if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR && !sawError) {
-                doLog(log_, dashcam::log::LogLevel::ERROR, "pipeline bus error on %s: %s",
+                logPrintf(log_, dashcam::log::LogLevel::ERROR, "pipeline bus error on %s: %s",
                       info_.address.c_str(), describeMessage(msg).c_str());
                 sawError = true;
             } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
                 const unsigned seen = ++warningsSeen_;
                 if (seen <= kMaxWarningsLogged)
-                    doLog(log_, dashcam::log::LogLevel::WARN, "pipeline warning on %s: %s%s",
+                    logPrintf(log_, dashcam::log::LogLevel::WARN, "pipeline warning on %s: %s%s",
                           info_.address.c_str(), describeMessage(msg).c_str(),
                           seen == kMaxWarningsLogged ? " (further warnings not logged)" : "");
             }
@@ -498,7 +471,7 @@ void Camera_GST::open() {
     GError* err = nullptr;
     bool gstOk = gst_init_check(nullptr, nullptr, &err);
     if (!gstOk) {
-        doLog(log_, dashcam::log::LogLevel::ERROR,
+        logPrintf(log_, dashcam::log::LogLevel::ERROR,
               "gst_init failed for %s: %s", info_.address.c_str(),
               err ? err->message : "unknown");
     }
@@ -514,7 +487,7 @@ void Camera_GST::open() {
         status_.status = CAMERA_STATUS::OPEN;
         status_.currentError = ERROR_CODE::NONE;
     }
-    doLog(log_, dashcam::log::LogLevel::INFO,   // outside the lock: the callback contract
+    logPrintf(log_, dashcam::log::LogLevel::INFO,   // outside the lock: the callback contract
           "camera opened: %s", info_.address.c_str());
 }
 
@@ -528,7 +501,7 @@ void Camera_GST::close() {
         }
         requiresStop = (status_.status == CAMERA_STATUS::RUNNING);
     }
-    doLog(log_, dashcam::log::LogLevel::INFO,
+    logPrintf(log_, dashcam::log::LogLevel::INFO,
           "camera closing: %s", info_.address.c_str());
 
     // Drop lock before hitting GStreamer teardown logic to prevent deadlocks
@@ -630,9 +603,9 @@ void Camera_GST::start() {
     computeFpsRational(fmt.frameRate, frNum, frDen);
 
     std::string pipelineStr = buildPipelineString(fmt, frNum, frDen);
-    doLog(log_, dashcam::log::LogLevel::INFO,
+    logPrintf(log_, dashcam::log::LogLevel::INFO,
           "starting pipeline on %s", info_.address.c_str());
-    doLog(log_, dashcam::log::LogLevel::DEBUG,
+    logPrintf(log_, dashcam::log::LogLevel::DEBUG,
           "pipeline: %s", pipelineStr.c_str());
 
     // Publish the shared handles under stateMutex_ so status (already RUNNING) and
@@ -646,7 +619,7 @@ void Camera_GST::start() {
     if (error != nullptr || pipeline == nullptr) {
         // e.g. "no element \"nvarguscamerasrc\"" or "could not link ...": the
         // reason the camera will not start, so it is worth the line.
-        doLog(log_, dashcam::log::LogLevel::ERROR, "pipeline description rejected on %s: %s",
+        logPrintf(log_, dashcam::log::LogLevel::ERROR, "pipeline description rejected on %s: %s",
               info_.address.c_str(), error ? error->message : "unknown");
         if (error) g_error_free(error);
         if (pipeline) gst_object_unref(pipeline);
@@ -664,7 +637,7 @@ void Camera_GST::start() {
     GstElement* capValve  = gst_bin_get_by_name(GST_BIN(pipeline), "capvalve");
 
     if (!appsink || !cameraSrc || !tee || !capValve) {
-        doLog(log_, dashcam::log::LogLevel::ERROR,
+        logPrintf(log_, dashcam::log::LogLevel::ERROR,
               "required pipeline elements not found on %s", info_.address.c_str());
         if (appsink)   gst_object_unref(appsink);
         if (cameraSrc) gst_object_unref(cameraSrc);
@@ -703,7 +676,7 @@ void Camera_GST::start() {
 
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         if (!queue) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
                   "failed to create queue element for branch '%s'", branchName.c_str());
             gst_object_ref_sink(branchBin); gst_object_unref(branchBin);
             branchBin = nullptr;
@@ -723,7 +696,7 @@ void Camera_GST::start() {
 
         GstElement* valve = gst_element_factory_make("valve", nullptr);
         if (!valve) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
                   "failed to create valve element for branch '%s'", branchName.c_str());
             gst_object_ref_sink(queue);     gst_object_unref(queue);
             gst_object_ref_sink(branchBin); gst_object_unref(branchBin);
@@ -751,7 +724,7 @@ void Camera_GST::start() {
 
         GstPad* teeSrcPad = gst_element_request_pad_simple(tee_, "src_%u");
         if (!teeSrcPad) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
                   "failed to get tee src pad for branch '%s'", branchName.c_str());
             releaseRemaining(i + 1);
             branchError = true;
@@ -760,7 +733,7 @@ void Camera_GST::start() {
 
         GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
         if (!queueSinkPad) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
                   "failed to get queue sink pad for branch '%s'", branchName.c_str());
             gst_element_release_request_pad(tee_, teeSrcPad);
             gst_object_unref(teeSrcPad);
@@ -806,7 +779,7 @@ void Camera_GST::start() {
         }
 
         if (ret != GST_PAD_LINK_OK || !queueValveLinked || !valveLinked) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
                   "pad/element link failed for branch '%s'", branchName.c_str());
             gst_element_release_request_pad(tee_, teeSrcPad);
             gst_object_unref(teeSrcPad);
@@ -814,7 +787,7 @@ void Camera_GST::start() {
             branchError = true;
             break;
         }
-        doLog(log_, dashcam::log::LogLevel::INFO,
+        logPrintf(log_, dashcam::log::LogLevel::INFO,
               "branch linked: %s", branchName.c_str());
         teePads_.push_back(teeSrcPad);
         localValves[branchName] = valve;
@@ -848,7 +821,7 @@ void Camera_GST::start() {
     };
     auto logRejected = [&]() {
         for (const auto& r : rejected)
-            doLog(log_, dashcam::log::LogLevel::WARN,
+            logPrintf(log_, dashcam::log::LogLevel::WARN,
                   "attribute %s not applied on %s: unknown to the dictionary, or a value "
                   "the element does not take", r.c_str(), info_.address.c_str());
         rejected.clear();
@@ -882,7 +855,7 @@ void Camera_GST::start() {
             return;
         }
         if (ret == GST_STATE_CHANGE_ASYNC) {
-            doLog(log_, dashcam::log::LogLevel::ERROR,
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
                   "pipeline on %s did not reach PLAYING within %u ms", info_.address.c_str(),
                   params_.stateChangeTimeoutMs);
             setPipelineError();
@@ -890,7 +863,7 @@ void Camera_GST::start() {
         }
     }
 
-    doLog(log_, dashcam::log::LogLevel::INFO,
+    logPrintf(log_, dashcam::log::LogLevel::INFO,
           "pipeline running: %s", info_.address.c_str());
 
     // Drain anything queued during the startup window.  status_ is already
@@ -915,7 +888,7 @@ void Camera_GST::stop() {
         if (status_.status != CAMERA_STATUS::RUNNING) return;
         status_.status = CAMERA_STATUS::OPEN;
     }
-    doLog(log_, dashcam::log::LogLevel::INFO,
+    logPrintf(log_, dashcam::log::LogLevel::INFO,
           "stopping pipeline: %s", info_.address.c_str());
     teardownPipeline();
     {
@@ -1006,7 +979,7 @@ void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin,
     }
     // Logged outside the lock (the callback contract), and the bin released:
     // ownership passes on every call, since no caller frees a refused bin.
-    doLog(log_, dashcam::log::LogLevel::ERROR, "cannot add camera branch '%s': %s",
+    logPrintf(log_, dashcam::log::LogLevel::ERROR, "cannot add camera branch '%s': %s",
           name.c_str(), refused);
     if (sinkBin) {
         gst_object_ref_sink(sinkBin);

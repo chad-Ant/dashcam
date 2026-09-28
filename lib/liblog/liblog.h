@@ -12,6 +12,17 @@ enum class LogLevel { DEBUG, INFO, WARN, ERROR };
 using LogCallback = std::function<void(LogLevel, const std::string&)>;
 
 /**
+ * @brief printf-style logging through @p cb, for the libraries that take a
+ *        LogCallback.  A no-op when @p cb is empty.
+ *
+ * Never truncates (the fixed 512-byte buffers it replaces cut long pipeline
+ * strings and debug details), and the compiler checks the format against its
+ * arguments.
+ */
+void logPrintf(const LogCallback& cb, LogLevel lvl, const char* fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
+/**
  * @brief Tunable logger parameters.  Defaults preserve the historical
  *        hardcoded values.
  *

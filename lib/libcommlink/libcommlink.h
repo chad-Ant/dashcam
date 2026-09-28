@@ -102,6 +102,12 @@ struct CommLinkConfig {
      */
     bool allowAcmFallback = false;
 
+    /**
+     * Where auto-discovery looks: @c <devRoot>/serial/by-id and
+     * @c <devRoot>/ttyACM*.  Only tests change it (they point it at a fake tree).
+     */
+    std::string devRoot = "/dev";
+
     uint32_t baudRate = 115200; ///< Ignored by USB CDC (no line rate); set for termios validity.
 
     int reconnectMs = 1000;  ///< Delay between reopen attempts while the device is absent.
@@ -275,16 +281,21 @@ public:
     /**
      * @brief List candidate bridge device nodes, most specific first.
      *
-     * Scans /dev/serial/by-id for entries containing @p idMatch and resolves
-     * each symlink, then — only if @p includeAcmFallback — appends any
-     * /dev/ttyACM* not already listed.
+     * Scans @p devRoot/serial/by-id for entries containing @p idMatch and
+     * resolves each symlink, then — only if @p includeAcmFallback — appends any
+     * @p devRoot/ttyACM* not already listed.  Never throws; a scan cut short by
+     * a node vanishing keeps what it found before.
      */
     static std::vector<std::string> enumerate(const std::string& idMatch = "USB_JTAG",
-                                              bool includeAcmFallback = true);
+                                              bool includeAcmFallback = true,
+                                              const std::string& devRoot = "/dev");
 
 private:
     void rxLoop();
     bool openPort();
+    /// openPort() under m_portMtx.  @p opened receives the path when this call
+    /// opened it (left empty when the port was already open).
+    bool openPortLocked(std::string& opened);
     void closePort();
     void feed(const uint8_t* data, size_t len, uint32_t nowMs);
     void onFrame(uint8_t type, const uint8_t* payload, uint8_t len);
