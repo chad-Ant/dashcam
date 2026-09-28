@@ -60,7 +60,8 @@ namespace dashcam::camera {
  * **Attribute lifecycle:**
  * - Attributes set before start() are queued in pendingAttributes_ and applied
  *   to camera_src_ inside start(), before the pipeline transitions to PLAYING.
- * - Attributes set during RUNNING are applied immediately to camera_src_ hardware.
+ * - Attributes set during RUNNING are applied immediately to camera_src_, once
+ *   start() has returned; while it is still building they are queued too.
  *
  * **Concurrent safety:**
  * - Concurrent start() calls are serialized by the state machine (optimistic RUNNING claim).
@@ -77,8 +78,10 @@ namespace dashcam::camera {
  */
 struct PipelineParams {
     uint32_t captureTimeoutMs     = 1000;  ///< captureFrame() max wait for a frame.
-    uint32_t stateChangeTimeoutMs = 5000;  ///< Async PLAYING / NULL state-change wait.
-    uint32_t eosTimeoutMs         = 5000;  ///< Teardown EOS flush wait.
+    uint32_t stateChangeTimeoutMs = 5000;  ///< Async PLAYING / NULL state-change wait; also how long
+                                           ///< teardown waits for a stuck EOS after flushing branches.
+    uint32_t eosTimeoutMs         = 5000;  ///< Teardown EOS flush wait.  A branch still holding the
+                                           ///< EOS back then is flushed (its file not finalised).
     uint32_t captureQueueDepth    = 2;     ///< appsink-branch leaky queue max-size-buffers.
     uint32_t appsinkMaxBuffers    = 1;     ///< appsink max-buffers.
     uint32_t branchQueueDepth     = 2;     ///< Leaky (inference) branch queue max-size-buffers;
@@ -122,7 +125,7 @@ protected:
         std::string  name;           ///< User-supplied identifier for setBranchEnabled().
         GstElement*  bin;            ///< GStreamer bin providing the branch logic (owned by pipeline after start()).
         bool         leaky;          ///< true = leaky downstream queue (inference); false = blocking (recording).
-        bool         initialEnabled; ///< If false, valve starts with drop=TRUE (turning buffers into GAP events, so the sink still prerolls) until setBranchEnabled(true).
+        bool         initialEnabled; ///< If false, valve starts with drop=TRUE until setBranchEnabled(true), and the bin's sinks are async=false (they cannot preroll).
     };
 
     /// Branches registered via addBranch() before start().  The pipeline takes
@@ -213,7 +216,9 @@ protected:
      *           ! <convert> ! appsink name=mysink (appsinkMaxBuffers, no sync)
      * @endverbatim
      * The valve forwards sticky events while dropping (drop-mode=1), so EOS still
-     * reaches the appsink during teardown when capture is disabled.
+     * reaches the appsink during teardown when capture is disabled.  start()
+     * sets the appsink's wait-on-eos to false, so a stream that ends posts EOS
+     * even when nobody pulls the last sample.
      *
      * @param convert  The driver's conversion chain to video/x-raw,format=BGR.
      */
@@ -256,21 +261,33 @@ protected:
                                   const std::string& value);
 
     /**
-     * @brief Add @p name = @p value to @p controls (created on first use) and
-     *        write the whole set to @p src's "extra-controls" (v4l2src).
+     * @brief Write @p controls to @p src's "extra-controls" (v4l2src), the auto
+     *        controls (auto_exposure, white_balance_automatic,
+     *        focus_automatic_continuous, hue_automatic) first, then the rest in
+     *        their order in @p controls.
      *
-     * v4l2src replaces its extra-controls as a whole on every write — applying
-     * them at once if the device is open, else when it opens — so the set is
-     * accumulated here to keep earlier controls.
+     * v4l2src writes the fields in order, and uvcvideo refuses a manual value
+     * (EACCES) while its auto control is on.  v4l2src replaces its stored set
+     * with each write, applying it at once if the device is open, else when it
+     * opens: start()'s flushes therefore write every queued control in one
+     * structure, and a write while running carries only its own control.
      *
      * @return @c false when @p src has no "extra-controls" structure property.
      */
-    static bool setExtraControl(GstElement* src, GstStructure*& controls,
-                                const std::string& name, int value);
+    static bool writeExtraControls(GstElement* src, const GstStructure* controls);
 
-    /// Controls written through setExtraControl() since start(); freed with the
-    /// pipeline.  Guarded by stateMutex_.
-    GstStructure* extraControls_ = nullptr;
+    /// During start()'s attribute flushes: the V4L2 controls collected for one
+    /// writeExtraControls().  nullptr otherwise.  Guarded by stateMutex_.
+    GstStructure* controlBatch_ = nullptr;
+
+    /**
+     * @brief Apply and clear pendingAttributes_ (start() runs it before PLAYING
+     *        and after): each through applyAttributeGStreamer(), the V4L2
+     *        controls among them in one writeExtraControls().
+     * @param[out] rejected  Receives "name=value" for each one refused.
+     * @pre stateMutex_ held, camera_src_ set.
+     */
+    void flushPendingAttributes(std::vector<std::string>& rejected);
 
     /**
      * @brief Parse a decimal integer from @p str without throwing.
@@ -313,16 +330,26 @@ private:
     void setPipelineError();
 
     /**
-     * @brief Drain any pending GST_MESSAGE_ERROR from the pipeline bus.
+     * @brief Sends EOS to a PLAYING pipeline and waits for it, bounded even when
+     *        a branch or the source has stopped moving; see the definition.
+     * @return false when the pipeline was left to the EOS thread: the caller
+     *         must not set its state or release its pads.
+     */
+    bool finishStream(GstElement* pipe, GstElement* sinkRef,
+                      const std::map<std::string, GstElement*>& valves);
+
+    /**
+     * @brief Drain the pipeline bus, reporting errors and the end of the stream.
      *
      * There is no GLib main loop driving a bus watch, so runtime pipeline
      * failures (sensor disconnect, Argus/encoder errors) would otherwise go
      * unnoticed and captureFrame() would silently time out forever.  This polls
-     * the bus non-blocking; on the first error it logs the detail and
-     * transitions RUNNING → ERROR (recording pipelineError()).  Called from
-     * captureFrame() and getCameraStatus(), so even a recording-only camera
-     * (no captureFrame() consumer) surfaces pipeline death via status polling.
-     * Acquires stateMutex_ internally; must not be called with it held.
+     * the bus non-blocking; on the first error, or an EOS (a live source that
+     * stopped), it logs it and transitions RUNNING → ERROR (recording
+     * pipelineError()).  Called from captureFrame() and getCameraStatus(), so
+     * even a recording-only camera (no captureFrame() consumer) surfaces
+     * pipeline death via status polling.  Does nothing while start() is still
+     * building.  Acquires stateMutex_ internally; must not be called with it held.
      */
     void checkBusErrors();
 
@@ -336,6 +363,10 @@ private:
     /// Bus warnings seen this run (see checkBusErrors(), which captureFrame()
     /// and getCameraStatus() may run on different threads); reset by start().
     std::atomic<unsigned> warningsSeen_{0};
+
+    /// The pipeline posted EOS (checkBusErrors() took it off the bus): teardown
+    /// sends no second one.  Reset by start().
+    std::atomic<bool> eosSeen_{false};
 
 public:
     /**
@@ -448,6 +479,10 @@ public:
      * @note If a concurrent start() is still constructing the pipeline, stop()
      *       blocks until that construction finishes (bounded by the start()
      *       state-change timeouts), then tears the pipeline down normally.
+     * @note Bounded by PipelineParams: eosTimeoutMs for the EOS, then at most
+     *       stateChangeTimeoutMs more if a branch or the source is stuck, plus
+     *       the NULL transition.  A pipeline whose source thread stays stuck is
+     *       left behind and released when that thread frees (logged as ERROR).
      */
     void stop() override;
 
@@ -483,10 +518,10 @@ public:
      *                       backpressure, blocking the tee if the queue fills. Use for
      *                       recording branches where frame loss is unacceptable.
      * @param[in] initialEnabled  @c false starts the branch dropping until
-     *                     setBranchEnabled(true).  Its valve then forwards the dropped
-     *                     buffers as GAP events (drop-mode transform-to-gap), so the
-     *                     branch's sink prerolls and start() still reaches PLAYING;
-     *                     branches that start enabled drop without GAPs when disabled.
+     *                     setBranchEnabled(true).  Every sink in @p sinkBin is then set
+     *                     async=false, so start() reaches PLAYING without a preroll
+     *                     buffer from it; the sinks render from their first buffer once
+     *                     enabled.  A sink that must preroll cannot be in such a branch.
      * @pre Must be called before start().  Calling while RUNNING (or with a null
      *      bin or an empty name) sets INVALID_ATTRIBUTE, logs why and releases
      *      @p sinkBin.

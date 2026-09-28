@@ -88,7 +88,8 @@ enum class CAMERA_STATUS {
     CLOSED,  ///< Default state; no resources held.
     OPEN,    ///< Device opened and GStreamer initialised; pipeline not yet running.
     RUNNING, ///< Capture pipeline active; captureFrame() will return data.
-    ERROR    ///< A non-recoverable error has occurred; close() then re-open to recover.
+    ERROR    ///< A non-recoverable error has occurred, or the stream ended (the source stopped);
+             ///< close() then re-open to recover.
 };
 
 // ─── data structures ─────────────────────────────────────────────────────────
@@ -350,8 +351,12 @@ enum class AttributeValueType {
     RangeString,  ///< Mirrored to "val val" (nvargus range properties).
     V4l2Control,  ///< An integer V4L2 control, not a property: gstProperty is the control's
                   ///< normalised name (v4l2-ctl --list-ctrls, e.g. "white_balance_temperature"),
-                  ///< written through v4l2src's "extra-controls".  v4l2src has properties
-                  ///< only for brightness, contrast, saturation and hue.
+                  ///< written through v4l2src's "extra-controls" (kept while the device is
+                  ///< closed and applied when it opens, auto controls first).  Only "is an
+                  ///< integer" is checked: v4l2src gives no feedback, the driver clamps a value
+                  ///< outside the control's range, and a missing control, a bad menu value or
+                  ///< a refused write is dropped with a GStreamer warning.  All of these
+                  ///< report NONE; check with v4l2-ctl.
 };
 
 /**

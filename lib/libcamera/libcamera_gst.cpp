@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <system_error>
+#include <thread>
 
 // ─── file-local log helper ────────────────────────────────────────────────────
 
@@ -36,6 +39,63 @@ std::string describeMessage(GstMessage* msg) {
 /// Bus warnings logged per pipeline run before the rest are only counted.
 constexpr unsigned kMaxWarningsLogged = 10;
 
+/// V4L2 auto controls, written ahead of every other control in one
+/// extra-controls write: uvcvideo refuses a manual value (EACCES) while its
+/// auto control is on, and v4l2src writes the fields in order.  Kernel 5.15
+/// names first, then the older ones.
+constexpr const char* kAutoControls[] = {
+    "auto_exposure", "white_balance_automatic", "focus_automatic_continuous", "hue_automatic",
+    "exposure_auto", "white_balance_temperature_auto", "focus_auto",
+};
+
+/// Does @p src take V4L2 controls through a GstStructure "extra-controls" (v4l2src)?
+bool hasExtraControls(GstElement* src) {
+    GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "extra-controls");
+    return pspec && pspec->value_type == GST_TYPE_STRUCTURE;
+}
+
+/// async=false on every sink in @p el (itself, or anywhere inside it when it is
+/// a bin).  Such a sink does not hold the pipeline's state change waiting for a
+/// preroll buffer.
+void unsetSinksAsync(GstElement* el) {
+    auto apply = [](GstElement* e) {
+        if (GST_IS_BIN(e) || !GST_OBJECT_FLAG_IS_SET(e, GST_ELEMENT_FLAG_SINK)) return;
+        GParamSpec* ps = g_object_class_find_property(G_OBJECT_GET_CLASS(e), "async");
+        if (ps && ps->value_type == G_TYPE_BOOLEAN && (ps->flags & G_PARAM_WRITABLE))
+            g_object_set(e, "async", FALSE, NULL);
+    };
+    apply(el);
+    if (!GST_IS_BIN(el)) return;
+    GstIterator* it = gst_bin_iterate_recurse(GST_BIN(el));
+    GValue item = G_VALUE_INIT;
+    for (bool done = false; !done;) {
+        switch (gst_iterator_next(it, &item)) {
+            case GST_ITERATOR_OK:
+                apply(GST_ELEMENT(g_value_get_object(&item)));
+                g_value_reset(&item);
+                break;
+            case GST_ITERATOR_RESYNC:
+                gst_iterator_resync(it);
+                break;
+            default:
+                done = true;
+                break;
+        }
+    }
+    g_value_unset(&item);
+    gst_iterator_free(it);
+}
+
+/// The EOS send of one teardown, shared with the thread that makes it: that
+/// thread outlives the teardown when the pipeline is left behind (see
+/// Camera_GST::finishStream()).
+struct EosSend {
+    std::mutex              m;
+    std::condition_variable cv;
+    bool done      = false;   ///< gst_element_send_event() returned.
+    bool abandoned = false;   ///< The teardown gave up: the thread releases the pipeline.
+};
+
 } // namespace
 
 namespace dashcam::camera {
@@ -43,101 +103,68 @@ namespace dashcam::camera {
 // ─── private helpers ────────────────────────────────────────────────────────
 
 /// Destruction order matters for GStreamer reference counting:
-///   1. Atomically claim pipeline_ via swap under stateMutex_ (re-entrancy guard).
-///   2. If the pipeline reached PLAYING: send EOS, then drain the appsink while
-///      waiting for the pipeline EOS (or replacing error) on the bus — forces
-///      the muxer to finalise the container.  See the combined loop below for
-///      why draining is mandatory, and the check above it for why never before
-///      PLAYING.
+///   1. Atomically claim pipeline_, and the branch lists, under stateMutex_
+///      (re-entrancy guard; setBranchEnabled() then finds no valves).
+///   2. If the pipeline reached PLAYING and its stream has not already ended:
+///      finishStream() sends EOS and waits, bounded, for the muxers to finalise
+///      their containers.  It may leave a stuck pipeline behind (see there).
 ///   3. Set pipeline to NULL and wait for confirmation — joins the streaming thread.
 ///      NOTE: on CSI, nvarguscamerasrc's PAUSED→READY can itself block ~5 s when
 ///      the Argus session ends in the CANCELLED path (daemon-state dependent);
 ///      that wait is internal to the NVIDIA element and bounded by its own
 ///      timeout — not something this code can shorten.
 ///   4. Release tee request pads (gst_element_release_request_pad + unref).
-///   5. Free orphaned branch bins (registered but never added to the pipeline);
-///      clear tracking vectors.
+///   5. Free orphaned branch bins (registered but never added to the pipeline).
 ///   6. Unref non-owning element handles (tee_, camera_src_, appsink_).
 ///   7. Unref the pipeline — releases all bin members.
 ///
 /// The pipeline MUST reach NULL before pads are released.  Releasing request
 /// pads while the streaming thread is still running (i.e. before NULL state)
 /// is a GStreamer API violation and can cause the streaming thread to crash.
+/// A pipeline left behind in step 2 is therefore not touched past step 1: its
+/// EOS thread sets it to NULL and drops the last ref when it frees.
 void Camera_GST::teardownPipeline() {
     // Atomically claim the pipeline pointer so a concurrent re-entrant call
     // (e.g. a future bus-watch callback racing a lifecycle stop) gets nullptr
-    // and exits immediately rather than double-freeing.
+    // and exits immediately rather than double-freeing.  The branch lists go
+    // with it: setBranchEnabled() and addBranch() read them under the lock.
     GstElement* pipe = nullptr;
     GstElement* sinkRef = nullptr;
+    std::vector<BranchEntry> branches;
+    std::map<std::string, GstElement*> valves;
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
         std::swap(pipe, pipeline_);
         if (pipe && appsink_)
             sinkRef = static_cast<GstElement*>(gst_object_ref(appsink_));
+        branches.swap(branches_);
+        valves.swap(branchValves_);
     }
 
+    bool released = true;   // false: finishStream() left the pipeline to its EOS thread
     if (pipe) {
         // EOS only to a pipeline that reached PLAYING.  One still short of it
         // (a start() that timed out: a sink that never prerolled, Argus slow to
-        // come up) has sinks blocked in preroll and a source thread blocked
-        // behind them; gst_element_send_event(EOS) then blocks forever, and
-        // takes the NULL transition below with it — measured 2026-09-28 with a
-        // live source and a sink that never got a buffer.  Such a pipeline never
-        // streamed, so there is no container to finalise: straight to NULL.
+        // come up) cannot finalise a container anyway: a sink in PAUSED holds
+        // every buffer after its first until PLAYING, so a muxer's closing
+        // writes would wait there.  Straight to NULL: a branch that did preroll
+        // may have written the start of a file, and it stays unfinalised (the
+        // accepted cost; start() reported ERROR).  A stream that already ended
+        // (checkBusErrors() saw its EOS) has nothing left to flush.
         GstState state, pending;
         gst_element_get_state(pipe, &state, &pending, 0);
-        if (state == GST_STATE_PLAYING) {
+        if (state == GST_STATE_PLAYING && !eosSeen_)
+            released = finishStream(pipe, sinkRef, valves);
 
-            gst_element_send_event(pipe, gst_event_new_eos());
-
-            // Wait for the pipeline EOS (or the error that replaces it) while
-            // simultaneously draining the appsink, all under one eosTimeoutMs
-            // deadline.  Two platform behaviours force the combined loop:
-            //  - GstAppSink defers its EOS (and therefore the pipeline EOS
-            //    message) until the application has pulled every queued sample.
-            //    The captureFrame() consumer has stopped by now, so teardown
-            //    must pull the trailing frames itself, and must keep pulling
-            //    until the appsink reports EOS — frames still in flight behind
-            //    an empty queue would otherwise re-block the EOS handler.
-            //  - nvarguscamerasrc sometimes posts an ERROR (Argus CANCELLED)
-            //    instead of forwarding EOS at all; a drain-then-wait sequence
-            //    would burn the full drain budget before seeing that error.
-            // The EOS window stays generous on purpose: with a ±30 s recording
-            // pre-buffer, matroskamux can need >1.5 s to flush on a CPU-encoder
-            // path.  Bounded: every iteration waits <= 50 ms or pulls a sample
-            // (finite after EOS), and the deadline caps the whole loop.
-            GstBus* bus = gst_element_get_bus(pipe);
-            if (bus) {
-                const gint64 deadline = g_get_monotonic_time()
-                    + static_cast<gint64>(params_.eosTimeoutMs) * G_TIME_SPAN_MILLISECOND;
-                const GstMessageType eosMask =
-                    static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
-                GstMessage* msg = nullptr;
-                while (!msg && g_get_monotonic_time() < deadline) {
-                    const bool sinkDone = !sinkRef ||
-                        gst_app_sink_is_eos(GST_APP_SINK(sinkRef));
-                    if (!sinkDone) {
-                        GstSample* s = gst_app_sink_try_pull_sample(
-                            GST_APP_SINK(sinkRef), 25 * GST_MSECOND);
-                        if (s) gst_sample_unref(s);
-                    }
-                    // Block on the bus only once the appsink is fully drained;
-                    // until then just poll so the drain keeps making progress.
-                    msg = gst_bus_timed_pop_filtered(
-                        bus, sinkDone ? 50 * GST_MSECOND : 0, eosMask);
-                }
-                if (msg) gst_message_unref(msg);
-                gst_object_unref(bus);
-            }
+        if (released) {
+            // Transition to NULL joins the streaming thread.  nvarguscamerasrc
+            // hardware teardown can be briefly async, so wait for confirmation
+            // before releasing pads or unreffing elements.
+            GstStateChangeReturn sc = gst_element_set_state(pipe, GST_STATE_NULL);
+            if (sc == GST_STATE_CHANGE_ASYNC)
+                gst_element_get_state(pipe, nullptr, nullptr,
+                                      params_.stateChangeTimeoutMs * GST_MSECOND);
         }
-
-        // Transition to NULL joins the streaming thread.  nvarguscamerasrc
-        // hardware teardown can be briefly async, so wait for confirmation
-        // before releasing pads or unreffing elements.
-        GstStateChangeReturn sc = gst_element_set_state(pipe, GST_STATE_NULL);
-        if (sc == GST_STATE_CHANGE_ASYNC)
-            gst_element_get_state(pipe, nullptr, nullptr,
-                                  params_.stateChangeTimeoutMs * GST_MSECOND);
     }
     if (sinkRef) gst_object_unref(sinkRef);
 
@@ -148,8 +175,10 @@ void Camera_GST::teardownPipeline() {
         appsink_       = nullptr;
     }
 
+    // A pipeline left behind still streams into these pads: only drop our refs;
+    // the tee releases them when that pipeline is finalised.
     for (GstPad* pad : teePads_) {
-        if (tee_) gst_element_release_request_pad(tee_, pad);
+        if (tee_ && released) gst_element_release_request_pad(tee_, pad);
         gst_object_unref(pad);
     }
     teePads_.clear();
@@ -158,7 +187,7 @@ void Camera_GST::teardownPipeline() {
     // (e.g., addBranch() then close() without start(), or a failed early start()).
     // Bins that were gst_bin_add_many()'d have the pipeline as their parent and
     // will be freed by gst_object_unref(pipe) below; check parent to distinguish.
-    for (auto& br : branches_) {
+    for (auto& br : branches) {
         if (br.bin) {
             GstObject* parent = gst_object_get_parent(GST_OBJECT(br.bin));
             if (parent) {
@@ -169,8 +198,6 @@ void Camera_GST::teardownPipeline() {
             }
         }
     }
-    branches_.clear();
-    branchValves_.clear();
 
     // Null the element handles under the lock (consistent with appsink_ above),
     // then unref outside it.  Other threads read these pointers only under
@@ -178,20 +205,134 @@ void Camera_GST::teardownPipeline() {
     GstElement* teeToUnref   = nullptr;
     GstElement* srcToUnref   = nullptr;
     GstElement* valveToUnref = nullptr;
-    GstStructure* controlsToFree = nullptr;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         teeToUnref   = tee_;        tee_        = nullptr;
         srcToUnref   = camera_src_; camera_src_ = nullptr;
         valveToUnref = capValve_;   capValve_   = nullptr;
-        controlsToFree = extraControls_; extraControls_ = nullptr;
     }
-    if (controlsToFree) gst_structure_free(controlsToFree);
     if (teeToUnref)     gst_object_unref(teeToUnref);
     if (srcToUnref)     gst_object_unref(srcToUnref);
     if (valveToUnref)   gst_object_unref(valveToUnref);
     if (appsinkToUnref) gst_object_unref(appsinkToUnref);
     if (pipe)           gst_object_unref(pipe);
+}
+
+/// Sends EOS to a PLAYING pipeline and waits, up to params_.eosTimeoutMs, for
+/// the pipeline's EOS (or the error that replaces it), so muxers finalise their
+/// containers.  Bounded in every case:
+///
+/// - The EOS goes out on its own thread.  gst_element_send_event() does not
+///   return until each source's streaming thread lets go of its pad, and that
+///   thread may be stuck in a push: a branch that stopped taking buffers fills
+///   its blocking queue, and the tee then waits on it for good.  The send also
+///   holds the pipeline's state lock, so the NULL transition cannot run either.
+/// - If the send is still stuck at the deadline, each branch is flushed from
+///   its head (FLUSH_START on the pad after its valve, which a dropping valve
+///   would not pass on).  That unblocks a GStreamer wait anywhere downstream: a
+///   sink, a queue, a clock.  The tee's push then fails, the source's thread
+///   lets go, and the send completes.  Healthy branches get the EOS that late,
+///   with no time left to finalise: their frames had stopped with the tee.
+/// - If even that does not free it within params_.stateChangeTimeoutMs, the
+///   source's thread is stuck where no flush reaches (a driver call).  The
+///   pipeline is left to the EOS thread, which sets it to NULL and drops its
+///   ref once the send returns; returns false, and the caller must not touch
+///   the pipeline again.
+///
+/// Meanwhile the capture appsink is drained, as teardown always did: the
+/// captureFrame() consumer has stopped, and an appsink left at wait-on-eos=true
+/// holds its EOS until its queue is pulled.  The wait also ends on an ERROR:
+/// nvarguscamerasrc sometimes posts one (Argus CANCELLED) instead of
+/// forwarding EOS, and draining first would burn the budget before seeing it.
+bool Camera_GST::finishStream(GstElement* pipe, GstElement* sinkRef,
+                              const std::map<std::string, GstElement*>& valves) {
+    auto send = std::make_shared<EosSend>();
+    std::thread sender;
+    try {
+        GstElement* senderPipe = static_cast<GstElement*>(gst_object_ref(pipe));
+        sender = std::thread([send, senderPipe] {
+            gst_element_send_event(senderPipe, gst_event_new_eos());
+            bool abandoned;
+            {
+                std::lock_guard<std::mutex> lk(send->m);
+                send->done = true;
+                abandoned  = send->abandoned;
+            }
+            send->cv.notify_all();
+            if (abandoned) gst_element_set_state(senderPipe, GST_STATE_NULL);
+            gst_object_unref(senderPipe);
+        });
+    } catch (const std::system_error& e) {
+        gst_object_unref(pipe);   // the ref the thread would have dropped
+        logPrintf(log_, dashcam::log::LogLevel::ERROR,
+              "cannot start the EOS thread for %s (%s): stopping without EOS",
+              info_.address.c_str(), e.what());
+        return true;
+    }
+
+    // The EOS window stays generous on purpose: with a ±30 s recording
+    // pre-buffer, matroskamux can need >1.5 s to flush on a CPU-encoder path.
+    // Every iteration waits <= 50 ms or pulls a sample (finite after EOS).
+    GstBus* bus = gst_element_get_bus(pipe);
+    const gint64 deadline = g_get_monotonic_time()
+        + static_cast<gint64>(params_.eosTimeoutMs) * G_TIME_SPAN_MILLISECOND;
+    const GstMessageType eosMask = static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+    bool ended = false, sawEos = false;
+    while (bus && !ended && !eosSeen_ && g_get_monotonic_time() < deadline) {
+        const bool sinkDone = !sinkRef || gst_app_sink_is_eos(GST_APP_SINK(sinkRef));
+        if (!sinkDone) {
+            GstSample* s = gst_app_sink_try_pull_sample(GST_APP_SINK(sinkRef), 25 * GST_MSECOND);
+            if (s) gst_sample_unref(s);
+        }
+        // Block on the bus only once the appsink is fully drained; until then
+        // just poll so the drain keeps making progress.
+        GstMessage* msg = gst_bus_timed_pop_filtered(bus, sinkDone ? 50 * GST_MSECOND : 0, eosMask);
+        if (msg) {
+            ended  = true;
+            sawEos = GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS;
+            gst_message_unref(msg);
+        }
+    }
+    if (bus) gst_object_unref(bus);
+
+    auto sent = [&] { return send->done; };
+    std::unique_lock<std::mutex> lk(send->m);
+    // The EOS reached every sink, so the send is returning: its message can
+    // beat that by a moment.
+    if (sawEos || eosSeen_)
+        send->cv.wait_for(lk, std::chrono::milliseconds(params_.stateChangeTimeoutMs), sent);
+    if (!sent()) {
+        lk.unlock();
+        logPrintf(log_, dashcam::log::LogLevel::WARN,
+              "EOS not delivered on %s within %u ms: a branch has stopped taking frames; "
+              "flushing the branches (their files are not finalised)",
+              info_.address.c_str(), params_.eosTimeoutMs);
+        for (const auto& [name, valve] : valves) {
+            GstPad* valveSrc = gst_element_get_static_pad(valve, "src");
+            GstPad* head = valveSrc ? gst_pad_get_peer(valveSrc) : nullptr;
+            if (head) {
+                gst_pad_send_event(head, gst_event_new_flush_start());
+                gst_object_unref(head);
+            }
+            if (valveSrc) gst_object_unref(valveSrc);
+        }
+        lk.lock();
+        send->cv.wait_for(lk, std::chrono::milliseconds(params_.stateChangeTimeoutMs), sent);
+    }
+    const bool freed = sent();
+    if (!freed) send->abandoned = true;
+    lk.unlock();
+
+    if (freed) {
+        sender.join();
+        return true;
+    }
+    sender.detach();
+    logPrintf(log_, dashcam::log::LogLevel::ERROR,
+          "pipeline on %s is stuck: EOS could not be sent within %u ms of flushing; "
+          "left behind, released when its streaming thread frees",
+          info_.address.c_str(), params_.stateChangeTimeoutMs);
+    return false;
 }
 
 void Camera_GST::setPipelineError() {
@@ -208,8 +349,11 @@ void Camera_GST::setPipelineError() {
 }
 
 void Camera_GST::logFirstBusError(GstElement* pipe, const char* what) {
+    // A bin wakes the state-change wait with FAILURE first and forwards the
+    // ERROR to the bus after: wait a moment for it rather than lose the reason.
     GstBus* bus = pipe ? gst_element_get_bus(pipe) : nullptr;
-    GstMessage* msg = bus ? gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR) : nullptr;
+    GstMessage* msg = bus ? gst_bus_timed_pop_filtered(bus, 250 * GST_MSECOND, GST_MESSAGE_ERROR)
+                          : nullptr;
     if (msg) {
         logPrintf(log_, dashcam::log::LogLevel::ERROR, "%s on %s: %s", what,
               info_.address.c_str(), describeMessage(msg).c_str());
@@ -223,25 +367,27 @@ void Camera_GST::logFirstBusError(GstElement* pipe, const char* what) {
 
 void Camera_GST::checkBusErrors() {
     // Take a ref on the pipeline under the lock so a concurrent teardown can't
-    // free it while we poll its bus.
+    // free it while we poll its bus.  Not while start() is still building: its
+    // own state-change waits report a failure, and find the error on the bus.
     GstElement* pipeRef = nullptr;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        if (status_.status != CAMERA_STATUS::RUNNING || !pipeline_) return;
+        if (status_.status != CAMERA_STATUS::RUNNING || !pipeline_ || starting_) return;
         pipeRef = static_cast<GstElement*>(gst_object_ref(pipeline_));
     }
 
     GstBus* bus = gst_element_get_bus(pipeRef);
     bool sawError = false;
+    bool sawEos   = false;
     if (bus) {
-        // Drain every message except EOS (which teardownPipeline() waits for) so
-        // the bus queue can't grow unbounded over a long capture.  Report the
-        // first error, and warnings (a branch complaining before it fails) up to
-        // a cap per run, so a chatty element cannot flood the log.
-        const GstMessageType drainMask =
-            static_cast<GstMessageType>(GST_MESSAGE_ANY & ~GST_MESSAGE_EOS);
+        // Drain every message so the bus queue can't grow unbounded over a long
+        // capture.  Report the first error, and warnings (a branch complaining
+        // before it fails) up to a cap per run, so a chatty element cannot
+        // flood the log.  EOS is kept as eosSeen_: a live camera's stream only
+        // ends when its source gives up, and teardown must not wait for a
+        // second one.
         GstMessage* msg;
-        while ((msg = gst_bus_pop_filtered(bus, drainMask)) != nullptr) {
+        while ((msg = gst_bus_pop(bus)) != nullptr) {
             if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR && !sawError) {
                 logPrintf(log_, dashcam::log::LogLevel::ERROR, "pipeline bus error on %s: %s",
                       info_.address.c_str(), describeMessage(msg).c_str());
@@ -252,6 +398,9 @@ void Camera_GST::checkBusErrors() {
                     logPrintf(log_, dashcam::log::LogLevel::WARN, "pipeline warning on %s: %s%s",
                           info_.address.c_str(), describeMessage(msg).c_str(),
                           seen == kMaxWarningsLogged ? " (further warnings not logged)" : "");
+            } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
+                sawEos   = true;
+                eosSeen_ = true;
             }
             gst_message_unref(msg);
         }
@@ -259,15 +408,23 @@ void Camera_GST::checkBusErrors() {
     }
     gst_object_unref(pipeRef);
 
-    if (sawError) {
+    if (sawError || sawEos) {
         // Flip to ERROR; the app observes this via getCameraStatus() and calls
         // close() to release the pipeline.  Leave teardown to that path so we
         // don't tear down a pipeline captureFrame() may still be reffing.
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        if (status_.status == CAMERA_STATUS::RUNNING) {
-            status_.status       = CAMERA_STATUS::ERROR;
-            status_.currentError = pipelineError();
+        bool ended = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            if (status_.status == CAMERA_STATUS::RUNNING) {
+                status_.status       = CAMERA_STATUS::ERROR;
+                status_.currentError = pipelineError();
+                ended = !sawError;
+            }
         }
+        if (ended)
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
+                  "pipeline on %s reached end of stream: the source stopped delivering frames",
+                  info_.address.c_str());
     }
 }
 
@@ -281,11 +438,40 @@ void Camera_GST::applyAttributeGStreamer(const std::string& name,
     bool ok = false;
     if (entry && entry->valueType == AttributeValueType::V4l2Control) {
         int iv = 0;
-        ok = safeStoi(value, iv) && setExtraControl(camera_src_, extraControls_, entry->gstProperty, iv);
+        ok = !entry->gstProperty.empty() && safeStoi(value, iv) && hasExtraControls(camera_src_);
+        if (ok && controlBatch_) {
+            // A flush: every control goes to the element in one write, below.
+            gst_structure_set(controlBatch_, entry->gstProperty.c_str(), G_TYPE_INT, iv, NULL);
+        } else if (ok) {
+            // Running: this control alone.  v4l2src applies the whole structure
+            // it is given, so re-sending earlier controls would undo whatever
+            // changed them since (another process, the exposure loop).
+            GstStructure* one = gst_structure_new("controls", entry->gstProperty.c_str(),
+                                                  G_TYPE_INT, iv, NULL);
+            ok = writeExtraControls(camera_src_, one);
+            gst_structure_free(one);
+        }
     } else if (entry) {
         ok = applyGstProperty(camera_src_, *entry, value);
     }
     status_.currentError = ok ? ERROR_CODE::NONE : ERROR_CODE::INVALID_ATTRIBUTE;
+}
+
+// V4L2 controls collect in controlBatch_ and go to v4l2src in one write, auto
+// controls first (writeExtraControls()): pendingAttributes_ is sorted by alias,
+// so "exposure" would otherwise come before "exposure_auto".
+void Camera_GST::flushPendingAttributes(std::vector<std::string>& rejected) {
+    controlBatch_ = gst_structure_new_empty("controls");
+    for (const auto& [attrName, attrValue] : pendingAttributes_) {
+        applyAttributeGStreamer(attrName, attrValue);
+        if (status_.currentError == ERROR_CODE::INVALID_ATTRIBUTE)
+            rejected.push_back(attrName + "=" + attrValue);
+    }
+    if (gst_structure_n_fields(controlBatch_) > 0)
+        writeExtraControls(camera_src_, controlBatch_);
+    gst_structure_free(controlBatch_);
+    controlBatch_ = nullptr;
+    pendingAttributes_.clear();
 }
 
 // ─── static utilities ────────────────────────────────────────────────────────
@@ -382,7 +568,7 @@ bool Camera_GST::applyGstProperty(GstElement* src,
             break;
         }
 
-        case AttributeValueType::V4l2Control:   // not a property: setExtraControl()
+        case AttributeValueType::V4l2Control:   // not a property: writeExtraControls()
             return false;
     }
 
@@ -399,13 +585,19 @@ bool Camera_GST::applyGstProperty(GstElement* src,
     return ok;
 }
 
-bool Camera_GST::setExtraControl(GstElement* src, GstStructure*& controls,
-                                 const std::string& name, int value) {
-    GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "extra-controls");
-    if (!pspec || pspec->value_type != GST_TYPE_STRUCTURE || name.empty()) return false;
-    if (!controls) controls = gst_structure_new_empty("controls");
-    gst_structure_set(controls, name.c_str(), G_TYPE_INT, value, NULL);
-    g_object_set(G_OBJECT(src), "extra-controls", controls, NULL);
+bool Camera_GST::writeExtraControls(GstElement* src, const GstStructure* controls) {
+    if (!src || !controls || !hasExtraControls(src)) return false;
+    GstStructure* ordered = gst_structure_new_empty(gst_structure_get_name(controls));
+    for (const char* name : kAutoControls)
+        if (const GValue* v = gst_structure_get_value(controls, name))
+            gst_structure_set_value(ordered, name, v);
+    for (gint i = 0; i < gst_structure_n_fields(controls); ++i) {
+        const char* name = gst_structure_nth_field_name(controls, static_cast<guint>(i));
+        if (!gst_structure_has_field(ordered, name))
+            gst_structure_set_value(ordered, name, gst_structure_get_value(controls, name));
+    }
+    g_object_set(G_OBJECT(src), "extra-controls", ordered, NULL);
+    gst_structure_free(ordered);
     return true;
 }
 
@@ -494,7 +686,10 @@ void Camera_GST::open() {
 void Camera_GST::close() {
     bool requiresStop = false;
     {
-        std::lock_guard<std::mutex> lock(stateMutex_);
+        std::unique_lock<std::mutex> lock(stateMutex_);
+        // As in stop(): never tear down a pipeline start() is still building.
+        // The status alone does not say so: it can read ERROR by then.
+        startCv_.wait(lock, [this] { return !starting_; });
         if (status_.status == CAMERA_STATUS::CLOSED) {
             status_.currentError = ERROR_CODE::CAMERA_ALREADY_CLOSED;
             return;
@@ -528,11 +723,12 @@ void Camera_GST::getCameraInfo(cameraInfo& info) const { info = info_; }
 
 void Camera_GST::setCameraAttribute(const std::string& name, const std::string& value) {
     std::lock_guard<std::mutex> lock(stateMutex_);
-    if (status_.status != CAMERA_STATUS::RUNNING || !camera_src_) {
-        // Queue in three cases: not yet started; start() is mid-construction
-        // (RUNNING claimed before camera_src_ is set); or ERROR state recovery.
-        // The late-attributes drain at the end of start() flushes these once
-        // camera_src_ is valid.
+    if (status_.status != CAMERA_STATUS::RUNNING || !camera_src_ || starting_) {
+        // Queue in three cases: not yet started; start() still building (the
+        // source element exists before PLAYING, but v4l2src may be walking its
+        // extra-controls as it opens the device, and freeing them under it);
+        // or ERROR state recovery.  The late-attributes drain at the end of
+        // start() flushes what start() has not.
         pendingAttributes_[name] = value;
         // Preserve the causal error code in ERROR state: overwriting it with
         // NONE would leave status polling showing status=ERROR, error=NONE,
@@ -588,6 +784,7 @@ void Camera_GST::start() {
         }
         formatIndex = status_.currentFormatIndex;
         status_.status = CAMERA_STATUS::RUNNING;  // Optimistic claim; Phase 2 proceeds, or setPipelineError() reverts.
+        status_.frameCount = 0;                   // "since start()"
         starting_ = true;  // Cleared (with startCv_ notify) on every exit path:
                            // setPipelineError() for failures, end of start() on success.
         // Clear any stale error (e.g. a prior out-of-range setCameraVideoFormat)
@@ -613,7 +810,8 @@ void Camera_GST::start() {
     // instead of being assigned bare while another thread reads them under the lock.
     // pipeline_ is published first so setPipelineError() → teardownPipeline() can
     // release it (and any orphaned branch bins) on every failure path below.
-    warningsSeen_ = 0;   // only this thread touches it until the pipeline runs
+    warningsSeen_ = 0;   // only this thread touches these until the pipeline runs
+    eosSeen_      = false;
     GError* error = nullptr;
     GstElement* pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
     if (error != nullptr || pipeline == nullptr) {
@@ -646,6 +844,12 @@ void Camera_GST::start() {
         setPipelineError();   // tears down the published pipeline_ and orphan branches
         return;
     }
+
+    // The capture appsink's EOS must not wait for the application to pull its
+    // last sample (the default): with nobody pulling, a stream that ends would
+    // never post EOS, and the camera would keep reporting RUNNING.
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(appsink), "wait-on-eos"))
+        g_object_set(appsink, "wait-on-eos", FALSE, NULL);
 
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -708,17 +912,22 @@ void Camera_GST::start() {
         // A dropping valve must still pass EOS (sticky), otherwise a branch that
         // is disabled at stop() time never delivers EOS to its sink — the muxer
         // never finalises its file and teardownPipeline() waits out the full EOS
-        // timeout: forward-sticky-events (1).  A branch that starts DISABLED
-        // needs more: its sink would never see a buffer, never preroll, and the
-        // pipeline would never reach PLAYING (start() timed out, measured
-        // 2026-09-28) — so it turns dropped buffers into GAP events
-        // (transform-to-gap, 2), on which sinks preroll; EOS passes too.
-        // drop-mode is only changeable in NULL/READY, so it is set here.
-        g_object_set(G_OBJECT(valve), "drop-mode",
-                     branchInitEnabled ? 1 /* forward-sticky-events */ : 2 /* transform-to-gap */,
-                     NULL);
-        if (!branchInitEnabled)
+        // timeout: forward-sticky-events (1).  drop-mode is only changeable in
+        // NULL/READY, so it is set here.
+        //
+        // A branch that starts DISABLED never gets a buffer before PLAYING, so
+        // its sinks could not preroll and start() would time out (measured
+        // 2026-09-28).  Its sinks are made async=false: they then do not take
+        // part in the preroll at all, and render from their first buffer once
+        // the branch is enabled.  (Turning the dropped buffers into GAP events
+        // instead, drop-mode 2, prerolls a bare sink only: videorate swallows
+        // GAPs, so the inference bins still timed out, and x264enc queues one
+        // per frame until its next buffer, without bound.)
+        g_object_set(G_OBJECT(valve), "drop-mode", 1 /* forward-sticky-events */, NULL);
+        if (!branchInitEnabled) {
             g_object_set(G_OBJECT(valve), "drop", TRUE, NULL);
+            unsetSinksAsync(branchBin);
+        }
 
         gst_bin_add_many(GST_BIN(pipeline_), queue, valve, branchBin, nullptr);
 
@@ -811,14 +1020,6 @@ void Camera_GST::start() {
     // A rejected one (a config typo, a value the element does not take) is
     // logged once the lock is released.
     std::vector<std::string> rejected;
-    auto flushPending = [&](std::map<std::string, std::string>& pending) {
-        for (const auto& [attrName, attrValue] : pending) {
-            applyAttributeGStreamer(attrName, attrValue);
-            if (status_.currentError == ERROR_CODE::INVALID_ATTRIBUTE)
-                rejected.push_back(attrName + "=" + attrValue);
-        }
-        pending.clear();
-    };
     auto logRejected = [&]() {
         for (const auto& r : rejected)
             logPrintf(log_, dashcam::log::LogLevel::WARN,
@@ -828,7 +1029,7 @@ void Camera_GST::start() {
     };
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        flushPending(pendingAttributes_);
+        flushPendingAttributes(rejected);
     }
     logRejected();
 
@@ -843,9 +1044,8 @@ void Camera_GST::start() {
     if (ret == GST_STATE_CHANGE_ASYNC) {
         // Block until Argus/V4L2 hardware fully initialises (up to 5 s).
         // status_ is RUNNING at this point (claimed optimistically above).
-        // With the camera_src_ null-guard in setCameraAttribute(), any concurrent
-        // attribute writes during this window are safely queued into
-        // pendingAttributes_ and drained by the late-attributes flush below.
+        // setCameraAttribute() queues while starting_, so attribute writes
+        // during this window wait for the late-attributes flush below.
         GstState state, pending;
         ret = gst_element_get_state(pipeline_, &state, &pending,
                                     params_.stateChangeTimeoutMs * GST_MSECOND);
@@ -870,7 +1070,7 @@ void Camera_GST::start() {
     // RUNNING (claimed at the top of start() to serialise concurrent callers).
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        flushPending(pendingAttributes_);
+        flushPendingAttributes(rejected);
         starting_ = false;  // construction phase over (success); unblock stop()
     }
     startCv_.notify_all();

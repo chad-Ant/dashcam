@@ -463,7 +463,15 @@ static bool test_attribute_dictionary() {
     const AttributeEntry* csiSat = dict.resolve("saturation", "CSI");
     const AttributeEntry* usbSat = dict.resolve("saturation", "USB");
     check(csiSat && csiSat->valueType == AttributeValueType::Float, "saturation/CSI -> float");
-    check(usbSat && usbSat->valueType == AttributeValueType::Int,   "saturation/USB -> int");
+    check(usbSat && usbSat->gstProperty == "saturation" &&
+          usbSat->valueType == AttributeValueType::V4l2Control,
+          "saturation/USB -> the saturation V4L2 control (v4l2src drops its property while closed)");
+    const AttributeEntry* csiAwb = dict.resolve("white balance, automatic", "CSI");
+    const AttributeEntry* usbAwb = dict.resolve("white balance, automatic", "USB");
+    check(csiAwb && csiAwb->gstProperty == "awblock" && usbAwb &&
+          usbAwb->gstProperty == "white_balance_automatic" &&
+          usbAwb->valueType == AttributeValueType::V4l2Control,
+          "white balance, automatic -> awblock on CSI, the white_balance_automatic control on USB");
 
     check(dict.resolve("EXPOSURE", "CSI") == csiExp,               "resolve is case-insensitive");
     check(dict.resolve("Exposure Time, Absolute", "CSI") == csiExp, "multi-word alias with spaces/commas");

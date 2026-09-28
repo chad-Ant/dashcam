@@ -11,11 +11,16 @@
 // config/camera_attributes.xml against the real element),
 // start failures and runtime bus errors (with the element and GStreamer's
 // detail in the log), and the USB / CSI pipeline strings.
+// Shutdown stays bounded when a branch stops consuming or the source's thread
+// is stuck; a stream that ends is reported; branches that start disabled
+// (videorate, x264enc) still let start() reach PLAYING.
+//
+// A watchdog fails the run (exit 2) if one test hangs, naming it.
 //
 // Needs only GStreamer core + base plugins (videotestsrc, videoconvert).
 // Runs anywhere: cloud sandbox, dev container, Jetson.
 //
-// Usage: camera_gst_test
+// Usage: camera_gst_test [part of a test name]   (all tests without one)
 
 #include "libcamera_csi.h"
 #include "libcamera_gst.h"
@@ -23,12 +28,15 @@
 
 #include <linux/videodev2.h>
 
+#include <csignal>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,6 +50,32 @@ static void check(bool ok, const std::string& what) {
     std::printf("  %s  %s\n", ok ? "ok  " : "FAIL", what.c_str());
     if (!ok) ++g_fails;
 }
+
+// ─── watchdog ────────────────────────────────────────────────────────────────
+
+static std::atomic<const char*> g_stage{"startup"};
+
+static void onWatchdog(int) {
+    const char* s = g_stage.load();
+    const char a[] = "\n  FAIL  watchdog: hung in \"";
+    const char b[] = "\"\nRESULT: FAIL (hang)\n";
+    ssize_t r = ::write(1, a, sizeof(a) - 1);
+    r = ::write(1, s, std::strlen(s));
+    r = ::write(1, b, sizeof(b) - 1);
+    (void)r;
+    _exit(2);
+}
+
+/// Names the running test for the watchdog and gives it @p budgetSec.
+static void stage(const char* name, unsigned budgetSec) {
+    g_stage = name;
+    ::alarm(budgetSec);
+}
+
+static double secondsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+static std::string secs(double s) { return std::to_string(s).substr(0, 4) + " s"; }
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -65,6 +99,10 @@ struct LogSink {
         std::lock_guard<std::mutex> lk(m);
         lines.clear();
     }
+    void dump() {
+        std::lock_guard<std::mutex> lk(m);
+        for (const auto& l : lines) std::printf("        | %s\n", l.c_str());
+    }
 };
 
 constexpr uint32_t kW = 321;   // odd: the BGR row stride is padded to 964, not 963
@@ -80,17 +118,34 @@ static cameraInfo testInfo() {
 }
 
 /// Camera_GST over videotestsrc.  @c description replaces the whole pipeline
-/// (start-failure tests); otherwise the source is followed by the drivers'
-/// own captureBranch().
+/// (start-failure tests); otherwise the source (plus @c sourceOptions) is
+/// followed by the drivers' own captureBranch().
 class TestCamera : public Camera_GST {
 public:
     explicit TestCamera(const cameraInfo& ci = testInfo()) : Camera_GST(ci) {}
     ~TestCamera() override = default;
 
     using Camera_GST::applyGstProperty;
-    using Camera_GST::setExtraControl;
+    using Camera_GST::writeExtraControls;
 
     std::string description;
+    std::string sourceOptions;   ///< e.g. "num-buffers=10"
+
+    /// Attribute writes that reached the element from a thread other than
+    /// @c startThread while start() was still building the pipeline.
+    std::atomic<int> directWhileStarting{0};
+    std::thread::id  startThread;
+
+    /// A ref on the running pipeline (or nullptr); the caller unrefs it.
+    GstElement* pipelineRef() {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        return pipeline_ ? static_cast<GstElement*>(gst_object_ref(pipeline_)) : nullptr;
+    }
+    /// The source element's src pad (ref), for probes.
+    GstPad* sourcePad() {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        return camera_src_ ? gst_element_get_static_pad(camera_src_, "src") : nullptr;
+    }
 
     CAMERA_STATUS state() const {
         cameraStatus s;
@@ -134,10 +189,15 @@ public:
 protected:
     ERROR_CODE pipelineError() const override { return ERROR_CODE::USB_PIPELINE_ERROR; }
     const char* cameraTypeTag() const override { return "USB"; }
+    void applyAttributeGStreamer(const std::string& name, const std::string& value) override {
+        // Runs with stateMutex_ held, so starting_ is read consistently.
+        if (starting_ && std::this_thread::get_id() != startThread) ++directWhileStarting;
+        Camera_GST::applyAttributeGStreamer(name, value);
+    }
     std::string buildPipelineString(const cameraVideoFormat& fmt,
                                     uint32_t frNum, uint32_t frDen) const override {
         if (!description.empty()) return description;
-        return "videotestsrc name=camerasrc is-live=true"
+        return "videotestsrc name=camerasrc is-live=true " + sourceOptions +
                " ! video/x-raw, format=(string)I420, width=" + std::to_string(fmt.width) +
                ", height=" + std::to_string(fmt.height) +
                ", framerate=" + std::to_string(frNum) + "/" + std::to_string(frDen) +
@@ -250,6 +310,8 @@ static void testLifecycleAndCapture() {
     cam.start();
     check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == frameBytes,
           "restart after stop() captures again");
+    check(cam.frames() == 1, "frameCount starts again from 0 at start() (" +
+                             std::to_string(cam.frames()) + " after one frame)");
     cam.close();
     check(cam.state() == CAMERA_STATUS::CLOSED, "close() while running -> CLOSED");
     cam.close();
@@ -271,8 +333,9 @@ static void testCaptureValve() {
 
     cam.setCaptureEnabled(false);
     check(cam.error() == ERROR_CODE::NONE, "setCaptureEnabled(false) accepted");
-    // Frames already queued past the valve may still arrive; after those, none.
-    pull(cam, buf, 3);
+    // Frames already past the valve may still arrive (a starved streaming
+    // thread can leave more than one): drain until a pull times out.
+    for (int i = 0; i < 20 && pull(cam, buf, 1) != 0; ++i) {}
     uint32_t written = 1;
     cam.captureFrame(buf.data(), static_cast<uint32_t>(buf.size()), written);
     check(written == 0, "no frames while capture is disabled");
@@ -411,6 +474,21 @@ static void testAttributes() {
     cam2.close();
 }
 
+/// The field names of @p s, in order, space separated.
+static std::string fieldOrder(const GstStructure* s) {
+    std::string out;
+    for (gint i = 0; s && i < gst_structure_n_fields(s); ++i)
+        out += std::string(out.empty() ? "" : " ") + gst_structure_nth_field_name(s, static_cast<guint>(i));
+    return out;
+}
+
+/// The "extra-controls" structure currently on @p el (caller frees).
+static GstStructure* extraControlsOf(GstElement* el) {
+    GstStructure* set = nullptr;
+    g_object_get(el, "extra-controls", &set, nullptr);
+    return set;
+}
+
 static void testExtraControls() {
     std::printf("\n--- V4L2 controls through v4l2src extra-controls ---\n");
     gst_init(nullptr, nullptr);
@@ -420,27 +498,108 @@ static void testExtraControls() {
         return;
     }
     gst_object_ref_sink(v4l2);
-    GstStructure* controls = nullptr;
-    const bool a = TestCamera::setExtraControl(v4l2, controls, "gain", 10);
-    const bool b = TestCamera::setExtraControl(v4l2, controls, "white_balance_temperature", 4600);
-    const bool c = TestCamera::setExtraControl(v4l2, controls, "gain", 12);   // replaces, keeps the other
-    GstStructure* set = nullptr;
-    g_object_get(v4l2, "extra-controls", &set, nullptr);
-    gint gain = -1, wb = -1;
-    const bool readBack = set && gst_structure_get_int(set, "gain", &gain) &&
-                          gst_structure_get_int(set, "white_balance_temperature", &wb);
-    check(a && b && c && readBack && gain == 12 && wb == 4600 && gst_structure_n_fields(set) == 2,
-          "controls accumulate in one structure on the element (gain=12, wb=4600)");
+
+    // In the order a std::map of aliases flushes them: manual values first.
+    GstStructure* in = gst_structure_new("controls",
+        "exposure_time_absolute", G_TYPE_INT, 150, "gain", G_TYPE_INT, 3,
+        "auto_exposure", G_TYPE_INT, 1, "white_balance_temperature", G_TYPE_INT, 4600,
+        "white_balance_automatic", G_TYPE_INT, 0, NULL);
+    check(TestCamera::writeExtraControls(v4l2, in), "a batch is written to v4l2src");
+    GstStructure* set = extraControlsOf(v4l2);
+    const std::string order = fieldOrder(set);
+    check(order == "auto_exposure white_balance_automatic exposure_time_absolute gain white_balance_temperature",
+          "auto controls first, the rest in their order (" + order + ")");
+    gint exp = -1;
+    check(set && gst_structure_get_int(set, "exposure_time_absolute", &exp) && exp == 150,
+          "values are kept (exposure_time_absolute=150)");
     if (set) gst_structure_free(set);
-    if (controls) gst_structure_free(controls);
+    gst_structure_free(in);
+
+    GstStructure* one = gst_structure_new("controls", "gain", G_TYPE_INT, 7, NULL);
+    TestCamera::writeExtraControls(v4l2, one);
+    gst_structure_free(one);
+    set = extraControlsOf(v4l2);
+    check(fieldOrder(set) == "gain",
+          "a later write carries only its own control (earlier ones are not re-sent)");
+    if (set) gst_structure_free(set);
     gst_object_unref(v4l2);
 
     GstElement* test = gst_element_factory_make("videotestsrc", nullptr);
     gst_object_ref_sink(test);
-    GstStructure* none = nullptr;
-    check(!TestCamera::setExtraControl(test, none, "gain", 1) && none == nullptr,
-          "an element without extra-controls is refused, nothing allocated");
+    GstStructure* any = gst_structure_new("controls", "gain", G_TYPE_INT, 1, NULL);
+    check(!TestCamera::writeExtraControls(test, any), "an element without extra-controls is refused");
+    gst_structure_free(any);
     gst_object_unref(test);
+}
+
+/// A camera whose source element is a standalone v4l2src: no device is
+/// needed, since v4l2src keeps extra-controls while closed.  Drives the real
+/// attribute paths: start()'s flush, and a write while running.
+struct V4l2ControlCamera : TestCamera {
+    GstElement* src = nullptr;
+    bool attach() {
+        src = gst_element_factory_make("v4l2src", nullptr);
+        if (!src) return false;
+        gst_object_ref_sink(src);
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        camera_src_ = static_cast<GstElement*>(gst_object_ref(src));
+        return true;
+    }
+    void flush() {   // as start() does, before PLAYING
+        std::vector<std::string> rejected;
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        flushPendingAttributes(rejected);
+    }
+    void pretendRunning(bool running) {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        status_.status = running ? CAMERA_STATUS::RUNNING : CAMERA_STATUS::OPEN;
+    }
+    std::string controlsOnElement() {
+        GstStructure* set = extraControlsOf(src);
+        const std::string order = fieldOrder(set);
+        if (set) gst_structure_free(set);
+        return order;
+    }
+    ~V4l2ControlCamera() override {
+        {
+            std::lock_guard<std::mutex> lk(stateMutex_);
+            if (camera_src_) gst_object_unref(camera_src_);
+            camera_src_ = nullptr;
+            status_.status = CAMERA_STATUS::OPEN;
+        }
+        if (src) gst_object_unref(src);
+    }
+};
+
+static bool loadRepoDictionary(AttributeDictionary& dict);
+
+static void testControlFlushOrder() {
+    std::printf("\n--- V4L2 controls: start()'s flush and writes while running ---\n");
+    gst_init(nullptr, nullptr);
+    AttributeDictionary dict;
+    V4l2ControlCamera cam;
+    if (!loadRepoDictionary(dict) || !cam.attach()) {
+        std::printf("  skip  no v4l2src, or no config/camera_attributes.xml\n");
+        return;
+    }
+    cam.setAttributeDictionary(dict);
+    cam.open();
+    // Queued before start(): the map sorts them "exposure", "exposure_auto", "gain".
+    cam.setCameraAttribute("exposure", "150");
+    cam.setCameraAttribute("exposure_auto", "1");
+    cam.setCameraAttribute("gain", "3");
+    cam.flush();
+    const std::string batch = cam.controlsOnElement();
+    check(batch == "auto_exposure exposure_time_absolute gain",
+          "start()'s flush writes one batch, auto_exposure first (" + batch + ")");
+
+    cam.pretendRunning(true);
+    cam.setCameraAttribute("brightness", "40");
+    const std::string one = cam.controlsOnElement();
+    check(cam.error() == ERROR_CODE::NONE && one == "brightness",
+          "a write while running sends only its own control (" + one + ")");
+    cam.pretendRunning(false);
+    cam.close();
 }
 
 /// config/camera_attributes.xml from the repo root, or the build's seeded copy.
@@ -630,6 +789,373 @@ static void testConcurrentCaptureAndStop() {
     cam.close();
 }
 
+// ─── shutdown, end of stream, disabled branches ──────────────────────────────
+
+/// A recording branch whose sink has stopped taking buffers: an appsink nobody
+/// pulls, with drop=false.  Its blocking queue fills, and the tee's push (the
+/// source's streaming thread) then waits on it for good.
+static GstElement* stuckBranch() {
+    GError* err = nullptr;
+    GstElement* bin = gst_parse_bin_from_description(
+        "appsink name=stuck max-buffers=1 drop=false sync=false emit-signals=false", TRUE, &err);
+    if (err) g_error_free(err);
+    return bin;
+}
+
+/// Pulls until captureFrame() times out: the tee no longer feeds capture.
+static bool waitForStall(TestCamera& cam, std::vector<uint8_t>& buf, double maxSec) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (secondsSince(t0) < maxSec) {
+        uint32_t w = 0;
+        cam.captureFrame(buf.data(), static_cast<uint32_t>(buf.size()), w);
+        if (w == 0) return true;
+    }
+    return false;
+}
+
+static void testStalledBranchShutdown() {
+    std::printf("\n--- shutdown with a branch that stopped consuming ---\n");
+    gst_init(nullptr, nullptr);
+    PipelineParams p = fastParams();
+    p.eosTimeoutMs = 250;
+    p.captureTimeoutMs = 300;
+    LogSink log;
+    TestCamera cam;
+    cam.setLogCallback(log.callback());
+    cam.setPipelineParams(p);
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+
+    cam.addBranch("rec", stuckBranch());   // blocking queue, as a recording branch
+    cam.start();
+    check(cam.state() == CAMERA_STATUS::RUNNING, "start() with the branch -> RUNNING");
+    check(waitForStall(cam, buf, 6.0), "the branch fills its queue and stalls the tee (capture times out)");
+    auto t0 = std::chrono::steady_clock::now();
+    cam.stop();
+    double sec = secondsSince(t0);
+    check(cam.state() == CAMERA_STATUS::OPEN && sec < 1.5,
+          "stop() returns within the 250 ms EOS budget plus the flush (" + secs(sec) + "; hung before)");
+    check(log.has("W EOS not delivered on videotestsrc within 250 ms"), "... and logs why");
+
+    cam.start();
+    check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(),
+          "the camera starts and captures again afterwards");
+    cam.stop();
+
+    // The same through close() from ERROR (the other teardown path).
+    cam.addBranch("rec", stuckBranch());
+    cam.start();
+    waitForStall(cam, buf, 6.0);
+    cam.failSource("simulated");
+    check(cam.state() == CAMERA_STATUS::ERROR, "an error while stalled -> ERROR");
+    t0 = std::chrono::steady_clock::now();
+    cam.close();
+    sec = secondsSince(t0);
+    check(cam.state() == CAMERA_STATUS::CLOSED && sec < 1.5, "close() from ERROR is bounded too (" + secs(sec) + ")");
+}
+
+/// Stands in for a driver whose streaming thread is stuck where no flush
+/// reaches it: a probe on the source pad that blocks until released.
+struct Wedge {
+    std::mutex m;
+    std::condition_variable cv;
+    bool wedge = false;
+    bool inside = false;
+};
+// Global: the probe stays on the old pipeline's pad until that pipeline is
+// freed, which may be after the test returns.
+static Wedge g_wedge;
+
+static GstPadProbeReturn wedgeProbe(GstPad*, GstPadProbeInfo*, gpointer data) {
+    auto* w = static_cast<Wedge*>(data);
+    std::unique_lock<std::mutex> lk(w->m);
+    if (w->wedge) {
+        w->inside = true;
+        w->cv.notify_all();
+        w->cv.wait(lk, [w] { return !w->wedge; });
+        w->inside = false;
+    }
+    return GST_PAD_PROBE_OK;
+}
+static std::atomic<bool> g_pipelineFinalized{false};
+static void onPipelineFinalized(gpointer, GObject*) { g_pipelineFinalized = true; }
+
+static void testWedgedSourceShutdown() {
+    std::printf("\n--- shutdown with the source's thread stuck ---\n");
+    PipelineParams p = fastParams();
+    p.eosTimeoutMs = 250;
+    p.stateChangeTimeoutMs = 600;
+    LogSink log;
+    TestCamera cam;
+    cam.setLogCallback(log.callback());
+    cam.setPipelineParams(p);
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    cam.start();
+    std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+    check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(), "running");
+
+    Wedge& w = g_wedge;
+    w.wedge = w.inside = false;
+    GstPad* pad = cam.sourcePad();
+    GstElement* pipe = cam.pipelineRef();
+    if (!pad || !pipe) {
+        check(false, "test setup: source pad and pipeline");
+        return;
+    }
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, wedgeProbe, &w, nullptr);
+    gst_object_unref(pad);
+    g_pipelineFinalized = false;
+    g_object_weak_ref(G_OBJECT(pipe), onPipelineFinalized, nullptr);
+    gst_object_unref(pipe);   // the weak ref watches; the camera keeps its own
+    {
+        std::unique_lock<std::mutex> lk(w.m);
+        w.wedge = true;
+        w.cv.wait_for(lk, std::chrono::seconds(3), [&] { return w.inside; });
+        check(w.inside, "the source's streaming thread is stuck in the probe");
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    cam.stop();
+    const double sec = secondsSince(t0);
+    check(cam.state() == CAMERA_STATUS::OPEN && sec < 1.6,
+          "stop() returns after the EOS budget and one state-change wait (" + secs(sec) + ")");
+    check(log.has("E pipeline on videotestsrc is stuck"), "... and says the pipeline was left behind");
+
+    cam.start();
+    check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(),
+          "a new pipeline starts while the old one is still stuck");
+    {
+        std::lock_guard<std::mutex> lk(w.m);
+        w.wedge = false;
+    }
+    w.cv.notify_all();
+    const auto t1 = std::chrono::steady_clock::now();
+    while (!g_pipelineFinalized && secondsSince(t1) < 5.0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(g_pipelineFinalized, "the stuck pipeline is released once its thread frees (" + secs(secondsSince(t1)) + ")");
+    cam.close();
+}
+
+static void testFiniteStream() {
+    std::printf("\n--- a stream that ends ---\n");
+    PipelineParams p = fastParams();
+    p.eosTimeoutMs = 3000;   // a teardown that waited for another EOS would show
+    for (const bool puller : {false, true}) {
+        const std::string how = puller ? " (with a puller)" : " (nobody pulling)";
+        LogSink log;
+        TestCamera cam;
+        cam.setLogCallback(log.callback());
+        cam.setPipelineParams(p);
+        cam.sourceOptions = "num-buffers=10";
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        cam.start();
+        check(cam.state() == CAMERA_STATUS::RUNNING, "10-frame source -> RUNNING" + how);
+        std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (cam.state() == CAMERA_STATUS::RUNNING && secondsSince(t0) < 3.0) {
+            if (puller) pull(cam, buf, 1);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        check(cam.state() == CAMERA_STATUS::ERROR && cam.error() == ERROR_CODE::USB_PIPELINE_ERROR,
+              "the end of the stream turns RUNNING into ERROR" + how);
+        check(log.has("E pipeline on videotestsrc reached end of stream"), "... and is logged" + how);
+        const auto t1 = std::chrono::steady_clock::now();
+        cam.close();
+        const double sec = secondsSince(t1);
+        check(cam.state() == CAMERA_STATUS::CLOSED && sec < 1.0,
+              "close() does not wait for another EOS (" + secs(sec) + ", budget 3 s)" + how);
+    }
+}
+
+static void onHandoffCount(GstElement*, GstBuffer*, GstPad*, gpointer counter) {
+    ++*static_cast<std::atomic<int>*>(counter);
+}
+static GstPadProbeReturn countGaps(GstPad*, GstPadProbeInfo* info, gpointer counter) {
+    if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info)) == GST_EVENT_GAP)
+        ++*static_cast<std::atomic<int>*>(counter);
+    return GST_PAD_PROBE_OK;
+}
+/// @p description ending in "fakesink name=out", counting its buffers and the
+/// GAP events that reach the branch.
+static GstElement* countedBranch(const std::string& description, std::atomic<int>* buffers,
+                                 std::atomic<int>* gaps) {
+    GError* err = nullptr;
+    GstElement* bin = gst_parse_bin_from_description(description.c_str(), TRUE, &err);
+    if (err) {
+        std::printf("  (branch \"%s\": %s)\n", description.c_str(), err->message);
+        g_error_free(err);
+    }
+    if (!bin) return nullptr;
+    GstElement* out = gst_bin_get_by_name(GST_BIN(bin), "out");
+    g_object_set(out, "signal-handoffs", TRUE, NULL);
+    g_signal_connect(out, "handoff", G_CALLBACK(onHandoffCount), buffers);
+    gst_object_unref(out);
+    GstPad* sink = gst_element_get_static_pad(bin, "sink");
+    gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, countGaps, gaps, nullptr);
+    gst_object_unref(sink);
+    return bin;
+}
+
+static void testDisabledProcessingBranches() {
+    std::printf("\n--- branches that start disabled (inference, RTP shapes) ---\n");
+    gst_init(nullptr, nullptr);
+    LogSink log;
+    TestCamera cam;
+    cam.setLogCallback(log.callback());
+    cam.setPipelineParams(fastParams());
+    std::atomic<int> laneBufs{0}, laneGaps{0}, rtpBufs{0}, rtpGaps{0};
+    // The lane / driver inference bins start with videorate drop-only=true.
+    cam.addBranch("lanes", countedBranch("videorate drop-only=true max-rate=5 ! fakesink name=out sync=false",
+                                         &laneBufs, &laneGaps), true, false);
+    GstElementFactory* x264 = gst_element_factory_find("x264enc");
+    if (x264) {
+        gst_object_unref(x264);
+        cam.addBranch("rtp", countedBranch("videoconvert ! videoscale ! video/x-raw, width=160, height=120"
+                                           " ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=5"
+                                           " ! fakesink name=out sync=false async=false",
+                                           &rtpBufs, &rtpGaps), false, false);
+    } else {
+        std::printf("  skip  x264enc branch: no x264enc here\n");
+    }
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    cam.start();
+    check(cam.state() == CAMERA_STATUS::RUNNING,
+          "start() reaches PLAYING with a disabled videorate branch (it timed out before)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    check(laneBufs == 0 && rtpBufs == 0, "disabled branches receive no buffers");
+    check(laneGaps == 0 && rtpGaps == 0, "... and no GAP events (x264enc queued one per frame, unbounded)");
+
+    cam.setBranchEnabled("lanes", true);
+    if (x264) cam.setBranchEnabled("rtp", true);
+    const auto t0 = std::chrono::steady_clock::now();
+    while ((laneBufs == 0 || (x264 && rtpBufs == 0)) && secondsSince(t0) < 3.0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(laneBufs > 0, "the videorate branch gets frames once enabled (" + std::to_string(laneBufs) + ")");
+    if (x264) check(rtpBufs > 0, "the x264enc branch encodes once enabled (" + std::to_string(rtpBufs) + ")");
+    const auto t1 = std::chrono::steady_clock::now();
+    cam.stop();
+    check(cam.state() == CAMERA_STATUS::OPEN && secondsSince(t1) < 1.5,
+          "stop() delivers EOS through them (" + secs(secondsSince(t1)) + ", budget 2 s)");
+    cam.close();
+}
+
+static void testAttributesDuringStart() {
+    std::printf("\n--- attributes and close() while start() is still building ---\n");
+    gst_init(nullptr, nullptr);
+    AttributeDictionary dict;
+    dict.entries.push_back({"pattern", "USB", AttributeValueType::Int, {"pattern"}});
+    PipelineParams p = fastParams();
+    p.eosTimeoutMs = 600;
+    for (int round = 0; round < 2; ++round) {
+        TestCamera cam;
+        cam.setAttributeDictionary(dict);
+        cam.setPipelineParams(p);
+        // A branch whose first buffer takes 300 ms keeps start() waiting for
+        // PLAYING that long, with the source element already in place.
+        GError* err = nullptr;
+        cam.addBranch("slow", gst_parse_bin_from_description(
+                                  "identity sleep-time=300000 ! fakesink sync=false", TRUE, &err), true);
+        if (err) g_error_free(err);
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        cam.startThread = std::this_thread::get_id();
+        std::atomic<bool> done{false};
+        std::thread writer([&] {
+            while (!done) cam.setCameraAttribute("pattern", "1");
+        });
+        std::thread closer;
+        if (round == 1)
+            closer = std::thread([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                cam.close();
+            });
+        cam.start();
+        done = true;
+        writer.join();
+        if (round == 0) {
+            check(cam.directWhileStarting == 0,
+                  "no attribute write reaches the element from another thread while start() runs (" +
+                  std::to_string(cam.directWhileStarting.load()) + ")");
+            check(cam.sourceInt("pattern") == 1, "... they are queued and applied when start() finishes");
+        } else {
+            closer.join();
+            check(cam.state() == CAMERA_STATUS::CLOSED, "close() during start() waits for it, then closes");
+        }
+        cam.close();
+    }
+}
+
+static void testPollsDuringFailingStart() {
+    std::printf("\n--- status polls and close() racing a start() that fails ---\n");
+    gst_init(nullptr, nullptr);
+    for (int round = 0; round < 3; ++round) {
+        LogSink log;
+        TestCamera cam;
+        cam.setLogCallback(log.callback());
+        cam.setPipelineParams(fastParams());
+        // Fails 200 ms into the wait for PLAYING, while another thread polls.
+        GError* err = nullptr;
+        cam.addBranch("bad", gst_parse_bin_from_description(
+                                 "identity sleep-time=200000 ! identity name=broken error-after=1"
+                                 " ! fakesink sync=false", TRUE, &err), true);
+        if (err) g_error_free(err);
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        std::atomic<bool> done{false};
+        std::thread poller([&] {
+            bool closed = false;
+            while (!done) {
+                cameraStatus st;
+                cam.getCameraStatus(st);
+                if (st.status == CAMERA_STATUS::ERROR && !closed) {   // what an app does
+                    cam.close();
+                    closed = true;
+                }
+            }
+        });
+        cam.start();
+        done = true;
+        poller.join();
+        const std::string r = "round " + std::to_string(round + 1) + ": ";
+        // Before PLAYING either way: while set_state() runs, or during its wait.
+        const bool reported = log.has("E pipeline failed while starting on videotestsrc: broken:") ||
+                              log.has("E pipeline refused to start on videotestsrc: broken:");
+        check(reported, r + "start() reports the element's error (polls leave it on the bus)");
+        check(!log.has("pipeline bus error"), r + "... and no poll reported it instead");
+        if (!reported) log.dump();
+        cam.close();
+        check(cam.state() == CAMERA_STATUS::CLOSED, r + "closed");
+    }
+}
+
+static void testBranchTogglesRacingStop() {
+    std::printf("\n--- setBranchEnabled() racing stop() ---\n");
+    gst_init(nullptr, nullptr);
+    TestCamera cam;
+    cam.setPipelineParams(fastParams());
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    for (int round = 0; round < 3; ++round) {
+        cam.addBranch("rec", countingBranch());
+        cam.start();
+        std::atomic<bool> run{true};
+        std::thread t([&] {
+            bool on = false;
+            while (run) cam.setBranchEnabled("rec", on = !on);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        cam.stop();
+        run = false;
+        t.join();
+        check(cam.state() == CAMERA_STATUS::OPEN, "round " + std::to_string(round + 1) + ": stop() under toggles");
+    }
+    cam.close();
+}
+
 static void testPipelineStrings() {
     std::printf("\n--- USB / CSI pipeline strings ---\n");
     cameraInfo usb;
@@ -665,19 +1191,44 @@ static void testPipelineStrings() {
           "CSI 1080p60 scaled to 720p20: the exact string");
 }
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // progress visible even if a test hangs
+    std::signal(SIGALRM, onWatchdog);
+    const std::string only = argc > 1 ? argv[1] : "";
     std::printf("camera_gst_test — Camera_GST over videotestsrc (no camera needed)\n");
-    testLifecycleAndCapture();
-    testCaptureValve();
-    testBranches();
-    testAttributes();
-    testExtraControls();
-    testRepoDictionary();
-    testStartFailures();
-    testRuntimeBusMessages();
-    testConcurrentCaptureAndStop();
-    testPipelineStrings();
+    struct Test { const char* name; unsigned budgetSec; void (*run)(); };
+    const Test tests[] = {
+        {"lifecycle and capture",      30, testLifecycleAndCapture},
+        {"capture valve",              30, testCaptureValve},
+        {"branches",                   30, testBranches},
+        {"attributes",                 30, testAttributes},
+        {"extra-controls",             30, testExtraControls},
+        {"control flush order",        30, testControlFlushOrder},
+        {"repo dictionary",            30, testRepoDictionary},
+        {"start failures",             60, testStartFailures},
+        {"runtime bus messages",       30, testRuntimeBusMessages},
+        {"capture racing stop",        30, testConcurrentCaptureAndStop},
+        {"stalled branch shutdown",    40, testStalledBranchShutdown},
+        {"wedged source shutdown",     40, testWedgedSourceShutdown},
+        {"finite stream",              40, testFiniteStream},
+        {"disabled branches",          40, testDisabledProcessingBranches},
+        {"attributes during start",    40, testAttributesDuringStart},
+        {"polls during a failing start", 40, testPollsDuringFailingStart},
+        {"branch toggles racing stop", 30, testBranchTogglesRacingStop},
+        {"pipeline strings",           30, testPipelineStrings},
+    };
+    int ran = 0;
+    for (const Test& t : tests) {
+        if (!only.empty() && std::string(t.name).find(only) == std::string::npos) continue;
+        stage(t.name, t.budgetSec);
+        t.run();
+        ++ran;
+    }
+    if (ran == 0) {
+        std::printf("no test matches \"%s\"\n", only.c_str());
+        return 1;
+    }
+    ::alarm(0);
     std::printf("\nRESULT: %s (%d failure%s)\n", g_fails ? "FAIL" : "PASS", g_fails,
                 g_fails == 1 ? "" : "s");
     return g_fails ? 1 : 0;

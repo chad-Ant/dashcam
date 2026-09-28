@@ -18,10 +18,17 @@
                      v4l2_control  an integer V4L2 control, written through v4l2src's
                                    extra-controls; gstProperty is the control's name as
                                    v4l2-ctl lists it (lower case, "_" for separators).
-                                   v4l2src has properties only for brightness,
-                                   contrast, saturation and hue.
-                   The parsed value is converted to the property's own type and
+                                   Auto controls (auto_exposure, white_balance_automatic,
+                                   ...) are written before the manual values they gate.
+                   A property value is converted to the property's own type and
                    range-checked; one that does not fit is refused with a WARN.
+                   A v4l2_control value is checked for being an integer only: v4l2src
+                   gives no feedback.  The driver clamps a value outside the control's
+                   range, and v4l2src drops a control the camera lacks, a bad menu
+                   value, or one the driver refuses (a manual value while its auto
+                   control is on) with only a GStreamer warning.  setCameraAttribute()
+                   reports NONE in all these cases: check the range and the result
+                   with v4l2-ctl -d /dev/videoN (list-ctrls, get-ctrl).
 
   Alias matching is case-insensitive.  Add new entries here; no recompile needed.
   camera_gst_test checks every entry against the real element (v4l2src; also
@@ -46,14 +53,14 @@
     <Alias>gain_range</Alias>
   </Attribute>
 
-  <!-- AE lock: value 0 → AE running (aelock=FALSE), non-zero → AE locked (aelock=TRUE) -->
+  <!-- AE lock, as "auto exposure" on/off: 0 → AE locked (aelock=TRUE), non-zero → AE running (aelock=FALSE) -->
   <Attribute gstProperty="aelock" type="CSI" valueType="bool_from_zero">
     <Alias>auto exposure</Alias>
     <Alias>aelock</Alias>
     <Alias>ae_lock</Alias>
   </Attribute>
 
-  <!-- AWB lock: same zero / non-zero semantics as aelock -->
+  <!-- AWB lock, as "white balance, automatic" on/off: 0 → AWB locked (awblock=TRUE), non-zero → AWB running -->
   <Attribute gstProperty="awblock" type="CSI" valueType="bool_from_zero">
     <Alias>white balance, automatic</Alias>
     <Alias>awblock</Alias>
@@ -102,26 +109,30 @@
     <Alias>edge_enhancement_strength</Alias>
   </Attribute>
 
-  <!-- ── USB (v4l2src GObject properties) ────────────────────────────────────── -->
+  <!-- ── USB (v4l2src: V4L2 controls through extra-controls) ─────────────────── -->
 
-  <Attribute gstProperty="brightness" type="USB" valueType="int">
+  <!-- v4l2src also has brightness / contrast / saturation / hue properties, but
+       it applies those only while the device is open and stores nothing
+       otherwise, so a value set before start() was dropped.  extra-controls is
+       kept and applied when the device opens. -->
+  <Attribute gstProperty="brightness" type="USB" valueType="v4l2_control">
     <Alias>brightness</Alias>
   </Attribute>
 
-  <Attribute gstProperty="contrast" type="USB" valueType="int">
+  <Attribute gstProperty="contrast" type="USB" valueType="v4l2_control">
     <Alias>contrast</Alias>
   </Attribute>
 
-  <Attribute gstProperty="saturation" type="USB" valueType="int">
+  <Attribute gstProperty="saturation" type="USB" valueType="v4l2_control">
     <Alias>saturation</Alias>
   </Attribute>
 
-  <Attribute gstProperty="hue" type="USB" valueType="int">
+  <Attribute gstProperty="hue" type="USB" valueType="v4l2_control">
     <Alias>hue</Alias>
   </Attribute>
 
-  <!-- V4L2 controls v4l2src has no property for (they were named here as
-       properties until 2026-09-28, which v4l2src ignored with a GLib warning). -->
+  <!-- Controls v4l2src has no property for (named here as properties until
+       2026-09-28, which v4l2src ignored with a GLib warning). -->
   <Attribute gstProperty="sharpness" type="USB" valueType="v4l2_control">
     <Alias>sharpness</Alias>
   </Attribute>
@@ -134,6 +145,16 @@
     <Alias>gain</Alias>
   </Attribute>
 
+  <!-- 0 = manual white balance; white_balance_temperature applies only then
+       (uvcvideo refuses it while this is 1, the UGREEN's default). -->
+  <Attribute gstProperty="white_balance_automatic" type="USB" valueType="v4l2_control">
+    <Alias>white_balance_automatic</Alias>
+    <Alias>white balance, automatic</Alias>
+    <Alias>white_balance_temperature_auto</Alias>
+    <Alias>auto_white_balance</Alias>
+  </Attribute>
+
+  <!-- Kelvin; needs white_balance_automatic=0 (above). -->
   <Attribute gstProperty="white_balance_temperature" type="USB" valueType="v4l2_control">
     <Alias>white_balance_temperature</Alias>
     <Alias>white balance temperature</Alias>
