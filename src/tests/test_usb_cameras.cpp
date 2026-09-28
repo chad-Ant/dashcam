@@ -3,6 +3,12 @@
 // Single-camera tests (Tests 1-7, 4b):  always run against the first USB camera found.
 // Dual-camera tests   (Tests 8-10): run only when 2+ USB cameras are present.
 //
+// A UVC camera keeps its control values until it loses power, and this suite
+// runs on the dashcam's own camera: main() reads the controls it writes
+// (brightness, gain, backlight_compensation) before the first test and writes
+// them back after the last, with the camera closed.  A value that does not
+// read back as found fails the run.
+//
 // Usage: ./usb_test
 // Requires: UVC cameras at /dev/videoN, GStreamer 1.0 with v4l2src + videoconvert
 
@@ -28,6 +34,57 @@ namespace fs = std::filesystem;
 static AttributeDictionary g_dict;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
+
+/// A value for control @p cid inside its range and on its step grid, and not
+/// its current value @p orig (read here).  false when the camera lacks the
+/// control, or it is read-only or inactive right now.
+static bool pickControlValue(int fd, uint32_t cid, int& want, int& orig,
+                             struct v4l2_queryctrl& q) {
+    if (!v4l2::queryControl(fd, cid, q) || !v4l2::getControl(fd, cid, orig)) return false;
+    if (q.flags & (V4L2_CTRL_FLAG_INACTIVE | V4L2_CTRL_FLAG_READ_ONLY)) return false;
+    const int step = q.step > 0 ? q.step : 1;
+    want = q.minimum + ((q.maximum - q.minimum) / 2 / step) * step;   // mid-range, on the grid
+    if (want == orig) want = (orig - step >= q.minimum) ? orig - step : orig + step;
+    return true;
+}
+
+/// The controls this suite writes, as found before the first test.
+struct ControlSnapshot {
+    struct Entry { const char* name; uint32_t cid; int value; };
+    std::vector<Entry> entries;
+
+    void take(const std::string& device) {
+        const v4l2::Fd fd = v4l2::openNode(device, O_RDWR);
+        const Entry all[] = {{"brightness", V4L2_CID_BRIGHTNESS, 0},
+                             {"gain", V4L2_CID_GAIN, 0},
+                             {"backlight_compensation", V4L2_CID_BACKLIGHT_COMPENSATION, 0}};
+        for (Entry e : all) {
+            struct v4l2_queryctrl q;
+            if (fd.valid() && v4l2::queryControl(fd.get(), e.cid, q) &&
+                v4l2::getControl(fd.get(), e.cid, e.value))
+                entries.push_back(e);
+        }
+    }
+
+    /// Writes every value back, then reads each: true when all read as found.
+    bool restore(const std::string& device) const {
+        const v4l2::Fd fd = v4l2::openNode(device, O_RDWR);
+        if (!fd.valid()) {
+            printf("  cannot open %s to restore the controls\n", device.c_str());
+            return entries.empty();
+        }
+        bool ok = true;
+        for (const Entry& e : entries) {
+            v4l2::setControl(fd.get(), e.cid, e.value);
+            int now = -1;
+            const bool same = v4l2::getControl(fd.get(), e.cid, now) && now == e.value;
+            printf("  %-24s %d%s\n", e.name, now, same ? " (as found)" :
+                   (" (FAIL: found " + std::to_string(e.value) + ")").c_str());
+            ok = ok && same;
+        }
+        return ok;
+    }
+};
 
 static bool checkRunning(Camera_USB& cam, const char* phase) {
     cameraStatus st;
@@ -139,15 +196,25 @@ static bool test_frame_capture(const cameraInfo& info) {
     return ok;
 }
 
-// Test 3: attribute queued before start() is applied without error.
-// Sets brightness=128; the attribute should be flushed by start() with no pipeline error.
+// Test 3: brightness queued before start() reaches the device.  The value is
+// inside the camera's range (the driver clamps anything else and reports
+// success) and is read back with VIDIOC_G_CTRL while running: until
+// 2026-09-28 it went to v4l2src's brightness property, which v4l2src drops
+// while the device is closed, and only the error code was checked.
 static bool test_attribute_before_start(const cameraInfo& info) {
     std::cout << "\n--- Test 3: Attribute Queued Before start() ---\n";
     if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
+    const v4l2::Fd fd = v4l2::openNode(info.address, O_RDWR);
+    struct v4l2_queryctrl q;
+    int want = 0, orig = 0;
+    if (!fd.valid() || !pickControlValue(fd.get(), V4L2_CID_BRIGHTNESS, want, orig, q)) {
+        printf("  brightness not settable on this camera (skipped)\n");
+        return true;
+    }
 
     Camera_USB cam(info);
     cam.setAttributeDictionary(g_dict);
-    cam.setCameraAttribute("brightness", "128");
+    cam.setCameraAttribute("brightness", std::to_string(want));
     cam.open();
     cam.setCameraVideoFormat(0);
     cam.start();
@@ -155,19 +222,29 @@ static bool test_attribute_before_start(const cameraInfo& info) {
 
     cameraStatus st;
     cam.getCameraStatus(st);
-    bool ok = (st.currentError == ERROR_CODE::NONE);
-    printf("  currentError after start: %d %s\n",
-           static_cast<int>(st.currentError), ok ? "(OK)" : "(FAIL — expected NONE)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    int got = -1;
+    v4l2::getControl(fd.get(), V4L2_CID_BRIGHTNESS, got);
+    const bool ok = st.currentError == ERROR_CODE::NONE && got == want;
+    printf("  brightness queued %d (range %d..%d, was %d), device reads %d, error=%d %s\n", want,
+           q.minimum, q.maximum, orig, got, static_cast<int>(st.currentError), ok ? "(OK)" : "(FAIL)");
 
     cam.stop();
     cam.close();
     return ok;
 }
 
-// Test 4: attribute written while RUNNING is applied immediately.
+// Test 4: brightness written while RUNNING reaches the device (in range, read back).
 static bool test_attribute_while_running(const cameraInfo& info) {
     std::cout << "\n--- Test 4: Attribute Set While Running ---\n";
     if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
+    const v4l2::Fd fd = v4l2::openNode(info.address, O_RDWR);
+    struct v4l2_queryctrl q;
+    int want = 0, orig = 0;
+    if (!fd.valid() || !pickControlValue(fd.get(), V4L2_CID_BRIGHTNESS, want, orig, q)) {
+        printf("  brightness not settable on this camera (skipped)\n");
+        return true;
+    }
 
     Camera_USB cam(info);
     cam.setAttributeDictionary(g_dict);
@@ -176,25 +253,30 @@ static bool test_attribute_while_running(const cameraInfo& info) {
     cam.start();
     if (!checkRunning(cam, "Test 4")) { cam.close(); return false; }
 
-    cam.setCameraAttribute("brightness", "100");
+    cam.setCameraAttribute("brightness", std::to_string(want));
     cameraStatus st;
     cam.getCameraStatus(st);
-    bool ok = (st.currentError == ERROR_CODE::NONE);
-    printf("  brightness=100 while RUNNING: error=%d %s\n",
-           static_cast<int>(st.currentError), ok ? "(OK)" : "(FAIL)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    int got = -1;
+    v4l2::getControl(fd.get(), V4L2_CID_BRIGHTNESS, got);
+    const bool ok = st.currentError == ERROR_CODE::NONE && got == want;
+    printf("  brightness=%d while RUNNING (range %d..%d), device reads %d, error=%d %s\n", want,
+           q.minimum, q.maximum, got, static_cast<int>(st.currentError), ok ? "(OK)" : "(FAIL)");
 
     cam.stop();
     cam.close();
     return ok;
 }
 
-// Test 4b: attribute values actually reach the device, which Tests 3-4 (error
-// code only) cannot show.  brightness is a v4l2src property; gain and
-// backlight_compensation are V4L2 controls written through v4l2src's
+// Test 4b: several controls, set one after another while RUNNING, each reach
+// the device.  All three are V4L2 controls written through v4l2src's
 // extra-controls (valueType v4l2_control).  Each control the camera has, and
-// that is active (gain is not while the camera's own auto-exposure runs), is set
-// inside its range while RUNNING and read back with VIDIOC_G_CTRL; the original
-// value is restored afterwards.
+// that is active and writable, is set inside its range and read back with
+// VIDIOC_G_CTRL, then put back through this fd.  A later write must not undo
+// that: each write carries only its own control (it used to re-send them all,
+// so gain went back to the test value).  uvcvideo does not flag gain inactive
+// under the camera's auto-exposure; only exposure_time_absolute,
+// white_balance_temperature, focus_absolute and hue follow an auto control.
 static bool test_attribute_reaches_device(const cameraInfo& info) {
     std::cout << "\n--- Test 4b: Attribute Values Reach the Device ---\n";
     if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
@@ -208,26 +290,19 @@ static bool test_attribute_reaches_device(const cameraInfo& info) {
     cam.start();
     if (!checkRunning(cam, "Test 4b")) { cam.close(); return false; }
 
-    struct Probe { const char* alias; uint32_t cid; };
-    const Probe probes[] = {{"brightness",             V4L2_CID_BRIGHTNESS},
-                            {"gain",                   V4L2_CID_GAIN},
-                            {"backlight_compensation", V4L2_CID_BACKLIGHT_COMPENSATION}};
+    struct Probe { const char* alias; uint32_t cid; int orig; bool done; };
+    Probe probes[] = {{"brightness",             V4L2_CID_BRIGHTNESS, 0, false},
+                      {"gain",                   V4L2_CID_GAIN, 0, false},
+                      {"backlight_compensation", V4L2_CID_BACKLIGHT_COMPENSATION, 0, false}};
     bool ok = true;
     int  tried = 0;
-    for (const Probe& p : probes) {
+    for (Probe& p : probes) {
         struct v4l2_queryctrl q;
-        int orig = 0;
-        if (!v4l2::queryControl(fd.get(), p.cid, q) || !v4l2::getControl(fd.get(), p.cid, orig)) {
-            printf("  %-24s not on this camera (skipped)\n", p.alias);
+        int want = 0;
+        if (!pickControlValue(fd.get(), p.cid, want, p.orig, q)) {
+            printf("  %-24s not on this camera, or read-only / inactive now (skipped)\n", p.alias);
             continue;
         }
-        if (q.flags & (V4L2_CTRL_FLAG_INACTIVE | V4L2_CTRL_FLAG_READ_ONLY)) {
-            printf("  %-24s inactive or read-only right now (skipped)\n", p.alias);
-            continue;
-        }
-        const int step = q.step > 0 ? q.step : 1;
-        int want = q.minimum + ((q.maximum - q.minimum) / 2 / step) * step;   // mid-range, on the grid
-        if (want == orig) want = (orig - step >= q.minimum) ? orig - step : orig + step;
         cam.setCameraAttribute(p.alias, std::to_string(want));
         cameraStatus st;
         cam.getCameraStatus(st);
@@ -239,9 +314,19 @@ static bool test_attribute_reaches_device(const cameraInfo& info) {
                q.minimum, q.maximum, got, static_cast<int>(st.currentError), pass ? "(OK)" : "(FAIL)");
         ok = ok && pass;
         ++tried;
-        v4l2::setControl(fd.get(), p.cid, orig);   // leave the camera as found
+        v4l2::setControl(fd.get(), p.cid, p.orig);   // leave the camera as found
+        p.done = true;
     }
     if (tried == 0) printf("  none of the probed controls is settable on this camera\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (const Probe& p : probes) {   // no later write may have undone a put-back
+        int now = -1;
+        if (!p.done) continue;
+        v4l2::getControl(fd.get(), p.cid, now);
+        const bool kept = now == p.orig;
+        printf("  %-24s put back to %d, reads %d %s\n", p.alias, p.orig, now, kept ? "(OK)" : "(FAIL)");
+        ok = ok && kept;
+    }
 
     cam.stop();
     cam.close();
@@ -550,6 +635,8 @@ int main(int argc, char* argv[]) {
     }
 
     const cameraInfo& c0 = *usb[0];
+    ControlSnapshot found;
+    found.take(c0.address);
 
     bool t1  = test_open_close(c0);
     bool t2  = test_frame_capture(c0);
@@ -570,6 +657,9 @@ int main(int argc, char* argv[]) {
         std::cout << "\n--- Tests 8-10 SKIPPED (need >= 2 USB cameras, found 1) ---\n";
     }
 
+    std::cout << "\n--- Camera controls put back (camera closed) ---\n";
+    const bool restored = found.restore(c0.address);
+
     printf("\n=== Results ===\n");
     auto r = [](bool ok) { return ok ? "PASS" : "FAIL"; };
     printf("Test  1  Open/close lifecycle:             %s\n", r(t1));
@@ -580,13 +670,14 @@ int main(int argc, char* argv[]) {
     printf("Test  5  Invalid attribute name:           %s\n", r(t5));
     printf("Test  6  Stop/restart cycle:               %s\n", r(t6));
     printf("Test  7  Format cycling:                   %s\n", r(t7));
+    printf("Controls restored as found:                %s\n", r(restored));
     if (usb.size() >= 2) {
         printf("Test  8  Dual simultaneous (alternating):  %s\n", r(t8));
         printf("Test  9  Dual concurrent (threads):        %s\n", r(t9));
         printf("Test 10  Dual independent stop:            %s\n", r(t10));
     }
 
-    bool passed = t1 && t2 && t3 && t4 && t4b && t5 && t6 && t7;
+    bool passed = t1 && t2 && t3 && t4 && t4b && t5 && t6 && t7 && restored;
     if (usb.size() >= 2) passed = passed && t8 && t9 && t10;
     return passed ? 0 : 1;
 }
