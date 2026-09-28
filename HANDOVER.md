@@ -1,4 +1,4 @@
-# Handover — branch `camera`, 2026-09-27 (evening)
+# Handover — branch `camera`, 2026-09-28
 
 ## Where things stand
 
@@ -12,6 +12,10 @@
 | I2C bus errors | `1e93aeb` | A glitch that the controller sees as a START or STOP mid-transfer now fails that transfer, resets the controller, counts it (`i2cerr=`) and recovers the bus. Before, it returned a garbage byte as data, or left every later transfer refused while the lines read idle. **Proven on the rig 2026-09-27:** BusFaultInjection 15/15, twice (results below). Production flashed; `i2cto=0 i2cerr=0` at rest. | a drive: `i2cerr=` before and after the wiring rework |
 | Build scripts | `c232b6d` | `check_core.sh` holds the arduino:samd 1.8.14 check. `install_map.sh` and the BusFaultInjection script now apply it too. | — |
 | liblog | `07a61d4` | `liblog.h` includes `<cstdint>`, so the tree builds with GCC 13 without `-include cstdint`. | — |
+| libcamera: dependencies | `05f3075` | `AttributeDictionary` now lives in libcamera (`libcamera_attributes.cpp`); libconfig no longer includes libcamera. There is no behaviour change. | — |
+| libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The one intended difference is that an interrupted ioctl retries, where it used to read as "no focus control". | **not run on hardware:** `scan_cameras`, and v0.4's exposure/focus lines at start (below) |
+| libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed branches added disabled, which could never start. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. | **not run on hardware:** `camera_gst_test` on GStreamer 1.20.3 (below) |
+| libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). Every attribute write is type- and range-checked, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. | **not run on hardware:** `usb_test` Test 4b, and the CSI dictionary check (below) |
 
 ## Who does what: read before handing work across
 
@@ -27,7 +31,8 @@ Two coders work on this branch:
   the Jetson's files only when someone commits them or pastes them into the conversation.
 - **Build or run anything that needs CUDA or a camera.**
   - CUDA: `liblanedetector` and `libdriverstate`, and so `dashcam_v0_2` and `dashcam_v0_3`, do not build there.
-  - Camera: `record_test` Part B, `csi_test` and `usb_test` cannot run.
+  - Camera: `record_test` Part B, `csi_test` and `usb_test` cannot run. `camera_gst_test` covers the GStreamer
+    camera class over videotestsrc, but not v4l2src or Argus themselves.
 - **Build the binary you flash.** It compiles the MKR firmware with GCC 13.2 against the core cloned from git
   (recipe below), not with the Jetson's 7.2.1. That is a compile check, not the shipped image. It has not built
   the ESP32-C3 firmware at all; only the C3 host tests run there.
@@ -52,6 +57,35 @@ Two coders work on this branch:
   records. It cannot go and look for them.
 - Treat its firmware changes as unproven until you have run them. It compiled them with a different compiler, and
   none of that code has run on a real bus.
+
+## Next (Jetson coder): run the libcamera changes on the Jetson
+
+The cloud session changed libcamera on 2026-09-28 and could not run any of it against a camera or GStreamer
+1.20.3. None of it touches the recording path of `dashcam_v0_4` except the shared V4L2 helpers under its exposure
+and focus control. In the container, `make`, then from the repo root with `B=$(ls -td bin/build_* | head -1)`:
+
+1. **`$B/camera_gst_test`**, with no camera needed. Expect `RESULT: PASS`, 70 checks in about 5 s. What it adds on
+   the Jetson:
+   - It runs on GStreamer 1.20.3; the sandbox has 1.24. Branches added disabled rely on valve `drop-mode=2`
+     (transform-to-gap), which should exist since 1.20. If `start() links both branches` fails, that is why.
+   - The line `CSI: all N entries name a writable nvarguscamerasrc property ...` checks the CSI half of
+     `camera_attributes.xml` against the real Argus element. The sandbox skips it. A `bad:` list names entries
+     to fix.
+2. **`$B/usb_test`** with the UGREEN attached; stop `dashcam-v04` first, since it holds the camera.
+   - Test 4b sets brightness (a v4l2src property) and backlight compensation (a V4L2 control through
+     `extra-controls`) while running, reads each back from the device, then restores it.
+   - Gain is skipped while the camera's own auto-exposure has it inactive.
+   - Expect "device reads" equal to "set" for each control, and Tests 1-7 as before.
+3. **`$B/scan_cameras`**: the UGREEN should be listed with the same formats and controls as before
+   (discovery now uses the shared helpers).
+4. **v0.4 on the car.** After the rebuild and restart, the start log should show the same
+   `exposure: frame-rate priority on ...` line as before (and `focus: fixed at ...` if `FocusMode` is `fixed`), with
+   no new WARN.
+5. **A deployed `camera_attributes.xml`** matters only to v0.2 and v0.3. The build seeds it with `cp -n`, so a copy
+   under `/user/output/configs` keeps the old six USB entries. Those are now refused with a WARN instead of being
+   ignored silently. Replace it with `config/camera_attributes.xml`.
+
+Report back in this file: the `camera_gst_test` RESULT and CSI line, and usb_test's Test 4b lines.
 
 ## Done 2026-09-27 (Jetson coder): the bus-error fix proven on the rig
 
@@ -148,6 +182,10 @@ glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the 
 - **v0.3 overlay:** it keeps its own copy of the bridge→overlay rules. On a fix without altitude it shows the last
   altitude, or the 52.3 m placeholder. v0.4 uses `src/bridge_overlay.h`. Skipped on request.
 - **Unused libraries:** `libstereocam` and `libsigndetector` are in the tree, but no target builds them.
+- **Seen during the libcamera pass, left for the next libraries:**
+  - `libcan.cpp:319` and `libgpio.cpp:311` ignore `read()`'s return (the only two warnings in the build).
+  - `Camera_GST::getCameraStatus()` drains the bus through a `const_cast` (it works, but it is a smell).
+  - `cameraAttribute` stores control ranges as `float`, which is lossy past 2^24 (no such control on the UGREEN).
 
 ## Cloud sessions: compile-checking the MKR firmware
 
@@ -245,7 +283,9 @@ make -C peripherals/esp32-c3/tests/host check        # bridge 79
 make                                                 # every target, inside the l4t-ml-gpio container
 B=$(ls -td bin/build_* | head -1)                    # the build just made; run from the repo root
 $B/dashcam_v0_4 --self-test && $B/config_test && $B/bridge_overlay_test
+$B/camera_gst_test                                   # Camera_GST over videotestsrc: no camera needed
 $B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
+$B/usb_test                                          # a USB camera (stop dashcam-v04 first)
 ```
 
 The Wire changes have no host test: they are register-level SAMD21 code, proven only on the rig
@@ -253,5 +293,6 @@ The Wire changes have no host test: they are register-level SAMD21 code, proven 
 
 Where each test can run:
 - **Anywhere, cloud included:** the host suites, `mutations`, `--self-test`, `config_test`,
-  `bridge_overlay_test` and `record_test` Part A.
-- **Jetson only:** CUDA targets, `record_test` Part B, and everything on the rig or the car.
+  `bridge_overlay_test`, `camera_gst_test` and `record_test` Part A.
+- **Jetson only:** CUDA targets, `record_test` Part B, `usb_test`, `csi_test`, `scan_cameras` (with a camera), and
+  everything on the rig or the car.
