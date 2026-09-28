@@ -135,6 +135,9 @@ BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) src/tests/test_bridge_overla
 # exposure_test: frame-rate-priority auto-exposure loop (pure logic, no camera)
 EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests/test_exposure.cpp)
 
+# focus_test: the fixed-focus hold against a simulated UVC camera (its own ioctl(), no camera)
+FOCUS_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_FOCUS_SRCS) src/tests/test_focus.cpp)
+
 # camera_gst_test: Camera_GST over videotestsrc — lifecycle, capture, branches,
 # attributes, start/runtime errors, USB/CSI pipeline strings (no camera needed)
 CAMGST_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) src/tests/test_camera_gst.cpp)
@@ -188,7 +191,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
                                          $(LIBDSTATE_SRCS) src/tests/test_libdriverstate.cpp) \
                     $(call make_cu_objs, $(LIBDSTATE_CU_SRCS))
 
-ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(CAMGST_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
+ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(FOCUS_TEST_OBJS) $(CAMGST_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS))
@@ -204,6 +207,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/dashcam_v0_3 \
            $(BUILD_DIR)/dashcam_v0_4 \
            $(BUILD_DIR)/exposure_test \
+           $(BUILD_DIR)/focus_test \
            $(BUILD_DIR)/camera_gst_test \
            $(BUILD_DIR)/timesync_test \
            $(BUILD_DIR)/bridge_overlay_test \
@@ -278,6 +282,9 @@ $(BUILD_DIR)/dashcam_v0_4: $(V04_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/exposure_test: $(EXPO_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/focus_test: $(FOCUS_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/camera_gst_test: $(CAMGST_TEST_OBJS)

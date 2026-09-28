@@ -39,10 +39,22 @@ bool UvcFocusControl::open(const std::string& device, int position,
     }
 
     // What to hand back: the state as found, not the default — someone may have
-    // set the lens by hand (v4l2-ctl) before this ran.
+    // set the lens by hand (v4l2-ctl) before this ran.  Nothing is taken over
+    // unless it can be handed back: an autofocus state that cannot be read
+    // would be "restored" to the default (turning autofocus on for a camera
+    // found in manual), and with autofocus off the lens position is the state.
     int prevAuto = 1, prevAbs = 0;
-    if (!v4l2::getControl(fd.get(), V4L2_CID_FOCUS_AUTO, prevAuto)) prevAuto = qAuto.default_value;
+    if (!v4l2::getControl(fd.get(), V4L2_CID_FOCUS_AUTO, prevAuto)) {
+        why = device + ": cannot read the autofocus state (" + std::strerror(errno) +
+              "), so it could not be restored; focus left as it is";
+        return false;
+    }
     const bool prevAbsOk = v4l2::getControl(fd.get(), V4L2_CID_FOCUS_ABSOLUTE, prevAbs);
+    if (!prevAbsOk && prevAuto == 0) {
+        why = device + ": autofocus is off and the lens position cannot be read (" +
+              std::strerror(errno) + "), so it could not be restored; focus left as it is";
+        return false;
+    }
 
     const int pos = snapFocusPosition(position, qAbs.minimum, qAbs.maximum, qAbs.step);
     if (pos != position && log_)
@@ -78,15 +90,22 @@ bool UvcFocusControl::open(const std::string& device, int position,
 
 void UvcFocusControl::close() {
     if (fd_ < 0) return;
-    // The lens position only matters if autofocus was off when found: restore it
-    // while autofocus is still off, then the autofocus state itself.
-    if (prevAuto_ == 0 && prevAbsOk_) setCtrl(V4L2_CID_FOCUS_ABSOLUTE, prevAbs_);
-    setCtrl(V4L2_CID_FOCUS_AUTO, prevAuto_);
+    // The lens position only matters if autofocus was off when found (open()
+    // then required it to be readable): restore it while autofocus is still
+    // off, then the autofocus state itself.
+    std::string failed;
+    if (prevAuto_ == 0 && prevAbsOk_ && !setCtrl(V4L2_CID_FOCUS_ABSOLUTE, prevAbs_))
+        failed = std::string(" (lens position: ") + std::strerror(errno) + ")";
+    if (!setCtrl(V4L2_CID_FOCUS_AUTO, prevAuto_))
+        failed += std::string(" (autofocus state: ") + std::strerror(errno) + ")";
     ::close(fd_);
     fd_ = -1;
-    if (log_)
+    if (!log_) return;
+    if (failed.empty())
         log_(LogLevel::INFO, std::string("focus: handed back to the camera on ") + device_ +
                              (prevAuto_ ? " (autofocus on)" : " (autofocus off, as found)"));
+    else   // e.g. unplugged: it comes back with its power-on defaults anyway
+        log_(LogLevel::WARN, "focus: could not hand the focus back on " + device_ + failed);
 }
 
 } // namespace dashcam::camera

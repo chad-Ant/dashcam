@@ -45,14 +45,16 @@ public:
      * @brief Continuous autofocus off on @p device, lens held at @p position
      *        (clamped/snapped to the camera's range; a clamp is logged).
      * @return false (with @p why) when the device cannot be opened or has no
-     *         autofocus / absolute-focus control, or a write is refused — the
-     *         camera's focus is then left exactly as it was.
+     *         autofocus / absolute-focus control, the state to hand back cannot
+     *         be read (the autofocus state; with autofocus off, also the lens
+     *         position), or a write is refused — the camera's focus is then left
+     *         exactly as it was.
      */
     bool open(const std::string& device, int position,
               dashcam::log::LogCallback log, std::string& why);
 
-    /// Restore the focus state found at open(). Idempotent; errors are ignored
-    /// (the device may already be unplugged).
+    /// Restore the focus state found at open(). Idempotent; a refused write is
+    /// logged as WARN and otherwise ignored (the device may be unplugged).
     void close();
 
     bool isOpen() const { return fd_ >= 0; }
