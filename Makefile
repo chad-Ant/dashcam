@@ -162,6 +162,11 @@ CAN_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAN_SRCS) src/tests/can_test.c
 COMMLINK_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) \
                      src/tests/test_commlink.cpp)
 
+# commlink_sim_test: CommLink + libuart against a simulated ESP32-C3 bridge on a pty
+# (handshake, frames, commands, watchdog, hot-plug, discovery) — no hardware needed
+COMMLINK_SIM_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) \
+                         src/tests/test_commlink_sim.cpp)
+
 # network_test: TCP/UDP socket loopback + SNTP internet-time smoke test
 NET_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBNET_SRCS) src/tests/test_libnetwork.cpp)
 
@@ -186,7 +191,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
 ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(CAMGST_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
-                   $(CSI_RTP_OBJS) $(COMMLINK_OBJS))
+                   $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS))
 
 DEPS := $(ALL_OBJS:.o=.d)
 
@@ -206,6 +211,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
            $(BUILD_DIR)/commlink_test \
+           $(BUILD_DIR)/commlink_sim_test \
            $(BUILD_DIR)/network_test \
            $(BUILD_DIR)/csi_rtp_test \
            $(BUILD_DIR)/gpio_test \
@@ -293,6 +299,9 @@ $(BUILD_DIR)/can_test: $(CAN_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/commlink_test: $(COMMLINK_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/commlink_sim_test: $(COMMLINK_SIM_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/network_test: $(NET_TEST_OBJS)
