@@ -12,16 +12,56 @@
 
 namespace {
 
-static void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
-                  const char* fmt, ...) {
+// printf-style, checked by the compiler.  Never truncates: the DEBUG pipeline
+// description and a GStreamer debug string both run past any fixed buffer.
+__attribute__((format(printf, 3, 4)))
+void doLog(const dashcam::log::LogCallback& cb, dashcam::log::LogLevel lvl,
+           const char* fmt, ...) {
     if (!cb) return;
-    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_list again;
+    va_copy(again, ap);
+    char buf[512];
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    cb(lvl, buf);
+    if (n < 0) {
+        va_end(again);
+        return;
+    }
+    if (static_cast<size_t>(n) < sizeof(buf)) {
+        va_end(again);
+        cb(lvl, buf);
+        return;
+    }
+    std::string msg(static_cast<size_t>(n), '\0');
+    std::vsnprintf(&msg[0], msg.size() + 1, fmt, again);
+    va_end(again);
+    cb(lvl, msg);
 }
+
+// "<element>: <message> (<debug>)" for a bus ERROR or WARNING: which element
+// failed, and GStreamer's own detail (e.g. "reason not-negotiated").
+std::string describeMessage(GstMessage* msg) {
+    GError* err = nullptr;
+    gchar*  dbg = nullptr;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) gst_message_parse_error(msg, &err, &dbg);
+    else                                            gst_message_parse_warning(msg, &err, &dbg);
+    std::string s = GST_MESSAGE_SRC_NAME(msg);
+    s += ": ";
+    s += err ? err->message : "unknown";
+    if (dbg && *dbg) {
+        s += " (";
+        s += dbg;
+        s += ")";
+    }
+    if (err) g_error_free(err);
+    g_free(dbg);
+    return s;
+}
+
+/// Bus warnings logged per pipeline run before the rest are only counted.
+constexpr unsigned kMaxWarningsLogged = 10;
 
 } // namespace
 
@@ -31,9 +71,11 @@ namespace dashcam::camera {
 
 /// Destruction order matters for GStreamer reference counting:
 ///   1. Atomically claim pipeline_ via swap under stateMutex_ (re-entrancy guard).
-///   2. Send EOS, then drain the appsink while waiting for the pipeline EOS
-///      (or replacing error) on the bus — forces the muxer to finalise the
-///      container.  See the combined loop below for why draining is mandatory.
+///   2. If the pipeline reached PLAYING: send EOS, then drain the appsink while
+///      waiting for the pipeline EOS (or replacing error) on the bus — forces
+///      the muxer to finalise the container.  See the combined loop below for
+///      why draining is mandatory, and the check above it for why never before
+///      PLAYING.
 ///   3. Set pipeline to NULL and wait for confirmation — joins the streaming thread.
 ///      NOTE: on CSI, nvarguscamerasrc's PAUSED→READY can itself block ~5 s when
 ///      the Argus session ends in the CANCELLED path (daemon-state dependent);
@@ -62,13 +104,16 @@ void Camera_GST::teardownPipeline() {
     }
 
     if (pipe) {
-        // timeout=0 returns the last *achieved* state, which is stale during an
-        // async transition.  Check pending too: if the pipeline is mid-transition
-        // toward PLAYING we must still send EOS so mp4mux writes its moov atom.
+        // EOS only to a pipeline that reached PLAYING.  One still short of it
+        // (a start() that timed out: a sink that never prerolled, Argus slow to
+        // come up) has sinks blocked in preroll and a source thread blocked
+        // behind them; gst_element_send_event(EOS) then blocks forever, and
+        // takes the NULL transition below with it — measured 2026-09-28 with a
+        // live source and a sink that never got a buffer.  Such a pipeline never
+        // streamed, so there is no container to finalise: straight to NULL.
         GstState state, pending;
         gst_element_get_state(pipe, &state, &pending, 0);
-        if (state == GST_STATE_PLAYING  || state == GST_STATE_PAUSED ||
-            pending == GST_STATE_PLAYING || pending == GST_STATE_PAUSED) {
+        if (state == GST_STATE_PLAYING) {
 
             gst_element_send_event(pipe, gst_event_new_eos());
 
@@ -186,6 +231,20 @@ void Camera_GST::setPipelineError() {
     startCv_.notify_all();
 }
 
+void Camera_GST::logFirstBusError(GstElement* pipe, const char* what) {
+    GstBus* bus = pipe ? gst_element_get_bus(pipe) : nullptr;
+    GstMessage* msg = bus ? gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR) : nullptr;
+    if (msg) {
+        doLog(log_, dashcam::log::LogLevel::ERROR, "%s on %s: %s", what,
+              info_.address.c_str(), describeMessage(msg).c_str());
+        gst_message_unref(msg);
+    } else {
+        doLog(log_, dashcam::log::LogLevel::ERROR, "%s on %s (no error on the bus)", what,
+              info_.address.c_str());
+    }
+    if (bus) gst_object_unref(bus);
+}
+
 void Camera_GST::checkBusErrors() {
     // Take a ref on the pipeline under the lock so a concurrent teardown can't
     // free it while we poll its bus.
@@ -201,21 +260,22 @@ void Camera_GST::checkBusErrors() {
     if (bus) {
         // Drain every message except EOS (which teardownPipeline() waits for) so
         // the bus queue can't grow unbounded over a long capture.  Report the
-        // first error encountered.
+        // first error, and warnings (a branch complaining before it fails) up to
+        // a cap per run, so a chatty element cannot flood the log.
         const GstMessageType drainMask =
             static_cast<GstMessageType>(GST_MESSAGE_ANY & ~GST_MESSAGE_EOS);
         GstMessage* msg;
         while ((msg = gst_bus_pop_filtered(bus, drainMask)) != nullptr) {
             if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR && !sawError) {
-                GError* err = nullptr;
-                gchar*  dbg = nullptr;
-                gst_message_parse_error(msg, &err, &dbg);
-                doLog(log_, dashcam::log::LogLevel::ERROR,
-                      "pipeline bus error on %s: %s", info_.address.c_str(),
-                      err ? err->message : "unknown");
-                if (err) g_error_free(err);
-                g_free(dbg);
+                doLog(log_, dashcam::log::LogLevel::ERROR, "pipeline bus error on %s: %s",
+                      info_.address.c_str(), describeMessage(msg).c_str());
                 sawError = true;
+            } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
+                const unsigned seen = ++warningsSeen_;
+                if (seen <= kMaxWarningsLogged)
+                    doLog(log_, dashcam::log::LogLevel::WARN, "pipeline warning on %s: %s%s",
+                          info_.address.c_str(), describeMessage(msg).c_str(),
+                          seen == kMaxWarningsLogged ? " (further warnings not logged)" : "");
             }
             gst_message_unref(msg);
         }
@@ -339,6 +399,15 @@ bool Camera_GST::applyGstProperty(GstElement* src,
     return false;
 }
 
+std::string Camera_GST::captureBranch(const std::string& convert) const {
+    return " ! tee name=srctee"
+           " srctee. ! queue max-size-buffers=" + std::to_string(params_.captureQueueDepth) +
+           " leaky=2 ! valve name=capvalve drop-mode=1"
+           " ! " + convert +
+           " ! appsink name=mysink drop=true max-buffers=" + std::to_string(params_.appsinkMaxBuffers) +
+           " emit-signals=false sync=false";
+}
+
 void Camera_GST::computeFpsRational(float fps, uint32_t& frNum, uint32_t& frDen) {
     // Casting a negative (or NaN) float to uint32_t is undefined behaviour;
     // the !(x > 0) form also catches NaN.  Fall back to 1/1 like the zero case.
@@ -398,15 +467,17 @@ void Camera_GST::open() {
     }
     if (err) g_error_free(err);
 
-    std::lock_guard<std::mutex> lock(stateMutex_);
-    if (!gstOk) {
-        status_.status = CAMERA_STATUS::ERROR;
-        status_.currentError = pipelineError();
-        return;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (!gstOk) {
+            status_.status = CAMERA_STATUS::ERROR;
+            status_.currentError = pipelineError();
+            return;
+        }
+        status_.status = CAMERA_STATUS::OPEN;
+        status_.currentError = ERROR_CODE::NONE;
     }
-    status_.status = CAMERA_STATUS::OPEN;
-    status_.currentError = ERROR_CODE::NONE;
-    doLog(log_, dashcam::log::LogLevel::INFO,
+    doLog(log_, dashcam::log::LogLevel::INFO,   // outside the lock: the callback contract
           "camera opened: %s", info_.address.c_str());
 }
 
@@ -532,9 +603,14 @@ void Camera_GST::start() {
     // instead of being assigned bare while another thread reads them under the lock.
     // pipeline_ is published first so setPipelineError() → teardownPipeline() can
     // release it (and any orphaned branch bins) on every failure path below.
+    warningsSeen_ = 0;   // only this thread touches it until the pipeline runs
     GError* error = nullptr;
     GstElement* pipeline = gst_parse_launch(pipelineStr.c_str(), &error);
     if (error != nullptr || pipeline == nullptr) {
+        // e.g. "no element \"nvarguscamerasrc\"" or "could not link ...": the
+        // reason the camera will not start, so it is worth the line.
+        doLog(log_, dashcam::log::LogLevel::ERROR, "pipeline description rejected on %s: %s",
+              info_.address.c_str(), error ? error->message : "unknown");
         if (error) g_error_free(error);
         if (pipeline) gst_object_unref(pipeline);
         setPipelineError();   // pipeline_ still null; teardown frees orphan branches, sets ERROR
@@ -619,12 +695,18 @@ void Camera_GST::start() {
             branchError = true;
             break;
         }
-        // forward-sticky-events: a dropping valve must still pass EOS (sticky),
-        // otherwise a branch that is disabled at stop() time never delivers EOS
-        // to its sink — the muxer never finalises its file and teardownPipeline()
-        // waits out the full EOS timeout.  drop-mode is only changeable in
-        // NULL/READY, so it must be set here rather than at enable/disable time.
-        g_object_set(G_OBJECT(valve), "drop-mode", 1 /* forward-sticky-events */, NULL);
+        // A dropping valve must still pass EOS (sticky), otherwise a branch that
+        // is disabled at stop() time never delivers EOS to its sink — the muxer
+        // never finalises its file and teardownPipeline() waits out the full EOS
+        // timeout: forward-sticky-events (1).  A branch that starts DISABLED
+        // needs more: its sink would never see a buffer, never preroll, and the
+        // pipeline would never reach PLAYING (start() timed out, measured
+        // 2026-09-28) — so it turns dropped buffers into GAP events
+        // (transform-to-gap, 2), on which sinks preroll; EOS passes too.
+        // drop-mode is only changeable in NULL/READY, so it is set here.
+        g_object_set(G_OBJECT(valve), "drop-mode",
+                     branchInitEnabled ? 1 /* forward-sticky-events */ : 2 /* transform-to-gap */,
+                     NULL);
         if (!branchInitEnabled)
             g_object_set(G_OBJECT(valve), "drop", TRUE, NULL);
 
@@ -727,6 +809,8 @@ void Camera_GST::start() {
     // Hardware boots here with the correct ISP settings already applied.
     GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
+        // The element that refused posted why (device busy, not-negotiated, ...).
+        logFirstBusError(pipeline_, "pipeline refused to start");
         setPipelineError();
         return;
     }
@@ -739,7 +823,15 @@ void Camera_GST::start() {
         GstState state, pending;
         ret = gst_element_get_state(pipeline_, &state, &pending,
                                     params_.stateChangeTimeoutMs * GST_MSECOND);
-        if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            logFirstBusError(pipeline_, "pipeline failed while starting");
+            setPipelineError();
+            return;
+        }
+        if (ret == GST_STATE_CHANGE_ASYNC) {
+            doLog(log_, dashcam::log::LogLevel::ERROR,
+                  "pipeline on %s did not reach PLAYING within %u ms", info_.address.c_str(),
+                  params_.stateChangeTimeoutMs);
             setPipelineError();
             return;
         }
@@ -852,16 +944,24 @@ void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& by
 
 void Camera_GST::addBranch(const std::string& name, GstElement* sinkBin,
                            bool leaky, bool initialEnabled) {  // defaults in header
-    std::lock_guard<std::mutex> lock(stateMutex_);
-    if (!sinkBin || name.empty() || status_.status == CAMERA_STATUS::RUNNING) {
-        doLog(log_, dashcam::log::LogLevel::ERROR,
-              "cannot add camera branch '%s': %s", name.c_str(),
-              !sinkBin ? "null bin" : name.empty() ? "empty name"
-                                                : "camera already running");
+    const char* refused = !sinkBin ? "null bin" : name.empty() ? "empty name" : nullptr;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (!refused && status_.status == CAMERA_STATUS::RUNNING) refused = "camera already running";
+        if (!refused) {
+            branches_.push_back({name, sinkBin, leaky, initialEnabled});
+            return;
+        }
         status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
-        return;
     }
-    branches_.push_back({name, sinkBin, leaky, initialEnabled});
+    // Logged outside the lock (the callback contract), and the bin released:
+    // ownership passes on every call, since no caller frees a refused bin.
+    doLog(log_, dashcam::log::LogLevel::ERROR, "cannot add camera branch '%s': %s",
+          name.c_str(), refused);
+    if (sinkBin) {
+        gst_object_ref_sink(sinkBin);
+        gst_object_unref(sinkBin);
+    }
 }
 
 GstElement* Camera_GST::getTee() const {

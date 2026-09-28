@@ -48,12 +48,7 @@ std::string Camera_USB::buildPipelineString(const cameraVideoFormat& fmt,
 
     return "v4l2src name=camerasrc device=" + info_.address +
            " ! " + formatCaps +
-           " ! tee name=srctee"
-           " srctee. ! queue max-size-buffers=" + std::to_string(params_.captureQueueDepth) +
-           " leaky=2 ! valve name=capvalve drop-mode=1"
-           " ! videoconvert ! video/x-raw, format=(string)BGR"
-           " ! appsink name=mysink drop=true max-buffers=" + std::to_string(params_.appsinkMaxBuffers) +
-           " emit-signals=false sync=false";
+           captureBranch("videoconvert ! video/x-raw, format=(string)BGR");
 }
 
 const char* Camera_USB::cameraTypeTag() const { return "USB"; }

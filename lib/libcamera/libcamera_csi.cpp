@@ -33,17 +33,9 @@ std::string Camera_CSI::buildPipelineString(const cameraVideoFormat& fmt,
         pipe += ", format=(string)NV12, framerate=" + std::to_string(on) + "/" + std::to_string(od);
     }
 
-    // The capture valve gates the CPU conversion chain (nvvidconv/videoconvert
-    // run per frame even when nobody pulls the appsink): drop-mode=1 forwards
-    // sticky events so EOS still reaches the appsink during teardown.
-    pipe += " ! tee name=srctee"
-            " srctee. ! queue max-size-buffers=" + std::to_string(params_.captureQueueDepth) +
-            " leaky=2 ! valve name=capvalve drop-mode=1"
-            " ! nvvidconv ! video/x-raw, format=(string)BGRx"
-            " ! videoconvert ! video/x-raw, format=(string)BGR"
-            " ! appsink name=mysink drop=true max-buffers=" + std::to_string(params_.appsinkMaxBuffers) +
-            " emit-signals=false sync=false";
-    return pipe;
+    // NVMM NV12 → BGRx on the VIC, then the CPU drops the padding byte.
+    return pipe + captureBranch("nvvidconv ! video/x-raw, format=(string)BGRx"
+                                " ! videoconvert ! video/x-raw, format=(string)BGR");
 }
 
 const char* Camera_CSI::cameraTypeTag() const { return "CSI"; }

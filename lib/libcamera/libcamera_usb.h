@@ -46,7 +46,7 @@ namespace dashcam::camera {
  *       OR
  *     ! [video/x-raw, format=YUY2, WxH, fps]     ← raw path
  *     ! tee name=srctee
- *   srctee. ! queue ! videoconvert ! BGR
+ *   srctee. ! queue ! valve name=capvalve ! videoconvert ! BGR
  *          ! appsink name=mysink
  *   srctee. ! queue ! valve ! <branch0>
  *   ...

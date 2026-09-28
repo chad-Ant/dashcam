@@ -46,8 +46,10 @@ namespace dashcam::camera {
  * @verbatim
  *   nvarguscamerasrc name=camerasrc sensor-id=N
  *     ! video/x-raw(memory:NVMM), NV12, WxH, fps
+ *     [! nvvidconv ! scaled NV12] [! videorate ! capped fps]   ← setOutputResolution()
  *     ! tee name=srctee
- *   srctee. ! queue ! nvvidconv ! BGRx ! appsink name=mysink
+ *   srctee. ! queue ! valve name=capvalve ! nvvidconv ! BGRx ! videoconvert ! BGR
+ *          ! appsink name=mysink
  *   srctee. ! queue ! valve ! <branch0>
  *   ...
  * @endverbatim

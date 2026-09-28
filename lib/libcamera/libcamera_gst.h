@@ -21,6 +21,7 @@
 #include "liblog.h"
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <mutex>
@@ -121,7 +122,7 @@ protected:
         std::string  name;           ///< User-supplied identifier for setBranchEnabled().
         GstElement*  bin;            ///< GStreamer bin providing the branch logic (owned by pipeline after start()).
         bool         leaky;          ///< true = leaky downstream queue (inference); false = blocking (recording).
-        bool         initialEnabled; ///< If false, valve starts with drop=TRUE so recording is paused until setBranchEnabled(true).
+        bool         initialEnabled; ///< If false, valve starts with drop=TRUE (turning buffers into GAP events, so the sink still prerolls) until setBranchEnabled(true).
     };
 
     /// Branches registered via addBranch() before start().  The pipeline takes
@@ -184,15 +185,9 @@ protected:
     /**
      * @brief Build the complete GStreamer pipeline description string.
      *
-     * The returned string must:
-     *  - Name the source element @c camerasrc  (retrieved later via gst_bin_get_by_name).
-     *  - Name the tee element    @c srctee.
-     *  - Name the appsink        @c mysink, configured with
-     *    @c drop=true emit-signals=false sync=false and
-     *    @c max-buffers=params_.appsinkMaxBuffers.
-     *  - Size the appsink-branch @c queue with
-     *    @c max-size-buffers=params_.captureQueueDepth (keep @c leaky=2).
-     *  - Output @c video/x-raw,format=BGR on the mysink branch.
+     * The returned string must name the source element @c camerasrc (attribute
+     * writes go to it) and end with captureBranch(), which supplies the other
+     * elements start() looks up by name: @c srctee, @c capvalve and @c mysink.
      *
      * @param[in] fmt    Active capture format (width, height, pixelFormat, …).
      * @param[in] frNum  Framerate numerator (already GCD-reduced).
@@ -209,6 +204,20 @@ protected:
      * @return A stable string literal identifying the concrete driver.
      */
     virtual const char* cameraTypeTag() const = 0;
+
+    /**
+     * @brief The capture half every driver's pipeline ends with, from the tee on:
+     * @verbatim
+     *   ! tee name=srctee
+     *   srctee. ! queue (leaky, captureQueueDepth) ! valve name=capvalve
+     *           ! <convert> ! appsink name=mysink (appsinkMaxBuffers, no sync)
+     * @endverbatim
+     * The valve forwards sticky events while dropping (drop-mode=1), so EOS still
+     * reaches the appsink during teardown when capture is disabled.
+     *
+     * @param convert  The driver's conversion chain to video/x-raw,format=BGR.
+     */
+    std::string captureBranch(const std::string& convert) const;
 
     /**
      * @brief Translate a name/value attribute pair into a GStreamer property write.
@@ -294,6 +303,17 @@ private:
      * Acquires stateMutex_ internally; must not be called with it held.
      */
     void checkBusErrors();
+
+    /**
+     * @brief Log why a pipeline failed to start: the first ERROR on its bus
+     *        (element, message, GStreamer's debug detail), prefixed by @p what.
+     *        Must run before teardownPipeline(), which discards the bus.
+     */
+    void logFirstBusError(GstElement* pipe, const char* what);
+
+    /// Bus warnings seen this run (see checkBusErrors(), which captureFrame()
+    /// and getCameraStatus() may run on different threads); reset by start().
+    std::atomic<unsigned> warningsSeen_{0};
 
 public:
     /**
@@ -421,8 +441,12 @@ public:
      *   srctee. ! queue [! valve] ! sinkBin
      * @endverbatim
      *
-     * Ownership of @p sinkBin transfers to the pipeline via gst_bin_add().
-     * Branches must be re-registered before each start() following a stop().
+     * Ownership of @p sinkBin always passes to the camera: an accepted bin is
+     * added to the pipeline at start() (or released by close() / the destructor
+     * if it never starts), and a refused one is released here.  Keep your own
+     * ref (gst_object_ref / gst_bin_get_by_name) on anything inside it you need
+     * afterwards.  Branches must be re-registered before each start() following
+     * a stop().
      *
      * @param[in] name     Unique branch identifier used by setBranchEnabled().
      * @param[in] sinkBin  GstElement (typically a GstBin) to attach to the tee.
@@ -436,8 +460,14 @@ public:
      *                     - @c false (default): Blocking queue. Buffers accumulate on
      *                       backpressure, blocking the tee if the queue fills. Use for
      *                       recording branches where frame loss is unacceptable.
-     * @pre Must be called before start().  Calling while RUNNING sets INVALID_ATTRIBUTE
-     *      and returns without modification.
+     * @param[in] initialEnabled  @c false starts the branch dropping until
+     *                     setBranchEnabled(true).  Its valve then forwards the dropped
+     *                     buffers as GAP events (drop-mode transform-to-gap), so the
+     *                     branch's sink prerolls and start() still reaches PLAYING;
+     *                     branches that start enabled drop without GAPs when disabled.
+     * @pre Must be called before start().  Calling while RUNNING (or with a null
+     *      bin or an empty name) sets INVALID_ATTRIBUTE, logs why and releases
+     *      @p sinkBin.
      *
      * @post Branches are linked during start().  On a failed start(), all branches
      *       are torn down by teardownPipeline().  Bins registered but never
