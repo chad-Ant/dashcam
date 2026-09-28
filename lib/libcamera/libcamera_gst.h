@@ -238,17 +238,39 @@ protected:
     /**
      * @brief Apply a single resolved attribute entry to a GStreamer source element.
      *
-     * Converts @p value to the type encoded in @p entry and calls g_object_set().
-     * Used by concrete applyAttributeGStreamer() implementations.
+     * Parses @p value as @p entry says, converts it to the property's own type
+     * and writes it.  Used by applyAttributeGStreamer().
      *
      * @param[in] src    GStreamer element to modify (must be non-null).
      * @param[in] entry  Resolved dictionary entry (gstProperty + valueType).
      * @param[in] value  Value string from CameraConfig::capabilities.
-     * @return @c true on success; @c false if @p value cannot be parsed.
+     * @return @c false — and nothing written — when @p src has no writable
+     *         property of that name, @p value does not parse, or it does not
+     *         convert to the property's type or fit its range.  (g_object_set()
+     *         used to print a GLib warning and report success for the first,
+     *         read the wrong C type for a mismatch, and drop an out-of-range
+     *         value with a warning.)
      */
     static bool applyGstProperty(GstElement* src,
                                   const AttributeEntry& entry,
                                   const std::string& value);
+
+    /**
+     * @brief Add @p name = @p value to @p controls (created on first use) and
+     *        write the whole set to @p src's "extra-controls" (v4l2src).
+     *
+     * v4l2src replaces its extra-controls as a whole on every write — applying
+     * them at once if the device is open, else when it opens — so the set is
+     * accumulated here to keep earlier controls.
+     *
+     * @return @c false when @p src has no "extra-controls" structure property.
+     */
+    static bool setExtraControl(GstElement* src, GstStructure*& controls,
+                                const std::string& name, int value);
+
+    /// Controls written through setExtraControl() since start(); freed with the
+    /// pipeline.  Guarded by stateMutex_.
+    GstStructure* extraControls_ = nullptr;
 
     /**
      * @brief Parse a decimal integer from @p str without throwing.

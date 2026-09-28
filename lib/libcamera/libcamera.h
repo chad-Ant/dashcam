@@ -336,15 +336,22 @@ public:
 // ─── attribute dictionary ─────────────────────────────────────────────────────
 
 /**
- * @brief How a capability value string is converted before being handed to g_object_set().
+ * @brief How a capability value string is parsed before it is written to the
+ *        source element.  The parsed value is then converted to the property's
+ *        own type (int → enum / uint / int64, float → double, ...) and range
+ *        checked; a value that does not fit is refused (INVALID_ATTRIBUTE).
  */
 enum class AttributeValueType {
-    String,       ///< Pass value string directly as const char*.
-    Int,          ///< Parse as gint.
-    Float,        ///< Parse as gfloat.
-    Bool,         ///< Parse "true"/"false" or "1"/"0" as gboolean.
-    BoolFromZero, ///< Parse as int; 0 → TRUE, non-zero → FALSE (AE/AWB lock inversion).
-    RangeString,  ///< Mirror single value to "val val" as const char* (nvargus range props).
+    String,       ///< The value string as is.
+    Int,          ///< Parsed as an integer.
+    Float,        ///< Parsed as a float.
+    Bool,         ///< "true"/"false" or "1"/"0".
+    BoolFromZero, ///< Parsed as an integer; 0 → TRUE, non-zero → FALSE (AE/AWB lock inversion).
+    RangeString,  ///< Mirrored to "val val" (nvargus range properties).
+    V4l2Control,  ///< An integer V4L2 control, not a property: gstProperty is the control's
+                  ///< normalised name (v4l2-ctl --list-ctrls, e.g. "white_balance_temperature"),
+                  ///< written through v4l2src's "extra-controls".  v4l2src has properties
+                  ///< only for brightness, contrast, saturation and hue.
 };
 
 /**

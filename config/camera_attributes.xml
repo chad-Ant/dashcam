@@ -5,17 +5,27 @@
   element property name used by the source element (nvarguscamerasrc / v4l2src).
 
   Attributes:
-    gstProperty  — property name passed to g_object_set().
+    gstProperty  — the source element's property name; for v4l2_control, the
+                   V4L2 control's name instead (see below).
     type         — "CSI" | "USB" | "any".
-    valueType    — how the value string is converted:
-                     string        pass value directly as const char*
-                     int           parse as gint
-                     float         parse as gfloat
-                     bool          "true"/"false" or "1"/"0" → gboolean
+    valueType    — how the value string is parsed:
+                     string        the string as is
+                     int           an integer
+                     float         a float
+                     bool          "true"/"false" or "1"/"0"
                      bool_from_zero  int; 0→TRUE, non-zero→FALSE (AE/AWB lock inversion)
                      range_string  mirror single value to "val val" (nvargus range props)
+                     v4l2_control  an integer V4L2 control, written through v4l2src's
+                                   extra-controls; gstProperty is the control's name as
+                                   v4l2-ctl lists it (lower case, "_" for separators).
+                                   v4l2src has properties only for brightness,
+                                   contrast, saturation and hue.
+                   The parsed value is converted to the property's own type and
+                   range-checked; one that does not fit is refused with a WARN.
 
   Alias matching is case-insensitive.  Add new entries here; no recompile needed.
+  camera_gst_test checks every entry against the real element (v4l2src; also
+  nvarguscamerasrc where it is installed).
 -->
 <CameraAttributeDictionary>
 
@@ -110,34 +120,44 @@
     <Alias>hue</Alias>
   </Attribute>
 
-  <Attribute gstProperty="sharpness" type="USB" valueType="int">
+  <!-- V4L2 controls v4l2src has no property for (they were named here as
+       properties until 2026-09-28, which v4l2src ignored with a GLib warning). -->
+  <Attribute gstProperty="sharpness" type="USB" valueType="v4l2_control">
     <Alias>sharpness</Alias>
   </Attribute>
 
-  <Attribute gstProperty="gamma" type="USB" valueType="int">
+  <Attribute gstProperty="gamma" type="USB" valueType="v4l2_control">
     <Alias>gamma</Alias>
   </Attribute>
 
-  <Attribute gstProperty="gain" type="USB" valueType="int">
+  <Attribute gstProperty="gain" type="USB" valueType="v4l2_control">
     <Alias>gain</Alias>
   </Attribute>
 
-  <Attribute gstProperty="white-balance-temperature" type="USB" valueType="int">
+  <Attribute gstProperty="white_balance_temperature" type="USB" valueType="v4l2_control">
     <Alias>white_balance_temperature</Alias>
     <Alias>white balance temperature</Alias>
     <Alias>white-balance-temperature</Alias>
   </Attribute>
 
-  <Attribute gstProperty="backlight-compensation" type="USB" valueType="int">
+  <Attribute gstProperty="backlight_compensation" type="USB" valueType="v4l2_control">
     <Alias>backlight_compensation</Alias>
     <Alias>backlight compensation</Alias>
     <Alias>backlight-compensation</Alias>
   </Attribute>
 
-  <Attribute gstProperty="exposure" type="USB" valueType="int">
+  <!-- Takes effect only with auto_exposure=1 (manual); 100 µs units. -->
+  <Attribute gstProperty="exposure_time_absolute" type="USB" valueType="v4l2_control">
     <Alias>exposure</Alias>
     <Alias>exposure_absolute</Alias>
     <Alias>exposure absolute</Alias>
+    <Alias>exposure_time_absolute</Alias>
+  </Attribute>
+
+  <!-- 1 = manual, 3 = aperture priority (the camera's own auto-exposure). -->
+  <Attribute gstProperty="auto_exposure" type="USB" valueType="v4l2_control">
+    <Alias>auto_exposure</Alias>
+    <Alias>exposure_auto</Alias>
   </Attribute>
 
 </CameraAttributeDictionary>

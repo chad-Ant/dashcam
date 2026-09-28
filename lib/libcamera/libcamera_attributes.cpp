@@ -19,6 +19,7 @@ AttributeValueType parseValueType(const char* str) {
     if (s == "bool")           return AttributeValueType::Bool;
     if (s == "bool_from_zero") return AttributeValueType::BoolFromZero;
     if (s == "range_string")   return AttributeValueType::RangeString;
+    if (s == "v4l2_control")   return AttributeValueType::V4l2Control;
     return AttributeValueType::String;
 }
 

@@ -1,12 +1,13 @@
 // USB camera function test — Jetson Orin Nano
 //
-// Single-camera tests (Tests 1-7):  always run against the first USB camera found.
+// Single-camera tests (Tests 1-7, 4b):  always run against the first USB camera found.
 // Dual-camera tests   (Tests 8-10): run only when 2+ USB cameras are present.
 //
 // Usage: ./usb_test
 // Requires: UVC cameras at /dev/videoN, GStreamer 1.0 with v4l2src + videoconvert
 
 #include "libcamera_usb.h"
+#include "libcamera_v4l2.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -181,6 +182,66 @@ static bool test_attribute_while_running(const cameraInfo& info) {
     bool ok = (st.currentError == ERROR_CODE::NONE);
     printf("  brightness=100 while RUNNING: error=%d %s\n",
            static_cast<int>(st.currentError), ok ? "(OK)" : "(FAIL)");
+
+    cam.stop();
+    cam.close();
+    return ok;
+}
+
+// Test 4b: attribute values actually reach the device, which Tests 3-4 (error
+// code only) cannot show.  brightness is a v4l2src property; gain and
+// backlight_compensation are V4L2 controls written through v4l2src's
+// extra-controls (valueType v4l2_control).  Each control the camera has, and
+// that is active (gain is not while the camera's own auto-exposure runs), is set
+// inside its range while RUNNING and read back with VIDIOC_G_CTRL; the original
+// value is restored afterwards.
+static bool test_attribute_reaches_device(const cameraInfo& info) {
+    std::cout << "\n--- Test 4b: Attribute Values Reach the Device ---\n";
+    if (info.videoFormats.empty()) { std::cerr << "  No formats\n"; return false; }
+    const v4l2::Fd fd = v4l2::openNode(info.address, O_RDWR);
+    if (!fd.valid()) { std::cerr << "  cannot open " << info.address << "\n"; return false; }
+
+    Camera_USB cam(info);
+    cam.setAttributeDictionary(g_dict);
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    cam.start();
+    if (!checkRunning(cam, "Test 4b")) { cam.close(); return false; }
+
+    struct Probe { const char* alias; uint32_t cid; };
+    const Probe probes[] = {{"brightness",             V4L2_CID_BRIGHTNESS},
+                            {"gain",                   V4L2_CID_GAIN},
+                            {"backlight_compensation", V4L2_CID_BACKLIGHT_COMPENSATION}};
+    bool ok = true;
+    int  tried = 0;
+    for (const Probe& p : probes) {
+        struct v4l2_queryctrl q;
+        int orig = 0;
+        if (!v4l2::queryControl(fd.get(), p.cid, q) || !v4l2::getControl(fd.get(), p.cid, orig)) {
+            printf("  %-24s not on this camera (skipped)\n", p.alias);
+            continue;
+        }
+        if (q.flags & (V4L2_CTRL_FLAG_INACTIVE | V4L2_CTRL_FLAG_READ_ONLY)) {
+            printf("  %-24s inactive or read-only right now (skipped)\n", p.alias);
+            continue;
+        }
+        const int step = q.step > 0 ? q.step : 1;
+        int want = q.minimum + ((q.maximum - q.minimum) / 2 / step) * step;   // mid-range, on the grid
+        if (want == orig) want = (orig - step >= q.minimum) ? orig - step : orig + step;
+        cam.setCameraAttribute(p.alias, std::to_string(want));
+        cameraStatus st;
+        cam.getCameraStatus(st);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        int got = -1;
+        v4l2::getControl(fd.get(), p.cid, got);
+        const bool pass = st.currentError == ERROR_CODE::NONE && got == want;
+        printf("  %-24s set %d (range %d..%d), device reads %d, error=%d %s\n", p.alias, want,
+               q.minimum, q.maximum, got, static_cast<int>(st.currentError), pass ? "(OK)" : "(FAIL)");
+        ok = ok && pass;
+        ++tried;
+        v4l2::setControl(fd.get(), p.cid, orig);   // leave the camera as found
+    }
+    if (tried == 0) printf("  none of the probed controls is settable on this camera\n");
 
     cam.stop();
     cam.close();
@@ -494,6 +555,7 @@ int main(int argc, char* argv[]) {
     bool t2  = test_frame_capture(c0);
     bool t3  = test_attribute_before_start(c0);
     bool t4  = test_attribute_while_running(c0);
+    bool t4b = test_attribute_reaches_device(c0);
     bool t5  = test_attribute_invalid(c0);
     bool t6  = test_stop_restart(c0);
     bool t7  = test_format_cycling(c0);
@@ -514,6 +576,7 @@ int main(int argc, char* argv[]) {
     printf("Test  2  Frame capture (3 s):              %s\n", r(t2));
     printf("Test  3  Attribute queued before start:    %s\n", r(t3));
     printf("Test  4  Attribute set while running:      %s\n", r(t4));
+    printf("Test 4b  Attribute values reach device:    %s\n", r(t4b));
     printf("Test  5  Invalid attribute name:           %s\n", r(t5));
     printf("Test  6  Stop/restart cycle:               %s\n", r(t6));
     printf("Test  7  Format cycling:                   %s\n", r(t7));
@@ -523,7 +586,7 @@ int main(int argc, char* argv[]) {
         printf("Test 10  Dual independent stop:            %s\n", r(t10));
     }
 
-    bool passed = t1 && t2 && t3 && t4 && t5 && t6 && t7;
+    bool passed = t1 && t2 && t3 && t4 && t4b && t5 && t6 && t7;
     if (usb.size() >= 2) passed = passed && t8 && t9 && t10;
     return passed ? 0 : 1;
 }

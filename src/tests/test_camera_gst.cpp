@@ -5,7 +5,10 @@
 // Covers the lifecycle (open/start/capture/stop/close, restart, recovery after
 // ERROR), BGR capture from an odd-width source (row stride ≠ width × 3), the
 // capture valve, branches (linking, runtime enable/disable, misuse), attributes
-// (queued before start, applied while running, unknown alias, bad value),
+// (queued before start, applied while running, unknown alias, bad value, a
+// property the element lacks, a value outside its type or range, V4L2
+// controls through v4l2src's extra-controls; every entry of
+// config/camera_attributes.xml against the real element),
 // start failures and runtime bus errors (with the element and GStreamer's
 // detail in the log), and the USB / CSI pipeline strings.
 //
@@ -19,6 +22,8 @@
 #include "libcamera_usb.h"
 
 #include <linux/videodev2.h>
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -81,6 +86,9 @@ class TestCamera : public Camera_GST {
 public:
     explicit TestCamera(const cameraInfo& ci = testInfo()) : Camera_GST(ci) {}
     ~TestCamera() override = default;
+
+    using Camera_GST::applyGstProperty;
+    using Camera_GST::setExtraControl;
 
     std::string description;
 
@@ -160,6 +168,9 @@ static AttributeDictionary testDictionary() {
     d.entries.push_back({"pattern", "USB", AttributeValueType::Int, {"pattern", "Test Pattern"}});
     d.entries.push_back({"horizontal-speed", "any", AttributeValueType::Int, {"speed"}});
     d.entries.push_back({"is-live", "CSI", AttributeValueType::Bool, {"csi only"}});
+    d.entries.push_back({"no-such-property", "USB", AttributeValueType::Int, {"typo"}});
+    d.entries.push_back({"horizontal-speed", "USB", AttributeValueType::String, {"speed as text"}});
+    d.entries.push_back({"sharpness", "USB", AttributeValueType::V4l2Control, {"sharpness"}});
     return d;
 }
 
@@ -369,7 +380,128 @@ static void testAttributes() {
     cam.setCameraAttribute("pattern", "3x");
     check(cam.error() == ERROR_CODE::INVALID_ATTRIBUTE && cam.sourceInt("pattern") == 2,
           "unparsable value -> INVALID_ATTRIBUTE, property unchanged");
+    cam.setCameraAttribute("pattern", "999");
+    check(cam.error() == ERROR_CODE::INVALID_ATTRIBUTE && cam.sourceInt("pattern") == 2,
+          "value outside the enum -> INVALID_ATTRIBUTE, property unchanged");
+    cam.setCameraAttribute("typo", "1");
+    check(cam.error() == ERROR_CODE::INVALID_ATTRIBUTE,
+          "an entry naming a property the element lacks -> INVALID_ATTRIBUTE (was NONE)");
+    cam.setCameraAttribute("speed as text", "7");
+    check(cam.error() == ERROR_CODE::INVALID_ATTRIBUTE && cam.sourceInt("horizontal-speed") == 4,
+          "a string entry for an int property -> INVALID_ATTRIBUTE (was a wrong-type write)");
+    cam.setCameraAttribute("sharpness", "3");
+    check(cam.error() == ERROR_CODE::INVALID_ATTRIBUTE,
+          "a V4L2 control on a source without extra-controls -> INVALID_ATTRIBUTE");
     cam.close();
+
+    // Rejected while queued: start() still runs, and says which one failed.
+    LogSink log;
+    TestCamera cam2;
+    cam2.setLogCallback(log.callback());
+    cam2.setAttributeDictionary(testDictionary());
+    cam2.setPipelineParams(fastParams());
+    cam2.open();
+    cam2.setCameraVideoFormat(0);
+    cam2.setCameraAttribute("pattern", "999");
+    cam2.setCameraAttribute("speed", "2");
+    cam2.start();
+    check(cam2.state() == CAMERA_STATUS::RUNNING && cam2.sourceInt("horizontal-speed") == 2,
+          "a rejected queued attribute does not stop start() or the others");
+    check(log.has("W attribute pattern=999 not applied on videotestsrc"), "... and is logged by name");
+    cam2.close();
+}
+
+static void testExtraControls() {
+    std::printf("\n--- V4L2 controls through v4l2src extra-controls ---\n");
+    gst_init(nullptr, nullptr);
+    GstElement* v4l2 = gst_element_factory_make("v4l2src", nullptr);
+    if (!v4l2) {
+        std::printf("  skip  no v4l2src (gst-plugins-good) here\n");
+        return;
+    }
+    gst_object_ref_sink(v4l2);
+    GstStructure* controls = nullptr;
+    const bool a = TestCamera::setExtraControl(v4l2, controls, "gain", 10);
+    const bool b = TestCamera::setExtraControl(v4l2, controls, "white_balance_temperature", 4600);
+    const bool c = TestCamera::setExtraControl(v4l2, controls, "gain", 12);   // replaces, keeps the other
+    GstStructure* set = nullptr;
+    g_object_get(v4l2, "extra-controls", &set, nullptr);
+    gint gain = -1, wb = -1;
+    const bool readBack = set && gst_structure_get_int(set, "gain", &gain) &&
+                          gst_structure_get_int(set, "white_balance_temperature", &wb);
+    check(a && b && c && readBack && gain == 12 && wb == 4600 && gst_structure_n_fields(set) == 2,
+          "controls accumulate in one structure on the element (gain=12, wb=4600)");
+    if (set) gst_structure_free(set);
+    if (controls) gst_structure_free(controls);
+    gst_object_unref(v4l2);
+
+    GstElement* test = gst_element_factory_make("videotestsrc", nullptr);
+    gst_object_ref_sink(test);
+    GstStructure* none = nullptr;
+    check(!TestCamera::setExtraControl(test, none, "gain", 1) && none == nullptr,
+          "an element without extra-controls is refused, nothing allocated");
+    gst_object_unref(test);
+}
+
+/// config/camera_attributes.xml from the repo root, or the build's seeded copy.
+static bool loadRepoDictionary(AttributeDictionary& dict) {
+    if (AttributeDictionary::load("config/camera_attributes.xml", dict)) return true;
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return false;
+    std::string dir(exe, static_cast<size_t>(n));
+    dir = dir.substr(0, dir.find_last_of('/'));
+    return AttributeDictionary::load(dir + "/config/camera_attributes.xml", dict);
+}
+
+/// Would @p type's parsed value convert to @p propType?
+static bool convertible(AttributeValueType type, GType propType) {
+    switch (type) {
+        case AttributeValueType::Int:          return g_value_type_transformable(G_TYPE_INT, propType);
+        case AttributeValueType::Float:        return g_value_type_transformable(G_TYPE_FLOAT, propType);
+        case AttributeValueType::Bool:
+        case AttributeValueType::BoolFromZero: return g_value_type_transformable(G_TYPE_BOOLEAN, propType);
+        case AttributeValueType::String:
+        case AttributeValueType::RangeString:  return g_value_type_transformable(G_TYPE_STRING, propType);
+        case AttributeValueType::V4l2Control:  return false;
+    }
+    return false;
+}
+
+static void testRepoDictionary() {
+    std::printf("\n--- config/camera_attributes.xml against the real elements ---\n");
+    gst_init(nullptr, nullptr);
+    AttributeDictionary dict;
+    check(loadRepoDictionary(dict) && !dict.entries.empty(), "the repository dictionary loads");
+    struct Source { const char* type; const char* factory; };
+    for (const Source src : {Source{"USB", "v4l2src"}, Source{"CSI", "nvarguscamerasrc"}}) {
+        GstElement* el = gst_element_factory_make(src.factory, nullptr);
+        if (!el) {
+            std::printf("  skip  %s entries: no %s here\n", src.type, src.factory);
+            continue;
+        }
+        gst_object_ref_sink(el);
+        int checked = 0;
+        std::string bad;
+        for (const auto& e : dict.entries) {
+            if (e.type != src.type && e.type != "any") continue;
+            ++checked;
+            if (e.valueType == AttributeValueType::V4l2Control) {
+                GParamSpec* ps = g_object_class_find_property(G_OBJECT_GET_CLASS(el), "extra-controls");
+                if (!ps || ps->value_type != GST_TYPE_STRUCTURE) bad += " " + e.gstProperty + "(no extra-controls)";
+                continue;
+            }
+            GParamSpec* ps = g_object_class_find_property(G_OBJECT_GET_CLASS(el), e.gstProperty.c_str());
+            if (!ps)                                       bad += " " + e.gstProperty + "(missing)";
+            else if (!(ps->flags & G_PARAM_WRITABLE))      bad += " " + e.gstProperty + "(read-only)";
+            else if (!convertible(e.valueType, ps->value_type))
+                bad += " " + e.gstProperty + "(type " + g_type_name(ps->value_type) + ")";
+        }
+        gst_object_unref(el);
+        check(checked > 0 && bad.empty(), std::string(src.type) + ": all " + std::to_string(checked) +
+              " entries name a writable " + src.factory + " property of a fitting type, or a V4L2 control" +
+              (bad.empty() ? "" : " — bad:" + bad));
+    }
 }
 
 static void testStartFailures() {
@@ -540,6 +672,8 @@ int main() {
     testCaptureValve();
     testBranches();
     testAttributes();
+    testExtraControls();
+    testRepoDictionary();
     testStartFailures();
     testRuntimeBusMessages();
     testConcurrentCaptureAndStop();

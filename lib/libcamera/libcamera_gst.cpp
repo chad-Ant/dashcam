@@ -205,12 +205,15 @@ void Camera_GST::teardownPipeline() {
     GstElement* teeToUnref   = nullptr;
     GstElement* srcToUnref   = nullptr;
     GstElement* valveToUnref = nullptr;
+    GstStructure* controlsToFree = nullptr;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         teeToUnref   = tee_;        tee_        = nullptr;
         srcToUnref   = camera_src_; camera_src_ = nullptr;
         valveToUnref = capValve_;   capValve_   = nullptr;
+        controlsToFree = extraControls_; extraControls_ = nullptr;
     }
+    if (controlsToFree) gst_structure_free(controlsToFree);
     if (teeToUnref)     gst_object_unref(teeToUnref);
     if (srcToUnref)     gst_object_unref(srcToUnref);
     if (valveToUnref)   gst_object_unref(valveToUnref);
@@ -302,11 +305,14 @@ void Camera_GST::applyAttributeGStreamer(const std::string& name,
         return;
     }
     const AttributeEntry* entry = dict_.resolve(name, cameraTypeTag());
-    if (!entry || !applyGstProperty(camera_src_, *entry, value)) {
-        status_.currentError = ERROR_CODE::INVALID_ATTRIBUTE;
-        return;
+    bool ok = false;
+    if (entry && entry->valueType == AttributeValueType::V4l2Control) {
+        int iv = 0;
+        ok = safeStoi(value, iv) && setExtraControl(camera_src_, extraControls_, entry->gstProperty, iv);
+    } else if (entry) {
+        ok = applyGstProperty(camera_src_, *entry, value);
     }
-    status_.currentError = ERROR_CODE::NONE;
+    status_.currentError = ok ? ERROR_CODE::NONE : ERROR_CODE::INVALID_ATTRIBUTE;
 }
 
 // ─── static utilities ────────────────────────────────────────────────────────
@@ -348,27 +354,46 @@ bool Camera_GST::applyGstProperty(GstElement* src,
                                    const AttributeEntry& entry,
                                    const std::string& value) {
     const char* prop = entry.gstProperty.c_str();
+    GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), prop);
+    if (!pspec || !(pspec->flags & G_PARAM_WRITABLE) || (pspec->flags & G_PARAM_CONSTRUCT_ONLY))
+        return false;
 
+    // Parse into a GValue of the dictionary's type...
+    GValue in = G_VALUE_INIT;
     switch (entry.valueType) {
         case AttributeValueType::String:
-            g_object_set(G_OBJECT(src), prop, value.c_str(), NULL);
-            return true;
+            g_value_init(&in, G_TYPE_STRING);
+            g_value_set_string(&in, value.c_str());
+            break;
 
-        case AttributeValueType::Int: {
+        case AttributeValueType::RangeString:
+            g_value_init(&in, G_TYPE_STRING);
+            g_value_set_string(&in, (value + " " + value).c_str());
+            break;
+
+        case AttributeValueType::Int:
+        case AttributeValueType::BoolFromZero: {
             int iv = 0;
             if (!safeStoi(value, iv)) return false;
-            g_object_set(G_OBJECT(src), prop, static_cast<gint>(iv), NULL);
-            return true;
+            if (entry.valueType == AttributeValueType::Int) {
+                g_value_init(&in, G_TYPE_INT);
+                g_value_set_int(&in, iv);
+            } else {
+                g_value_init(&in, G_TYPE_BOOLEAN);
+                g_value_set_boolean(&in, iv == 0 ? TRUE : FALSE);
+            }
+            break;
         }
 
         case AttributeValueType::Float: {
             char* end = nullptr;
-            float fv = std::strtof(value.c_str(), &end);
+            const float fv = std::strtof(value.c_str(), &end);
             // Reject empty input and trailing garbage (e.g. "1.5abc"), matching
             // the strictness of the Int path via safeStoi().
             if (end == value.c_str() || *end != '\0') return false;
-            g_object_set(G_OBJECT(src), prop, static_cast<gfloat>(fv), NULL);
-            return true;
+            g_value_init(&in, G_TYPE_FLOAT);
+            g_value_set_float(&in, fv);
+            break;
         }
 
         case AttributeValueType::Bool: {
@@ -379,24 +404,36 @@ bool Camera_GST::applyGstProperty(GstElement* src,
             if      (lower == "true"  || lower == "1") bv = TRUE;
             else if (lower == "false" || lower == "0") bv = FALSE;
             else return false;
-            g_object_set(G_OBJECT(src), prop, bv, NULL);
-            return true;
+            g_value_init(&in, G_TYPE_BOOLEAN);
+            g_value_set_boolean(&in, bv);
+            break;
         }
 
-        case AttributeValueType::BoolFromZero: {
-            int iv = 0;
-            if (!safeStoi(value, iv)) return false;
-            g_object_set(G_OBJECT(src), prop, iv == 0 ? TRUE : FALSE, NULL);
-            return true;
-        }
-
-        case AttributeValueType::RangeString: {
-            std::string range = value + " " + value;
-            g_object_set(G_OBJECT(src), prop, range.c_str(), NULL);
-            return true;
-        }
+        case AttributeValueType::V4l2Control:   // not a property: setExtraControl()
+            return false;
     }
-    return false;
+
+    // ...then convert it to the property's own type (int → enum, uint, int64;
+    // float → double; ...) and range-check it before writing anything.
+    GValue out = G_VALUE_INIT;
+    g_value_init(&out, pspec->value_type);
+    const bool ok = g_value_type_transformable(G_VALUE_TYPE(&in), pspec->value_type) &&
+                    g_value_transform(&in, &out) &&
+                    !g_param_value_validate(pspec, &out);   // true = had to change it
+    if (ok) g_object_set_property(G_OBJECT(src), prop, &out);
+    g_value_unset(&in);
+    g_value_unset(&out);
+    return ok;
+}
+
+bool Camera_GST::setExtraControl(GstElement* src, GstStructure*& controls,
+                                 const std::string& name, int value) {
+    GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(src), "extra-controls");
+    if (!pspec || pspec->value_type != GST_TYPE_STRUCTURE || name.empty()) return false;
+    if (!controls) controls = gst_structure_new_empty("controls");
+    gst_structure_set(controls, name.c_str(), G_TYPE_INT, value, NULL);
+    g_object_set(G_OBJECT(src), "extra-controls", controls, NULL);
+    return true;
 }
 
 std::string Camera_GST::captureBranch(const std::string& convert) const {
@@ -798,13 +835,29 @@ void Camera_GST::start() {
     // bringup, so frame 0 uses the requested exposure/gain/lock with no AE flash.
     // Holding stateMutex_ here is safe: no streaming thread exists yet, so
     // g_object_set is just writing struct fields — no blocking, no callbacks.
+    // A rejected one (a config typo, a value the element does not take) is
+    // logged once the lock is released.
+    std::vector<std::string> rejected;
+    auto flushPending = [&](std::map<std::string, std::string>& pending) {
+        for (const auto& [attrName, attrValue] : pending) {
+            applyAttributeGStreamer(attrName, attrValue);
+            if (status_.currentError == ERROR_CODE::INVALID_ATTRIBUTE)
+                rejected.push_back(attrName + "=" + attrValue);
+        }
+        pending.clear();
+    };
+    auto logRejected = [&]() {
+        for (const auto& r : rejected)
+            doLog(log_, dashcam::log::LogLevel::WARN,
+                  "attribute %s not applied on %s: unknown to the dictionary, or a value "
+                  "the element does not take", r.c_str(), info_.address.c_str());
+        rejected.clear();
+    };
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        for (const auto& [attrName, attrValue] : pendingAttributes_) {
-            applyAttributeGStreamer(attrName, attrValue);
-        }
-        pendingAttributes_.clear();
+        flushPending(pendingAttributes_);
     }
+    logRejected();
 
     // Hardware boots here with the correct ISP settings already applied.
     GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
@@ -842,16 +895,13 @@ void Camera_GST::start() {
 
     // Drain anything queued during the startup window.  status_ is already
     // RUNNING (claimed at the top of start() to serialise concurrent callers).
-    std::map<std::string, std::string> lateAttribs;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        lateAttribs = std::move(pendingAttributes_);
-        for (const auto& [attrName, attrValue] : lateAttribs) {
-            applyAttributeGStreamer(attrName, attrValue);
-        }
+        flushPending(pendingAttributes_);
         starting_ = false;  // construction phase over (success); unblock stop()
     }
     startCv_.notify_all();
+    logRejected();
 }
 
 void Camera_GST::stop() {

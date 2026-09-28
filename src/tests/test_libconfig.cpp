@@ -457,7 +457,9 @@ static bool test_attribute_dictionary() {
     const AttributeEntry* csiExp = dict.resolve("exposure", "CSI");
     const AttributeEntry* usbExp = dict.resolve("exposure", "USB");
     check(csiExp && csiExp->gstProperty == "exposuretimerange", "exposure/CSI -> exposuretimerange");
-    check(usbExp && usbExp->gstProperty == "exposure",          "exposure/USB -> exposure");
+    check(usbExp && usbExp->gstProperty == "exposure_time_absolute" &&
+          usbExp->valueType == AttributeValueType::V4l2Control,
+          "exposure/USB -> the exposure_time_absolute V4L2 control");
     const AttributeEntry* csiSat = dict.resolve("saturation", "CSI");
     const AttributeEntry* usbSat = dict.resolve("saturation", "USB");
     check(csiSat && csiSat->valueType == AttributeValueType::Float, "saturation/CSI -> float");
