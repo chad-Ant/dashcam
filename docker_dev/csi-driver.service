@@ -1,0 +1,35 @@
+# systemd unit: load the IMX296 CSI sensor driver at boot, before Argus starts.
+#
+# Replaces the Jetson's own driver unit, which stopped nvargus-daemon, failed to
+# load a module built for another kernel, and left Argus stopped (2026-09-28).
+# Ordered before nvargus-daemon, so at boot Argus is never stopped at all: the
+# module loads first and Argus finds the sensor when it starts.  Run by hand
+# (`sudo csi_driver.sh load`) it stops Argus around the load and always starts
+# it again.  A module that cannot load (none for this kernel, or built for
+# another) is refused before Argus is touched; the unit then fails, and
+# `journalctl -u csi-driver` says why.
+#
+# Install (once, needs sudo), after disabling the old unit:
+#   sudo install -m 755 /home/jetson/dashcam/docker_dev/csi_driver.sh /usr/local/sbin/dashcam-csi-driver
+#   sudo cp /home/jetson/dashcam/docker_dev/csi-driver.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable csi-driver.service
+# Check without changing anything: /usr/local/sbin/dashcam-csi-driver check
+#
+# The script is installed under /usr/local/sbin because root runs it: a copy in
+# the user's clone could be edited by that user.  Set CSI_MODULE below if the
+# driver is not named nv_imx296.
+
+[Unit]
+Description=IMX296 CSI sensor driver (checked against the running kernel)
+Before=nvargus-daemon.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CSI_MODULE=nv_imx296
+ExecStart=/usr/local/sbin/dashcam-csi-driver load
+
+[Install]
+WantedBy=multi-user.target
