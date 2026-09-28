@@ -16,6 +16,9 @@
 | libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The EINTR retry is defensive only: the apps install handlers with `std::signal`, which sets SA_RESTART, so it never fires on the Jetson. **Run on the Jetson 2026-09-28:** `scan_cameras` output is byte-identical to the previous build's, and v0.4 starts, records and stops as before (results below). | — |
 | libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. **Run on the Jetson 2026-09-28:** `camera_gst_test` passes on GStreamer 1.20.3. The fix for branches that start disabled works only when the sink sees GAP events directly, so not for this project's real branches (review item C below). | the review items below |
 | libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). A write is checked against the **element's** property type and range, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. That does not check the **device's** range: the driver clamps out-of-range USB values, and those still report NONE (review item F). **Run on the Jetson 2026-09-28:** `usb_test` Test 4b reads back every control it sets, and the CSI dictionary check passes. `usb_test` changes the camera's settings and leaves them changed (review item A). | the review items below |
+| libcommlink: fixes | `68fcceb` | CommLink logged its port open/close lines with the port mutex held, so a log callback that asked the link anything deadlocked (latent; v0.4's does not). The bridge tty and the wake pipe are now close-on-exec (children such as `nmcli` inherited them). `typeName()` now names `CMD_SET_IMU_MODE` in both `HostProtocol.h` copies, which stay byte-identical; the wire is unchanged. Discovery keeps partial results when a node vanishes mid-scan. `Uart::read(0)` no longer makes two `fcntl()` calls per read. New `logPrintf()` in liblog replaces three private log helpers. | **not run on hardware:** `commlink_test` with the C3, and v0.4's bridge line (below) |
+| libbus | `5be7a5b` | `ibus.h` (the base of libuart, libspi and libi2c) moved from `lib/libgpio` to `lib/libbus`. There is no code change. | — |
+| commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | a run on the Jetson (below) |
 
 ## Who does what: read before handing work across
 
@@ -112,6 +115,44 @@ The MKR and C3 host suites were not rerun, because this pass does not touch `per
 
 `bbc0caa` also changed discovery (`getCameraList()`), which v0.4 runs at every recording start. The note in the old
 step list missed that; steps 3 and 4 cover it.
+
+## Next (Jetson coder): run the libcommlink pass on the Jetson
+
+The cloud session changed libcommlink and libuart on 2026-09-28 (`68fcceb`..`0f548d7`) and ran them only
+against a simulated bridge. The link's wire traffic is unchanged. Stop `dashcam-v04` first: it holds the bridge
+port exclusively. In the container, `make`, then from the repo root with `B=$(ls -td bin/build_* | head -1)`:
+
+1. **`$B/commlink_sim_test`** needs no hardware. Expect `RESULT: PASS`, 73 checks in about 6 s. It runs the pty
+   fake bridge on the Jetson's GCC 11.4 and kernel.
+2. **`$B/commlink_test`** with the C3 plugged in, for about 30 s (`$B/commlink_test "" 30` auto-discovers).
+   Expect:
+   - `bridge fw 1.0 proto 7`, then telemetry and status lines;
+   - pulling and reinserting the C3's cable: `bridge port closed`, then `bridge port open`, a new HELLO,
+     streaming again, and `reconnects=1` in the stats line;
+   - no `NACK` lines. If one appears, it now names the command (`CMD_SET_IMU_MODE`, not `UNKNOWN`).
+3. **v0.4:** after the rebuild and restart, the start log shows `bridge fw 1.0 proto 7` as before, and the overlay's
+   vehicle fields fill in.
+4. **The C3 needs no reflash.** The only `HostProtocol.h` change is a name in `typeName()`, which the C3 never
+   calls. `md5sum lib/libcommlink/HostProtocol.h peripherals/esp32-c3/lib/hostLink/HostProtocol.h` must print the
+   same sum twice.
+
+Report back in this file: the sim test's RESULT and the `commlink_test` reconnect lines.
+
+**Proposed, not done:** each changes behaviour on the car, so it is the Jetson coder's or the user's call.
+- **Back off after a failed handshake.**
+  - Today a bridge on the wrong firmware, or a silent device, is reopened every reconnectMs + handshakeMs
+    (about 3 s) forever.
+  - Each round logs about four lines. v0.4's `quietRepeats` demotes the repeats to DEBUG, but DEBUG is the default
+    level, so the log file still grows.
+  - Proposal: double the interval per consecutive handshake failure, capped at about 30 s, and reset it on a
+    compatible HELLO. It would slow reconnecting to a bridge that was just reflashed by up to the cap.
+- **Twelve more libraries** keep their own truncating `doLog()`: libcan, libconfig, libdriverstate, libgpio (x2),
+  libi2c, liblanedetector, libmidi, librecord (x2), libspi and libstereocam. Switch each to `logPrintf()` in its
+  own pass.
+- **`Uart::readLine()`** costs a poll and a read per character. That is fine for `gpio_test`'s NMEA; buffer it if
+  a real consumer appears.
+
+The libcamera review items A–J below are still open. This pass did not touch them.
 
 ## Next: review items from the libcamera pass
 
@@ -382,6 +423,8 @@ make                                                 # every target, inside the 
 B=$(ls -td bin/build_* | head -1)                    # the build just made; run from the repo root
 $B/dashcam_v0_4 --self-test && $B/config_test && $B/bridge_overlay_test
 $B/camera_gst_test                                   # Camera_GST over videotestsrc: no camera needed
+$B/commlink_sim_test                                 # CommLink + libuart against a simulated C3 on a pty: no hardware
+$B/commlink_test "" 30                               # the real C3 bridge (stop dashcam-v04 first)
 $B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
 $B/usb_test                                          # a USB camera (stop dashcam-v04 first; afterwards restore, item A)
 $B/scan_cameras                                      # lists the cameras, their controls and formats
@@ -396,6 +439,6 @@ The Wire changes have no host test: they are register-level SAMD21 code, proven 
 
 Where each test can run:
 - **Anywhere, cloud included:** the host suites, `mutations`, `--self-test`, `config_test`,
-  `bridge_overlay_test`, `camera_gst_test` and `record_test` Part A.
-- **Jetson only:** CUDA targets, `record_test` Part B, `usb_test`, `csi_test`, `scan_cameras` (with a camera), and
-  everything on the rig or the car.
+  `bridge_overlay_test`, `camera_gst_test`, `commlink_sim_test` and `record_test` Part A.
+- **Jetson only:** CUDA targets, `record_test` Part B, `usb_test`, `csi_test`, `scan_cameras` (with a camera),
+  `commlink_test` (with the C3), and everything on the rig or the car.
