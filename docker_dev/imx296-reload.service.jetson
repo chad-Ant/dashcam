@@ -1,0 +1,24 @@
+# imx296-reload.service — the unit installed on the Jetson (/etc/systemd/system/, enabled),
+# copied 2026-09-28 for reference. It is the vendor's file, byte for byte: the CAM-IMX296RAW
+# package, IMX296 unified binary v1.1 (k5.15.185-tegra), imx296-reload.service. Its module is
+# named imx296 (not nv_imx296). On 5.15.199-tegra modprobe fails ('Module imx296 not
+# found') after the unit has stopped nvargus-daemon, so Argus stays down. On
+# 5.15.185-tegra (R36.5.0, since 2026-09-30) it works as intended.
+# docker_dev/csi-driver.service would replace it only after HANDOVER.md items K-P.
+# Not installed from here.
+
+[Unit]
+Description=Reload IMX296 module and restart nvargus-daemon after boot
+After=nvargus-daemon.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStartPre=/bin/systemctl stop nvargus-daemon
+ExecStartPre=/sbin/modprobe -r imx296
+ExecStart=/sbin/modprobe imx296
+ExecStartPost=/bin/systemctl start nvargus-daemon
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
