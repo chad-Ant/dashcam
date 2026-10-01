@@ -5,7 +5,7 @@
 | Item | Commit | Status | Still needs |
 |---|---|---|---|
 | Platform | — | **Rootfs, kernel and userspace back on L4T R36.5.0 (JetPack 6.2.2, kernel 5.15.185-tegra) on 2026-09-30**, for the IMX296 driver; the 65 NVIDIA packages are held. **The QSPI bootloader/UEFI is still 36.5.2** (slot B; the 36.5.0 capsule did not take effect). On this mix, the IMX296 in CAM1 streams through Argus again (`csi_test` 5/5), and v0.4, the UGREEN and CUDA all work (below). | The user's call: stay (works, tested), or **upgrade to R36.5.2 with the IMX296 driver rebuilt from source** (`~/drive_logs/tools/l4t_upgrade_36_5_2.sh`, prepared and reviewed 2026-10-01; this also matches the bootloader again). UEFI refuses a 36.5.0 bootloader. |
-| IMX296 driver for any kernel | — | Rebuilt from the vendor's own source (recovered from their git history) plus FRC 971's mode table. Its code, data, strings and `.modinfo` are byte-identical to the vendor's 5.15.185 module (the files differ only in debug info and build-id), and a 5.15.199 build has 41/41 CRCs matching 36.5.2. Tools, outside the repo: `~/drive_logs/tools/imx296_driver/build.sh`, `l4t_upgrade_36_5_2.sh`, `l4t_rollback_36_5_0.sh`, `verify_platform.sh` (below). | **not run on hardware:** the 5.15.199 module on a 5.15.199 kernel (upgrade step 4) |
+| IMX296 driver for any kernel | — | Rebuilt from the vendor's own source (recovered from their git history) plus FRC 971's mode table. Its code, data, strings and `.modinfo` are byte-identical to the vendor's 5.15.185 module (the files differ only in debug info and build-id), and a 5.15.199 build has 41/41 CRCs matching 36.5.2. Tools, outside the repo: `~/drive_logs/tools/imx296_driver/build.sh`, `l4t_upgrade_36_5_2.sh`, `l4t_rollback_36_5_0.sh`, `verify_platform.sh`, and the pre-reboot checks they share, `l4t_checks.sh` (tested by `test_l4t_checks.sh`; rewritten 2026-10-01 after two reviews, below). | **not run on hardware:** the 5.15.199 module on a 5.15.199 kernel (upgrade step 4) |
 | High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
 | CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
 | Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
@@ -113,6 +113,8 @@ R36.5.0 as of 2026-09-30, and the upgrade is the user's call.
 | `l4t_rollback_36_5_0.sh` | R36.5.2 → R36.5.0, the state verified on 2026-09-30. Same modes and the same checks. Rewritten on 2026-10-01: the 09-30 version could no longer run, because the apt history had rotated and the packages are held. |
 | `l4t_36_5_2.pairs`, `l4t_36_5_0.pairs` | The 65 `package=version` pairs for each direction, frozen on 2026-10-01, because `/var/log/apt/history.log` rotates. The 36.5.2 list equals the `dpkg -l` that the rollback backed up before running. The 36.5.0 list equals what is installed now. |
 | `verify_platform.sh [--quick]` | The test after any platform change. It changes nothing and stops no service. |
+| `l4t_checks.sh` | The boot-file checks that the upgrade, the rollback and `verify_platform.sh` share: `extlinux_default_check`, `extlinux_entry_check` and `initrd_check`. It is sourced, not run, and every script that uses it stops if it is missing, so copy it along with them. It reads `extlinux.conf` the way NVIDIA's UEFI launcher does, and the initrd the way the kernel does (below). |
+| `test_l4t_checks.sh` | Its regression test: 109 checks against good and broken boot entries and initrds built in a temporary directory, plus this machine's own `/boot`, read-only. No root needed; about 10 s. Every rule is load-bearing: deleting any one of them (37 mutants) makes it fail. |
 
 What `l4t_upgrade_36_5_2.sh --apply` does:
 1. Installs the 65 packages with `--allow-change-held-packages`. The holds stay.
@@ -123,10 +125,13 @@ Before it says "All checks passed", it checks:
 - that `/boot/Image` is 5.15.199;
 - that the uvcvideo, cdc-acm, imx296 and tegra-camera module files exist for 5.15.199, that imx296 is in
   `modules.dep`, and that `modprobe -n` resolves it;
-- that the initrd carries nvme, nvme-core, pcie-tegra194 and phy-p2u for 5.15.199 (the root file system is on NVMe,
-  and these are modules);
+- that `/boot/initrd` is whole (one gzip stream, one cpio archive, nothing hidden after either) and carries nvme,
+  nvme-core, pcie-tegra194 and phy-p2u for 5.15.199, byte-identical to the installed modules (the root file system
+  is on NVMe, and these are modules);
 - that `dpkg --audit` is clean;
-- `DEFAULT JetsonIO` and the cam1 overlay;
+- that `DEFAULT JetsonIO` is the only DEFAULT, and that the JetsonIO entry boots `/boot/Image` and `/boot/initrd`,
+  with the running root's `root=PARTUUID=` and the cam1 overlay as its only camera overlay, every file present,
+  and the overlay applying to its DTB (`fdtoverlay`);
 - the holds.
 
 Any failure ends with "do NOT reboot". Re-running it is safe.
@@ -161,6 +166,66 @@ Checked fine:
 - `nv-update-extlinux` keeps the JetsonIO entry and its FDT/OVERLAYS lines;
 - the A_kernel fallback holds a bootable stock 5.15.199 (without the camera overlay).
 
+**Second review, 2026-10-01 afternoon: the pre-reboot checks.** These checks decide whether the user may reboot,
+so they were reviewed again, for what they let through.
+- **The user's reviewer found two holes; both were reproduced.**
+  - The initrd check threw away decompression errors (`zcat … || true`): an initrd missing its last 25% still listed
+    all four NVMe modules, and passed.
+  - The overlay check (`awk '/^LABEL JetsonIO/{f=1} f && /OVERLAYS/'`) never ended the entry. It accepted the overlay
+    under a later entry, a commented-out `OVERLAYS` line and a nonexistent file. It also accepted a `.dtbo.bak` name
+    and a `LABEL JetsonIO-old`.
+  - The rollback script had the same two checks, and `verify_platform.sh` the overlay one.
+- **A first fix moved both checks into `l4t_checks.sh`.** A workflow then attacked it: three attackers worked against
+  NVIDIA's own sources (edk2-nvidia `L4TLauncher.c`, identical at r36.5, r36.5.1 and r36.5-updates; the r36.5
+  kernel's `init/initramfs.c` and `lib/decompress_inflate.c`), and a skeptic re-ran every finding.
+  - 26 findings: 25 confirmed and 1 plausible. One of the confirmed is a false alarm on initrd layouts that
+    `nv-update-initrd` never writes, and needs no change.
+  - All low severity: NVIDIA's tools (`jetson-io`, `nv-update-extlinux`, `nv-update-initrd`) never write such files.
+    Only a hand edit or a broken writer would get through.
+  - The confirmed ones that mattered:
+    - the launcher matches keywords case-sensitively by prefix (`FDTDIR` is read as `FDT`), cuts every line at the
+      first `#`, drops CRs, and reads only the first 10 entries;
+    - the check never looked at `APPEND` (without it the launcher dereferences NULL, and the kernel has no `root=`);
+    - a zero-filled or non-DTB overlay or FDT passed: the launcher then falls back to the kernel partition, without
+      the camera;
+    - the kernel unpacks everything after the first cpio trailer, and a second gzip member, which `cpio -t` never
+      shows, and keeps the last copy of a name.
+- **The rewrite parses both files the way their readers do,** in Python, called from `l4t_checks.sh`. It refuses
+  anything it cannot read the same way as the boot path:
+  - non-ASCII bytes;
+  - keyword-like lines that are not plain `KEYWORD value`;
+  - a JetsonIO entry that is not exactly one of the first 10, or that lacks any of LINUX, INITRD, FDT, OVERLAYS or
+    APPEND, or has two of one;
+  - an `APPEND` without the running root's `root=PARTUUID=`;
+  - an overlay list with spaces, empty items, `.`/`..`/`//`, a file outside the root file system, or a second camera
+    overlay;
+  - overlays that `fdtoverlay` cannot apply to the FDT;
+  - in the initrd: gzip header flags the kernel cannot skip, a cut-off stream, data after the stream or the cpio
+    trailer, a bad cpio header, a duplicate name (after `lib -> usr/lib`), a hard link, modules not where the
+    kernel's `/lib/modules` will be, or bytes that differ from the installed module.
+- **Also fixed.**
+  - The rollback now checks the boot entry in `--check` and before it changes anything (it used to find a broken
+    entry only after the downgrade).
+  - Boot-entry problems after apt now print as `WARNING`, which the grep in step 2 matches.
+  - A re-run stopped by a bad entry says not to reboot if an earlier `--apply` ran.
+  - An initrd failure names the repair: `nv-update-initrd` cannot fix a damaged initrd, so the message gives
+    `sudo apt-get install --reinstall --allow-change-held-packages nvidia-l4t-initrd`.
+  - The scripts find `l4t_checks.sh` when run through a symlink.
+- **Verified on the Jetson.**
+  - `test_l4t_checks.sh`: 109/109 checks, and all 37 mutants caught. The reviewer's faults, and the attackers' data
+    after the cpio trailer or in a second gzip member, are each shown to have passed the old check. The attackers
+    showed their other cases passing the first fix.
+  - The live `/boot` passes.
+  - So does an initrd built the way 36.5.2 will build it: the attacker ran the 36.5.2 `nv-update-initrd` (identical
+    to 36.5.0's) under fakeroot on the 36.5.2 base initrd and kernel modules. So does `extlinux.conf` as the
+    attacker's run of the 36.5.2 kernel package's `nv-update-extlinux` left it.
+  - Upgrade and rollback `--check` report `ready`.
+  - A stubbed `--apply` (apt, install, depmod and `sed -i` replaced) passes on the live R36.5.0 state.
+  - The real upgrade's checks, run before its packages, give `do NOT reboot` and exit 3.
+  - `verify_platform.sh --quick`: 13/13.
+- **Known false alarm.** An initrd layout that `nv-update-initrd` never writes (hard links, the crc cpio format)
+  fails with a clear message, although the kernel could boot it. This machine does not make such initrds.
+
 **Upgrade procedure** (the user, on the bench, with HDMI and a keyboard or the serial console attached):
 1. `bash ~/drive_logs/tools/l4t_upgrade_36_5_2.sh --check`, then `--simulate`.
 2. `sudo systemctl stop dashcam-v04`. Then run the apply at the console, or with nohup over SSH, because tmux is not
@@ -169,8 +234,8 @@ Checked fine:
    - `sudo nohup bash ~/drive_logs/tools/l4t_upgrade_36_5_2.sh --apply > ~/l4t_upgrade.log 2>&1 &`
    - `tail -f ~/l4t_upgrade.log`
 
-   The log must show `All checks passed.` (the script's next steps follow it), and no `WARNING` or `do NOT reboot`
-   line: `grep -E 'All checks passed|WARNING|do NOT reboot' ~/l4t_upgrade.log`.
+   The log must show `All checks passed.` (the script's next steps follow it), and no `WARNING`, `WRONG`, `FAILED`
+   or `do NOT reboot` line: `grep -E 'All checks passed|WARNING|WRONG|FAILED|do NOT reboot|upgrade:' ~/l4t_upgrade.log`.
 3. `sudo reboot` on bench power. The first boot writes the capsule and restarts once by itself; do not cut power. If
    it hangs at the camera driver, choose "primary kernel" in the boot menu, which boots without the overlay.
 4. `bash ~/drive_logs/tools/verify_platform.sh`. Expect kernel 5.15.199, R36.5.2, UEFI 36.5.2, `Detected IMX296LQ`,
@@ -871,6 +936,7 @@ $B/record_test                                       # Part A needs GStreamer ba
 $B/usb_test                                          # a USB camera (stop dashcam-v04 first); puts its controls back
 $B/scan_cameras                                      # lists the cameras, their controls and formats
 bash ~/drive_logs/tools/verify_platform.sh           # on the Jetson, not in the container: after a platform change
+bash ~/drive_logs/tools/test_l4t_checks.sh           # on the Jetson: the pre-reboot checks of the upgrade/rollback
 ```
 
 `usb_test` puts brightness, gain and backlight_compensation back as found (`782bdfd`). It passed on the Jetson on
