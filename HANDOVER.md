@@ -5,7 +5,7 @@
 | Item | Commit | Status | Still needs |
 |---|---|---|---|
 | Platform | — | **Rootfs, kernel and userspace back on L4T R36.5.0 (JetPack 6.2.2, kernel 5.15.185-tegra) on 2026-09-30**, for the IMX296 driver; the 65 NVIDIA packages are held. **The QSPI bootloader/UEFI is still 36.5.2** (slot B; the 36.5.0 capsule did not take effect). On this mix, the IMX296 in CAM1 streams through Argus again (`csi_test` 5/5), and v0.4, the UGREEN and CUDA all work (below). | The user's call: stay (works, tested), or **upgrade to R36.5.2 with the IMX296 driver rebuilt from source** (`~/drive_logs/tools/l4t_upgrade_36_5_2.sh`, prepared and reviewed 2026-10-01; this also matches the bootloader again). UEFI refuses a 36.5.0 bootloader. |
-| IMX296 driver for any kernel | — | Rebuilt from the vendor's own source (recovered from their git history) plus FRC 971's mode table. Its code, data, strings and `.modinfo` are byte-identical to the vendor's 5.15.185 module (the files differ only in debug info and build-id), and a 5.15.199 build has 41/41 CRCs matching 36.5.2. Tools, outside the repo: `~/drive_logs/tools/imx296_driver/build.sh`, `l4t_upgrade_36_5_2.sh`, `l4t_rollback_36_5_0.sh`, `verify_platform.sh`, and the pre-reboot checks they share, `l4t_checks.sh` (tested by `test_l4t_checks.sh`; rewritten 2026-10-01 after two reviews, below). | **not run on hardware:** the 5.15.199 module on a 5.15.199 kernel (upgrade step 4) |
+| IMX296 driver for any kernel | — | Rebuilt from the vendor's own source (recovered from their git history) plus FRC 971's mode table. Its code, data, strings and `.modinfo` are byte-identical to the vendor's 5.15.185 module (the files differ only in debug info and build-id), and a 5.15.199 build has 41/41 CRCs matching 36.5.2. Tools, outside the repo: `~/drive_logs/tools/imx296_driver/build.sh`, `l4t_upgrade_36_5_2.sh`, `l4t_rollback_36_5_0.sh`, `verify_platform.sh`, and the pre-reboot checks they share, `l4t_checks.sh` (tested by `test_l4t_checks.sh`; rewritten 2026-10-01 after three reviews, below). | **not run on hardware:** the 5.15.199 module on a 5.15.199 kernel (upgrade step 4) |
 | High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
 | CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
 | Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
@@ -114,7 +114,7 @@ R36.5.0 as of 2026-09-30, and the upgrade is the user's call.
 | `l4t_36_5_2.pairs`, `l4t_36_5_0.pairs` | The 65 `package=version` pairs for each direction, frozen on 2026-10-01, because `/var/log/apt/history.log` rotates. The 36.5.2 list equals the `dpkg -l` that the rollback backed up before running. The 36.5.0 list equals what is installed now. |
 | `verify_platform.sh [--quick]` | The test after any platform change. It changes nothing and stops no service. |
 | `l4t_checks.sh` | The boot-file checks that the upgrade, the rollback and `verify_platform.sh` share: `extlinux_default_check`, `extlinux_entry_check` and `initrd_check`. It is sourced, not run, and every script that uses it stops if it is missing, so copy it along with them. It reads `extlinux.conf` the way NVIDIA's UEFI launcher does, and the initrd the way the kernel does (below). |
-| `test_l4t_checks.sh` | Its regression test: 109 checks against good and broken boot entries and initrds built in a temporary directory, plus this machine's own `/boot`, read-only. No root needed; about 10 s. Every rule is load-bearing: deleting any one of them (37 mutants) makes it fail. |
+| `test_l4t_checks.sh` | Its regression test: 141 checks against good and broken boot entries, initrds and package lists built in a temporary directory, plus this machine's own `/boot` and packages, read-only. No root needed; about 15 s. Every rule is load-bearing: removing or weakening any one of them (56 mutants) makes it fail. |
 
 What `l4t_upgrade_36_5_2.sh --apply` does:
 1. Installs the 65 packages with `--allow-change-held-packages`. The holds stay.
@@ -125,21 +125,23 @@ Before it says "All checks passed", it checks:
 - that `/boot/Image` is 5.15.199;
 - that the uvcvideo, cdc-acm, imx296 and tegra-camera module files exist for 5.15.199, that imx296 is in
   `modules.dep`, and that `modprobe -n` resolves it;
-- that `/boot/initrd` is whole (one gzip stream, one cpio archive, nothing hidden after either) and carries nvme,
-  nvme-core, pcie-tegra194 and phy-p2u for 5.15.199, byte-identical to the installed modules (the root file system
-  is on NVMe, and these are modules);
+- that `/boot/initrd` is whole (one gzip stream, one cpio archive, nothing hidden after either); that, unpacked the
+  way the kernel does it, every entry is created; that it then carries nvme, nvme-core, pcie-tegra194 and phy-p2u
+  for 5.15.199 where `modprobe` looks, byte-identical to the installed modules (the root file system is on NVMe,
+  and these are modules); and that `/init` and everything it needs to reach the root are there;
 - that `dpkg --audit` is clean;
 - that `DEFAULT JetsonIO` is the only DEFAULT, and that the JetsonIO entry boots `/boot/Image` and `/boot/initrd`,
   with the running root's `root=PARTUUID=` and the cam1 overlay as its only camera overlay, every file present,
   and the overlay applying to its DTB (`fdtoverlay`);
-- the holds.
+- that each of the 65 target packages, by name, is held and installed at its target version.
 
 Any failure ends with "do NOT reboot". Re-running it is safe.
 
 `--check` reports `ready`, and `--simulate` shows 65 Inst, 65 Conf and 0 Remv.
 
 What `verify_platform.sh` covers:
-- **Platform:** kernel, release and UEFI; that the packages are held and at one release; the boot entry and overlay;
+- **Platform:** kernel, release and UEFI; that each of the release's 65 packages is held and at its version (by
+  name, from its pairs file); the boot entry and overlay;
   imx296 built for the running kernel, loaded and probed, with no I2C or capture errors; Argus and the reload unit;
   both cameras.
 - **Tests, in the dev container:** `csi_test`, `csi_rtp_test`, `camera_gst_test` (with the CSI dictionary against
@@ -225,6 +227,47 @@ so they were reviewed again, for what they let through.
   - `verify_platform.sh --quick`: 13/13.
 - **Known false alarm.** An initrd layout that `nv-update-initrd` never writes (hard links, the crc cpio format)
   fails with a clear message, although the kernel could boot it. This machine does not make such initrds.
+
+**Third review, 2026-10-01 evening: two more gaps, both reproduced and fixed.**
+- **The initrd check read the archive, not what the kernel would unpack.** A copy of the live initrd without the
+  NVMe modules' parent directories passed, and so did one without `/init`.
+  - The kernel creates a file with `filp_open(O_CREAT)`. When the parent directory does not exist (yet), that fails
+    and the entry is skipped, silently.
+  - Without an executable `/init`, the kernel tries to mount `root=` itself, and nvme is a module.
+- **`initrd_check` now unpacks the archive into a model of the kernel's rootfs** (`init/initramfs.c`: `do_name`,
+  `do_symlink`, `clean_path`), starting from the built-in initramfs (`/dev`, `/dev/console`, `/root`).
+  - Every entry must be created. A file written twice, or a directory entry with data, fails.
+  - The modules are looked up through symlinks at `/lib/modules/<kver>/`, where `modprobe` looks.
+  - It requires an executable `/init`, and everything NVIDIA's R36.5 `/init` needs on its way to an NVMe root:
+    - bash, its `#!` interpreter;
+    - `mount`, `cat`, `grep`, `sed`, `tail`, `ln`, `kmod`, `modprobe`, `sleep`, `expr` and `chroot`, on bash's
+      default PATH (the kernel gives `/init` none);
+    - for each of them, its ELF loader and every `DT_NEEDED` library, in the loader's default directories (the
+      initrd has no `ld.so.cache`).
+
+    The command list comes from the R36.5 `/init`. If NVIDIA changes that script, update `INIT_COMMANDS` in
+    `l4t_checks.sh`.
+- **The hold check counted; it did not compare.** With `nvidia-l4t-kernel` unheld and an unrelated `nvidia-*`
+  package held, the count was still 65, and it passed.
+  - `holds_check` now compares the held names with the 65 in the pairs file, and names any that is missing.
+  - Added: `versions_check`. Each of the 65 must be installed (dpkg state `i`, no error flag; held packages show
+    `hi`) at exactly its target version.
+  - The upgrade and the rollback run both before the reboot. `verify_platform.sh` runs both against its release's
+    pairs file.
+- **Verified on the Jetson.**
+  - `test_l4t_checks.sh`: 141/141. The new cases:
+    - missing parent directories (also shown to have passed the old check), directories after their files, a file
+      replacing a directory;
+    - no `/init`, or one that is not executable; a missing interpreter, loader, library or command; a cut-off ELF;
+    - the kernel unheld behind another hold; wrong versions; dpkg error flags.
+  - 56 mutants, each removing or weakening one rule: all caught.
+  - The live `/boot/initrd` passes, and so does the simulated 36.5.2 initrd.
+  - Both reported scenarios, end to end through the rollback's real check section (an `apt-mark` shim; the edited
+    initrds in place of `/boot/initrd`): `do NOT reboot`, exit 3.
+  - Upgrade and rollback `--check` report `ready`, and the stubbed rollback `--apply` passes.
+  - `verify_platform.sh --quick`: 14/14. The new version check is the extra one.
+- **Note.** A stubbed upgrade `--apply` can no longer pass. With apt stubbed the packages do not move, and the
+  version check says so; that is what it is for.
 
 **Upgrade procedure** (the user, on the bench, with HDMI and a keyboard or the serial console attached):
 1. `bash ~/drive_logs/tools/l4t_upgrade_36_5_2.sh --check`, then `--simulate`.
