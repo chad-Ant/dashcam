@@ -1,0 +1,12 @@
+{
+  "status": "validated against USB under current room light; daylight and motion validation pending",
+  "isp_profile": "session_20261001_2146/c7_usb_half.isp",
+  "isp_sha256": "bd5c2cacf7696d71ddd63896dddf94ac09dbed619fa8278ba59d322af799d9c0",
+  "nvarguscamerasrc_properties": {
+    "ee-mode": 0,
+    "tnr-mode": 1,
+    "saturation": 1.0
+  },
+  "note": "This is a recorded preset, not automatically loaded by the dashcam. Do not deploy the bench-only fixed exposure/gain or AE/AWB locks for road use. Installing the ISP file alone does not disable runtime edge enhancement.",
+  "superseded_2026-10-01_2345": "Review: c7 matches the UGREEN better under this lamp in-sample only; ~0 gain vs nominal chart values; saturation=1.0 came from a JPEG decode bug (0.9 scores better). Not recommended as is; see README 'Corrections and review, 23:45'."
+}

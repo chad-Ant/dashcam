@@ -1,0 +1,11 @@
+--- imx296.c.pre	2026-10-01 07:56:51.138278126 +0700
++++ imx296.c	2026-10-01 07:56:51.142278024 +0700
+@@ -33,7 +33,7 @@
+ 
+ // Stolen from nv_imx268.c
+ 
+-#include "../platform/tegra/camera/camera_gpio.h"
++/* camera_gpio.h dropped for an out-of-tree build: nothing from it is used (only <linux/gpio.h>). */
+ #include "imx296_mode_tbls.h"
+ 
+ static const struct of_device_id imx296_of_match[] = {

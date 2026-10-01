@@ -1,0 +1,5 @@
+# camera captures stay on the Jetson (photos of the room); their JSON/log results are kept
+*.jpg
+shots/
+shots_vendor_and_gst/
+noise_study/

@@ -1,0 +1,176 @@
+05:45:15 Backup of the installed profile: /var/backups/csi-trial.7X3yAE/entry.isp
+05:45:15 Output: /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515
+05:45:18 [0] c5_rpi100T installed (20b4c94c5fa4); capturing -> /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/00_c5_rpi100T
+NvMMLiteBlockCreate : Block : BlockType = 1 
+captured unset
+captured base
+captured ee005
+captured ee010
+captured ee020
+captured ee_default
+captured sat090
+captured sat110
+captured sat120
+captured sat130
+captured base_end
+Complete: /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/00_c5_rpi100T
+GST_ARGUS: NvArgusCameraSrc: Setting Exposure Time Range : 675000 675000
+GST_ARGUS: NvArgusCameraSrc: Setting Gain Range : 11.5 11.5
+GST_ARGUS: NvArgusCameraSrc: Setting ISP Digital Gain Range : 1 1
+GST_ARGUS: Creating output stream
+CONSUMER: Waiting until producer is connected...
+GST_ARGUS: Available Sensor modes :
+GST_ARGUS: 1456 x 1088 FR = 60.375671 fps Duration = 16562963 ; Analog Gain range min 0.062500, max 12.500000; Exposure Range min 1000, max 1000000;
+
+GST_ARGUS: Running with following settings:
+   Camera index = 0 
+   Camera mode  = 0 
+   Output Stream W = 1456 H = 1088 
+   seconds to Run    = 0 
+   Frame Rate = 60.375671 
+GST_ARGUS: Setup Complete, Starting captures for 0 seconds
+GST_ARGUS: Starting repeat capture requests.
+CONSUMER: Producer has connected; continuing.
+GST_ARGUS: Cleaning up
+CONSUMER: Done Success
+GST_ARGUS: Done Success
+05:45:52 [1] c8_sh15 installed (43ec0c810e05); capturing -> /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/01_c8_sh15
+NvMMLiteBlockCreate : Block : BlockType = 1 
+captured unset
+captured base
+captured ee005
+captured ee010
+captured ee020
+captured ee_default
+captured sat090
+captured sat110
+captured sat120
+captured sat130
+captured base_end
+Complete: /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/01_c8_sh15
+GST_ARGUS: NvArgusCameraSrc: Setting Exposure Time Range : 675000 675000
+GST_ARGUS: NvArgusCameraSrc: Setting Gain Range : 11.5 11.5
+GST_ARGUS: NvArgusCameraSrc: Setting ISP Digital Gain Range : 1 1
+GST_ARGUS: Creating output stream
+CONSUMER: Waiting until producer is connected...
+GST_ARGUS: Available Sensor modes :
+GST_ARGUS: 1456 x 1088 FR = 60.375671 fps Duration = 16562963 ; Analog Gain range min 0.062500, max 12.500000; Exposure Range min 1000, max 1000000;
+
+GST_ARGUS: Running with following settings:
+   Camera index = 0 
+   Camera mode  = 0 
+   Output Stream W = 1456 H = 1088 
+   seconds to Run    = 0 
+   Frame Rate = 60.375671 
+GST_ARGUS: Setup Complete, Starting captures for 0 seconds
+GST_ARGUS: Starting repeat capture requests.
+CONSUMER: Producer has connected; continuing.
+GST_ARGUS: Cleaning up
+CONSUMER: Done Success
+GST_ARGUS: Done Success
+05:46:26 [2] c5_rpi100T installed (20b4c94c5fa4); capturing -> /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/02_c5_rpi100T
+NvMMLiteBlockCreate : Block : BlockType = 1 
+captured unset
+captured base
+captured ee005
+captured ee010
+captured ee020
+captured ee_default
+captured sat090
+captured sat110
+captured sat120
+captured sat130
+captured base_end
+Complete: /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/02_c5_rpi100T
+GST_ARGUS: NvArgusCameraSrc: Setting Exposure Time Range : 675000 675000
+GST_ARGUS: NvArgusCameraSrc: Setting Gain Range : 11.5 11.5
+GST_ARGUS: NvArgusCameraSrc: Setting ISP Digital Gain Range : 1 1
+GST_ARGUS: Creating output stream
+CONSUMER: Waiting until producer is connected...
+GST_ARGUS: Available Sensor modes :
+GST_ARGUS: 1456 x 1088 FR = 60.375671 fps Duration = 16562963 ; Analog Gain range min 0.062500, max 12.500000; Exposure Range min 1000, max 1000000;
+
+GST_ARGUS: Running with following settings:
+   Camera index = 0 
+   Camera mode  = 0 
+   Output Stream W = 1456 H = 1088 
+   seconds to Run    = 0 
+   Frame Rate = 60.375671 
+GST_ARGUS: Setup Complete, Starting captures for 0 seconds
+GST_ARGUS: Starting repeat capture requests.
+CONSUMER: Producer has connected; continuing.
+GST_ARGUS: Cleaning up
+CONSUMER: Done Success
+GST_ARGUS: Done Success
+05:46:59 [3] c8_v5off installed (4d40517a3965); capturing -> /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/03_c8_v5off
+NvMMLiteBlockCreate : Block : BlockType = 1 
+captured unset
+captured base
+captured ee005
+captured ee010
+captured ee020
+captured ee_default
+captured sat090
+captured sat110
+captured sat120
+captured sat130
+captured base_end
+Complete: /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/03_c8_v5off
+GST_ARGUS: NvArgusCameraSrc: Setting Exposure Time Range : 675000 675000
+GST_ARGUS: NvArgusCameraSrc: Setting Gain Range : 11.5 11.5
+GST_ARGUS: NvArgusCameraSrc: Setting ISP Digital Gain Range : 1 1
+GST_ARGUS: Creating output stream
+CONSUMER: Waiting until producer is connected...
+GST_ARGUS: Available Sensor modes :
+GST_ARGUS: 1456 x 1088 FR = 60.375671 fps Duration = 16562963 ; Analog Gain range min 0.062500, max 12.500000; Exposure Range min 1000, max 1000000;
+
+GST_ARGUS: Running with following settings:
+   Camera index = 0 
+   Camera mode  = 0 
+   Output Stream W = 1456 H = 1088 
+   seconds to Run    = 0 
+   Frame Rate = 60.375671 
+GST_ARGUS: Setup Complete, Starting captures for 0 seconds
+GST_ARGUS: Starting repeat capture requests.
+CONSUMER: Producer has connected; continuing.
+GST_ARGUS: Cleaning up
+CONSUMER: Done Success
+GST_ARGUS: Done Success
+05:47:33 [4] c5_rpi100T installed (20b4c94c5fa4); capturing -> /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/04_c5_rpi100T
+NvMMLiteBlockCreate : Block : BlockType = 1 
+captured unset
+captured base
+captured ee005
+captured ee010
+captured ee020
+captured ee_default
+captured sat090
+captured sat110
+captured sat120
+captured sat130
+captured base_end
+Complete: /home/jetson/drive_logs/tools/isp_tuning/trial_20261002_054515/04_c5_rpi100T
+GST_ARGUS: NvArgusCameraSrc: Setting Exposure Time Range : 675000 675000
+GST_ARGUS: NvArgusCameraSrc: Setting Gain Range : 11.5 11.5
+GST_ARGUS: NvArgusCameraSrc: Setting ISP Digital Gain Range : 1 1
+GST_ARGUS: Creating output stream
+CONSUMER: Waiting until producer is connected...
+GST_ARGUS: Available Sensor modes :
+GST_ARGUS: 1456 x 1088 FR = 60.375671 fps Duration = 16562963 ; Analog Gain range min 0.062500, max 12.500000; Exposure Range min 1000, max 1000000;
+
+GST_ARGUS: Running with following settings:
+   Camera index = 0 
+   Camera mode  = 0 
+   Output Stream W = 1456 H = 1088 
+   seconds to Run    = 0 
+   Frame Rate = 60.375671 
+GST_ARGUS: Setup Complete, Starting captures for 0 seconds
+GST_ARGUS: Starting repeat capture requests.
+CONSUMER: Producer has connected; continuing.
+GST_ARGUS: Cleaning up
+CONSUMER: Done Success
+GST_ARGUS: Done Success
+05:48:04 All captures complete. Analyse: python3 ab_report.py trial_20261002_054515  (l4t-ml-gpio container)
+05:48:04 Entry profile restored (20b4c94c5fa4).
+05:48:04 nvargus-daemon restarted.
+05:48:04 Recorder untouched. Exit 0.

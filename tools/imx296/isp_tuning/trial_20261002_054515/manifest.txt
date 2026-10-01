@@ -1,0 +1,6 @@
+trial_ab.sh --manual c8_sh15 c8_v5off   started 2026-10-02T05:45:15+07:00
+backup dir: /var/backups/csi-trial.7X3yAE
+20b4c94c5fa4663aaef762192d0ecbd9b5d68066a32fc5e78d2950ab36456d61  entry.isp
+20b4c94c5fa4663aaef762192d0ecbd9b5d68066a32fc5e78d2950ab36456d61  c5_rpi100T.isp
+43ec0c810e0582ccfdb674d85b34d74efac2d491fc0a23c1bbed2600ab166c4c  c8_sh15.isp
+4d40517a39653634595e0ddc986d317cfddaaed16f9799abb0ec27304b8b9799  c8_v5off.isp

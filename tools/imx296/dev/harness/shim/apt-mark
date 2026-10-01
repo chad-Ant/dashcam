@@ -1,0 +1,3 @@
+#!/bin/bash
+# test shim: the kernel's hold is gone, an unrelated package is held instead (still 65)
+if [ "${1:-}" = showhold ]; then /usr/bin/apt-mark showhold | grep -vx nvidia-l4t-kernel; echo nvidia-unrelated-package; else exec /usr/bin/apt-mark "$@"; fi

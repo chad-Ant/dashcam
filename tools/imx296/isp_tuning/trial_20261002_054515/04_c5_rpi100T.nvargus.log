@@ -1,0 +1,49 @@
+Oct 02 05:47:30.260582 ubuntu nvargus-daemon[195274]: === python3[195283]: Connection closed (FFFF850EB840)
+Oct 02 05:47:30.261718 ubuntu nvargus-daemon[195274]: === python3[195283]: Connection cleaned up (FFFF850EB840)
+Oct 02 05:47:30.412668 ubuntu systemd[1]: Stopping Argus daemon...
+Oct 02 05:47:30.485052 ubuntu systemd[1]: nvargus-daemon.service: Deactivated successfully.
+Oct 02 05:47:30.485925 ubuntu systemd[1]: Stopped Argus daemon.
+Oct 02 05:47:30.486029 ubuntu systemd[1]: nvargus-daemon.service: Consumed 10.864s CPU time.
+Oct 02 05:47:30.491418 ubuntu systemd[1]: Started Argus daemon.
+Oct 02 05:47:30.504783 ubuntu nvargus-daemon[195368]: === NVIDIA Libargus Camera Service (0.99.33)
+Oct 02 05:47:30.504783 ubuntu nvargus-daemon[195368]: === Listening for connections...
+Oct 02 05:47:33.870391 ubuntu nvargus-daemon[195368]: === python3[195382]: Connection established (FFFF8D9DB840)
+Oct 02 05:47:33.960575 ubuntu nvargus-daemon[195368]: OFParserListModules: module list: /proc/device-tree/tegra-camera-platform/modules/module0
+Oct 02 05:47:33.962656 ubuntu nvargus-daemon[195368]: NvPclHwGetModuleList: No module data found
+Oct 02 05:47:33.965490 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error ModuleNotPresent: V4L2Device not available (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function verifyDeviceCaps(), line 208)
+Oct 02 05:47:33.965490 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error ModuleNotPresent:  (propagating from /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function initialize(), line 68)
+Oct 02 05:47:33.966683 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error ModuleNotPresent: V4L2Device not available (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function verifyDeviceCaps(), line 208)
+Oct 02 05:47:33.966683 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error ModuleNotPresent:  (propagating from /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function initialize(), line 68)
+Oct 02 05:47:33.983159 ubuntu nvargus-daemon[195368]: OFParserGetVirtualDevice: NVIDIA Camera virtual enumerator not found in proc device-tree
+Oct 02 05:47:34.009156 ubuntu nvargus-daemon[195368]: CAM: serial no file already exists, skips storing againinitializeDevNode: Failed to open dev node '/dev/camera/video1'; No such file or directory, trying alternate default location
+Oct 02 05:47:34.009757 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error IoctlFailed:  (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function getFrameRate(), line 1585)
+Oct 02 05:47:34.009757 ubuntu nvargus-daemon[195368]: (NvOdmDevice) Error IoctlFailed:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function loadModeProperties(), line 488)
+Oct 02 05:47:34.009757 ubuntu nvargus-daemon[195368]: (NvOdmDevice) Error IoctlFailed:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function loadModeList(), line 420)
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: (NvOdmDevice) Error IoctlFailed:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function initialize(), line 193)
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: NvPclDriverInitializeData: Unable to initialize driver v4l2_sensor_usb
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: NvPclInitializeDrivers: error: Failed to init camera sub module v4l2_sensor_usb
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: NvPclStartPlatformDrivers: Failed to start module drivers
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: NvPclStateControllerOpen: Failed ImagerGUID 1. (error 0x3000F)
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: NvPclOpen: PCL Open Failed. Error: 0xf
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter: Sensor could not be opened. (in src/services/capture/CaptureServiceDeviceSensor.cpp, function getSourceFromGuid(), line 725)
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter:  (propagating from src/services/capture/CaptureService.cpp, function addSourceByGuid(), line 465)
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter:  (propagating from src/api/CameraDriver.cpp, function addSourceByIndex(), line 384)
+Oct 02 05:47:34.009958 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter:  (propagating from src/api/CameraDriver.cpp, function getSource(), line 556)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: initializeDevNode: Failed to open dev node '/dev/camera/video2'; No such file or directory, trying alternate default location
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error NotSupported: Must be capture/output devices (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function setActiveBufferType(), line 815)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: (NvCamV4l2) Error NotSupported:  (propagating from /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function initialize(), line 70)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: (NvOdmDevice) Error NotSupported:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function initialize(), line 146)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: NvPclDriverInitializeData: Unable to initialize driver v4l2_sensor_usb
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: NvPclInitializeDrivers: error: Failed to init camera sub module v4l2_sensor_usb
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: NvPclStartPlatformDrivers: Failed to start module drivers
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: NvPclStateControllerOpen: Failed ImagerGUID 2. (error 0x2)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: NvPclOpen: PCL Open Failed. Error: 0xf
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter: Sensor could not be opened. (in src/services/capture/CaptureServiceDeviceSensor.cpp, function getSourceFromGuid(), line 725)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter:  (propagating from src/services/capture/CaptureService.cpp, function addSourceByGuid(), line 465)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter:  (propagating from src/api/CameraDriver.cpp, function addSourceByIndex(), line 384)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: SCF: Error BadParameter:  (propagating from src/api/CameraDriver.cpp, function getSource(), line 556)
+Oct 02 05:47:34.010300 ubuntu nvargus-daemon[195368]: === python3[195382]: CameraProvider initialized (0xffff88a4ba40)
+Oct 02 05:48:03.393301 ubuntu nvargus-daemon[195368]: CAM: serial no file already exists, skips storing again=== python3[195382]: CameraProvider destroyed (0xffff88a4ba40)
+Oct 02 05:48:03.401398 ubuntu nvargus-daemon[195368]: CaptureService:stop: is requested --------------------------
+Oct 02 05:48:03.950483 ubuntu nvargus-daemon[195368]: === python3[195382]: Connection closed (FFFF8D9DB840)
+Oct 02 05:48:03.951138 ubuntu nvargus-daemon[195368]: === python3[195382]: Connection cleaned up (FFFF8D9DB840)

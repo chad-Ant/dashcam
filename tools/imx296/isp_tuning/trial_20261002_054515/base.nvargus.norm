@@ -1,0 +1,36 @@
+CAM: serial no file already exists, skips storing againinitializeDevNode: Failed to open dev node '/dev/camera/video1'; No such file or directory, trying alternate default location
+CAM: serial no file already exists, skips storing again=== python3: CameraProvider destroyed ()
+CaptureService:stop: is requested --------------------------
+initializeDevNode: Failed to open dev node '/dev/camera/video2'; No such file or directory, trying alternate default location
+=== Listening for connections...
+(NvCamV4l2) Error IoctlFailed:  (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function getFrameRate(), line 1585)
+(NvCamV4l2) Error ModuleNotPresent:  (propagating from /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function initialize(), line 68)
+(NvCamV4l2) Error ModuleNotPresent: V4L2Device not available (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function verifyDeviceCaps(), line 208)
+(NvCamV4l2) Error NotSupported: Must be capture/output devices (in /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function setActiveBufferType(), line 815)
+(NvCamV4l2) Error NotSupported:  (propagating from /dvs/git/dirty/git-master_linux/camera/utils/nvcamv4l2/v4l2_device.cpp, function initialize(), line 70)
+=== NVIDIA Libargus Camera Service (0.99.33)
+(NvOdmDevice) Error IoctlFailed:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function initialize(), line 193)
+(NvOdmDevice) Error IoctlFailed:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function loadModeList(), line 420)
+(NvOdmDevice) Error IoctlFailed:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function loadModeProperties(), line 488)
+(NvOdmDevice) Error NotSupported:  (propagating from dvs/git/dirty/git-master_linux/camera-partner/imager/src/devices/V4L2SensorNonViCsi.cpp, function initialize(), line 146)
+NvPclDriverInitializeData: Unable to initialize driver v4l2_sensor_usb
+NvPclHwGetModuleList: No module data found
+NvPclInitializeDrivers: error: Failed to init camera sub module v4l2_sensor_usb
+NvPclOpen: PCL Open Failed. Error: 
+NvPclStartPlatformDrivers: Failed to start module drivers
+NvPclStateControllerOpen: Failed ImagerGUID 1. (error )
+NvPclStateControllerOpen: Failed ImagerGUID 2. (error )
+Oct 02 05:45:15.488776 ubuntu systemd: Stopping Argus daemon...
+Oct 02 05:45:15.490313 ubuntu systemd: nvargus-daemon.service: Deactivated successfully.
+Oct 02 05:45:15.491387 ubuntu systemd: Stopped Argus daemon.
+Oct 02 05:45:15.495981 ubuntu systemd: Started Argus daemon.
+OFParserGetVirtualDevice: NVIDIA Camera virtual enumerator not found in proc device-tree
+OFParserListModules: module list: /proc/device-tree/tegra-camera-platform/modules/module0
+=== python3: CameraProvider initialized ()
+=== python3: Connection cleaned up ()
+=== python3: Connection closed ()
+=== python3: Connection established ()
+SCF: Error BadParameter:  (propagating from src/api/CameraDriver.cpp, function addSourceByIndex(), line 384)
+SCF: Error BadParameter:  (propagating from src/api/CameraDriver.cpp, function getSource(), line 556)
+SCF: Error BadParameter:  (propagating from src/services/capture/CaptureService.cpp, function addSourceByGuid(), line 465)
+SCF: Error BadParameter: Sensor could not be opened. (in src/services/capture/CaptureServiceDeviceSensor.cpp, function getSourceFromGuid(), line 725)

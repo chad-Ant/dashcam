@@ -1,0 +1,251 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+set -e
+
+init_var()
+{
+	INITRD="/tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/fr352/boot/initrd"
+	LIST_DIR="/tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/fr352/etc/nv-update-initrd/list.d"
+	INITRD_BAK="${INITRD}_bak"
+	IMAGES_PATH=("/tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/fr352/boot/Image" "/tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/fr352/boot/Image.real-time")
+	DESTDIR=
+	local _is_image_exist="false"
+
+	# The temp directory containing the backup files from the previous initrd, created in preinst script
+	INITRD_BAK_DIR="/tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/fr352/var/tmp/nvidia-l4t-initrd.backup"
+	# Check if nvidia-l4t-initrd.deb is going to be installed. Otherwise, it's called by a dpkg trigger
+	INSTALL_FLAG_FILE="nvidia-l4t-initrd.install"
+	IS_INITRD_OTA=$([ -f "${INITRD_BAK_DIR}/${INSTALL_FLAG_FILE}" ] && echo true || echo false)
+	# Crypttab path in initrd
+	CRYPTTAB="etc/crypttab"
+
+	if [ ! -f "${INITRD}" ]; then
+		echo "Error: ${INITRD} not found"
+		exit 1
+	fi
+
+	if [ ! -d "${LIST_DIR}" ]; then
+		echo "Error: ${LIST_DIR} not found"
+		exit 1
+	fi
+
+	# Pre-check for the existence of the kernel image
+	for image_path in "${IMAGES_PATH[@]}"; do
+		if [ -f "${image_path}" ]; then
+			_is_image_exist="true"
+		fi
+	done
+	if [ "${_is_image_exist}" = "false" ]; then
+		echo "Error: kernel image not found"
+		exit 1
+	fi
+}
+
+cleanup()
+{
+	echo "Cleaning up the temporary directory for updating the initrd.."
+	if [ -f "${temp_list}" ]; then
+		rm -f "${temp_list}"
+	fi
+	if [ -d "${DESTDIR}" ]; then
+		rm -rf "${DESTDIR}"
+	fi
+	if [ -f "${list_file}" ]; then
+		rm -f "${list_file}"
+	fi
+	if [ -d "${INITRD_BAK_DIR}" ]; then
+		rm -rf "${INITRD_BAK_DIR}"
+	fi
+}
+
+# Check if disk encryption is enabled for the rootfs
+is_rootfs_encrypted() {
+	root_dev="$(sed -ne 's/.*\broot=\([^ ]*\)\b.*/\1/p' < /proc/cmdline)"
+
+	if [[ "${root_dev}" == *UUID* ]]; then
+		root_dev="$(/sbin/findfs "${root_dev}")"
+		root_type="$(blkid -s TYPE -o value "${root_dev}")"
+
+		if [[ "${root_type}" == "crypto_LUKS" ]]; then
+			return 0
+		fi
+	fi
+
+	return 1
+}
+
+add_luks_files()
+{
+	local _initrd_dir="${1}"
+	local _cryptsetup_locking_path="run/cryptsetup"
+
+	echo "Add locking path ${_initrd_dir}/${_cryptsetup_locking_path}"
+	install -o 0 -g 0 -m 0755 -d "${_initrd_dir}/${_cryptsetup_locking_path}"
+
+	# Add backup crypttab to the initrd
+	echo "Add ${_initrd_dir}/${CRYPTTAB}"
+	cp -p "${INITRD_BAK_DIR}/${CRYPTTAB}" "${_initrd_dir}/${CRYPTTAB}"
+}
+
+modify_initrd()
+{
+	local _initrd_path="${1}"
+	local _kernel_version=
+	temp_list=
+	# Create temporary directory for initrd contents
+	DESTDIR=$(mktemp -d)
+	pushd "${DESTDIR}" > /dev/null
+	gunzip -c "${_initrd_path}" | cpio -i --quiet
+
+	# Add the file list that need to be updated to initrd
+	temp_list=$(mktemp)
+	for file in "${LIST_DIR}/"*; do
+		if [ -f "${file}" ]; then
+			echo "Include ${file}"
+			cat "${file}" >> "${temp_list}"
+		fi
+	done
+	# Remove all files under lib/modules in the initrd and repopulate it later
+	# to prevent it from expanding every time the kernel is updated.
+	rm -rf "${DESTDIR}/lib/modules/"*
+	# Always explicitly remove /etc/.disable_initrd_bash in the initrd for development.
+	# Having a root bash shell launched due to failures results in a security
+	# vulnerability. Production systems are expected to package this file.
+	rm -f "${DESTDIR}/etc/.disable_initrd_bash"
+	# Add the modules of each image into initrd
+	for image_path in "${IMAGES_PATH[@]}"; do
+		if [ ! -f "${image_path}" ]; then
+			continue
+		fi
+
+		_kernel_version=$(get_kernel_version "${image_path}")
+		echo "nv-update-initrd: Updating ${INITRD} from ${LIST_DIR} for kernel version ${_kernel_version}.."
+		copy_files_initrd "${DESTDIR}" "${temp_list}" "${_kernel_version}"
+	done
+	# Highlight that production systems should package /etc/.disable_initrd_bash.
+	if [ ! -f "${DESTDIR}/etc/.disable_initrd_bash" ]; then
+		echo "WARNING: File /etc/.disable_initrd_bash is not present in initrd." \
+			"This is appropriate for development but must be packed for production!"
+	fi
+
+	# Add LUKS files if disk encryption is enabled for the rootfs and
+	# it is the installation of the nvidia-l4t-initrd Debian package
+	if is_rootfs_encrypted && [ "$IS_INITRD_OTA" = true ]; then
+		add_luks_files "${DESTDIR}"
+	fi
+
+	# Include config files in the modprobe.d directories for modprobe
+	echo "Updating modprobe.d configuration directories for modprobe.."
+	MODPROBE_DIRS=("/etc/modprobe.d" "/lib/modprobe.d")
+	for modprobe_dir in "${MODPROBE_DIRS[@]}"; do
+		# Clean old config files before updating
+		rm -rf "${DESTDIR:?}/${modprobe_dir}"
+
+		mkdir -p "${DESTDIR}/${modprobe_dir}"
+		for file in "${modprobe_dir}"/*.conf; do
+			if test -e "$file"; then
+				copy_file config "$file"
+			fi
+		done
+	done
+
+	find . | cpio -H newc -o --quiet | gzip -9 -n > "${_initrd_path}"
+	popd > /dev/null
+}
+
+copy_files_initrd()
+{
+	local _initrd_dir="${1}"
+	local _list="${2}"
+	local _kernel_version="${3}"
+	list_file="$(mktemp)"
+
+	# filter out comments and perform variable substitution
+	grep -E "^[^#]" "${_list}" | sed \
+		-e "s|<KERNEL_VERSION>|${_kernel_version}|g" >"${list_file}"
+
+	local _src=
+	local _dst=
+	local _dst_dir=
+	# Copy all the binary
+	while read -r path
+	do
+		_src="$(echo "${path}" | cut -d ':' -f 1)"; case "$_src" in /lib/modules/*) _src="/tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/fr352$_src" ;; esac
+		_dst="$(echo "${path}" | cut -d ':' -f 2)"
+		_dst_dir="${_dst%/*}"
+		# shellcheck disable=SC2086
+		if [ -e "${_src}" ] || find ${_src} > /dev/null 2>&1; then
+			echo "Add ${_src}"
+			mkdir -p "${_initrd_dir}/${_dst_dir}"
+			# shellcheck disable=SC2086
+			cp -f ${_src} "${_initrd_dir}/${_dst}"
+		else
+			echo "Error: ${_src} not found"
+			exit 1
+		fi
+	done < "${list_file}"
+
+	rm -f "${list_file}"
+}
+
+get_kernel_version()
+{
+	local _image_path=${1}
+	local _kernel_version=
+
+	# Check if the kernel image exists, which is used to find the kernel version
+	if [ -e "${_image_path}" ]; then
+		# This may occur when:
+		# 'apply_binaries' is executed on the host or target
+		# Debian package upgrade is performed on the target
+		_kernel_version="$(strings "${_image_path}" | grep -oE "Linux version [0-9a-zA-Z\.\-]+[+]* " | cut -d\  -f 3 | head -1)"
+	fi
+
+	echo "${_kernel_version}"
+}
+
+init_var
+
+. /tmp/claude-1000/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/scratchpad/attack_initrd/i352/x/usr/share/nv-update-initrd/hook-functions
+
+# backup initrd
+cp "${INITRD}" "${INITRD_BAK}"
+
+# modify backup
+trap cleanup EXIT
+modify_initrd "${INITRD_BAK}"
+
+# update initrd
+cp "${INITRD_BAK}" "${INITRD}"
+
+# remove backup initrd
+rm -f "${INITRD_BAK}"

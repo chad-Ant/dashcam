@@ -1,0 +1,22 @@
+--- imx296.c.orig	2026-10-01 07:56:10.888255050 +0700
++++ imx296.c	2026-10-01 07:56:10.924252221 +0700
+@@ -726,7 +726,7 @@
+ 
+ 	// Set manual black level based on sensor type
+ 	if (priv->is_mono) {
+-		imx296_write(s_data, IMX296_BLKLEVEL, 0x070, &err);  // Mono: 112
++		imx296_write(s_data, IMX296_BLKLEVEL, 0x03c, &err);  // Mono: 60 (vendor v1.1)
+ 	} else {
+ 		imx296_write(s_data, IMX296_BLKLEVEL, 0x032, &err);  // Color: 50
+ 	}
+@@ -852,8 +852,8 @@
+ 	if (ret < 0)
+ 		goto done;
+ 
+-	dev_info(sensor->tc_dev->dev, "found IMX%uLQ (%u.%uC)\n", model,
+-		 temp / 1000, (temp / 100) % 10);
++	dev_info(sensor->tc_dev->dev, "found IMX%uL%c (%u.%uC)\n", model,
++		 sensor->is_mono ? 'L' : 'Q', temp / 1000, (temp / 100) % 10);
+ 
+ done:
+ 	imx296_write(sensor->s_data, IMX296_CTRL00, IMX296_CTRL00_STANDBY, NULL);

@@ -1,0 +1,9 @@
+# NVIDIA packages and their extracted trees: fetch them as in ../README.md (Prerequisites)
+debs/
+headers-*/
+dtbs-*/
+# build intermediates; the built modules themselves are kept
+out-*/*
+!out-*/imx296.ko
+# the tarball is kept; its extracted copy is not
+src/imx296_source_working_20260615/

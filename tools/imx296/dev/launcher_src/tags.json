@@ -1,0 +1,1002 @@
+[
+  {
+    "name": "untagged-1adfd5799eead93d5b07",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/untagged-1adfd5799eead93d5b07",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/untagged-1adfd5799eead93d5b07",
+    "commit": {
+      "sha": "50bf0f178d9ce2ad3102fa253623de5b831cdb34",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/50bf0f178d9ce2ad3102fa253623de5b831cdb34"
+    },
+    "node_id": "REF_kwDOG7KontoAJ3JlZnMvdGFncy91bnRhZ2dlZC0xYWRmZDU3OTllZWFkOTNkNWIwNw"
+  },
+  {
+    "name": "uefi-2022210.5.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-2022210.5.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-2022210.5.2",
+    "commit": {
+      "sha": "a58c53065a3b93d2182ce22dbea046f8fa9eb3b3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/a58c53065a3b93d2182ce22dbea046f8fa9eb3b3"
+    },
+    "node_id": "REF_kwDOG7KonrpyZWZzL3RhZ3MvdWVmaS0yMDIyMjEwLjUuMg"
+  },
+  {
+    "name": "uefi-202608.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202608.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202608.1",
+    "commit": {
+      "sha": "cb7cff715a2a5f154bba2db652af0c6ab3b84f0f",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/cb7cff715a2a5f154bba2db652af0c6ab3b84f0f"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDguMQ"
+  },
+  {
+    "name": "uefi-202608.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202608.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202608.0",
+    "commit": {
+      "sha": "d6838b81998d6e2510c57d77efd72e9cb2de19ed",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/d6838b81998d6e2510c57d77efd72e9cb2de19ed"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDguMA"
+  },
+  {
+    "name": "uefi-202606.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202606.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202606.1",
+    "commit": {
+      "sha": "ed29c0870f091dde372264108f37ace44516bc23",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/ed29c0870f091dde372264108f37ace44516bc23"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDYuMQ"
+  },
+  {
+    "name": "uefi-202606.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202606.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202606.0",
+    "commit": {
+      "sha": "4180a6549b7a0533c4f4a6a96b025aabb9810fe7",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/4180a6549b7a0533c4f4a6a96b025aabb9810fe7"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDYuMA"
+  },
+  {
+    "name": "uefi-202605.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202605.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202605.0",
+    "commit": {
+      "sha": "fd77facdc6252a394f66b9c8dbd35d7f0166fa73",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/fd77facdc6252a394f66b9c8dbd35d7f0166fa73"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDUuMA"
+  },
+  {
+    "name": "uefi-202603.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202603.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202603.3",
+    "commit": {
+      "sha": "7e9f9ec4de8d979807683a7b4605a15ec3299b89",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/7e9f9ec4de8d979807683a7b4605a15ec3299b89"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDMuMw"
+  },
+  {
+    "name": "uefi-202603.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202603.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202603.2",
+    "commit": {
+      "sha": "bd49b331a0bbdeef7a34c224a3767f77e36da0c4",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/bd49b331a0bbdeef7a34c224a3767f77e36da0c4"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDMuMg"
+  },
+  {
+    "name": "uefi-202603.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202603.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202603.1",
+    "commit": {
+      "sha": "bd49b331a0bbdeef7a34c224a3767f77e36da0c4",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/bd49b331a0bbdeef7a34c224a3767f77e36da0c4"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDMuMQ"
+  },
+  {
+    "name": "uefi-202603.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202603.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202603.0",
+    "commit": {
+      "sha": "769a46e57f8550c705bc81d19e835a088ef417ba",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/769a46e57f8550c705bc81d19e835a088ef417ba"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDMuMA"
+  },
+  {
+    "name": "uefi-202602.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202602.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202602.0",
+    "commit": {
+      "sha": "860006de0ffeafb803a50576f6b0a3330c76ce54",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/860006de0ffeafb803a50576f6b0a3330c76ce54"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDIuMA"
+  },
+  {
+    "name": "uefi-202601.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202601.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202601.0",
+    "commit": {
+      "sha": "28265983c88500aae64ddaf74cddfe18cf841163",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/28265983c88500aae64ddaf74cddfe18cf841163"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI2MDEuMA"
+  },
+  {
+    "name": "uefi-202512.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202512.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202512.1",
+    "commit": {
+      "sha": "96210ef6fc6537787cb451b9cb0c9ee25faa33d0",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/96210ef6fc6537787cb451b9cb0c9ee25faa33d0"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MTIuMQ"
+  },
+  {
+    "name": "uefi-202512.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202512.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202512.0",
+    "commit": {
+      "sha": "39e870813aa3caa0ce09315a36f3d89af8b36967",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/39e870813aa3caa0ce09315a36f3d89af8b36967"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MTIuMA"
+  },
+  {
+    "name": "uefi-202511.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202511.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202511.1",
+    "commit": {
+      "sha": "e65db6a82e5e14e72876e3cc689b407feb1d3472",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/e65db6a82e5e14e72876e3cc689b407feb1d3472"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MTEuMQ"
+  },
+  {
+    "name": "uefi-202511.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202511.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202511.0",
+    "commit": {
+      "sha": "62b50e929322fd2e11365df3d310baae122b628c",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/62b50e929322fd2e11365df3d310baae122b628c"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MTEuMA"
+  },
+  {
+    "name": "uefi-202510.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202510.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202510.1",
+    "commit": {
+      "sha": "78408f6e999c0c6c1ec6f3988fc070b37e7814f8",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/78408f6e999c0c6c1ec6f3988fc070b37e7814f8"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MTAuMQ"
+  },
+  {
+    "name": "uefi-202510.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202510.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202510.0",
+    "commit": {
+      "sha": "eb784a6b5ae86e0e7e96f0fb88db393df1fc87f1",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/eb784a6b5ae86e0e7e96f0fb88db393df1fc87f1"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MTAuMA"
+  },
+  {
+    "name": "uefi-202509.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202509.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202509.1",
+    "commit": {
+      "sha": "ac816b537ae1aceb238fa0b809c2be19a7fdc15b",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/ac816b537ae1aceb238fa0b809c2be19a7fdc15b"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDkuMQ"
+  },
+  {
+    "name": "uefi-202509.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202509.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202509.0",
+    "commit": {
+      "sha": "98e9998fdfef612319d0069a88fa61727f3e4df8",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/98e9998fdfef612319d0069a88fa61727f3e4df8"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDkuMA"
+  },
+  {
+    "name": "uefi-202508.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202508.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202508.1",
+    "commit": {
+      "sha": "e94de8f5bb13aba03789299ee84bffc540aa5016",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/e94de8f5bb13aba03789299ee84bffc540aa5016"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDguMQ"
+  },
+  {
+    "name": "uefi-202508.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202508.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202508.0",
+    "commit": {
+      "sha": "6015a43d120d13df1396d7ae3afa66067391c0e2",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/6015a43d120d13df1396d7ae3afa66067391c0e2"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDguMA"
+  },
+  {
+    "name": "uefi-202507.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202507.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202507.1",
+    "commit": {
+      "sha": "50bf0f178d9ce2ad3102fa253623de5b831cdb34",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/50bf0f178d9ce2ad3102fa253623de5b831cdb34"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDcuMQ"
+  },
+  {
+    "name": "uefi-202507.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202507.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202507.0",
+    "commit": {
+      "sha": "95bd1e8eac1c80755dd324fb70e49478ee0369c3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/95bd1e8eac1c80755dd324fb70e49478ee0369c3"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDcuMA"
+  },
+  {
+    "name": "uefi-202506.4",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202506.4",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202506.4",
+    "commit": {
+      "sha": "aed072d99ffad0d82d65c6b43512e48db08a5b33",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/aed072d99ffad0d82d65c6b43512e48db08a5b33"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDYuNA"
+  },
+  {
+    "name": "uefi-202506.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202506.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202506.3",
+    "commit": {
+      "sha": "b4fc9d9902094a238c941d9bcb5ac7c795b21ac7",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/b4fc9d9902094a238c941d9bcb5ac7c795b21ac7"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDYuMw"
+  },
+  {
+    "name": "uefi-202506.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202506.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202506.2",
+    "commit": {
+      "sha": "899cdbc99a47b40721a6a074d966b4a00959412b",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/899cdbc99a47b40721a6a074d966b4a00959412b"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDYuMg"
+  },
+  {
+    "name": "uefi-202506.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202506.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202506.1",
+    "commit": {
+      "sha": "b88f1281031f7b3642fb25ad89842f08d63e2ac1",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/b88f1281031f7b3642fb25ad89842f08d63e2ac1"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDYuMQ"
+  },
+  {
+    "name": "uefi-202506.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202506.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202506.0",
+    "commit": {
+      "sha": "72859e2dec13979d568c3ee8bcd337c5ef7473f3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/72859e2dec13979d568c3ee8bcd337c5ef7473f3"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDYuMA"
+  },
+  {
+    "name": "uefi-202504.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202504.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202504.3",
+    "commit": {
+      "sha": "3dfabbec197a7614deaa57e4782296b57290a911",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/3dfabbec197a7614deaa57e4782296b57290a911"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDQuMw"
+  },
+  {
+    "name": "uefi-202504.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202504.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202504.2",
+    "commit": {
+      "sha": "79ad0c17aa4f13fdd5164d5b026fa49436b34891",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/79ad0c17aa4f13fdd5164d5b026fa49436b34891"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDQuMg"
+  },
+  {
+    "name": "uefi-202504.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202504.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202504.1",
+    "commit": {
+      "sha": "1368f0e18283757aff37c6f5e66432a87924aa2b",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/1368f0e18283757aff37c6f5e66432a87924aa2b"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDQuMQ"
+  },
+  {
+    "name": "uefi-202504.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202504.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202504.0",
+    "commit": {
+      "sha": "9f9fad4fa8067bf39ce5694845b8ae2802df85bb",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/9f9fad4fa8067bf39ce5694845b8ae2802df85bb"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDQuMA"
+  },
+  {
+    "name": "uefi-202503.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202503.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202503.1",
+    "commit": {
+      "sha": "22ade65290218d90ce54fd214be06df57576253e",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/22ade65290218d90ce54fd214be06df57576253e"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDMuMQ"
+  },
+  {
+    "name": "uefi-202503.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202503.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202503.0",
+    "commit": {
+      "sha": "437d36639b30b866490ca203e2037932ffff11c3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/437d36639b30b866490ca203e2037932ffff11c3"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDMuMA"
+  },
+  {
+    "name": "uefi-202502.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202502.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202502.1",
+    "commit": {
+      "sha": "70d7dbfbbb66b4405d2f4fd4187f932541037251",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/70d7dbfbbb66b4405d2f4fd4187f932541037251"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDIuMQ"
+  },
+  {
+    "name": "uefi-202502.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202502.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202502.0",
+    "commit": {
+      "sha": "711062e4055f09031ff9f27379b3c9b15553380e",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/711062e4055f09031ff9f27379b3c9b15553380e"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDIuMA"
+  },
+  {
+    "name": "uefi-202501.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202501.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202501.1",
+    "commit": {
+      "sha": "c097a8f709a4163bea86765e031b4379e6bc2c16",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/c097a8f709a4163bea86765e031b4379e6bc2c16"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDEuMQ"
+  },
+  {
+    "name": "uefi-202501.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202501.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202501.0",
+    "commit": {
+      "sha": "98c480c5e75005e6786714b54c06d0307926211b",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/98c480c5e75005e6786714b54c06d0307926211b"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI1MDEuMA"
+  },
+  {
+    "name": "uefi-202412.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202412.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202412.1",
+    "commit": {
+      "sha": "17d1417a9ce30283a5341ce5ad17e289ac517a4a",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/17d1417a9ce30283a5341ce5ad17e289ac517a4a"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MTIuMQ"
+  },
+  {
+    "name": "uefi-202412.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202412.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202412.0",
+    "commit": {
+      "sha": "c3ec321931efee561ac127af198e74f5ed183a00",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/c3ec321931efee561ac127af198e74f5ed183a00"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MTIuMA"
+  },
+  {
+    "name": "uefi-202410.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202410.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202410.1",
+    "commit": {
+      "sha": "b20445a3e9ee73756734bf2066c39118baa26562",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/b20445a3e9ee73756734bf2066c39118baa26562"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MTAuMQ"
+  },
+  {
+    "name": "uefi-202410.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202410.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202410.0",
+    "commit": {
+      "sha": "f4d4ea48518d3a9ba84170f35c77863037156f56",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/f4d4ea48518d3a9ba84170f35c77863037156f56"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MTAuMA"
+  },
+  {
+    "name": "uefi-202409.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202409.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202409.1",
+    "commit": {
+      "sha": "975fafc6a33ec29f1fed25f22e7deca73849d03d",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/975fafc6a33ec29f1fed25f22e7deca73849d03d"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDkuMQ"
+  },
+  {
+    "name": "uefi-202409.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202409.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202409.0",
+    "commit": {
+      "sha": "d3a6ad99466e78e5f5081f5e0ec308ad925cdb0c",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/d3a6ad99466e78e5f5081f5e0ec308ad925cdb0c"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDkuMA"
+  },
+  {
+    "name": "uefi-202408.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202408.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202408.0",
+    "commit": {
+      "sha": "59695be9eab437a41b270a8aec5137902689719d",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/59695be9eab437a41b270a8aec5137902689719d"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDguMA"
+  },
+  {
+    "name": "uefi-202406.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202406.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202406.0",
+    "commit": {
+      "sha": "a9a61c80c224f418418bd5f94c0e04762cd4cbdb",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/a9a61c80c224f418418bd5f94c0e04762cd4cbdb"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDYuMA"
+  },
+  {
+    "name": "uefi-202405.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202405.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202405.3",
+    "commit": {
+      "sha": "350c50a65a7b30d916b8c1901ed940f6d69bbcaa",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/350c50a65a7b30d916b8c1901ed940f6d69bbcaa"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDUuMw"
+  },
+  {
+    "name": "uefi-202405.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202405.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202405.2",
+    "commit": {
+      "sha": "85becaf8fbe323feef228c85160cf599f32f8121",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/85becaf8fbe323feef228c85160cf599f32f8121"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDUuMg"
+  },
+  {
+    "name": "uefi-202405.1.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202405.1.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202405.1.1",
+    "commit": {
+      "sha": "2645bbc66c86bbf1cae0c8c1d17af2d916c3ee42",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/2645bbc66c86bbf1cae0c8c1d17af2d916c3ee42"
+    },
+    "node_id": "REF_kwDOG7KonrlyZWZzL3RhZ3MvdWVmaS0yMDI0MDUuMS4x"
+  },
+  {
+    "name": "uefi-202405.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202405.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202405.1",
+    "commit": {
+      "sha": "5de7ef09811a06475248bf07661f7ae53e1c106d",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/5de7ef09811a06475248bf07661f7ae53e1c106d"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDUuMQ"
+  },
+  {
+    "name": "uefi-202405.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202405.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202405.0",
+    "commit": {
+      "sha": "ca7f3d9f3575275ec9907f5597f00fbab6e88e93",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/ca7f3d9f3575275ec9907f5597f00fbab6e88e93"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDUuMA"
+  },
+  {
+    "name": "uefi-202404.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202404.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202404.0",
+    "commit": {
+      "sha": "0c326dcc1fbee072cb03509e42fb48f0cb0c4ce2",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/0c326dcc1fbee072cb03509e42fb48f0cb0c4ce2"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDQuMA"
+  },
+  {
+    "name": "uefi-202403.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202403.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202403.0",
+    "commit": {
+      "sha": "a03bece4373a150a4a179ab92fb00c2764df237f",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/a03bece4373a150a4a179ab92fb00c2764df237f"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDMuMA"
+  },
+  {
+    "name": "uefi-202402.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202402.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202402.3",
+    "commit": {
+      "sha": "61c818a2c6541f2c3d8b1caa95dd0e35e16884cf",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/61c818a2c6541f2c3d8b1caa95dd0e35e16884cf"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDIuMw"
+  },
+  {
+    "name": "uefi-202402.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202402.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202402.2",
+    "commit": {
+      "sha": "73f4e33a015c4d0658b8a1114581ac05e2a04cd7",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/73f4e33a015c4d0658b8a1114581ac05e2a04cd7"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDIuMg"
+  },
+  {
+    "name": "uefi-202402.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202402.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202402.1",
+    "commit": {
+      "sha": "81336553c0720aa3f431f24f10f3b4fb95464af1",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/81336553c0720aa3f431f24f10f3b4fb95464af1"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDIuMQ"
+  },
+  {
+    "name": "uefi-202402.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202402.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202402.0",
+    "commit": {
+      "sha": "3278ac4fa5668c4cede541168c755f6939f8bb1f",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/3278ac4fa5668c4cede541168c755f6939f8bb1f"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDIuMA"
+  },
+  {
+    "name": "uefi-202401.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202401.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202401.0",
+    "commit": {
+      "sha": "d8a952cfe582ebc8bbd097899d8a95b7ad4f8b62",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/d8a952cfe582ebc8bbd097899d8a95b7ad4f8b62"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDI0MDEuMA"
+  },
+  {
+    "name": "uefi-202312.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202312.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202312.0",
+    "commit": {
+      "sha": "d25162005bfae4baefed30e2e6eeb67e2dbbd547",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/d25162005bfae4baefed30e2e6eeb67e2dbbd547"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMTIuMA"
+  },
+  {
+    "name": "uefi-202310.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202310.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202310.1",
+    "commit": {
+      "sha": "9dbd33920c4020c514a664a272e32e51b5a579c4",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/9dbd33920c4020c514a664a272e32e51b5a579c4"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMTAuMQ"
+  },
+  {
+    "name": "uefi-202310.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202310.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202310.0",
+    "commit": {
+      "sha": "e46db0dc53eefb821d9375e0d771bfc8f5226881",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/e46db0dc53eefb821d9375e0d771bfc8f5226881"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMTAuMA"
+  },
+  {
+    "name": "uefi-202309.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202309.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202309.0",
+    "commit": {
+      "sha": "05af69888e260c95778771486c3ee9a0f1d71d7a",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/05af69888e260c95778771486c3ee9a0f1d71d7a"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMDkuMA"
+  },
+  {
+    "name": "uefi-202308.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202308.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202308.1",
+    "commit": {
+      "sha": "efc857996e4321fe55d3a3904a5180a6b3ee4888",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/efc857996e4321fe55d3a3904a5180a6b3ee4888"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMDguMQ"
+  },
+  {
+    "name": "uefi-202308.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202308.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202308.0",
+    "commit": {
+      "sha": "71fc2f6de48f3e9f01214b4e9464dd03620b876b",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/71fc2f6de48f3e9f01214b4e9464dd03620b876b"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMDguMA"
+  },
+  {
+    "name": "uefi-202307.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202307.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202307.0",
+    "commit": {
+      "sha": "e447998618c1c2f13c6668a659e1849658ff360e",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/e447998618c1c2f13c6668a659e1849658ff360e"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMDcuMA"
+  },
+  {
+    "name": "uefi-202305.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202305.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202305.2",
+    "commit": {
+      "sha": "a8d027b18dc3f66f74de0183fff904669a33aad5",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/a8d027b18dc3f66f74de0183fff904669a33aad5"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMDUuMg"
+  },
+  {
+    "name": "uefi-202305.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202305.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202305.1",
+    "commit": {
+      "sha": "29f6c0106563e7102c85849641949ac3bd078605",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/29f6c0106563e7102c85849641949ac3bd078605"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIzMDUuMQ"
+  },
+  {
+    "name": "uefi-202305",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202305",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202305",
+    "commit": {
+      "sha": "f1840cc930682bdb041ceb1d976233599ef0f789",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/f1840cc930682bdb041ceb1d976233599ef0f789"
+    },
+    "node_id": "REF_kwDOG7KonrVyZWZzL3RhZ3MvdWVmaS0yMDIzMDU"
+  },
+  {
+    "name": "uefi-202210.8",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.8",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.8",
+    "commit": {
+      "sha": "2be5d5da5df85a0c4637f4e6d41340db746dd735",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/2be5d5da5df85a0c4637f4e6d41340db746dd735"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuOA"
+  },
+  {
+    "name": "uefi-202210.7",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.7",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.7",
+    "commit": {
+      "sha": "b3234614342d5be28a1169875166b3af5d534995",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/b3234614342d5be28a1169875166b3af5d534995"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuNw"
+  },
+  {
+    "name": "uefi-202210.6",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.6",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.6",
+    "commit": {
+      "sha": "4cd685745bcdb6533ade058a1f870502354c237e",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/4cd685745bcdb6533ade058a1f870502354c237e"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuNg"
+  },
+  {
+    "name": "uefi-202210.5.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.5.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.5.3",
+    "commit": {
+      "sha": "942f38f83b686174e6a962cbf2c7ba3b65ebe425",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/942f38f83b686174e6a962cbf2c7ba3b65ebe425"
+    },
+    "node_id": "REF_kwDOG7KonrlyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuNS4z"
+  },
+  {
+    "name": "uefi-202210.5.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.5.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.5.1",
+    "commit": {
+      "sha": "c4bd6568bd4c0e226d672050910863aba5535550",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/c4bd6568bd4c0e226d672050910863aba5535550"
+    },
+    "node_id": "REF_kwDOG7KonrlyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuNS4x"
+  },
+  {
+    "name": "uefi-202210.5",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.5",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.5",
+    "commit": {
+      "sha": "78a917ecc3639c84097a180dedd33ad8482c6fb5",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/78a917ecc3639c84097a180dedd33ad8482c6fb5"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuNQ"
+  },
+  {
+    "name": "uefi-202210.4",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.4",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.4",
+    "commit": {
+      "sha": "32eee0ec51f4bda624c606a825e90a520caba233",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/32eee0ec51f4bda624c606a825e90a520caba233"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuNA"
+  },
+  {
+    "name": "uefi-202210.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/uefi-202210.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/uefi-202210.3",
+    "commit": {
+      "sha": "8444db349648a77ed8e2e3047a93004c9cadb2d3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/8444db349648a77ed8e2e3047a93004c9cadb2d3"
+    },
+    "node_id": "REF_kwDOG7KonrdyZWZzL3RhZ3MvdWVmaS0yMDIyMTAuMw"
+  },
+  {
+    "name": "r39.2.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r39.2.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r39.2.1",
+    "commit": {
+      "sha": "7e9f9ec4de8d979807683a7b4605a15ec3299b89",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/7e9f9ec4de8d979807683a7b4605a15ec3299b89"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM5LjIuMQ"
+  },
+  {
+    "name": "r39.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r39.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r39.2",
+    "commit": {
+      "sha": "bd49b331a0bbdeef7a34c224a3767f77e36da0c4",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/bd49b331a0bbdeef7a34c224a3767f77e36da0c4"
+    },
+    "node_id": "REF_kwDOG7Konq9yZWZzL3RhZ3MvcjM5LjI"
+  },
+  {
+    "name": "r38.5",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r38.5",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r38.5",
+    "commit": {
+      "sha": "aed072d99ffad0d82d65c6b43512e48db08a5b33",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/aed072d99ffad0d82d65c6b43512e48db08a5b33"
+    },
+    "node_id": "REF_kwDOG7Konq9yZWZzL3RhZ3MvcjM4LjU"
+  },
+  {
+    "name": "r38.4",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r38.4",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r38.4",
+    "commit": {
+      "sha": "b4fc9d9902094a238c941d9bcb5ac7c795b21ac7",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/b4fc9d9902094a238c941d9bcb5ac7c795b21ac7"
+    },
+    "node_id": "REF_kwDOG7Konq9yZWZzL3RhZ3MvcjM4LjQ"
+  },
+  {
+    "name": "r38.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r38.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r38.2",
+    "commit": {
+      "sha": "899cdbc99a47b40721a6a074d966b4a00959412b",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/899cdbc99a47b40721a6a074d966b4a00959412b"
+    },
+    "node_id": "REF_kwDOG7Konq9yZWZzL3RhZ3MvcjM4LjI"
+  },
+  {
+    "name": "r36.5.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.5.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.5.1",
+    "commit": {
+      "sha": "3dfabbec197a7614deaa57e4782296b57290a911",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/3dfabbec197a7614deaa57e4782296b57290a911"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM2LjUuMQ"
+  },
+  {
+    "name": "r36.5",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.5",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.5",
+    "commit": {
+      "sha": "79ad0c17aa4f13fdd5164d5b026fa49436b34891",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/79ad0c17aa4f13fdd5164d5b026fa49436b34891"
+    },
+    "node_id": "REF_kwDOG7Konq9yZWZzL3RhZ3MvcjM2LjU"
+  },
+  {
+    "name": "r36.4.5",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.4.5",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.4.5",
+    "commit": {
+      "sha": "2645bbc66c86bbf1cae0c8c1d17af2d916c3ee42",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/2645bbc66c86bbf1cae0c8c1d17af2d916c3ee42"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM2LjQuNQ"
+  },
+  {
+    "name": "r36.4.4",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.4.4",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.4.4",
+    "commit": {
+      "sha": "350c50a65a7b30d916b8c1901ed940f6d69bbcaa",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/350c50a65a7b30d916b8c1901ed940f6d69bbcaa"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM2LjQuNA"
+  },
+  {
+    "name": "r36.4.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.4.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.4.3",
+    "commit": {
+      "sha": "85becaf8fbe323feef228c85160cf599f32f8121",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/85becaf8fbe323feef228c85160cf599f32f8121"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM2LjQuMw"
+  },
+  {
+    "name": "r36.4.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.4.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.4.0",
+    "commit": {
+      "sha": "5de7ef09811a06475248bf07661f7ae53e1c106d",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/5de7ef09811a06475248bf07661f7ae53e1c106d"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM2LjQuMA"
+  },
+  {
+    "name": "r36.3.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.3.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.3.0",
+    "commit": {
+      "sha": "81336553c0720aa3f431f24f10f3b4fb95464af1",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/81336553c0720aa3f431f24f10f3b4fb95464af1"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM2LjMuMA"
+  },
+  {
+    "name": "r36.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r36.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r36.2",
+    "commit": {
+      "sha": "9dbd33920c4020c514a664a272e32e51b5a579c4",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/9dbd33920c4020c514a664a272e32e51b5a579c4"
+    },
+    "node_id": "REF_kwDOG7Konq9yZWZzL3RhZ3MvcjM2LjI"
+  },
+  {
+    "name": "r35.6.4",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.6.4",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.6.4",
+    "commit": {
+      "sha": "942f38f83b686174e6a962cbf2c7ba3b65ebe425",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/942f38f83b686174e6a962cbf2c7ba3b65ebe425"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjYuNA"
+  },
+  {
+    "name": "r35.6.3",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.6.3",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.6.3",
+    "commit": {
+      "sha": "942f38f83b686174e6a962cbf2c7ba3b65ebe425",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/942f38f83b686174e6a962cbf2c7ba3b65ebe425"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjYuMw"
+  },
+  {
+    "name": "r35.6.2",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.6.2",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.6.2",
+    "commit": {
+      "sha": "a58c53065a3b93d2182ce22dbea046f8fa9eb3b3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/a58c53065a3b93d2182ce22dbea046f8fa9eb3b3"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjYuMg"
+  },
+  {
+    "name": "r35.6.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.6.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.6.1",
+    "commit": {
+      "sha": "c4bd6568bd4c0e226d672050910863aba5535550",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/c4bd6568bd4c0e226d672050910863aba5535550"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjYuMQ"
+  },
+  {
+    "name": "r35.6.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.6.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.6.0",
+    "commit": {
+      "sha": "78a917ecc3639c84097a180dedd33ad8482c6fb5",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/78a917ecc3639c84097a180dedd33ad8482c6fb5"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjYuMA"
+  },
+  {
+    "name": "r35.5.0",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.5.0",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.5.0",
+    "commit": {
+      "sha": "a5ac12d729f610035f16013482fa70284f75ddfd",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/a5ac12d729f610035f16013482fa70284f75ddfd"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjUuMA"
+  },
+  {
+    "name": "r35.4.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.4.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.4.1",
+    "commit": {
+      "sha": "8444db349648a77ed8e2e3047a93004c9cadb2d3",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/8444db349648a77ed8e2e3047a93004c9cadb2d3"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjQuMQ"
+  },
+  {
+    "name": "r35.3.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.3.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.3.1",
+    "commit": {
+      "sha": "63e71c987193cc57333994ca5b82a62c40fed5da",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/63e71c987193cc57333994ca5b82a62c40fed5da"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjMuMQ"
+  },
+  {
+    "name": "r35.2.1",
+    "zipball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/zipball/refs/tags/r35.2.1",
+    "tarball_url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/tarball/refs/tags/r35.2.1",
+    "commit": {
+      "sha": "26fc1867db1e956f0a2aa4d97a8644428ca03b88",
+      "url": "https://api.github.com/repos/NVIDIA/edk2-nvidia/commits/26fc1867db1e956f0a2aa4d97a8644428ca03b88"
+    },
+    "node_id": "REF_kwDOG7KonrFyZWZzL3RhZ3MvcjM1LjIuMQ"
+  }
+]
