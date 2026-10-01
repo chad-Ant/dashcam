@@ -4,8 +4,9 @@
 
 | Item | Commit | Status | Still needs |
 |---|---|---|---|
-| Platform | — | **Rootfs, kernel and userspace back on L4T R36.5.0 (JetPack 6.2.2, kernel 5.15.185-tegra) on 2026-09-30**, for the IMX296 driver; the 65 NVIDIA packages are held. **The QSPI bootloader/UEFI is still 36.5.2** (slot B; the 36.5.0 capsule did not take effect). On this mix, the IMX296 in CAM1 streams through Argus again (`csi_test` 5/5), and v0.4, the UGREEN and CUDA all work (below). | The user's call: stay (works, tested), or **upgrade to R36.5.2 with the IMX296 driver rebuilt from source** (`~/drive_logs/tools/l4t_upgrade_36_5_2.sh`, prepared and reviewed 2026-10-01; this also matches the bootloader again). UEFI refuses a 36.5.0 bootloader. |
-| IMX296 driver for any kernel | — | Rebuilt from the vendor's own source (recovered from their git history) plus FRC 971's mode table. Its code, data, strings and `.modinfo` are byte-identical to the vendor's 5.15.185 module (the files differ only in debug info and build-id), and a 5.15.199 build has 41/41 CRCs matching 36.5.2. Tools, outside the repo: `~/drive_logs/tools/imx296_driver/build.sh`, `l4t_upgrade_36_5_2.sh`, `l4t_rollback_36_5_0.sh`, `verify_platform.sh`, and the pre-reboot checks they share, `l4t_checks.sh` (tested by `test_l4t_checks.sh`; rewritten 2026-10-01 after three reviews, below). | **not run on hardware:** the 5.15.199 module on a 5.15.199 kernel (upgrade step 4) |
+| Platform | — | **Upgraded to L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra on 2026-10-01; UEFI also 36.5.2.** Existing 16:18 verification log: 24 PASS, 0 FAIL, 1 SKIP; all 65 target packages at target versions and held. See the evening update below. | `usb_test` was skipped while the recorder owned the USB camera; evening paired USB captures succeeded, but do not substitute for that full test. |
+| IMX296 driver for any kernel | — | Rebuilt from the vendor's source plus FRC 971's mode table; 41/41 CRCs match 36.5.2. **Now loaded and hardware-tested on 5.15.199:** platform log has `csi_test` 5/5, CSI RTP and Camera_GST PASS; evening tuning captured from the IMX296 through Argus. Build/upgrade/rollback tools remain outside the repo in `/home/jetson/drive_logs/tools/`. | Road-use validation after the platform/tuning changes. |
+| CSI image tuning | — | **c5_rpi100T is installed** (black level 50 + the IMX296 colour matrix the vendor file had transposed). The c7 A/B brings it closer to the USB camera (ΔE 11.7 → 6.7 once the CSI JPEGs are decoded correctly; first reported as 8.56 → 4.79). A review found that gain is mostly in-sample and about zero against the chart's own values, so **do not install c7 as it is**. The app sets no CSI properties today, so it gets the ISP's default sharpening (large halos). Details in "Review of the c7 work" below. | **c8 A/B done 2026-10-02: `c8_sh15` passes**, giving ee-mode=0-like output at the ISP default with the ee-strength knob kept. It is not installed yet; installing it needs the user's sudo. Then: a daylight A/B (`--auto`) and the CSI saturation in the app's config. |
 | High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
 | CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
 | Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
@@ -25,6 +26,335 @@
 | usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Open: item Z. |
 | Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Open: items X, Y. |
 | commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Open: item W. |
+
+## 2026-10-01 evening (Jetson): CSI/USB chart tuning and current rig state
+
+**Current state, not a deployment:** the user ran the privileged c7 A/B trial successfully. It restored
+`/var/nvidia/nvcam/settings/camera_overrides.isp` to **c5_rpi100T.isp** afterwards. The restore was verified by
+hash; `nvargus-daemon` is active and `dashcam-v04` remains **stopped**. The later c7 install command was offered
+but has **not** been run. No production application configuration or MCU firmware was changed by this tuning.
+
+| Profile | SHA-256 |
+|---|---|
+| Installed c5 | `20b4c94c5fa4663aaef762192d0ecbd9b5d68066a32fc5e78d2950ab36456d61` |
+| Tested c7 candidate | `bd5c2cacf7696d71ddd63896dddf94ac09dbed619fa8278ba59d322af799d9c0` |
+
+The recovery copy from this trial is `/var/backups/csi-trial.c4MsRq/camera_overrides.isp`.
+The candidate is `/home/jetson/drive_logs/tools/isp_tuning/session_20261001_2146/c7_usb_half.isp`.
+
+**Platform catch-up:** the existing log `/home/jetson/drive_logs/platform_checks/20261001-161803/summary.txt`
+records the completed R36.5.2 upgrade: 24 checks passed, none failed, one skipped. It includes the loaded
+5.15.199 IMX296 module, `csi_test` 5/5, CSI RTP, Camera_GST, discovery of both cameras, CUDA, and TensorRT
+(mean GPU compute 14.008 ms). `usb_test` was skipped because v0.4 owned the UGREEN at that time. This is a
+reviewed earlier log, not a fresh rerun of the platform suite. The evening chart sessions independently
+confirm live CSI and USB capture after the upgrade. Earlier rollback/pre-upgrade sections below are historical.
+
+### Measured A/B result
+
+Both cameras viewed the same printed chart under room lighting. Captures used **host GStreamer/Argus**;
+offline OpenCV analysis ran in an isolated `l4t-ml-gpio` container with no camera access. These tuning captures
+were **not** taken inside the production container. The USB camera was a relative reference, not a calibrated
+colour standard; ordinary printed patches and USB processing cannot establish absolute colour accuracy.
+
+Evidence directories (outside this repo, on the Jetson):
+
+- `/home/jetson/drive_logs/tools/isp_tuning/trial_20261001_215416_base/`
+- `/home/jetson/drive_logs/tools/isp_tuning/trial_20261001_215416_candidate/`
+
+Each contains `session.json`, `metrics.json`, JPEG pairs and the installed-profile snapshot. Both sessions
+completed with 50 pairs each and the expected distinct profile hashes. Analysis accepted **97/100 pairs**
+with all four chart markers detected in both images. Excluded: base `ee_default_1`, candidate `ee_default_4`
+and `base_end_1`. All five pairs at the main comparison setting were valid in each session.
+
+At **`ee-mode=0`, `tnr-mode=1`, `saturation=1.0`**, means over five pairs:
+
+| Measurement | c5 baseline | c7 candidate |
+|---|---:|---:|
+| Colour difference to USB, mean ΔE76 over 18 colour patches (lower is better) | 8.56 | 4.79 |
+| Grey difference to USB, mean ΔE76 over patches 19–22 | 5.36 | 4.03 |
+| CSI paper lightness L* | 71.15 | 70.23 |
+| USB paper lightness L* | 72.41 | 72.56 |
+
+**Correction (late evening review, below):** the CSI JPEGs hold limited-range BT.601 YCbCr with no JFIF marker,
+but every script decoded them as full range. With the correct decode, colour ΔE to USB is **11.71 (c5) vs 6.69
+(c7)**, and CSI paper L* is 74.9 vs USB 72.6. The ranking stands, but the saturation conclusion in the next
+paragraph does not: see "Review of the c7 work".
+
+The ~44% reduction in colour-matching error persisted at the end of the sweeps (8.60 versus 4.75).
+USB controls were not written; before/after dumps matched. USB automatic processing remained enabled,
+but measured reference drift between sessions was small: mean patch ΔE 0.35, maximum 0.76. Frames were
+paired, not hardware-synchronised. c7 is about 0.9 L* darker at the same sensor exposure and retains a grey
+tint (mean a*=+3.88, b*=-9.12); the USB reference itself renders blue greys.
+
+**Provisional c7 runtime choice (withdrawn, see the review below):** `ee-mode=0 tnr-mode=1 saturation=1.0`.
+Saturation 0.9 and 1.1 worsened c7's colour score to 5.59 and 5.68 respectively; the earlier 0.9 recommendation
+applied to c5 only. *With the correct decode, c7 scores 5.24 / 6.71 / 9.27 at 0.9 / 1.0 / 1.1, so 0.9 is
+better, and an explicit 1.0 is about 1.3× the chroma the app gets today with saturation unset.*
+Default sharpening produced strong low-contrast bright halos (~63% versus ~5% with enhancement off,
+representative frames). Spatial luma standard deviation was 2.39 versus 0.99; this includes print texture
+and JPEG artefacts, so it is not a sensor-noise measurement. These are indoor observations, not proof of
+better lane detection or all-light image quality. Earlier workspace experiments report green output with
+`tnr-mode=2`; that mode was not revalidated in this c7 A/B and should not be selected on this evidence.
+
+### Tools, pitfalls and next steps
+
+Workspace: `/home/jetson/drive_logs/tools/isp_tuning/`. `README.md` has detailed results at the top;
+its older c1/c2 and "Next: the printed chart" notes are historical, not the current state.
+
+- `tune_session.py` uses continuous CSI/USB sessions, fresh output directories, bounded frame waits,
+  settling, five pairs per setting, profile/control metadata and pipeline cleanup. It refuses an active recorder.
+- `analyse_session.py` measures valid four-marker pairs; `--no-fit` analyses an A/B without deriving another
+  candidate. c7 came from a half-strength, brightness-normalised USB colour fit to the stable
+  `session_20261001_2146` captures. The earlier `session_20261001_2142` lock-only run drifted in brightness
+  and was excluded from the final fit. Offline cross-validation numbers are not the live A/B scores above.
+- `trial_c7.sh` checks the baseline/candidate hashes, backs up the installed profile, captures both profiles,
+  and restores the original on normal exit/error/interrupt. It never starts the recorder. Power loss or
+  SIGKILL can bypass the restoration trap; retain the recovery copy.
+- The older `pair.sh`/`cycle.sh` were **not repaired or used**: capture failures can permit stale shot reuse,
+  and failed installs/restarts or interruption can leave an experimental profile selected.
+- Fixed bench settings are vendor-driver-specific: Argus `exposuretimerange="675000 675000"` and
+  `gainrange="11.5 11.5"`, digital gain 1, read back as exposure **675 lines (~10 ms)** and gain **184
+  (18.4 dB)** throughout the trial. Do not interpret these as 675 microseconds or 11.5× gain, or copy the
+  manual settings/AE-AWB locks into the road application.
+- `c7_runtime.json` only records the suggested runtime preset; it is **not loaded by the application**.
+  Installing an ISP file alone does not disable runtime edge enhancement.
+
+Next: select c7 only if the user chooses to proceed, then repeat paired comparisons in daylight and with
+automatic exposure/white balance, check moving scenes for blur/temporal artefacts, and verify the actual
+application's runtime properties before making a production default. Keep c5 and the backup available for
+rollback. No additional profile installation, service start, fixes or firmware changes were made while
+recording this handover.
+
+### Review of the c7 work, and what the lead tuning session found (2026-10-01, 23:45)
+
+This is the session that ran the upgrade and the c1–c6 rounds (`cycle.sh`). At the end it ran five agents:
+- one researched the ISP keys;
+- one measured edges and noise;
+- three reviewed: the sharpening result, the c7 trial, and the decode/saturation findings.
+
+Their full outputs are in `isp_tuning/reviews_20261001/`. Nothing was installed after 20:20 except by
+`trial_c7.sh`. The repo's code and config are unchanged, and no ISP file, service or camera setting was touched.
+
+**Platform: a lesson from the upgrade.** The first `--apply` stopped at its final hold check:
+`apt-get install --allow-change-held-packages` had **cleared all 65 holds**. Both `l4t_upgrade_36_5_2.sh` and
+`l4t_rollback_36_5_0.sh` now run `apt-mark hold` on the 65 after apt. The re-run passed, and after the reboot
+`verify_platform.sh` gave 24 pass, 0 fail, 1 skip. A backgrounded `sudo` that is waiting for a password shows
+state `T` and looks hung: run `sudo -v` first.
+
+**What is installed, and why.** `camera_overrides.isp` = `c5_rpi100T.isp` (sha256 `20b4c94c…`), installed since
+20:20. It differs from the vendor file in two ways:
+- **Black level 50, not 60.** The driver programs BLKLEVEL 0x032 for colour; the vendor ISP subtracted 60,
+  which crushed the shadows green. (c1)
+- **The colour matrix, untransposed.** `colorCorrection.srgbMatrix[i]` is the i-th **column** of the operator:
+  out = fileᵀ · in. Two things prove it:
+  - a probe file, rows [[1,0,0],[0,1,0],[0.5,0,0.5]], turned the greys orange-yellow (b* +13.7), as the
+    column reading predicts;
+  - the c7 trial matches its fitted matrix to 0.6 ΔE under this convention, against 27.8 ΔE under the other.
+
+  The InnoMaker file (v1.1) stores I + 0.5·(Raspberry Pi IMX296 5600 K CCM − I) row by row, i.e. transposed for
+  NVIDIA. That is the magenta cast. c5 is the RPi CCM at full strength, written column by column. It preserves
+  neutrals (column sums 1).
+- The vendor file is not an IMX296 tuning at all: it shares 403 of its 404 keys with NVIDIA's own IMX477 v.03
+  tuning. The NLM noise reduction (v8) and `sharpness.v5.tab` were deleted, and the CUDA DCT denoiser (v6),
+  which NVIDIA disables on Orin, was switched on.
+
+**Sharpening.**
+- `ee-mode=0` is the only setting measured that removes the halos. Same-session values, ee-mode=0 vs the ISP
+  default:
+  - bright halo on low-contrast edges: 5 % vs 62 %;
+  - luma noise in the grey patches: ×0.42–0.49;
+  - pixel-level grain: about ×1/3.
+- `ee-strength` 0.05 → 0.20 sits in between: rim and MTF are linear in strength, and 0 equals ee-mode=0.
+- A dark rim survives even ee-mode=0: 14–18 % on low-contrast edges, 22–25 % on high-contrast ones.
+- **`sharpness.v2` values are set indices: LOWER = STRONGER.** 0 is the strongest sharpening, and MaxValue is the
+  weakest (that end is inferred, not yet captured). The evidence is libnvscf's disassembly, NVIDIA's embedded
+  tunings and the measurements.
+  - So `c6_sh1` and `c6_sh0` sharpened **more** than the vendor table. The rim went 84 → 118 → 135 %, z +5.9 and
+    +9.0 against the measured spread.
+  - Their header comments now say so. Don't use them.
+- **File-only candidates, untested:** `c8_sh15.isp` (the auto table all 15) and `c8_v5off.isp`
+  (`sharpness.v5.enable = FALSE`, NVIDIA staff's advice for Xavier). Updated 2026-10-02, see below; `c8_v5tab15`
+  was dropped.
+  - Aim: give every app ee-mode=0-like output without setting properties.
+  - Pass, in a fixed-exposure A/B with the ISP default EE: low-contrast rim ≤ 20 %, halo ≤ 8 %, MTF(0.25) ≤ 1.15,
+    noise within 10 % of ee-mode=0, colour unchanged (±0.5 ΔE), clean override parse.
+
+**Analysis bug: the CSI stills.**
+- `nvjpegenc` writes limited-range BT.601 YCbCr (Y 16–235) into a JPEG with no JFIF marker. The UGREEN's are
+  JFIF full range. cv2 decodes both as full range, which lifts the CSI blacks and shrinks its chroma by 0.878.
+- Every CSI number before 22:55 is off by this, including the README's "EV +0.5 matches brightness": corrected,
+  EV +0.5 overshoots, at paper L* 95 vs 73.
+- The decode recipe is in `reviews_20261001/workflow_run2_verify.json` (`decode`). `chartcmp.py`, `chartnoise.py`,
+  `chartsharp.py` and `analyse_session.py` still use the wrong decode.
+- **Production:** none for v0.4, which never opens the CSI camera.
+  - v0.3's inference path (nvvidconv → BGRx) is correct.
+  - v0.3's RTP H.264 carries BT.601 samples but a VUI saying bt709. nvarguscamerasrc caps carry no colorimetry,
+    and GStreamer assumes bt709 above 576 lines.
+  - One-line fix, verified by emulation and **not applied**: `video/x-raw,format=(string)I420,colorimetry=(string)bt601`
+    after nvvidconv in `libnetwork_rtp.cpp`.
+
+**Saturation and the other properties.**
+- nvarguscamerasrc applies `saturation`, `ee-mode`, `ee-strength` and `tnr-*` **only when the property is set**
+  (`saturationPropSet` etc.).
+- `setColorSaturation` replaces the ISP's value; it does not multiply it (Argus `Settings.h`).
+- Unset, the effective saturation measures **about 0.75** of an explicit 1.0. The plausible mechanism is the
+  file's `defaults.saturation` 0.85 × `ae.saturation` 85; it has no same-session A/B yet.
+- The app sets **no** CSI properties today. The csi0 entry in `config/dashcam.xml` lists V4L2 metadata only, and
+  `libcamera_csi.cpp` builds a bare `nvarguscamerasrc`. So v0.3 would render the ISP default edge enhancement and
+  about 0.75 saturation.
+- Bench settings reach the app only as csi0 `<Capabilities>`, or baked into the ISP file.
+
+**c7: closer to the UGREEN, not shown to be better.**
+- **In-sample.** The fitted matrix predicts the trial to 0.1–0.2 ΔE, so the trial confirms the fit, not that it
+  generalises. The fit and the trial share the chart, the lamp, the fixed exposure and gain, an explicit
+  saturation of 1.0 and the target.
+- **Out of sample.** On 11 earlier auto-exposure captures, c7 is still closer to the UGREEN: 12.1 → 10.1, and
+  every capture improves.
+- **Against the chart's nominal values: about zero.** At the default saturation, 22.48 → 22.20 (exposure-
+  normalised) and 17.60 → 17.75 (white-balanced). Hue error is unchanged, 6.83 → 6.75. c7 rotates hues toward
+  the UGREEN, which is further from nominal (|dH| 8.1) than c5 is (6.9).
+- **The tint.** c7's columns sum to 0.891 / 0.958 / 0.950. That is a lamp-specific red cut (a* −1.6 on a neutral
+  that c5 renders neutral; −2.6 on white) plus 4 % darkening. On its own the tint is slightly harmful against
+  nominal.
+- **Grey cast.** Only a* improves; the blue b* ≈ −9 is untouched, because the UGREEN shares it.
+- **Option: `c7n`,** c7's neutral-preserving part on c5 (rows in the review). Untested.
+- **Settling it needs:** a reference with known values (a real ColorChecker, or the print measured with a
+  spectrophotometer), and a daylight + lamp A/B with auto AE/AWB, no locks, and saturation unset, 0.9 and 1.0.
+
+**`trial_c7.sh`: safe for the file, weak in details.** A simulation drove Ctrl-C, SIGTERM, SIGHUP, a hung child,
+a failed child and a failed restart. Every ordinary path ended with c5 installed, as it did for real at 21:54.
+Weak points:
+- Ctrl-C waits for the running capture, up to 120 s: `timeout` moves the child into its own process group.
+- The candidate hash is checked at the start but the file is installed 35 s later, from a jetson-writable path.
+- A second Ctrl-C can interrupt the restore.
+- "RESTORE FAILED" is printed when only the daemon restart failed.
+- The recorder check sees only the systemd unit.
+- There is no HUP trap.
+
+**`pair.sh` / `cycle.sh`: the other session's critique is fair.**
+- `cycle.sh` has no trap, so an interrupt can leave a test profile installed.
+- `pair.sh` can leave a stale image when a capture fails.
+- One frame per candidate leaves no measure of run-to-run spread.
+- The `[exposure: gain:]` readout is the **CSI's** (`/dev/video0`), not the UGREEN's, and it goes only to stdout.
+- Use `tune_session.py`-style sessions for A/B work.
+- Separately, the earlier lock-only session's frame-to-frame swing is probably 100 Hz lamp flicker at 14.8 ms.
+  675 lines ≈ 10 ms is exactly one flicker period.
+
+**Next, in order (2026-10-02: steps 1 and 2 done; c8_sh15 passed, install pending; see below):**
+1. ~~Switch the analysis scripts to the correct CSI decode.~~ Done.
+2. ~~A/B the c8 sharpening files.~~ Done: c8_sh15 passes. Install it (user's sudo).
+3. Pick the CSI properties (ee-mode=0 or c8; saturation about 0.9–1.0) and put them where the app reads them.
+4. Daylight + auto AE/AWB comparison of c5 / c7n before any production default.
+5. Fix the grey cast at its source, the AWB tables inherited from IMX477, not in the colour matrix.
+
+Files (`/home/jetson/drive_logs/tools/isp_tuning/`):
+- `chartcmp.py`, `chartnoise.py`, `chartsharp.py`, `c5gen.py`, `convtest.py`;
+- `chart/` (the printed chart and its geometry);
+- `c1_black50` … `c8_*` candidates;
+- `reviews_20261001/`.
+
+### 2026-10-02 early: the decode fixed, and an A/B kit for the c8 files (not run yet)
+
+Nothing was installed or restarted, and no camera was opened; the installed profile is still c5 (`20b4c94c…`).
+Three more agents reviewed this tooling adversarially, and their findings are fixed.
+
+**Decode.**
+- `csi_decode.py` (`is_nvjpeg`, `read_bgr`) recognises an nvjpegenc still from its header and expands the limited
+  range: no APPn marker, SOF component ids 0,1,2. It also caught 20 CSI files in `noise_study/` whose names lack
+  `.csi`.
+- `chartcmp`, `chartnoise`, `chartsharp`, `fitccm`, `match`, `regions` and `analyse_session` all use it now.
+- Checked:
+  - on all 485 JPEGs it matches an independent decode to 6e-5;
+  - JFIF (UGREEN) results are bit-identical to before;
+  - corrupt files return None, as cv2 did;
+  - `chartsharp` measures the JPEG's own (expanded) Y and keeps its clip column.
+- Paper spot 5, which sat inside sharpening halos, is gone.
+- `analyse_session.py` refuses to overwrite `metrics.json` / `c7_usb_half.isp` without `--force`.
+- Re-score: c5 11.70 vs c7 6.65 to the UGREEN. Pre-fix copies are in `reviews_20261001/pre_decode_fix/`.
+
+**What NVIDIA's parser does with the c8 files.** A reviewer ran the installed libnvscf parser in-process on each
+file; no camera was opened.
+- `sharpness.v2.{Preview,Still,Video}[r]` and `sharpness.v5.tab.*` are **one table**, and the last line wins.
+- `sharpness.v2.MaxValue` is parsed and **discarded**. Writing it as `15.0` would make the whole override fail
+  to load.
+- An unknown key skips only its line, and the loader logs it. A bad value or syntax error makes the whole load
+  fail: there is no silent fallback to vendor defaults.
+- The vendor table {3,3,5,…} replaces the stock ISP6 table {3,4,5,7,8,10,11}, so **the vendor file sharpens more
+  than NVIDIA's own default.**
+- The files now:
+  - `c8_sh15.isp` (sha256 `43ec0c81…`): the table all 15, no MaxValue line. At the ISP default it should select
+    exactly what ee-mode=0 selects (sharpen set 15, gain 0), and leave manual ee-strength and colour unchanged.
+  - `c8_v5off.isp` (`4d40517a…`): also kills manual ee-strength sharpening. Medium confidence.
+  - `c8_v5tab15` parsed identically to c8_sh15, so it moved to `reviews_20261001/superseded/`.
+
+**The kit.**
+- **`trial_ab.sh [--auto] <candidate>…`** (sudo) runs base, cand1, base, cand2, base with
+  `tune_session.py --manual --with-unset`. It restores the entry profile on every exit. Over `trial_c7.sh` it adds:
+  - signals act within about a second (Ctrl-C, Ctrl-\, TERM, a closed terminal);
+  - installs only from root-owned copies, by rename;
+  - a signal that lands as the restore starts cannot cut it short;
+  - file restore and daemon restart are reported apart;
+  - refuses if anything but nvargus holds a camera;
+  - saves each step's nvargus journal and warns on loader lines the base did not log.
+
+  It passed the reviewer's simulation: real pty signals, hangs and failed restarts, with the settings file
+  polled every 0.5 ms.
+- **`ab_report.py <trial dir> --json`** scores each candidate against its neighbouring base sessions:
+  - checks: the sharpening criteria above, colour unchanged, and a clean override parse from the saved journals;
+  - informational: manual ee-strength 0.2, which tells c8_v5off from c8_sh15.
+- **`tune_session.py`** has two new opt-in flags, and its defaults are unchanged:
+  - `--with-unset`: frames captured before any saturation property is set;
+  - `--auto`: no fixed exposure and no AE/AWB lock, for daylight.
+
+**To run (about 5 min; chart in view, recorder stopped):**
+```bash
+sudo bash ~/drive_logs/tools/isp_tuning/trial_ab.sh c8_sh15 c8_v5off
+docker run --rm --user 1000:1000 -v ~/drive_logs/tools/isp_tuning:/w -w /w l4t-ml-gpio:latest python3 ab_report.py trial_<stamp> --json
+```
+Daylight, later: `sudo bash …/trial_ab.sh --auto <candidates>` with the rig at a window.
+
+### 2026-10-02 05:45: the c8 A/B result. Both pass; `c8_sh15` is the one to use
+
+The user ran `trial_ab.sh c8_sh15 c8_v5off` (output in `isp_tuning/trial_20261002_054515/`, scored in `report.json`).
+- All 5 sessions completed with the expected profile hashes.
+- No loader lines appeared in any nvargus journal.
+- The entry profile c5 was restored, and it is still installed.
+
+ISP default edge enhancement (the path an app that sets no ee property gets), 5 frames each:
+
+| | c5 neighbours | **c8_sh15** | c8_v5off | ee-mode=0 (same sessions) |
+|---|---|---|---|---|
+| low-contrast dark rim | 77–92 % | **14.5 %** | 13.3 % | 13–16 % |
+| bright halo | 62–73 % | **7.2 %** | 7.5 % | 7–8 % |
+| MTF at 0.25 cy/px | 3.2 | **1.01** | 1.03 | 1.03–1.06 |
+| luma noise vs ee-off | ≈ 2.3× | **1.04×** | 0.94× | 1× |
+| manual ee-strength 0.2, halo | 22–25 % | **23 %** (kept) | 7.8 % (gone) | — |
+| colour ΔE vs neighbours | — | −0.25 | +0.09 | — |
+
+- Both behave as the parser review predicted.
+- `c8_sh15` is the better default:
+  - every app gets ee-mode=0-like output with no property set, which includes the dashcam app, since it sets none;
+  - `ee-strength` still works for anyone who wants mild sharpening.
+- `c8_v5off` disables the sharpen block outright.
+- Crops (`isp_tuning/reviews_20261001/c8_crops.png`): the c5 default draws pen-like outlines and grain;
+  `c8_sh15` at the default looks like ee-mode=0.
+- Side note: with saturation unset, the CSI is closer to the UGREEN than with an explicit 1.0 (ΔE 9.9 vs 12.7).
+
+**Marker detection, changed for this run.**
+- In the softer frames the CSI missed marker 0, which is only about 19 px wide (cells about 3 px). That dropped
+  half the frames, including all of c8_sh15's key frames.
+- A three-marker homography is not good enough: patch positions moved 3.5 px median, 6.6 px max.
+- `chartcmp.find_markers` now retries the markers it misses on a zero-phase unsharp-masked copy.
+  - Frames that found all four markers before are byte-identical, and the c5/c7 re-score is unchanged.
+  - The retry recovered 117 of 119 frames.
+  - Its corners differ from plain detection by median 0.31 / p95 1.24 px. That equals the detector's own spread
+    between two upscale factors on the same image (median 0.25 / p95 1.24).
+
+**To make c8_sh15 the default** (the user's sudo; it changes what every Argus app gets):
+```bash
+sudo install -m 0644 ~/drive_logs/tools/isp_tuning/c8_sh15.isp /var/nvidia/nvcam/settings/camera_overrides.isp && sudo systemctl restart nvargus-daemon
+```
+Back to c5: the same command with `c5_rpi100T.isp`. Not done yet.
 
 ## Who does what: read before handing work across
 
@@ -68,6 +398,10 @@ Two coders work on this branch:
   none of that code has run on a real bus.
 
 ## Done 2026-10-01 (Jetson coder): the IMX296 driver rebuilt from source, and tools to move between R36.5.0 and R36.5.2
+
+**Historical pre-upgrade notes:** the upgrade and hardware checks have since completed; see the evening
+update above. Statements below saying "not yet run" or "not applied" describe the state when these notes
+were originally written, not the current rig.
 
 **Why.** On R36.5.0 everything works, but the platform is held one release back, and the QSPI bootloader is already
 36.5.2. UEFI refused the 36.5.0 capsule: `fwupdmgr` reports `Current version 2360578`, `Minimum Version 2360578`,
@@ -117,7 +451,8 @@ R36.5.0 as of 2026-09-30, and the upgrade is the user's call.
 | `test_l4t_checks.sh` | Its regression test: 141 checks against good and broken boot entries, initrds and package lists built in a temporary directory, plus this machine's own `/boot` and packages, read-only. No root needed; about 15 s. Every rule is load-bearing: removing or weakening any one of them (56 mutants) makes it fail. |
 
 What `l4t_upgrade_36_5_2.sh --apply` does:
-1. Installs the 65 packages with `--allow-change-held-packages`. The holds stay.
+1. Installs the 65 packages with `--allow-change-held-packages`, which **clears their holds** (seen on 2026-10-01:
+   the first `--apply` stopped at the hold check), then holds them again with `apt-mark hold`.
 2. Puts the 5.15.199 `imx296.ko` in place *before* apt, then runs `depmod`.
 3. Restores `DEFAULT JetsonIO`, which the kernel package resets to `primary`.
 
@@ -162,7 +497,8 @@ Documented:
 - after the upgrade there is no 5.15.185 kernel to fall back to.
 
 Checked fine:
-- hold marks survive;
+- hold marks survive (**wrong**, found on the real run: `--allow-change-held-packages` clears them; the
+  scripts now re-hold after apt);
 - no conffile prompts;
 - nothing ships its own imx296 that would override this one;
 - `nv-update-extlinux` keeps the JetsonIO entry and its FDT/OVERLAYS lines;
