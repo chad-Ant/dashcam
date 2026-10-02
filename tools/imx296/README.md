@@ -15,7 +15,8 @@ and docs (`~/drive_logs/tools/...`) refer to it. The layout here mirrors it: the
 | `isp_tuning/` | Argus ISP override tuning against a printed ColorChecker/ArUco chart and a UGREEN USB reference. See `isp_tuning/README.md`, read top-down; the history is in `HANDOVER.md`. |
 
 What `isp_tuning/` holds:
-- **Profiles:** `c1`–`c8` `.isp` files. `c5_rpi100T` is installed; `c8_sh15` passed the sharpening A/B.
+- **Profiles:** `c1`–`c8` `.isp` files. `c8_sh15` (c5_rpi100T's colour plus the weakest sharpening index) passed
+  the sharpening A/B, and it has been installed since 2026-10-02 06:53, verified live.
 - **Capture tools:** `tune_session.py`, plus `trial_ab.sh`, the reviewed A-B-A trial that restores on every exit.
 - **Analysis:** `chartcmp.py`, `chartsharp.py`, `ab_report.py`, and `csi_decode.py`, which decodes the nvjpegenc
   stills' limited range correctly.

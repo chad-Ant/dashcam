@@ -1,9 +1,10 @@
-# IMX296 (CSI) image tuning — state on 2026-10-01 evening
+# IMX296 (CSI) image tuning — state on 2026-10-02 morning
 
-**Installed now (verified 21:46):** `/var/nvidia/nvcam/settings/camera_overrides.isp` =
-`c5_rpi100T.isp` (sha256 20b4c94c…). It includes the black-level correction and a
-transposed IMX296 colour matrix. The vendor original is `vendor_v1.1.isp`
-(sha256 c85a9342…). Earlier c1/c2 notes below are historical, not the current selection.
+**Installed now (since 2026-10-02 06:53, verified live 06:56):** `/var/nvidia/nvcam/settings/camera_overrides.isp`
+= `c8_sh15.isp` (sha256 43ec0c81…). It is c5_rpi100T's colour (black level 50, the transposed IMX296 colour
+matrix) plus the sharpness table at its weakest index, so the ISP's default output matches ee-mode=0. The vendor
+original is `vendor_v1.1.isp` (sha256 c85a9342…). The c5 base is `c5_rpi100T.isp` (20b4c94c…). Earlier c1/c2
+notes below are historical, not the current selection.
 
 ## Corrections and review, 23:45 (read first)
 
@@ -31,9 +32,11 @@ The repo's `HANDOVER.md` has the full text, under "Review of the c7 work…". Th
 - **`pair.sh`'s `[exposure gain]` readout is the CSI's (`/dev/video0`), not the UGREEN's.**
 - **c8 result (2026-10-02 05:45, `trial_20261002_054515/report.json`): `c8_sh15` PASSES.** At the ISP default it
   gives ee-mode=0-like output: rim 14.5 %, halo 7.2 %, MTF 1.01, noise 1.04× ee-off (c5: 82 %, 68 %, 3.2). Manual
-  ee-strength still works, and colour is unchanged. `c8_v5off` passes too, but disables ee-strength. To install
-  c8_sh15 (sudo):
-  `sudo install -m 0644 ~/drive_logs/tools/isp_tuning/c8_sh15.isp /var/nvidia/nvcam/settings/camera_overrides.isp && sudo systemctl restart nvargus-daemon`
+  ee-strength still works, and colour is unchanged. `c8_v5off` passes too, but disables ee-strength.
+  **Installed 2026-10-02 06:53.** Verified with a no-property capture (what the app does), which measures like
+  ee-mode=0: rim 19.5 % vs 21.2 %, halo 8.5 % vs 5.6 %, MTF 1.07 vs 1.10. There were no loader errors.
+  Back to c5:
+  `sudo install -m 0644 ~/drive_logs/tools/isp_tuning/c5_rpi100T.isp /var/nvidia/nvcam/settings/camera_overrides.isp && sudo systemctl restart nvargus-daemon`
 - **Marker detection:** `chartcmp.find_markers` retries missed markers on an unsharp-masked copy. ee-mode=0 frames
   lost marker 0; frames that already found all four are unchanged.
 - **The A/B kit (2026-10-02, reviewed):** `trial_ab.sh` (sudo; base, cand, base, …; restores on every exit),
