@@ -1,0 +1,169 @@
+(footprint "I2C_Header_1x04"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(tags "SparkFun")
+	(property "Reference" "REF**"
+		(at 0 -2 0)
+		(layer "F.Fab")
+		(uuid "da3b66fd-00f6-4730-8f53-0ca61e5674b7")
+		(effects
+			(font
+				(size 0.8 0.8)
+				(thickness 0.12)
+			)
+		)
+	)
+	(property "Value" "I2C"
+		(at 0 1.27 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "401e9a63-acd9-499e-9215-d165b3c709e5")
+		(effects
+			(font
+				(size 0.5 0.5)
+				(thickness 0.1)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "7199c183-cfac-448d-9e9b-8b434544cc8e")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "1cdc143c-4de6-45a5-abdf-506e2f220796")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_rect
+		(start -1.27 -1.27)
+		(end 8.89 1.27)
+		(stroke
+			(width 0.05)
+			(type default)
+		)
+		(fill no)
+		(layer "F.CrtYd")
+		(uuid "d751f9ff-7ec5-4d3c-af6c-2db2bf3e40f1")
+	)
+	(fp_poly
+		(pts
+			(xy -0.254 0.254) (xy 0.254 0.254) (xy 0.254 -0.254) (xy -0.254 -0.254)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(fill yes)
+		(layer "F.Fab")
+		(uuid "9058f323-d323-40f4-abe4-60e7b957ea37")
+	)
+	(fp_poly
+		(pts
+			(xy 2.286 0.254) (xy 2.794 0.254) (xy 2.794 -0.254) (xy 2.286 -0.254)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(fill yes)
+		(layer "F.Fab")
+		(uuid "7304fbf0-bc56-4e4a-b5e2-d3a1af574bce")
+	)
+	(fp_poly
+		(pts
+			(xy 4.826 0.254) (xy 5.334 0.254) (xy 5.334 -0.254) (xy 4.826 -0.254)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(fill yes)
+		(layer "F.Fab")
+		(uuid "26a1e2c1-afc9-4936-ae9f-ec7109254b9b")
+	)
+	(fp_poly
+		(pts
+			(xy 7.366 0.254) (xy 7.874 0.254) (xy 7.874 -0.254) (xy 7.366 -0.254)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(fill yes)
+		(layer "F.Fab")
+		(uuid "26444bd0-f5b7-4e84-802f-fab136f6d8b8")
+	)
+	(pad "1" thru_hole circle
+		(at 0 0 90)
+		(size 1.8796 1.8796)
+		(drill 1.016)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers yes)
+		(keep_end_layers yes)
+		(thermal_bridge_angle 0)
+		(uuid "ec5cccb4-d91b-416e-938d-3ae7ed41ebb6")
+	)
+	(pad "2" thru_hole circle
+		(at 2.54 0 90)
+		(size 1.8796 1.8796)
+		(drill 1.016)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers yes)
+		(keep_end_layers yes)
+		(thermal_bridge_angle 0)
+		(uuid "aa93bc2d-38f0-4255-9d15-1f3b34b2f43a")
+	)
+	(pad "3" thru_hole circle
+		(at 5.08 0 90)
+		(size 1.8796 1.8796)
+		(drill 1.016)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers yes)
+		(keep_end_layers yes)
+		(thermal_bridge_angle 0)
+		(uuid "66b7f6d7-a9b4-4b6b-8015-c0db50d1bcb5")
+	)
+	(pad "4" thru_hole circle
+		(at 7.62 0 90)
+		(size 1.8796 1.8796)
+		(drill 1.016)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers yes)
+		(keep_end_layers yes)
+		(thermal_bridge_angle 0)
+		(uuid "93352fa6-78a3-4f2f-b147-488109918ef9")
+	)
+	(embedded_fonts no)
+	(model "${SPARKFUN_KICAD_LIBRARY}/3dmodels/Connector.3dshapes/PinHeader_1x04_P2.54mm_Vertical.step"
+		(hide yes)
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz -0 -0 -90)
+		)
+	)
+)

@@ -1,0 +1,187 @@
+(footprint "R_0402_1005Metric"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "Resistor SMD 0402 (1005 Metric), square (rectangular) end terminal, IPC_7351 nominal, (Body size source: IPC-SM-782 page 72, https://www.pcb-3d.com/wordpress/wp-content/uploads/ipc-sm-782a_amendment_1_and_2.pdf), generated with kicad-footprint-generator")
+	(tags "SparkFun resistor")
+	(property "Reference" "REF**"
+		(at 0 1.65 0)
+		(layer "F.Fab")
+		(uuid "1a7b3df5-1b41-42f0-98cd-8617fa386ed0")
+		(effects
+			(font
+				(size 0.8 0.8)
+				(thickness 0.12)
+				(bold yes)
+			)
+		)
+	)
+	(property "Value" "680"
+		(at 0 1.17 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "f664ad04-536d-46e1-a66d-6526edfd9a61")
+		(effects
+			(font
+				(size 0.5 0.5)
+				(thickness 0.1)
+				(bold yes)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "efacc28f-070d-4451-ba38-ec0930ccb105")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "3c191729-f584-4e5a-a471-7088c8b800ee")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -0.153641 -0.38)
+		(end 0.153641 -0.38)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "7403639d-1d7f-4fc4-97a6-996449b81573")
+	)
+	(fp_line
+		(start -0.153641 0.38)
+		(end 0.153641 0.38)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "bd378817-e212-4309-898f-006f48b489f0")
+	)
+	(fp_line
+		(start -0.93 -0.47)
+		(end 0.93 -0.47)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "05c8b346-b5a8-4adb-a1aa-9a1c3a809a19")
+	)
+	(fp_line
+		(start -0.93 0.47)
+		(end -0.93 -0.47)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "df300bbe-bdd4-44b2-80a3-72040f0200dc")
+	)
+	(fp_line
+		(start 0.93 -0.47)
+		(end 0.93 0.47)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "f9687514-5e5d-40e3-863a-a70b9ebc36c4")
+	)
+	(fp_line
+		(start 0.93 0.47)
+		(end -0.93 0.47)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "3c1603ec-802d-465b-be57-e1194c42cf14")
+	)
+	(fp_line
+		(start -0.525 -0.27)
+		(end 0.525 -0.27)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "e219a70b-35dc-4681-8ef7-1d69716555e6")
+	)
+	(fp_line
+		(start -0.525 0.27)
+		(end -0.525 -0.27)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "042db872-76fd-4832-9e7a-bf342f05dfa0")
+	)
+	(fp_line
+		(start 0.525 -0.27)
+		(end 0.525 0.27)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "87b8950e-97e5-4d38-a60c-00b6d80c1fed")
+	)
+	(fp_line
+		(start 0.525 0.27)
+		(end -0.525 0.27)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "70b8470d-b5ed-40af-af48-55a215cab1c4")
+	)
+	(pad "1" smd roundrect
+		(at -0.51 0)
+		(size 0.54 0.64)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "db9dd387-7bc6-4806-94aa-7bb96f749224")
+	)
+	(pad "2" smd roundrect
+		(at 0.51 0)
+		(size 0.54 0.64)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "cf3ddabf-c15c-4ebf-85fe-809f0453c15f")
+	)
+	(embedded_fonts no)
+	(model "${SPARKFUN_KICAD_LIBRARY}/3dmodels/Resistor.3dshapes/R_0402_1005Metric.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

@@ -93,7 +93,10 @@ constexpr const char* LED595_QH_LOOP  = PIN16_GPIO23;
  * with `sudo /opt/nvidia/jetson-io/jetson-io.py` followed by a reboot before
  * /sys/class/pwm/ appears at all.
  *
- * Needs an external pull-up to 5 V. At power-on, before the first latch, the
+ * Needs an external pull-up to 3V3 (NOT 5 V - a 5 V pull-up forward-biases the
+ * driving pin's ESD clamp whenever that pin is tri-stated, and HCT's VIH of
+ * 2.0 V means 3.3 V disables the outputs with margin to spare). At power-on,
+ * before the first latch, the
  * 595 outputs are undefined and OE floating means that garbage is displayed —
  * a pull-up holds the outputs disabled until software takes over.
  */

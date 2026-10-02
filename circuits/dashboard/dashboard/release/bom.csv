@@ -1,0 +1,43 @@
+﻿Reference,Value,MPN,Footprint,Face,Notes
+BZ1,Buzzer,,Buzzer_Beeper:Buzzer_D14mm_H7mm_P10mm,Front,Actual mechanical part requires verification.
+C1,100nF,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,Front,
+C2,100nF,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,Front,
+C3,680uF,EEEFK1A681P,Capacitor_SMD:CP_Elec_8x10.5,Rear,
+C4,220uF,EEEFK1A221P,Capacitor_SMD:CP_Elec_8x6.2,Rear,
+D1,LED_ABGR,,dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch,Front,Leads formed to 2.54mm A-R-G-B. Verify actual LED.
+D2,LED_ABGR,,dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch,Front,Leads formed to 2.54mm A-R-G-B. Verify actual LED.
+D3,LED_ABGR,,dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch,Front,Leads formed to 2.54mm A-R-G-B. Verify actual LED.
+D4,LED_ABGR,,dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch,Front,Leads formed to 2.54mm A-R-G-B. Verify actual LED.
+D5,LED_ABGR,,dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch,Front,Leads formed to 2.54mm A-R-G-B. Verify actual LED.
+D6,LED,,dashboard:LED_D3mm_1mmDrill,Front,
+D7,SS34,,Diode_SMD:D_SMC,Rear,
+J1,DISPLAY,,dashboard:Display_Header_5pin,Front,
+J2,USB_A,,dashboard:USB_A_SparkFun_Numbered,Rear,Actual mechanical part requires verification.
+J3,Screw_Cage_3.5mm-10,1725737,dashboard:TerminalBlock_Right_10pin_2p54,Rear,
+L1,33uH,SRR1260-330M,Inductor_SMD:L_Bourns_SRR1260,Rear,
+R1,470,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R2,470,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R3,470,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R4,470,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R5,470,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R6,680,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R7,680,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R8,680,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R9,680,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R10,680,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R11,1.24k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R12,1.24k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R13,1.24k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R14,1.24k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R15,1.24k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R16,1.24k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+R17,1k,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,Front,
+U1,74HCT595D,74HCT595D,Package_SO:SOIC-16_3.9x9.9mm_P1.27mm,Front,
+U2,74HCT595D,74HCT595D,Package_SO:SOIC-16_3.9x9.9mm_P1.27mm,Front,
+U3,XIAO-Add-On,,dashboard:XIAO_ESP32_C3,Rear,
+U4,LM2596S-3.3,,Package_TO_SOT_SMD:TO-263-5_TabPin3,Rear,
+WL1,Insulated wire,,Board-only fitted link,Front,U2.4 to R5.1
+WL2,Insulated wire,,Board-only fitted link,Front,U2.12 to U1.12
+WL3,Insulated wire,,Board-only fitted link,Front,U2.14 to U1.9
+WL4,Insulated wire,,Board-only fitted link,Front,U2.15 to R8.1
+WL5,Insulated wire,,Board-only fitted link,Rear,J2.2 to J3.3

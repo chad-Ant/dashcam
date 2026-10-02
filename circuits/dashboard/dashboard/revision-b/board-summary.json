@@ -1,0 +1,11 @@
+{
+  "board_mm": [
+    52,
+    70
+  ],
+  "copper_layers": 2,
+  "board_thickness_mm": 1.6,
+  "footprints": 37,
+  "tracks": 485,
+  "vias": 72
+}

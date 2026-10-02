@@ -1,0 +1,13 @@
+{
+  "toner_pages": 2,
+  "assembly_pages": 5,
+  "board_mm": [
+    52,
+    70
+  ],
+  "toner_merge_scale": 1,
+  "horizontal_scale_bar_mm": 50,
+  "vertical_scale_bar_mm": 50,
+  "via_wires": 30,
+  "insulated_links": 5
+}

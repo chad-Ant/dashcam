@@ -1,0 +1,28 @@
+Drill report for dashboard.kicad_pcb
+Created on 2026-09-26T15:19:38
+
+Copper Layer Stackup:
+    =============================================================
+    L1 :  F.Cu                      front
+    L2 :  B.Cu                      back
+
+
+Drill file 'dashboard-PTH.drl' contains
+    plated through holes:
+    =============================================================
+    T1  0.300mm  0.0118"  (52 holes))
+    T2  0.800mm  0.0315"  (4 holes))
+    T3  1.000mm  0.0394"  (2 holes))
+    T4  1.016mm  0.0400"  (4 holes))
+    T5  1.200mm  0.0472"  (22 holes))
+    T6  1.400mm  0.0551"  (10 holes))
+    T7  2.311mm  0.0910"  (2 holes))
+
+    Total plated holes count 96
+
+
+Drill file 'dashboard-NPTH.drl' contains
+    unplated through holes:
+    =============================================================
+
+    Total unplated holes count 0

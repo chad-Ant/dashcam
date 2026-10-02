@@ -1,0 +1,52 @@
+{
+  "board_mm": [
+    70,
+    50
+  ],
+  "copper_layers": 2,
+  "board_thickness_mm": 1.6,
+  "footprints": 37,
+  "tracks": 427,
+  "vias": 52,
+  "front_components": [
+    "BZ1",
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6",
+    "J1",
+    "J2",
+    "J3",
+    "R1",
+    "R10",
+    "R11",
+    "R12",
+    "R13",
+    "R14",
+    "R15",
+    "R16",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "R8",
+    "R9",
+    "U3"
+  ],
+  "back_components": [
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "D7",
+    "L1",
+    "R17",
+    "U1",
+    "U2",
+    "U4"
+  ]
+}

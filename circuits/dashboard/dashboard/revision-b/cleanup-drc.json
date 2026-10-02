@@ -1,0 +1,894 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-09-26T16:42:35",
+    "ignored_checks": [
+        {
+            "description": "Footprint has no courtyard defined",
+            "key": "missing_courtyard"
+        },
+        {
+            "description": "Track endpoint not centered on via",
+            "key": "track_not_centered_on_via"
+        },
+        {
+            "description": "Tuning profile track geometries",
+            "key": "tuning_profile_track_geometries"
+        },
+        {
+            "description": "Footprint doesn't match symbol's footprint filters",
+            "key": "footprint_filters_mismatch"
+        },
+        {
+            "description": "Footprint component type doesn't match footprint pads",
+            "key": "footprint_type_mismatch"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "10.0.6",
+    "schematic_parity": [],
+    "source": "dashboard.kicad_pcb",
+    "unconnected_items": [
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {
+                    "description": "Track [5V] on B.Cu, length 0.6102 mm",
+                    "pos": {
+                        "x": 77.1517,
+                        "y": 77.095
+                    },
+                    "uuid": "1a22bbf4-ef44-46b5-a41c-5521d73b11e2"
+                },
+                {
+                    "description": "Track [5V] on B.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 86.0,
+                        "y": 77.095
+                    },
+                    "uuid": "72394076-cef3-4faa-ad10-7e9e85e6a1ac"
+                }
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        },
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {
+                    "description": "Track [5V] on B.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 86.0,
+                        "y": 77.095
+                    },
+                    "uuid": "72394076-cef3-4faa-ad10-7e9e85e6a1ac"
+                },
+                {
+                    "description": "Track [5V] on B.Cu, length 11.7000 mm",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 85.5
+                    },
+                    "uuid": "8479e65b-4aa9-4a39-894d-891b44de1122"
+                }
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        }
+    ],
+    "violations": [
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U2-QH)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 90.1807,
+                        "y": 62.2743
+                    },
+                    "uuid": "1355e515-fc0e-4696-af35-a78d6bcdeaa6"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U2-QH)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 93.175,
+                        "y": 72.5369
+                    },
+                    "uuid": "b3afde93-85c7-4ac5-8caa-ed93b508ee78"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(D6-K)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 95.0251,
+                        "y": 72.1013
+                    },
+                    "uuid": "b8dd5635-bc27-49e6-b796-558b636b5972"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U3-D2)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 66.01,
+                        "y": 69.7879
+                    },
+                    "uuid": "a001e960-78d2-4605-8861-60782518f8d2"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(D1-RK)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 53.5755,
+                        "y": 82.9145
+                    },
+                    "uuid": "839059b9-061e-40d3-b659-cc7bb0ca20de"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U2-QB)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 84.8366,
+                        "y": 65.9875
+                    },
+                    "uuid": "2fda68d1-761a-45be-92c6-4f55e0e814d2"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U2-QC)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 88.6993,
+                        "y": 84.1257
+                    },
+                    "uuid": "8e313a03-d7c3-45a7-8734-341582d5cbfb"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U2-QE)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 92.2125,
+                        "y": 83.7225
+                    },
+                    "uuid": "ebfd3159-b54c-4426-b19b-253ba55e4010"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U2-QA)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 92.4934,
+                        "y": 59.0243
+                    },
+                    "uuid": "9e214bb1-1eb8-47c1-b110-5ce84f5a46ad"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U1-QD)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 57.9465,
+                        "y": 61.8757
+                    },
+                    "uuid": "56c1c85c-845a-4942-934c-aa2b1171e67c"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U1-QD)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 62.2244,
+                        "y": 83.7344
+                    },
+                    "uuid": "800ac02d-a861-4970-aff5-10f12bb71f97"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(D2-RK)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 62.95,
+                        "y": 82.7331
+                    },
+                    "uuid": "fda9f516-2228-42c3-a6b9-ddcf52d0d43c"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U1-QB)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 54.7894,
+                        "y": 60.8743
+                    },
+                    "uuid": "042e4770-4752-471d-bd5d-39dd6327c685"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(U1-SER)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 88.069,
+                        "y": 99.669
+                    },
+                    "uuid": "6f4a71f4-b21f-4772-a26f-6478e97857f8"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "items": [
+                {
+                    "description": "Via [Net-(J1-Pin_4)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 86.6672,
+                        "y": 115.8178
+                    },
+                    "uuid": "d49ef938-7cf1-4817-a720-269ea255363e"
+                }
+            ],
+            "severity": "warning",
+            "type": "via_dangling"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'VI2C' on F.Silkscreen",
+                    "pos": {
+                        "x": 70.92,
+                        "y": 75.2
+                    },
+                    "uuid": "c9beed3b-4862-4470-bd36-83877f8dea3c"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text '5V' on F.Silkscreen",
+                    "pos": {
+                        "x": 73.46,
+                        "y": 75.2
+                    },
+                    "uuid": "a7019e34-5cd1-4537-9b69-afb2e50eea59"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'G' on F.Silkscreen",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 75.2
+                    },
+                    "uuid": "d620fbc9-e348-4136-a9a8-15d0e2ce6daa"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'SDA' on F.Silkscreen",
+                    "pos": {
+                        "x": 78.54,
+                        "y": 75.2
+                    },
+                    "uuid": "735907f9-6fe6-450b-974c-9d42f758ba5b"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'SCL' on F.Silkscreen",
+                    "pos": {
+                        "x": 81.08,
+                        "y": 75.2
+                    },
+                    "uuid": "0450dabb-a713-4f6b-a3fb-b2b824e255cf"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'CUSTOM PORT' on B.Silkscreen",
+                    "pos": {
+                        "x": 94.0,
+                        "y": 63.5
+                    },
+                    "uuid": "d7c47105-60b6-471e-bfef-fa26ada4724f"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text '5V' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 71.5
+                    },
+                    "uuid": "2ec35162-f548-4309-83dc-8439c4c9f581"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'D+' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 74.04
+                    },
+                    "uuid": "b074df47-eed4-4a29-b9e4-fccef5b3309a"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'D-' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 76.58
+                    },
+                    "uuid": "2a49ab31-9ae6-46cf-bc63-6c60c48a6d1f"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'G' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 79.12
+                    },
+                    "uuid": "f2187efd-0674-416a-be90-bcfae421eb6d"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 81.66
+                    },
+                    "uuid": "a38c4f19-05e7-4271-89d2-f5ade06cc3d6"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 84.2
+                    },
+                    "uuid": "721844e0-5410-4529-8f81-589a9e793e22"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 86.74
+                    },
+                    "uuid": "0cdc9d51-9916-41b9-a80d-fb70a2184281"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 89.28
+                    },
+                    "uuid": "903d73fd-73d8-4f9a-84a4-203077c4335f"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'RX' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 91.82
+                    },
+                    "uuid": "42a2f8df-8b9e-4092-ae8b-cd7f9bf33305"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Text height out of range (board setup constraints silk text height min height 0.8000 mm; actual 0.7000 mm)",
+            "items": [
+                {
+                    "description": "PCB text 'TX' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 94.36
+                    },
+                    "uuid": "52c91581-c29c-47a3-8803-08e31daf7c5c"
+                }
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "Reference field of D3",
+                    "pos": {
+                        "x": 72.6,
+                        "y": 75.5
+                    },
+                    "uuid": "91a22b05-bf9b-4dd3-b4a7-1dd3b4fd51b9"
+                },
+                {
+                    "description": "PCB text 'VI2C' on F.Silkscreen",
+                    "pos": {
+                        "x": 70.92,
+                        "y": 75.2
+                    },
+                    "uuid": "c9beed3b-4862-4470-bd36-83877f8dea3c"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "Reference field of D3",
+                    "pos": {
+                        "x": 72.6,
+                        "y": 75.5
+                    },
+                    "uuid": "91a22b05-bf9b-4dd3-b4a7-1dd3b4fd51b9"
+                },
+                {
+                    "description": "PCB text '5V' on F.Silkscreen",
+                    "pos": {
+                        "x": 73.46,
+                        "y": 75.2
+                    },
+                    "uuid": "a7019e34-5cd1-4537-9b69-afb2e50eea59"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'SCL' on F.Silkscreen",
+                    "pos": {
+                        "x": 81.08,
+                        "y": 75.2
+                    },
+                    "uuid": "0450dabb-a713-4f6b-a3fb-b2b824e255cf"
+                },
+                {
+                    "description": "Reference field of D4",
+                    "pos": {
+                        "x": 82.6,
+                        "y": 75.5
+                    },
+                    "uuid": "a5764621-91bf-4aff-a27e-a9173586d58d"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "Circle of BZ1 on F.Silkscreen",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 62.0
+                    },
+                    "uuid": "3fe5b71c-9e9c-4691-acf1-643a80843a32"
+                },
+                {
+                    "description": "PCB text 'DASHBOARD REV B' on F.Silkscreen",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 56.0
+                    },
+                    "uuid": "7f0a938b-15aa-4cd5-9fe8-cc50931fa112"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "Circle of BZ1 on F.Silkscreen",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 62.0
+                    },
+                    "uuid": "3fe5b71c-9e9c-4691-acf1-643a80843a32"
+                },
+                {
+                    "description": "PCB text '52 x 70 mm / 2 layers' on F.Silkscreen",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 57.5
+                    },
+                    "uuid": "db4ac374-b92e-467e-bb9e-9fa992541f88"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text '5V' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 71.5
+                    },
+                    "uuid": "2ec35162-f548-4309-83dc-8439c4c9f581"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                },
+                {
+                    "description": "PCB text 'D+' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 74.04
+                    },
+                    "uuid": "b074df47-eed4-4a29-b9e4-fccef5b3309a"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'D-' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 76.58
+                    },
+                    "uuid": "2a49ab31-9ae6-46cf-bc63-6c60c48a6d1f"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 81.66
+                    },
+                    "uuid": "a38c4f19-05e7-4271-89d2-f5ade06cc3d6"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 84.2
+                    },
+                    "uuid": "721844e0-5410-4529-8f81-589a9e793e22"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 86.74
+                    },
+                    "uuid": "0cdc9d51-9916-41b9-a80d-fb70a2184281"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'NC' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 89.28
+                    },
+                    "uuid": "903d73fd-73d8-4f9a-84a4-203077c4335f"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'RX' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 91.82
+                    },
+                    "uuid": "42a2f8df-8b9e-4092-ae8b-cd7f9bf33305"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "items": [
+                {
+                    "description": "PCB text 'TX' on B.Silkscreen",
+                    "pos": {
+                        "x": 98.0,
+                        "y": 94.36
+                    },
+                    "uuid": "52c91581-c29c-47a3-8803-08e31daf7c5c"
+                },
+                {
+                    "description": "Segment of J3 on B.Silkscreen",
+                    "pos": {
+                        "x": 97.6,
+                        "y": 69.88
+                    },
+                    "uuid": "a9e3a856-8b32-495f-8dbd-1a9eacbb6726"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clipped by solder mask",
+            "items": [
+                {
+                    "description": "PCB text '3V3 ONLY' on B.Silkscreen",
+                    "pos": {
+                        "x": 94.0,
+                        "y": 65.0
+                    },
+                    "uuid": "13b6cd12-197a-45c0-8a5a-813859b16ef4"
+                },
+                {
+                    "description": "PTH pad SH [unconnected-(J2-Shield-PadSH)] of J2",
+                    "pos": {
+                        "x": 91.6,
+                        "y": 66.5659
+                    },
+                    "uuid": "137d4493-5039-43aa-ad99-42413d08edf1"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_over_copper"
+        }
+    ]
+}

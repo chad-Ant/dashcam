@@ -1,0 +1,191 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-09-26T16:45:14",
+    "ignored_checks": [
+        {
+            "description": "Footprint has no courtyard defined",
+            "key": "missing_courtyard"
+        },
+        {
+            "description": "Track endpoint not centered on via",
+            "key": "track_not_centered_on_via"
+        },
+        {
+            "description": "Tuning profile track geometries",
+            "key": "tuning_profile_track_geometries"
+        },
+        {
+            "description": "Footprint doesn't match symbol's footprint filters",
+            "key": "footprint_filters_mismatch"
+        },
+        {
+            "description": "Footprint component type doesn't match footprint pads",
+            "key": "footprint_type_mismatch"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "10.0.6",
+    "schematic_parity": [],
+    "source": "dashboard.kicad_pcb",
+    "unconnected_items": [
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {
+                    "description": "Track [5V] on B.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 77.095
+                    },
+                    "uuid": "77aa67f5-6b88-4edc-9aa2-48ec2ff791b0"
+                },
+                {
+                    "description": "Track [5V] on B.Cu, length 1.9634 mm",
+                    "pos": {
+                        "x": 73.46,
+                        "y": 75.7067
+                    },
+                    "uuid": "1edcb536-05f0-430a-a1f6-6b3dfbfd897a"
+                }
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        }
+    ],
+    "violations": [
+        {
+            "description": "Clearance violation ( clearance 0.1500 mm; actual 0.0341 mm)",
+            "items": [
+                {
+                    "description": "Track [Net-(U2-QB)] on B.Cu, length 3.4000 mm",
+                    "pos": {
+                        "x": 84.4666,
+                        "y": 75.3
+                    },
+                    "uuid": "2d24eccb-4e93-48c7-88b9-5812d6aaaaac"
+                },
+                {
+                    "description": "Track [Net-(D4-RK)] on B.Cu, length 1.6667 mm",
+                    "pos": {
+                        "x": 84.8483,
+                        "y": 78.6493
+                    },
+                    "uuid": "a20753f6-f384-417a-9f3f-150a7b2d7771"
+                }
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Items shorting two nets (nets Net-(D4-RK) and Net-(U2-QB))",
+            "items": [
+                {
+                    "description": "Track [Net-(D4-RK)] on B.Cu, length 0.2843 mm",
+                    "pos": {
+                        "x": 84.8483,
+                        "y": 78.365
+                    },
+                    "uuid": "9e82cde3-5010-495d-a03a-ce160d63e1c2"
+                },
+                {
+                    "description": "Via [Net-(U2-QB)] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 84.4666,
+                        "y": 78.7
+                    },
+                    "uuid": "b6210b31-eb8f-4585-8ac8-e562c3316459"
+                }
+            ],
+            "severity": "error",
+            "type": "shorting_items"
+        },
+        {
+            "description": "Tracks crossing",
+            "items": [
+                {
+                    "description": "Track [Net-(U2-QB)] on B.Cu, length 3.4000 mm",
+                    "pos": {
+                        "x": 84.4666,
+                        "y": 75.3
+                    },
+                    "uuid": "2d24eccb-4e93-48c7-88b9-5812d6aaaaac"
+                },
+                {
+                    "description": "Track [5V] on B.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 77.095
+                    },
+                    "uuid": "77aa67f5-6b88-4edc-9aa2-48ec2ff791b0"
+                }
+            ],
+            "severity": "error",
+            "type": "tracks_crossing"
+        },
+        {
+            "description": "Tracks crossing",
+            "items": [
+                {
+                    "description": "Track [Net-(U2-QB)] on B.Cu, length 3.4000 mm",
+                    "pos": {
+                        "x": 84.4666,
+                        "y": 75.3
+                    },
+                    "uuid": "2d24eccb-4e93-48c7-88b9-5812d6aaaaac"
+                },
+                {
+                    "description": "Track [5V] on B.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 77.095
+                    },
+                    "uuid": "33595e74-5be0-48ea-881f-c338f57526b0"
+                }
+            ],
+            "severity": "error",
+            "type": "tracks_crossing"
+        },
+        {
+            "description": "Tracks crossing",
+            "items": [
+                {
+                    "description": "Track [Net-(J1-Pin_2)] on F.Cu, length 7.0895 mm",
+                    "pos": {
+                        "x": 77.67,
+                        "y": 73.98
+                    },
+                    "uuid": "258b52dd-2f15-45ae-a346-b3d5a56e7f7c"
+                },
+                {
+                    "description": "Track [5V] on F.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 76.0,
+                        "y": 77.095
+                    },
+                    "uuid": "d2402fb5-476d-491a-a049-701127df02cf"
+                }
+            ],
+            "severity": "error",
+            "type": "tracks_crossing"
+        },
+        {
+            "description": "Track has unconnected end",
+            "items": [
+                {
+                    "description": "Track [5V] on B.Cu, length 1.9634 mm",
+                    "pos": {
+                        "x": 73.46,
+                        "y": 75.7067
+                    },
+                    "uuid": "1edcb536-05f0-430a-a1f6-6b3dfbfd897a"
+                }
+            ],
+            "severity": "warning",
+            "type": "track_dangling"
+        }
+    ]
+}

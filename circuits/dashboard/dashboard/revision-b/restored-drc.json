@@ -1,0 +1,60 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-09-26T16:46:03",
+    "ignored_checks": [
+        {
+            "description": "Footprint has no courtyard defined",
+            "key": "missing_courtyard"
+        },
+        {
+            "description": "Track endpoint not centered on via",
+            "key": "track_not_centered_on_via"
+        },
+        {
+            "description": "Tuning profile track geometries",
+            "key": "tuning_profile_track_geometries"
+        },
+        {
+            "description": "Footprint doesn't match symbol's footprint filters",
+            "key": "footprint_filters_mismatch"
+        },
+        {
+            "description": "Footprint component type doesn't match footprint pads",
+            "key": "footprint_type_mismatch"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "10.0.6",
+    "schematic_parity": [],
+    "source": "dashboard.kicad_pcb",
+    "unconnected_items": [
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {
+                    "description": "Track [5V] on B.Cu, length 0.6102 mm",
+                    "pos": {
+                        "x": 77.1517,
+                        "y": 77.095
+                    },
+                    "uuid": "1a22bbf4-ef44-46b5-a41c-5521d73b11e2"
+                },
+                {
+                    "description": "Track [5V] on B.Cu, length 10.0000 mm",
+                    "pos": {
+                        "x": 86.0,
+                        "y": 77.095
+                    },
+                    "uuid": "72394076-cef3-4faa-ad10-7e9e85e6a1ac"
+                }
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        }
+    ],
+    "violations": []
+}

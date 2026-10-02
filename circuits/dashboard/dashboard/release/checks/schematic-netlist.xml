@@ -1,0 +1,1773 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<export version="E">
+  <design>
+    <source>D:\CPP_projects\dashcam\circuits\dashboard\dashboard\dashboard.kicad_sch</source>
+    <date>2026-09-27T11:59:40</date>
+    <tool>Eeschema 10.0.6</tool>
+    <sheet number="1" name="/" tstamps="/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>dashboard.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+  </design>
+  <components>
+    <comp ref="BZ1">
+      <value>Buzzer</value>
+      <footprint>Buzzer_Beeper:Buzzer_D14mm_H7mm_P10mm</footprint>
+      <description>Buzzer, polarized</description>
+      <fields>
+        <field name="Footprint">Buzzer_Beeper:Buzzer_D14mm_H7mm_P10mm</field>
+        <field name="Datasheet"/>
+        <field name="Description">Buzzer, polarized</field>
+      </fields>
+      <libsource lib="Device" part="Buzzer" description="Buzzer, polarized"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="quartz resonator ceramic"/>
+      <property name="ki_fp_filters" value="*Buzzer*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>39ddc37b-2825-482e-9a4a-294ec91056fd</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="C1">
+      <value>100nF</value>
+      <footprint>Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <datasheet>https://cdn.sparkfun.com/assets/8/a/4/a/5/Kemet_Capacitor_Datasheet.pdf</datasheet>
+      <description>Unpolarized capacitor</description>
+      <fields>
+        <field name="PROD_ID">CAP-00000</field>
+        <field name="Voltage">10V</field>
+        <field name="Tolerance">10%</field>
+        <field name="Footprint">Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet">https://cdn.sparkfun.com/assets/8/a/4/a/5/Kemet_Capacitor_Datasheet.pdf</field>
+        <field name="Description">Unpolarized capacitor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Capacitor_C" description="Unpolarized capacitor"/>
+      <property name="PROD_ID" value="CAP-00000"/>
+      <property name="Voltage" value="10V"/>
+      <property name="Tolerance" value="10%"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun cap capacitor"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>e5e2c5b7-906a-4ac1-891f-94bb39f925d1</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="C2">
+      <value>100nF</value>
+      <footprint>Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <datasheet>https://cdn.sparkfun.com/assets/8/a/4/a/5/Kemet_Capacitor_Datasheet.pdf</datasheet>
+      <description>Unpolarized capacitor</description>
+      <fields>
+        <field name="PROD_ID">CAP-00000</field>
+        <field name="Voltage">10V</field>
+        <field name="Tolerance">10%</field>
+        <field name="Footprint">Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet">https://cdn.sparkfun.com/assets/8/a/4/a/5/Kemet_Capacitor_Datasheet.pdf</field>
+        <field name="Description">Unpolarized capacitor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Capacitor_C" description="Unpolarized capacitor"/>
+      <property name="PROD_ID" value="CAP-00000"/>
+      <property name="Voltage" value="10V"/>
+      <property name="Tolerance" value="10%"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun cap capacitor"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>53ac3f85-098c-49cc-b7c7-28415d58592d</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="C3">
+      <value>680uF</value>
+      <footprint>Capacitor_SMD:CP_Elec_8x10.5</footprint>
+      <datasheet>https://industrial.panasonic.com/ww/products/pt/aluminum-cap-smd/models/EEEFK1A681P</datasheet>
+      <description>680uF 10V SMD, 8mm diameter, 10.2mm body, 600mA ripple, 160mOhm impedance</description>
+      <fields>
+        <field name="PROD_ID">CAP-00000</field>
+        <field name="Voltage">10V</field>
+        <field name="Tolerance">20%</field>
+        <field name="Manufacturer">Panasonic</field>
+        <field name="MPN">EEEFK1A681P</field>
+        <field name="Impedance_100kHz">160mOhm max</field>
+        <field name="Ripple_Current_100kHz">600mA RMS</field>
+        <field name="Footprint">Capacitor_SMD:CP_Elec_8x10.5</field>
+        <field name="Datasheet">https://industrial.panasonic.com/ww/products/pt/aluminum-cap-smd/models/EEEFK1A681P</field>
+        <field name="Description">680uF 10V SMD, 8mm diameter, 10.2mm body, 600mA ripple, 160mOhm impedance</field>
+      </fields>
+      <libsource lib="Device" part="C_Polarized_Small" description="Polarized capacitor, small symbol"/>
+      <property name="PROD_ID" value="CAP-00000"/>
+      <property name="Voltage" value="10V"/>
+      <property name="Tolerance" value="20%"/>
+      <property name="Manufacturer" value="Panasonic"/>
+      <property name="MPN" value="EEEFK1A681P"/>
+      <property name="Impedance_100kHz" value="160mOhm max"/>
+      <property name="Ripple_Current_100kHz" value="600mA RMS"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="cap capacitor"/>
+      <property name="ki_fp_filters" value="CP_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>cd6ee450-c0d1-42e8-b1bb-4df4b10155a4</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="C4">
+      <value>220uF</value>
+      <footprint>Capacitor_SMD:CP_Elec_8x6.2</footprint>
+      <datasheet>https://industrial.panasonic.com/ww/products/pt/aluminum-cap-smd/models/EEEFK1A221P</datasheet>
+      <description>220uF 10V SMD, 8mm diameter, 6.2mm body, 300mA ripple, 260mOhm impedance</description>
+      <fields>
+        <field name="PROD_ID">CAP-00000</field>
+        <field name="Voltage">10V</field>
+        <field name="Tolerance">20%</field>
+        <field name="Manufacturer">Panasonic</field>
+        <field name="MPN">EEEFK1A221P</field>
+        <field name="Impedance_100kHz">260mOhm max</field>
+        <field name="Ripple_Current_100kHz">300mA RMS</field>
+        <field name="Footprint">Capacitor_SMD:CP_Elec_8x6.2</field>
+        <field name="Datasheet">https://industrial.panasonic.com/ww/products/pt/aluminum-cap-smd/models/EEEFK1A221P</field>
+        <field name="Description">220uF 10V SMD, 8mm diameter, 6.2mm body, 300mA ripple, 260mOhm impedance</field>
+      </fields>
+      <libsource lib="Device" part="C_Polarized_Small" description="Polarized capacitor, small symbol"/>
+      <property name="PROD_ID" value="CAP-00000"/>
+      <property name="Voltage" value="10V"/>
+      <property name="Tolerance" value="20%"/>
+      <property name="Manufacturer" value="Panasonic"/>
+      <property name="MPN" value="EEEFK1A221P"/>
+      <property name="Impedance_100kHz" value="260mOhm max"/>
+      <property name="Ripple_Current_100kHz" value="300mA RMS"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="cap capacitor"/>
+      <property name="ki_fp_filters" value="CP_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>2540a3a5-8d11-4390-96a1-578560f9f042</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D1">
+      <value>LED_ABGR</value>
+      <footprint>dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</footprint>
+      <description>RGB LED, anode/blue/green/red</description>
+      <fields>
+        <field name="Footprint">dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</field>
+        <field name="Datasheet"/>
+        <field name="Description">RGB LED, anode/blue/green/red</field>
+      </fields>
+      <libsource lib="Device" part="LED_ABGR" description="RGB LED, anode/blue/green/red"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="LED RGB diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>5a23f129-0f20-4842-a969-9319aa149d42</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="4"/>
+            <pin num="3"/>
+            <pin num="2"/>
+            <pin num="1"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D2">
+      <value>LED_ABGR</value>
+      <footprint>dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</footprint>
+      <description>RGB LED, anode/blue/green/red</description>
+      <fields>
+        <field name="Footprint">dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</field>
+        <field name="Datasheet"/>
+        <field name="Description">RGB LED, anode/blue/green/red</field>
+      </fields>
+      <libsource lib="Device" part="LED_ABGR" description="RGB LED, anode/blue/green/red"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="LED RGB diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>96b91b16-2370-4a71-bcaa-8066193547ac</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="4"/>
+            <pin num="3"/>
+            <pin num="2"/>
+            <pin num="1"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D3">
+      <value>LED_ABGR</value>
+      <footprint>dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</footprint>
+      <description>RGB LED, anode/blue/green/red</description>
+      <fields>
+        <field name="Footprint">dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</field>
+        <field name="Datasheet"/>
+        <field name="Description">RGB LED, anode/blue/green/red</field>
+      </fields>
+      <libsource lib="Device" part="LED_ABGR" description="RGB LED, anode/blue/green/red"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="LED RGB diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>7c288ef8-a000-4146-aead-0d215446ad28</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="4"/>
+            <pin num="3"/>
+            <pin num="2"/>
+            <pin num="1"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D4">
+      <value>LED_ABGR</value>
+      <footprint>dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</footprint>
+      <description>RGB LED, anode/blue/green/red</description>
+      <fields>
+        <field name="Footprint">dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</field>
+        <field name="Datasheet"/>
+        <field name="Description">RGB LED, anode/blue/green/red</field>
+      </fields>
+      <libsource lib="Device" part="LED_ABGR" description="RGB LED, anode/blue/green/red"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="LED RGB diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>1b8e7d4a-37fe-4dbd-abd4-cd6f021c6c24</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="4"/>
+            <pin num="3"/>
+            <pin num="2"/>
+            <pin num="1"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D5">
+      <value>LED_ABGR</value>
+      <footprint>dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</footprint>
+      <description>RGB LED, anode/blue/green/red</description>
+      <fields>
+        <field name="Footprint">dashboard:LED_RGB_5mm_ARGB_P2.54_HomeEtch</field>
+        <field name="Datasheet"/>
+        <field name="Description">RGB LED, anode/blue/green/red</field>
+      </fields>
+      <libsource lib="Device" part="LED_ABGR" description="RGB LED, anode/blue/green/red"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="LED RGB diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>1a22dae5-9ed0-4200-aeee-e323c41b071e</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="4"/>
+            <pin num="3"/>
+            <pin num="2"/>
+            <pin num="1"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D6">
+      <value>LED</value>
+      <footprint>dashboard:LED_D3mm_1mmDrill</footprint>
+      <description>Light emitting diode</description>
+      <fields>
+        <field name="Sim.Pins">1=K 2=A</field>
+        <field name="Footprint">dashboard:LED_D3mm_1mmDrill</field>
+        <field name="Datasheet"/>
+        <field name="Description">Light emitting diode</field>
+      </fields>
+      <libsource lib="Device" part="LED" description="Light emitting diode"/>
+      <property name="Sim.Pins" value="1=K 2=A"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="LED diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>ed7cfc86-cbaa-4450-87e1-ded0e86d51df</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="D7">
+      <value>SS34</value>
+      <footprint>Diode_SMD:D_SMC</footprint>
+      <datasheet>https://www.vishay.com/docs/88751/ss32.pdf</datasheet>
+      <description>3A 40V Schottky rectifier; Vishay SS34-M3/57T; SMC (DO-214AB)</description>
+      <fields>
+        <field name="Footprint">Diode_SMD:D_SMC</field>
+        <field name="Datasheet">https://www.vishay.com/docs/88751/ss32.pdf</field>
+        <field name="Description">3A 40V Schottky rectifier; Vishay SS34-M3/57T; SMC (DO-214AB)</field>
+      </fields>
+      <libsource lib="Diode" part="1N5822" description="40V 3A Schottky Barrier Rectifier Diode, DO-201AD"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="diode Schottky"/>
+      <property name="ki_fp_filters" value="D*DO?201AD*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>a58e102b-36cc-417e-9916-0b6af40168bd</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="J1">
+      <value>DISPLAY</value>
+      <footprint>dashboard:Display_Header_5pin</footprint>
+      <description>Display interface: GND, 3V3 I2C level, SDA, SCL and 5V display supply</description>
+      <fields>
+        <field name="Footprint">dashboard:Display_Header_5pin</field>
+        <field name="Datasheet"/>
+        <field name="Description">Display interface: GND, 3V3 I2C level, SDA, SCL and 5V display supply</field>
+      </fields>
+      <libsource lib="dashboard" part="Display_5pin" description="Display interface: GND, 3V3 I2C level, SDA, SCL and 5V display supply"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun Qwiic pinout I2C connection"/>
+      <property name="ki_fp_filters" value="Connector*:*_1x??_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>a1e4a966-4d46-4bf7-906b-29ffedf1e73b</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="5"/>
+            <pin num="4"/>
+            <pin num="3"/>
+            <pin num="2"/>
+            <pin num="1"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="J2">
+      <value>USB_A</value>
+      <footprint>dashboard:USB_A_SparkFun_Numbered</footprint>
+      <description>USB Type A Device</description>
+      <fields>
+        <field name="Footprint">dashboard:USB_A_SparkFun_Numbered</field>
+        <field name="Datasheet"/>
+        <field name="Description">USB Type A Device</field>
+      </fields>
+      <libsource lib="Connector" part="USB_A" description="USB Type A connector"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="connector USB"/>
+      <property name="ki_fp_filters" value="USB*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0849c4e7-123f-4362-a200-e06d978b448b</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="SH"/>
+            <pin num="4"/>
+            <pin num="1"/>
+            <pin num="3"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="J3">
+      <value>Screw_Cage_3.5mm-10</value>
+      <footprint>dashboard:TerminalBlock_Right_10pin_2p54</footprint>
+      <datasheet>https://cdn.sparkfun.com/assets/b/9/7/3/6/19854.pdf</datasheet>
+      <description>Phoenix Contact MPT 0,5/10-2,54; part 1725737; 10-position 2.54mm screw terminal</description>
+      <fields>
+        <field name="PROD_ID">CONN-17279</field>
+        <field name="Footprint">dashboard:TerminalBlock_Right_10pin_2p54</field>
+        <field name="Datasheet">https://cdn.sparkfun.com/assets/b/9/7/3/6/19854.pdf</field>
+        <field name="Description">Phoenix Contact MPT 0,5/10-2,54; part 1725737; 10-position 2.54mm screw terminal</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Connector_ScrewCage_1x10_P3_5mm_Green" description="Screw cage terminal, single row"/>
+      <property name="PROD_ID" value="CONN-17279"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun screw terminal (cage only)"/>
+      <property name="ki_fp_filters" value="TerminalBlock*:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>633df16b-87ad-44b3-98ca-c3ba306de34d</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+            <pin num="3"/>
+            <pin num="4"/>
+            <pin num="5"/>
+            <pin num="6"/>
+            <pin num="7"/>
+            <pin num="8"/>
+            <pin num="9"/>
+            <pin num="10"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="L1">
+      <value>33uH</value>
+      <footprint>Inductor_SMD:L_Bourns_SRR1260</footprint>
+      <datasheet>https://www.bourns.com/docs/product-datasheets/srr1260.pdf</datasheet>
+      <description>Inductor</description>
+      <fields>
+        <field name="Manufacturer">Bourns</field>
+        <field name="MPN">SRR1260-330M</field>
+        <field name="Current_Rating">3.0A RMS; 2.8A typical saturation (25% L drop)</field>
+        <field name="DCR">60mOhm max</field>
+        <field name="Footprint">Inductor_SMD:L_Bourns_SRR1260</field>
+        <field name="Datasheet">https://www.bourns.com/docs/product-datasheets/srr1260.pdf</field>
+        <field name="Description">Inductor</field>
+      </fields>
+      <libsource lib="Device" part="L" description="Inductor"/>
+      <property name="Manufacturer" value="Bourns"/>
+      <property name="MPN" value="SRR1260-330M"/>
+      <property name="Current_Rating" value="3.0A RMS; 2.8A typical saturation (25% L drop)"/>
+      <property name="DCR" value="60mOhm max"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="inductor choke coil reactor magnetic"/>
+      <property name="ki_fp_filters" value="Choke_* *Coil* Inductor_* L_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>1401eecc-6499-4344-8ac5-55ee28ba6b5c</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R1">
+      <value>470</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-25018</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_470_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-25018"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>51325103-506c-41d6-8792-f71d291e7ace</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R2">
+      <value>470</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-25018</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_470_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-25018"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>71d3aef3-60d8-4e26-83ca-b81cf776b011</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R3">
+      <value>470</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-25018</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_470_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-25018"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>4ccf3f65-1181-4447-a52c-9f30b2e93757</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R4">
+      <value>470</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-25018</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_470_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-25018"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>d068b195-d362-49d0-890b-e4523d224395</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R5">
+      <value>470</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-25018</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_470_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-25018"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>57c08f78-0d85-4f84-9b72-1e6f8d668d88</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R6">
+      <value>680</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-22993</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_680_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-22993"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>44c15399-1068-4241-a0de-27c572364d22</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R7">
+      <value>680</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-22993</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_680_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-22993"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>935341a1-305c-48d0-89da-3d5c13c5370b</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R8">
+      <value>680</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-22993</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_680_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-22993"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>1776ba45-b4a8-40dc-89da-f7778870f223</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R9">
+      <value>680</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-22993</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_680_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-22993"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>4603bc24-4e2d-4f6a-a738-d2c4ee6b8cd8</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R10">
+      <value>680</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-22993</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_680_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-22993"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>ad0b2e55-640d-439a-ad53-befdd6f3c1f7</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R11">
+      <value>1.24k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-...</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1_24k_0603" description="Resistor"/>
+      <property name="PROD_ID" value="RES-..."/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>5cbb08f6-5990-4822-9db4-eeaece8ff224</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R12">
+      <value>1.24k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-...</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1_24k_0603" description="Resistor"/>
+      <property name="PROD_ID" value="RES-..."/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>8cde0229-9d8d-472a-ab5e-31de674b5c39</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R13">
+      <value>1.24k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-...</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1_24k_0603" description="Resistor"/>
+      <property name="PROD_ID" value="RES-..."/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>c2ebf961-ff3c-4d73-841c-8aba80f27118</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R14">
+      <value>1.24k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-...</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1_24k_0603" description="Resistor"/>
+      <property name="PROD_ID" value="RES-..."/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>e6b65eaa-848f-4b30-83b7-d3632894f8a5</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R15">
+      <value>1.24k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-...</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1_24k_0603" description="Resistor"/>
+      <property name="PROD_ID" value="RES-..."/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>384cca99-1129-4907-b079-6dbb6cb5eacd</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R16">
+      <value>1.24k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-...</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1_24k_0603" description="Resistor"/>
+      <property name="PROD_ID" value="RES-..."/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>8f70f9ed-666d-4861-a8b1-fe6aab5919a1</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R17">
+      <value>1k</value>
+      <footprint>Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <datasheet>https://www.vishay.com/docs/20035/dcrcwe3.pdf</datasheet>
+      <description>Resistor</description>
+      <fields>
+        <field name="PROD_ID">RES-14342</field>
+        <field name="Footprint">Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+      </fields>
+      <libsource lib="dashboard" part="SparkFun_Resistor_1k_0402" description="Resistor"/>
+      <property name="PROD_ID" value="RES-14342"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="SparkFun R res resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>f1d487ad-8219-41c4-9b4f-e3878b6e932f</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="U1">
+      <value>74HCT595D</value>
+      <footprint>Package_SO:SOIC-16_3.9x9.9mm_P1.27mm</footprint>
+      <datasheet>https://www.nexperia.com/product/74HCT595D</datasheet>
+      <description>8-bit serial in/out Shift Register 3-State Outputs</description>
+      <fields>
+        <field name="Footprint">Package_SO:SOIC-16_3.9x9.9mm_P1.27mm</field>
+        <field name="Datasheet">https://www.nexperia.com/product/74HCT595D</field>
+        <field name="Description">8-bit serial in/out Shift Register 3-State Outputs</field>
+      </fields>
+      <libsource lib="74xx" part="74HCT595" description="8-bit serial in/out Shift Register 3-State Outputs"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="HCTMOS SR 3State"/>
+      <property name="ki_fp_filters" value="DIP*W7.62mm* SOIC*3.9x9.9mm*P1.27mm* TSSOP*4.4x5mm*P0.65mm* SOIC*5.3x10.2mm*P1.27mm* SOIC*7.5x10.3mm*P1.27mm*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>a4b6c25c-82f3-4f15-b80b-6d0744a60265</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="14"/>
+            <pin num="11"/>
+            <pin num="10"/>
+            <pin num="12"/>
+            <pin num="13"/>
+            <pin num="16"/>
+            <pin num="8"/>
+            <pin num="15"/>
+            <pin num="1"/>
+            <pin num="2"/>
+            <pin num="3"/>
+            <pin num="4"/>
+            <pin num="5"/>
+            <pin num="6"/>
+            <pin num="7"/>
+            <pin num="9"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="U2">
+      <value>74HCT595D</value>
+      <footprint>Package_SO:SOIC-16_3.9x9.9mm_P1.27mm</footprint>
+      <datasheet>https://www.nexperia.com/product/74HCT595D</datasheet>
+      <description>8-bit serial in/out Shift Register 3-State Outputs</description>
+      <fields>
+        <field name="Footprint">Package_SO:SOIC-16_3.9x9.9mm_P1.27mm</field>
+        <field name="Datasheet">https://www.nexperia.com/product/74HCT595D</field>
+        <field name="Description">8-bit serial in/out Shift Register 3-State Outputs</field>
+      </fields>
+      <libsource lib="74xx" part="74HCT595" description="8-bit serial in/out Shift Register 3-State Outputs"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="HCTMOS SR 3State"/>
+      <property name="ki_fp_filters" value="DIP*W7.62mm* SOIC*3.9x9.9mm*P1.27mm* TSSOP*4.4x5mm*P0.65mm* SOIC*5.3x10.2mm*P1.27mm* SOIC*7.5x10.3mm*P1.27mm*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>f115eea2-9b9a-4c12-aea9-5f4d23449f77</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="14"/>
+            <pin num="11"/>
+            <pin num="10"/>
+            <pin num="12"/>
+            <pin num="13"/>
+            <pin num="16"/>
+            <pin num="8"/>
+            <pin num="15"/>
+            <pin num="1"/>
+            <pin num="2"/>
+            <pin num="3"/>
+            <pin num="4"/>
+            <pin num="5"/>
+            <pin num="6"/>
+            <pin num="7"/>
+            <pin num="9"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="U3">
+      <value>XIAO-Add-On</value>
+      <footprint>dashboard:XIAO_ESP32_C3</footprint>
+      <description>Powered via USB-C</description>
+      <fields>
+        <field name="Footprint">dashboard:XIAO_ESP32_C3</field>
+        <field name="Datasheet"/>
+        <field name="Description">Powered via USB-C</field>
+      </fields>
+      <libsource lib="dashboard" part="Seeed_Studio_XIAO_Series_XIAO_Add_On" description=""/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>a5daad2e-e239-4e5b-b414-4a9e4150613d</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+            <pin num="3"/>
+            <pin num="4"/>
+            <pin num="5"/>
+            <pin num="6"/>
+            <pin num="7"/>
+            <pin num="14"/>
+            <pin num="13"/>
+            <pin num="12"/>
+            <pin num="11"/>
+            <pin num="10"/>
+            <pin num="9"/>
+            <pin num="8"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="U4">
+      <value>LM2596S-3.3</value>
+      <footprint>Package_TO_SOT_SMD:TO-263-5_TabPin3</footprint>
+      <datasheet>http://www.ti.com/lit/ds/symlink/lm2596.pdf</datasheet>
+      <description>3.3V 3A Step-Down Voltage Regulator, TO-263</description>
+      <fields>
+        <field name="Footprint">Package_TO_SOT_SMD:TO-263-5_TabPin3</field>
+        <field name="Datasheet">http://www.ti.com/lit/ds/symlink/lm2596.pdf</field>
+        <field name="Description">3.3V 3A Step-Down Voltage Regulator, TO-263</field>
+      </fields>
+      <libsource lib="Regulator_Switching" part="LM2596S-3.3" description="3.3V 3A Step-Down Voltage Regulator, TO-263"/>
+      <property name="Sheetname" value="dashboard"/>
+      <property name="Sheetfile" value="dashboard.kicad_sch"/>
+      <property name="ki_keywords" value="Step-Down Voltage Regulator 3.3V 3A"/>
+      <property name="ki_fp_filters" value="TO?263*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>ccc7885f-1055-43c4-abbc-c71b2712bd57</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="5"/>
+            <pin num="3"/>
+            <pin num="4"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+  </components>
+  <libparts>
+    <libpart lib="74xx" part="74HCT595">
+      <description>8-bit serial in/out Shift Register 3-State Outputs</description>
+      <docs>https://assets.nexperia.com/documents/data-sheet/74HC_HCT595.pdf</docs>
+      <footprints>
+        <fp>DIP*W7.62mm*</fp>
+        <fp>SOIC*3.9x9.9mm*P1.27mm*</fp>
+        <fp>TSSOP*4.4x5mm*P0.65mm*</fp>
+        <fp>SOIC*5.3x10.2mm*P1.27mm*</fp>
+        <fp>SOIC*7.5x10.3mm*P1.27mm*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">74HCT595</field>
+        <field name="Footprint"/>
+        <field name="Datasheet">https://assets.nexperia.com/documents/data-sheet/74HC_HCT595.pdf</field>
+        <field name="Description">8-bit serial in/out Shift Register 3-State Outputs</field>
+      </fields>
+      <pins>
+        <pin num="1" name="QB" type="tri_state"/>
+        <pin num="2" name="QC" type="tri_state"/>
+        <pin num="3" name="QD" type="tri_state"/>
+        <pin num="4" name="QE" type="tri_state"/>
+        <pin num="5" name="QF" type="tri_state"/>
+        <pin num="6" name="QG" type="tri_state"/>
+        <pin num="7" name="QH" type="tri_state"/>
+        <pin num="8" name="GND" type="power_in"/>
+        <pin num="9" name="QH'" type="output"/>
+        <pin num="10" name="~{SRCLR}" type="input"/>
+        <pin num="11" name="SRCLK" type="input"/>
+        <pin num="12" name="RCLK" type="input"/>
+        <pin num="13" name="~{OE}" type="input"/>
+        <pin num="14" name="SER" type="input"/>
+        <pin num="15" name="QA" type="tri_state"/>
+        <pin num="16" name="VCC" type="power_in"/>
+      </pins>
+    </libpart>
+    <libpart lib="Connector" part="USB_A">
+      <description>USB Type A connector</description>
+      <footprints>
+        <fp>USB*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">USB_A</field>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description">USB Type A connector</field>
+      </fields>
+      <pins>
+        <pin num="1" name="VBUS" type="power_in"/>
+        <pin num="2" name="D-" type="bidirectional"/>
+        <pin num="3" name="D+" type="bidirectional"/>
+        <pin num="4" name="GND" type="power_in"/>
+        <pin num="SH" name="Shield" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="Buzzer">
+      <description>Buzzer, polarized</description>
+      <footprints>
+        <fp>*Buzzer*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">BZ</field>
+        <field name="Value">Buzzer</field>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description">Buzzer, polarized</field>
+      </fields>
+      <pins>
+        <pin num="1" name="+" type="passive"/>
+        <pin num="2" name="-" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="C_Polarized_Small">
+      <description>Polarized capacitor, small symbol</description>
+      <footprints>
+        <fp>CP_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">C_Polarized_Small</field>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description">Polarized capacitor, small symbol</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="L">
+      <description>Inductor</description>
+      <footprints>
+        <fp>Choke_*</fp>
+        <fp>*Coil*</fp>
+        <fp>Inductor_*</fp>
+        <fp>L_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">L</field>
+        <field name="Value">L</field>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description">Inductor</field>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="LED">
+      <description>Light emitting diode</description>
+      <footprints>
+        <fp>LED*</fp>
+        <fp>LED_SMD:*</fp>
+        <fp>LED_THT:*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">LED</field>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description">Light emitting diode</field>
+        <field name="Sim.Pins">1=K 2=A</field>
+      </fields>
+      <pins>
+        <pin num="1" name="K" type="passive"/>
+        <pin num="2" name="A" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="LED_ABGR">
+      <description>RGB LED, anode/blue/green/red</description>
+      <footprints>
+        <fp>LED*</fp>
+        <fp>LED_SMD:*</fp>
+        <fp>LED_THT:*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">LED_ABGR</field>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description">RGB LED, anode/blue/green/red</field>
+      </fields>
+      <pins>
+        <pin num="1" name="A" type="passive"/>
+        <pin num="2" name="BK" type="passive"/>
+        <pin num="3" name="GK" type="passive"/>
+        <pin num="4" name="RK" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Diode" part="1N5822">
+      <description>40V 3A Schottky Barrier Rectifier Diode, DO-201AD</description>
+      <docs>http://www.vishay.com/docs/88526/1n5820.pdf</docs>
+      <footprints>
+        <fp>D*DO?201AD*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">1N5822</field>
+        <field name="Footprint">Diode_THT:D_DO-201AD_P15.24mm_Horizontal</field>
+        <field name="Datasheet">http://www.vishay.com/docs/88526/1n5820.pdf</field>
+        <field name="Description">40V 3A Schottky Barrier Rectifier Diode, DO-201AD</field>
+      </fields>
+      <pins>
+        <pin num="1" name="K" type="passive"/>
+        <pin num="2" name="A" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Regulator_Switching" part="LM2596S-3.3">
+      <description>3.3V 3A Step-Down Voltage Regulator, TO-263</description>
+      <docs>http://www.ti.com/lit/ds/symlink/lm2596.pdf</docs>
+      <footprints>
+        <fp>TO?263*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">LM2596S-3.3</field>
+        <field name="Footprint">Package_TO_SOT_SMD:TO-263-5_TabPin3</field>
+        <field name="Datasheet">http://www.ti.com/lit/ds/symlink/lm2596.pdf</field>
+        <field name="Description">3.3V 3A Step-Down Voltage Regulator, TO-263</field>
+      </fields>
+      <pins>
+        <pin num="1" name="VIN" type="power_in"/>
+        <pin num="2" name="OUT" type="output"/>
+        <pin num="3" name="GND" type="power_in"/>
+        <pin num="4" name="FB" type="input"/>
+        <pin num="5" name="~{ON}/OFF" type="input"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="Display_5pin">
+      <description>Display interface: GND, 3V3 I2C level, SDA, SCL and 5V display supply</description>
+      <footprints>
+        <fp>Connector*:*_1x??_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">DISPLAY</field>
+        <field name="Footprint">dashboard:Display_Header_5pin</field>
+        <field name="Datasheet"/>
+        <field name="Description">Display interface: GND, 3V3 I2C level, SDA, SCL and 5V display supply</field>
+      </fields>
+      <pins>
+        <pin num="1" name="Pin_1" type="passive"/>
+        <pin num="2" name="Pin_2" type="passive"/>
+        <pin num="3" name="Pin_3" type="passive"/>
+        <pin num="4" name="Pin_4" type="passive"/>
+        <pin num="5" name="Pin_5" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="Seeed_Studio_XIAO_Series_XIAO_Add_On">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">XIAO-Add-On</field>
+        <field name="Footprint">Seeed_Studio_XIAO_Series:XIAO-14P-Add-On</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="D0" type="passive"/>
+        <pin num="2" name="D1" type="passive"/>
+        <pin num="3" name="D2" type="passive"/>
+        <pin num="4" name="D3" type="passive"/>
+        <pin num="5" name="D4" type="passive"/>
+        <pin num="6" name="D5" type="passive"/>
+        <pin num="7" name="D6" type="passive"/>
+        <pin num="8" name="D7" type="passive"/>
+        <pin num="9" name="D8" type="passive"/>
+        <pin num="10" name="D9" type="passive"/>
+        <pin num="11" name="D10" type="passive"/>
+        <pin num="12" name="3V3_OUT" type="passive"/>
+        <pin num="13" name="GND" type="passive"/>
+        <pin num="14" name="VBUS" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="SparkFun_Capacitor_C">
+      <description>Unpolarized capacitor</description>
+      <docs>https://cdn.sparkfun.com/assets/8/a/4/a/5/Kemet_Capacitor_Datasheet.pdf</docs>
+      <footprints>
+        <fp>C_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">C</field>
+        <field name="Footprint">dashboard:C_0603_1608Metric</field>
+        <field name="Datasheet">https://cdn.sparkfun.com/assets/8/a/4/a/5/Kemet_Capacitor_Datasheet.pdf</field>
+        <field name="Description">Unpolarized capacitor</field>
+        <field name="PROD_ID">CAP-00000</field>
+        <field name="Voltage">1kV</field>
+        <field name="Tolerance">100%</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="SparkFun_Connector_ScrewCage_1x10_P3_5mm_Green">
+      <description>Screw cage terminal, single row</description>
+      <docs>https://cdn.sparkfun.com/assets/b/9/7/3/6/19854.pdf</docs>
+      <footprints>
+        <fp>TerminalBlock*:*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">Screw_Cage_3.5mm-10</field>
+        <field name="Footprint">dashboard:TerminalBlock_1x10_3p5</field>
+        <field name="Datasheet">https://cdn.sparkfun.com/assets/b/9/7/3/6/19854.pdf</field>
+        <field name="Description">Screw cage terminal, single row</field>
+        <field name="PROD_ID">CONN-17279</field>
+      </fields>
+      <pins>
+        <pin num="1" name="Pin_1" type="passive"/>
+        <pin num="2" name="Pin_2" type="passive"/>
+        <pin num="3" name="Pin_3" type="passive"/>
+        <pin num="4" name="Pin_4" type="passive"/>
+        <pin num="5" name="Pin_3" type="passive"/>
+        <pin num="6" name="Pin_4" type="passive"/>
+        <pin num="7" name="Pin_2" type="passive"/>
+        <pin num="8" name="Pin_1" type="passive"/>
+        <pin num="9" name="Pin_1" type="passive"/>
+        <pin num="10" name="Pin_1" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="SparkFun_Resistor_1_24k_0603">
+      <description>Resistor</description>
+      <docs>https://www.vishay.com/docs/20035/dcrcwe3.pdf</docs>
+      <footprints>
+        <fp>R_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">1.24k</field>
+        <field name="Footprint">dashboard:R_0603_1608Metric</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+        <field name="PROD_ID">RES-...</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="SparkFun_Resistor_1k_0402">
+      <description>Resistor</description>
+      <docs>https://www.vishay.com/docs/20035/dcrcwe3.pdf</docs>
+      <footprints>
+        <fp>R_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">1k</field>
+        <field name="Footprint">dashboard:R_0402_1005Metric</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+        <field name="PROD_ID">RES-14342</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="SparkFun_Resistor_470_0402">
+      <description>Resistor</description>
+      <docs>https://www.vishay.com/docs/20035/dcrcwe3.pdf</docs>
+      <footprints>
+        <fp>R_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">470</field>
+        <field name="Footprint">dashboard:R_0402_1005Metric</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+        <field name="PROD_ID">RES-25018</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="dashboard" part="SparkFun_Resistor_680_0402">
+      <description>Resistor</description>
+      <docs>https://www.vishay.com/docs/20035/dcrcwe3.pdf</docs>
+      <footprints>
+        <fp>R_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">680</field>
+        <field name="Footprint">dashboard:R_0402_1005Metric</field>
+        <field name="Datasheet">https://www.vishay.com/docs/20035/dcrcwe3.pdf</field>
+        <field name="Description">Resistor</field>
+        <field name="PROD_ID">RES-22993</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+  </libparts>
+  <libraries>
+    <library logical="74xx">
+      <uri>${KICAD10_SYMBOL_DIR}/74xx.kicad_sym</uri>
+    </library>
+    <library logical="Connector">
+      <uri>${KICAD10_SYMBOL_DIR}/Connector.kicad_sym</uri>
+    </library>
+    <library logical="Device">
+      <uri>${KICAD10_SYMBOL_DIR}/Device.kicad_sym</uri>
+    </library>
+    <library logical="Diode">
+      <uri>${KICAD10_SYMBOL_DIR}/Diode.kicad_sym</uri>
+    </library>
+    <library logical="Regulator_Switching">
+      <uri>${KICAD10_SYMBOL_DIR}/Regulator_Switching.kicad_sym</uri>
+    </library>
+    <library logical="dashboard">
+      <uri>${KIPRJMOD}/dashboard.kicad_sym</uri>
+    </library>
+  </libraries>
+  <nets>
+    <net code="1" name="3.3V" class="Default">
+      <node ref="C4" pin="1" pintype="passive"/>
+      <node ref="J2" pin="1" pinfunction="VBUS_1" pintype="power_in"/>
+      <node ref="L1" pin="2" pinfunction="2_2" pintype="passive"/>
+      <node ref="U4" pin="4" pinfunction="FB_4" pintype="input"/>
+    </net>
+    <net code="2" name="5V" class="Default">
+      <node ref="C1" pin="1" pintype="passive"/>
+      <node ref="C2" pin="1" pintype="passive"/>
+      <node ref="C3" pin="1" pintype="passive"/>
+      <node ref="D1" pin="1" pinfunction="A_1" pintype="passive"/>
+      <node ref="D2" pin="1" pinfunction="A_1" pintype="passive"/>
+      <node ref="D3" pin="1" pinfunction="A_1" pintype="passive"/>
+      <node ref="D4" pin="1" pinfunction="A_1" pintype="passive"/>
+      <node ref="D5" pin="1" pinfunction="A_1" pintype="passive"/>
+      <node ref="D6" pin="2" pinfunction="A_2" pintype="passive"/>
+      <node ref="J1" pin="5" pinfunction="Pin_5_5" pintype="passive"/>
+      <node ref="J3" pin="1" pinfunction="Pin_1_1" pintype="passive"/>
+      <node ref="U1" pin="10" pinfunction="~{SRCLR}_10" pintype="input"/>
+      <node ref="U1" pin="16" pinfunction="VCC_16" pintype="power_in"/>
+      <node ref="U2" pin="10" pinfunction="~{SRCLR}_10" pintype="input"/>
+      <node ref="U2" pin="16" pinfunction="VCC_16" pintype="power_in"/>
+      <node ref="U4" pin="1" pinfunction="VIN_1" pintype="power_in"/>
+    </net>
+    <net code="3" name="GND" class="Default">
+      <node ref="BZ1" pin="2" pinfunction="-_2" pintype="passive"/>
+      <node ref="C1" pin="2" pintype="passive"/>
+      <node ref="C2" pin="2" pintype="passive"/>
+      <node ref="C3" pin="2" pintype="passive"/>
+      <node ref="C4" pin="2" pintype="passive"/>
+      <node ref="D7" pin="2" pinfunction="A_2" pintype="passive"/>
+      <node ref="J1" pin="1" pinfunction="Pin_1_1" pintype="passive"/>
+      <node ref="J2" pin="4" pinfunction="GND_4" pintype="power_in"/>
+      <node ref="J3" pin="4" pinfunction="Pin_4_4" pintype="passive"/>
+      <node ref="U1" pin="13" pinfunction="~{OE}_13" pintype="input"/>
+      <node ref="U1" pin="8" pinfunction="GND_8" pintype="power_in"/>
+      <node ref="U2" pin="13" pinfunction="~{OE}_13" pintype="input"/>
+      <node ref="U2" pin="8" pinfunction="GND_8" pintype="power_in"/>
+      <node ref="U3" pin="13" pinfunction="GND_13" pintype="passive"/>
+      <node ref="U4" pin="3" pinfunction="GND_3" pintype="power_in"/>
+      <node ref="U4" pin="5" pinfunction="~{ON}/OFF_5" pintype="input"/>
+    </net>
+    <net code="4" name="Net-(BZ1-+)" class="Default">
+      <node ref="BZ1" pin="1" pinfunction="+_1" pintype="passive"/>
+      <node ref="R17" pin="1" pintype="passive"/>
+    </net>
+    <net code="5" name="Net-(D1-BK)" class="Default">
+      <node ref="D1" pin="2" pinfunction="BK_2" pintype="passive"/>
+      <node ref="R6" pin="2" pintype="passive"/>
+    </net>
+    <net code="6" name="Net-(D1-GK)" class="Default">
+      <node ref="D1" pin="3" pinfunction="GK_3" pintype="passive"/>
+      <node ref="R11" pin="2" pintype="passive"/>
+    </net>
+    <net code="7" name="Net-(D1-RK)" class="Default">
+      <node ref="D1" pin="4" pinfunction="RK_4" pintype="passive"/>
+      <node ref="R1" pin="2" pintype="passive"/>
+    </net>
+    <net code="8" name="Net-(D2-BK)" class="Default">
+      <node ref="D2" pin="2" pinfunction="BK_2" pintype="passive"/>
+      <node ref="R7" pin="2" pintype="passive"/>
+    </net>
+    <net code="9" name="Net-(D2-GK)" class="Default">
+      <node ref="D2" pin="3" pinfunction="GK_3" pintype="passive"/>
+      <node ref="R12" pin="2" pintype="passive"/>
+    </net>
+    <net code="10" name="Net-(D2-RK)" class="Default">
+      <node ref="D2" pin="4" pinfunction="RK_4" pintype="passive"/>
+      <node ref="R2" pin="2" pintype="passive"/>
+    </net>
+    <net code="11" name="Net-(D3-BK)" class="Default">
+      <node ref="D3" pin="2" pinfunction="BK_2" pintype="passive"/>
+      <node ref="R8" pin="2" pintype="passive"/>
+    </net>
+    <net code="12" name="Net-(D3-GK)" class="Default">
+      <node ref="D3" pin="3" pinfunction="GK_3" pintype="passive"/>
+      <node ref="R13" pin="2" pintype="passive"/>
+    </net>
+    <net code="13" name="Net-(D3-RK)" class="Default">
+      <node ref="D3" pin="4" pinfunction="RK_4" pintype="passive"/>
+      <node ref="R3" pin="2" pintype="passive"/>
+    </net>
+    <net code="14" name="Net-(D4-BK)" class="Default">
+      <node ref="D4" pin="2" pinfunction="BK_2" pintype="passive"/>
+      <node ref="R9" pin="2" pintype="passive"/>
+    </net>
+    <net code="15" name="Net-(D4-GK)" class="Default">
+      <node ref="D4" pin="3" pinfunction="GK_3" pintype="passive"/>
+      <node ref="R14" pin="2" pintype="passive"/>
+    </net>
+    <net code="16" name="Net-(D4-RK)" class="Default">
+      <node ref="D4" pin="4" pinfunction="RK_4" pintype="passive"/>
+      <node ref="R4" pin="2" pintype="passive"/>
+    </net>
+    <net code="17" name="Net-(D5-BK)" class="Default">
+      <node ref="D5" pin="2" pinfunction="BK_2" pintype="passive"/>
+      <node ref="R10" pin="2" pintype="passive"/>
+    </net>
+    <net code="18" name="Net-(D5-GK)" class="Default">
+      <node ref="D5" pin="3" pinfunction="GK_3" pintype="passive"/>
+      <node ref="R15" pin="2" pintype="passive"/>
+    </net>
+    <net code="19" name="Net-(D5-RK)" class="Default">
+      <node ref="D5" pin="4" pinfunction="RK_4" pintype="passive"/>
+      <node ref="R5" pin="2" pintype="passive"/>
+    </net>
+    <net code="20" name="Net-(D6-K)" class="Default">
+      <node ref="D6" pin="1" pinfunction="K_1" pintype="passive"/>
+      <node ref="R16" pin="2" pintype="passive"/>
+    </net>
+    <net code="21" name="Net-(D7-K)" class="Default">
+      <node ref="D7" pin="1" pinfunction="K_1" pintype="passive"/>
+      <node ref="L1" pin="1" pinfunction="1_1" pintype="passive"/>
+      <node ref="U4" pin="2" pinfunction="OUT_2" pintype="output"/>
+    </net>
+    <net code="22" name="Net-(J1-Pin_2)" class="Default">
+      <node ref="J1" pin="2" pinfunction="Pin_2_2" pintype="passive"/>
+      <node ref="U3" pin="12" pinfunction="3V3_OUT_12" pintype="passive"/>
+    </net>
+    <net code="23" name="Net-(J1-Pin_3)" class="Default">
+      <node ref="J1" pin="3" pinfunction="Pin_3_3" pintype="passive"/>
+      <node ref="U3" pin="5" pinfunction="D4_5" pintype="passive"/>
+    </net>
+    <net code="24" name="Net-(J1-Pin_4)" class="Default">
+      <node ref="J1" pin="4" pinfunction="Pin_4_4" pintype="passive"/>
+      <node ref="U3" pin="6" pinfunction="D5_6" pintype="passive"/>
+    </net>
+    <net code="25" name="Net-(J2-D+)" class="Default">
+      <node ref="J2" pin="3" pinfunction="D+_3" pintype="bidirectional"/>
+      <node ref="J3" pin="2" pinfunction="Pin_2_2" pintype="passive"/>
+    </net>
+    <net code="26" name="Net-(J2-D-)" class="Default">
+      <node ref="J2" pin="2" pinfunction="D-_2" pintype="bidirectional"/>
+      <node ref="J3" pin="3" pinfunction="Pin_3_3" pintype="passive"/>
+    </net>
+    <net code="27" name="Net-(U1-QA)" class="Default">
+      <node ref="R1" pin="1" pintype="passive"/>
+      <node ref="U1" pin="15" pinfunction="QA_15" pintype="tri_state"/>
+    </net>
+    <net code="28" name="Net-(U1-QB)" class="Default">
+      <node ref="R11" pin="1" pintype="passive"/>
+      <node ref="U1" pin="1" pinfunction="QB_1" pintype="tri_state"/>
+    </net>
+    <net code="29" name="Net-(U1-QC)" class="Default">
+      <node ref="R6" pin="1" pintype="passive"/>
+      <node ref="U1" pin="2" pinfunction="QC_2" pintype="tri_state"/>
+    </net>
+    <net code="30" name="Net-(U1-QD)" class="Default">
+      <node ref="R2" pin="1" pintype="passive"/>
+      <node ref="U1" pin="3" pinfunction="QD_3" pintype="tri_state"/>
+    </net>
+    <net code="31" name="Net-(U1-QE)" class="Default">
+      <node ref="R12" pin="1" pintype="passive"/>
+      <node ref="U1" pin="4" pinfunction="QE_4" pintype="tri_state"/>
+    </net>
+    <net code="32" name="Net-(U1-QF)" class="Default">
+      <node ref="R7" pin="1" pintype="passive"/>
+      <node ref="U1" pin="5" pinfunction="QF_5" pintype="tri_state"/>
+    </net>
+    <net code="33" name="Net-(U1-QG)" class="Default">
+      <node ref="R3" pin="1" pintype="passive"/>
+      <node ref="U1" pin="6" pinfunction="QG_6" pintype="tri_state"/>
+    </net>
+    <net code="34" name="Net-(U1-QH')" class="Default">
+      <node ref="U1" pin="9" pinfunction="QH'_9" pintype="output"/>
+      <node ref="U2" pin="14" pinfunction="SER_14" pintype="input"/>
+    </net>
+    <net code="35" name="Net-(U1-QH)" class="Default">
+      <node ref="R13" pin="1" pintype="passive"/>
+      <node ref="U1" pin="7" pinfunction="QH_7" pintype="tri_state"/>
+    </net>
+    <net code="36" name="Net-(U1-RCLK)" class="Default">
+      <node ref="U1" pin="12" pinfunction="RCLK_12" pintype="input"/>
+      <node ref="U2" pin="12" pinfunction="RCLK_12" pintype="input"/>
+      <node ref="U3" pin="4" pinfunction="D3_4" pintype="passive"/>
+    </net>
+    <net code="37" name="Net-(U1-SER)" class="Default">
+      <node ref="U1" pin="14" pinfunction="SER_14" pintype="input"/>
+      <node ref="U3" pin="11" pinfunction="D10_11" pintype="passive"/>
+    </net>
+    <net code="38" name="Net-(U1-SRCLK)" class="Default">
+      <node ref="U1" pin="11" pinfunction="SRCLK_11" pintype="input"/>
+      <node ref="U2" pin="11" pinfunction="SRCLK_11" pintype="input"/>
+      <node ref="U3" pin="9" pinfunction="D8_9" pintype="passive"/>
+    </net>
+    <net code="39" name="Net-(U2-QA)" class="Default">
+      <node ref="R8" pin="1" pintype="passive"/>
+      <node ref="U2" pin="15" pinfunction="QA_15" pintype="tri_state"/>
+    </net>
+    <net code="40" name="Net-(U2-QB)" class="Default">
+      <node ref="R4" pin="1" pintype="passive"/>
+      <node ref="U2" pin="1" pinfunction="QB_1" pintype="tri_state"/>
+    </net>
+    <net code="41" name="Net-(U2-QC)" class="Default">
+      <node ref="R14" pin="1" pintype="passive"/>
+      <node ref="U2" pin="2" pinfunction="QC_2" pintype="tri_state"/>
+    </net>
+    <net code="42" name="Net-(U2-QD)" class="Default">
+      <node ref="R9" pin="1" pintype="passive"/>
+      <node ref="U2" pin="3" pinfunction="QD_3" pintype="tri_state"/>
+    </net>
+    <net code="43" name="Net-(U2-QE)" class="Default">
+      <node ref="R5" pin="1" pintype="passive"/>
+      <node ref="U2" pin="4" pinfunction="QE_4" pintype="tri_state"/>
+    </net>
+    <net code="44" name="Net-(U2-QF)" class="Default">
+      <node ref="R15" pin="1" pintype="passive"/>
+      <node ref="U2" pin="5" pinfunction="QF_5" pintype="tri_state"/>
+    </net>
+    <net code="45" name="Net-(U2-QG)" class="Default">
+      <node ref="R10" pin="1" pintype="passive"/>
+      <node ref="U2" pin="6" pinfunction="QG_6" pintype="tri_state"/>
+    </net>
+    <net code="46" name="Net-(U2-QH)" class="Default">
+      <node ref="R16" pin="1" pintype="passive"/>
+      <node ref="U2" pin="7" pinfunction="QH_7" pintype="tri_state"/>
+    </net>
+    <net code="47" name="Net-(U3-D2)" class="Default">
+      <node ref="R17" pin="2" pintype="passive"/>
+      <node ref="U3" pin="3" pinfunction="D2_3" pintype="passive"/>
+    </net>
+    <net code="48" name="Net-(U3-D6)" class="Default">
+      <node ref="J3" pin="10" pinfunction="Pin_1_10" pintype="passive"/>
+      <node ref="U3" pin="7" pinfunction="D6_7" pintype="passive"/>
+    </net>
+    <net code="49" name="Net-(U3-D7)" class="Default">
+      <node ref="J3" pin="9" pinfunction="Pin_1_9" pintype="passive"/>
+      <node ref="U3" pin="8" pinfunction="D7_8" pintype="passive"/>
+    </net>
+    <net code="50" name="unconnected-(J2-Shield-PadSH)" class="Default">
+      <node ref="J2" pin="SH" pinfunction="Shield_SH" pintype="passive+no_connect"/>
+    </net>
+    <net code="51" name="unconnected-(J3-Pin_1-Pad8)" class="Default">
+      <node ref="J3" pin="8" pinfunction="Pin_1_8" pintype="passive+no_connect"/>
+    </net>
+    <net code="52" name="unconnected-(J3-Pin_2-Pad7)" class="Default">
+      <node ref="J3" pin="7" pinfunction="Pin_2_7" pintype="passive+no_connect"/>
+    </net>
+    <net code="53" name="unconnected-(J3-Pin_3-Pad5)" class="Default">
+      <node ref="J3" pin="5" pinfunction="Pin_3_5" pintype="passive+no_connect"/>
+    </net>
+    <net code="54" name="unconnected-(J3-Pin_4-Pad6)" class="Default">
+      <node ref="J3" pin="6" pinfunction="Pin_4_6" pintype="passive+no_connect"/>
+    </net>
+    <net code="55" name="unconnected-(U2-QH'-Pad9)" class="Default">
+      <node ref="U2" pin="9" pinfunction="QH'_9" pintype="output+no_connect"/>
+    </net>
+    <net code="56" name="unconnected-(U3-D0-Pad1)" class="Default">
+      <node ref="U3" pin="1" pinfunction="D0_1" pintype="passive+no_connect"/>
+    </net>
+    <net code="57" name="unconnected-(U3-D1-Pad2)" class="Default">
+      <node ref="U3" pin="2" pinfunction="D1_2" pintype="passive+no_connect"/>
+    </net>
+    <net code="58" name="unconnected-(U3-D9-Pad10)" class="Default">
+      <node ref="U3" pin="10" pinfunction="D9_10" pintype="passive+no_connect"/>
+    </net>
+    <net code="59" name="unconnected-(U3-VBUS-Pad14)" class="Default">
+      <node ref="U3" pin="14" pinfunction="VBUS_14" pintype="passive+no_connect"/>
+    </net>
+  </nets>
+</export>

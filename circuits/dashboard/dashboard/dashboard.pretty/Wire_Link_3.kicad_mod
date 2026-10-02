@@ -1,0 +1,78 @@
+(footprint "Wire_Link_3"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "Fit insulated wire from U2 pin 14 to U1 pin 9; overlapped landing pads mark existing solder joints, not new holes.")
+	(property "Reference" "REF**"
+		(at 0 0 0)
+		(layer "F.SilkS")
+		(hide yes)
+		(uuid "30fc6275-d314-4daa-9246-378e27fcccab")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Value" "INSULATED WIRE - FIT"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "6d77b812-b028-4f19-920e-d01c7bb71e29")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "9e0d4435-5a90-43ec-87f0-666312f4a14f")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "76d17af1-6e3e-4668-be1e-63430b50d2cf")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(attr board_only exclude_from_pos_files)
+	(duplicate_pad_numbers_are_jumpers yes)
+	(fp_line
+		(start 0 0)
+		(end -24.650001 1)
+		(stroke
+			(width 0.2)
+			(type default)
+		)
+		(layer "User.1")
+		(uuid "4e49a30e-c73d-4de6-b8c2-19c63ded81b6")
+	)
+	(pad "1" smd rect
+		(at -24.65 1)
+		(size 0.3 0.3)
+		(layers "F.Cu")
+		(thermal_bridge_angle 45)
+		(uuid "b16f7737-b144-40c9-a206-f1274529aef9")
+	)
+	(pad "1" smd rect
+		(at 0 0)
+		(size 0.3 0.3)
+		(layers "F.Cu")
+		(thermal_bridge_angle 45)
+		(uuid "6fd3949d-ace3-474c-a9a2-c166a27448c1")
+	)
+	(embedded_fonts no)
+)

@@ -1,0 +1,92 @@
+[
+  {
+    "reference": "WL1",
+    "from": "U2.4",
+    "to": "R5.1",
+    "net": "Net-(U2-QE)",
+    "face": "Front",
+    "endpoints_mm_from_front_top_left": [
+      [
+        40.365,
+        12.975
+      ],
+      [
+        43.0,
+        39.0
+      ]
+    ],
+    "straight_distance_mm": 26.2
+  },
+  {
+    "reference": "WL2",
+    "from": "U2.12",
+    "to": "U1.12",
+    "net": "Net-(U1-RCLK)",
+    "face": "Front",
+    "endpoints_mm_from_front_top_left": [
+      [
+        41.635,
+        8.025
+      ],
+      [
+        10.635,
+        9.025
+      ]
+    ],
+    "straight_distance_mm": 31.0
+  },
+  {
+    "reference": "WL3",
+    "from": "U2.14",
+    "to": "U1.9",
+    "net": "Net-(U1-QH')",
+    "face": "Front",
+    "endpoints_mm_from_front_top_left": [
+      [
+        39.095,
+        8.025
+      ],
+      [
+        14.445,
+        9.025
+      ]
+    ],
+    "straight_distance_mm": 24.7
+  },
+  {
+    "reference": "WL4",
+    "from": "U2.15",
+    "to": "R8.1",
+    "net": "Net-(U2-QA)",
+    "face": "Front",
+    "endpoints_mm_from_front_top_left": [
+      [
+        37.825,
+        8.025
+      ],
+      [
+        25.5,
+        39.0
+      ]
+    ],
+    "straight_distance_mm": 33.3
+  },
+  {
+    "reference": "WL5",
+    "from": "J2.2",
+    "to": "J3.3",
+    "net": "Net-(J2-D-)",
+    "face": "Rear",
+    "endpoints_mm_from_front_top_left": [
+      [
+        37.388,
+        9.0
+      ],
+      [
+        51.05,
+        26.58
+      ]
+    ],
+    "straight_distance_mm": 22.3
+  }
+]
