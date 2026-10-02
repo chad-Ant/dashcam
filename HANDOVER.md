@@ -6,7 +6,7 @@
 |---|---|---|---|
 | Platform | — | **Upgraded to L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra on 2026-10-01; UEFI also 36.5.2.** Existing 16:18 verification log: 24 PASS, 0 FAIL, 1 SKIP; all 65 target packages at target versions and held. See the evening update below. | `usb_test` was skipped while the recorder owned the USB camera; evening paired USB captures succeeded, but do not substitute for that full test. |
 | IMX296 driver for any kernel | — | Rebuilt from the vendor's source plus FRC 971's mode table; 41/41 CRCs match 36.5.2. **Now loaded and hardware-tested on 5.15.199:** platform log has `csi_test` 5/5, CSI RTP and Camera_GST PASS; evening tuning captured from the IMX296 through Argus. Build/upgrade/rollback tools remain outside the repo in `/home/jetson/drive_logs/tools/`. | Road-use validation after the platform/tuning changes. |
-| CSI image tuning | — | **c5_rpi100T is installed** (black level 50 + the IMX296 colour matrix the vendor file had transposed). The c7 A/B brings it closer to the USB camera (ΔE 11.7 → 6.7 once the CSI JPEGs are decoded correctly; first reported as 8.56 → 4.79). A review found that gain is mostly in-sample and about zero against the chart's own values, so **do not install c7 as it is**. The app sets no CSI properties today, so it gets the ISP's default sharpening (large halos). Details in "Review of the c7 work" below. | **c8 A/B done 2026-10-02: `c8_sh15` passes**, giving ee-mode=0-like output at the ISP default with the ee-strength knob kept. It is not installed yet; installing it needs the user's sudo. Then: a daylight A/B (`--auto`) and the CSI saturation in the app's config. |
+| CSI image tuning | — | **c8_sh15 is installed (2026-10-02 06:53, verified live)**: c5_rpi100T's colour (black level 50 + the IMX296 colour matrix the vendor file had transposed) plus the sharpness table set to its weakest index, so the ISP's default output matches ee-mode=0. The c7 A/B brings it closer to the USB camera (ΔE 11.7 → 6.7 once the CSI JPEGs are decoded correctly; first reported as 8.56 → 4.79). A review found that gain is mostly in-sample and about zero against the chart's own values, so **do not install c7 as it is**. The app sets no CSI properties, and with c8_sh15 that default is now clean (no halos). Details in "Review of the c7 work" and the c8 sections below. | A daylight A/B (`--auto`) before calling it production; the CSI saturation in the app's config. |
 | High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
 | CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
 | Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
@@ -142,7 +142,7 @@ Their full outputs are in `isp_tuning/reviews_20261001/`. Nothing was installed 
 state `T` and looks hung: run `sudo -v` first.
 
 **What is installed, and why.** `camera_overrides.isp` = `c5_rpi100T.isp` (sha256 `20b4c94c…`), installed since
-20:20. It differs from the vendor file in two ways:
+20:20. *Superseded 2026-10-02 06:53 by `c8_sh15.isp`, which is c5 plus the sharpness table (see below).* It differs from the vendor file in two ways:
 - **Black level 50, not 60.** The driver programs BLKLEVEL 0x032 for colour; the vendor ISP subtracted 60,
   which crushed the shadows green. (c1)
 - **The colour matrix, untransposed.** `colorCorrection.srgbMatrix[i]` is the i-th **column** of the operator:
@@ -240,9 +240,9 @@ Weak points:
 - Separately, the earlier lock-only session's frame-to-frame swing is probably 100 Hz lamp flicker at 14.8 ms.
   675 lines ≈ 10 ms is exactly one flicker period.
 
-**Next, in order (2026-10-02: steps 1 and 2 done; c8_sh15 passed, install pending; see below):**
+**Next, in order (2026-10-02: steps 1 and 2 done; c8_sh15 installed and verified; see below):**
 1. ~~Switch the analysis scripts to the correct CSI decode.~~ Done.
-2. ~~A/B the c8 sharpening files.~~ Done: c8_sh15 passes. Install it (user's sudo).
+2. ~~A/B the c8 sharpening files.~~ Done: c8_sh15 passed, and it has been installed since 2026-10-02 06:53.
 3. Pick the CSI properties (ee-mode=0 or c8; saturation about 0.9–1.0) and put them where the app reads them.
 4. Daylight + auto AE/AWB comparison of c5 / c7n before any production default.
 5. Fix the grey cast at its source, the AWB tables inherited from IMX477, not in the colour matrix.
@@ -318,7 +318,7 @@ Daylight, later: `sudo bash …/trial_ab.sh --auto <candidates>` with the rig at
 The user ran `trial_ab.sh c8_sh15 c8_v5off` (output in `isp_tuning/trial_20261002_054515/`, scored in `report.json`).
 - All 5 sessions completed with the expected profile hashes.
 - No loader lines appeared in any nvargus journal.
-- The entry profile c5 was restored, and it is still installed.
+- The entry profile c5 was restored at the end of the trial.
 
 ISP default edge enhancement (the path an app that sets no ee property gets), 5 frames each:
 
@@ -350,11 +350,23 @@ ISP default edge enhancement (the path an app that sets no ee property gets), 5 
   - Its corners differ from plain detection by median 0.31 / p95 1.24 px. That equals the detector's own spread
     between two upscale factors on the same image (median 0.25 / p95 1.24).
 
-**To make c8_sh15 the default** (the user's sudo; it changes what every Argus app gets):
+**c8_sh15 is the default since 2026-10-02 06:53.** The user installed it:
 ```bash
 sudo install -m 0644 ~/drive_logs/tools/isp_tuning/c8_sh15.isp /var/nvidia/nvcam/settings/camera_overrides.isp && sudo systemctl restart nvargus-daemon
 ```
-Back to c5: the same command with `c5_rpi100T.isp`. Not done yet.
+Back to c5: the same command with `c5_rpi100T.isp`.
+
+**Verified at 06:56.**
+- The installed file's sha256 is `43ec0c81…` (= c8_sh15), and nvargus-daemon restarted in the same second.
+- Two later camera sessions loaded the override with no config-loader lines in the journal.
+- A capture with **no properties at all** (what the dashcam app does) measures like an ee-mode=0 capture taken a
+  minute later. One frame each:
+
+| | rise (px) | dark rim | bright halo | MTF at 0.25 | JPEG |
+|---|---|---|---|---|---|
+| no properties | 1.09 | 19.5 % | 8.5 % | 1.07 | 263 KB |
+| ee-mode=0 | 1.07 | 21.2 % | 5.6 % | 1.10 | 266 KB |
+| c5, no properties (2026-10-01) | 0.38 | 83 % | 61 % | 3.29 | 469 KB |
 
 ## Who does what: read before handing work across
 
