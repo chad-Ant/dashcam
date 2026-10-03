@@ -12,8 +12,12 @@
 // Covers the handshake and auto-stream, every frame type (and malformed, CRC-bad
 // and split frames), the commands and their argument checks, keepalive, the
 // silence watchdog, a mismatched and a silent device, hot unplug + replug,
-// discovery over a fake /dev tree (a silent candidate is skipped), and a log
-// callback that calls back into the link.
+// discovery over a fake /dev tree (a silent candidate is skipped, name order
+// whatever the node numbers, and in fallback mode a replug does not re-probe
+// the MKR console first), a log callback that calls back into the link (port
+// lines, malformed telemetry), and Uart::close() (discards unread output, drops
+// the exclusive lock, and against a scripted driver queue: waits out a DMA
+// transfer and slow progress, gives up on a stalled peer).
 //
 // Usage: commlink_sim_test        (runs anywhere: cloud sandbox, dev container, Jetson)
 
@@ -21,16 +25,21 @@
 #include "libuart.h"
 
 #include <fcntl.h>
+#include <linux/serial.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -60,6 +69,75 @@ static bool waitFor(const std::function<bool()>& pred, int ms) {
 }
 
 static void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// ─── a scripted driver TX queue, for Uart::close() ───────────────────────────
+//
+// A pty's TIOCOUTQ always reads 0, so on its own it never reaches close()'s
+// drain loop or its closing_wait step.  This binary defines ioctl() and
+// tcflush() itself, and the linker binds libuart's calls to them instead of
+// libc's.  For the one fd a test arms, they report a scripted driver queue
+// (TIOCOUTQ), keep a fake serial_struct (TIOCGSERIAL / TIOCSSERIAL) and note
+// what was still queued at the TCOFLUSH.  Every other call goes to the kernel
+// unchanged.
+
+namespace fakeq {
+std::atomic<int> armedFd{-1};       ///< The fd the script applies to; -1 = off.
+// The rest is touched only by calls on armedFd, i.e. on the arming thread.
+std::chrono::steady_clock::time_point armedAt;
+int bytes         = 0;      ///< Queued when armed.
+int holdMs        = -1;     ///< All of it held this long, then 0 (one DMA transfer); -1 = forever.
+int chunk         = 0;      ///< ... or this many bytes go every stepMs (FIFO-paced progress).
+int stepMs        = 0;
+int closingWait   = 3000;   ///< Fake serial_struct::closing_wait (10 ms units: 30 s).
+int serialSets    = 0;      ///< TIOCSSERIAL calls.
+int queuedAtFlush = -1;     ///< Queue at the last TCOFLUSH; -1 = none seen.
+
+int queue() {
+    const long el = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - armedAt).count());
+    if (chunk > 0) return std::max(0, bytes - chunk * static_cast<int>(el / stepMs));
+    return (holdMs < 0 || el < holdMs) ? bytes : 0;
+}
+void arm(int fd, int queued, int hold, int drop, int every) {
+    bytes = queued; holdMs = hold; chunk = drop; stepMs = every;
+    closingWait = 3000; serialSets = 0; queuedAtFlush = -1;
+    armedAt = std::chrono::steady_clock::now();
+    armedFd.store(fd);
+}
+void disarm() { armedFd.store(-1); }
+} // namespace fakeq
+
+extern "C" int ioctl(int fd, unsigned long req, ...) noexcept {
+    // Like libc's wrapper: the third argument is read whether or not the
+    // request has one (TIOCEXCL does not); the kernel ignores it then.
+    va_list ap;
+    va_start(ap, req);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+    if (fd >= 0 && fd == fakeq::armedFd.load()) {
+        if (req == TIOCOUTQ) { *static_cast<int*>(arg) = fakeq::queue(); return 0; }
+        if (req == TIOCGSERIAL) {
+            serial_struct ss{};
+            ss.closing_wait = static_cast<unsigned short>(fakeq::closingWait);
+            std::memcpy(arg, &ss, sizeof(ss));
+            return 0;
+        }
+        if (req == TIOCSSERIAL) {
+            serial_struct ss{};
+            std::memcpy(&ss, arg, sizeof(ss));
+            fakeq::closingWait = ss.closing_wait;
+            ++fakeq::serialSets;
+            return 0;
+        }
+    }
+    return static_cast<int>(::syscall(SYS_ioctl, fd, req, arg));
+}
+
+extern "C" int tcflush(int fd, int selector) noexcept {
+    if (fd >= 0 && fd == fakeq::armedFd.load() && (selector == TCOFLUSH || selector == TCIOFLUSH))
+        fakeq::queuedAtFlush = fakeq::queue();
+    return static_cast<int>(::syscall(SYS_ioctl, fd, TCFLSH, selector));   // libc's tcflush
+}
 
 // ─── log capture ─────────────────────────────────────────────────────────────
 
@@ -440,7 +518,10 @@ static void testCommands() {
     CommLink link;
     link.open(fastConfig(br.slave()), log.callback());
     link.start();
-    waitFor([&] { return link.isConnected(); }, 1000);
+    // Wait for the handshake's own CMD_START_STREAM, not just isConnected():
+    // the link is connected on the MSG_HELLO frame before handling it sends
+    // that command, which, cleared too early, would count as a second one.
+    waitFor([&] { return link.isConnected() && br.count(hostproto::CMD_START_STREAM) >= 1; }, 1000);
     br.clearCommands();
 
     check(!link.setDecimation(0), "setDecimation(0) refused");
@@ -597,6 +678,31 @@ static void testDiscovery() {
     check(CommLink::enumerate("USB_JTAG", true, (dev.path / "nowhere").string()).empty(),
           "enumerate() on a missing tree: empty, no exception");
 
+    // Name order must not depend on the nodes' numbers: AA resolves to .../9 and
+    // BB to .../10, which sort the other way round as strings.
+    {
+        TempDir t;
+        fs::create_directories(t.path / "nodes");
+        for (const char* n : {"9", "10"}) { std::FILE* f = std::fopen((t.path / "nodes" / n).c_str(), "w"); if (f) std::fclose(f); }
+        t.link("serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_AA-if00", "../../nodes/9");
+        t.link("serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_BB-if00", "../../nodes/10");
+        const auto got = CommLink::enumerate("USB_JTAG", false, t.path.string());
+        const std::string n9 = fs::canonical(t.path / "nodes" / "9").string();
+        const std::string n10 = fs::canonical(t.path / "nodes" / "10").string();
+        check(got.size() == 2 && got[0] == n9 && got[1] == n10,
+              "enumerate(): by-id name order even when the nodes straddle a power of ten (9, 10)");
+    }
+    // In fallback mode, a ttyACM node that a non-matching by-id entry names (the
+    // MKR's console) goes after one nothing names (the C3 before udev links it).
+    {
+        TempDir t;
+        for (const char* n : {"ttyACM0", "ttyACM1"}) { std::FILE* f = std::fopen((t.path / n).c_str(), "w"); if (f) std::fclose(f); }
+        t.link("serial/by-id/usb-Arduino_LLC_Arduino_MKRZero_CC-if00", "../../ttyACM0");
+        const auto got = CommLink::enumerate("USB_JTAG", true, t.path.string());
+        check(got.size() == 2 && got[0] == (t.path / "ttyACM1").string() && got[1] == (t.path / "ttyACM0").string(),
+              "enumerate(fallback): a node identified as another device comes after an unidentified one");
+    }
+
     LogSink log;
     CommLink link;
     CommLinkConfig cfg = fastConfig("");   // auto-discovery
@@ -609,13 +715,73 @@ static void testDiscovery() {
     link.close();
 }
 
+/// The rig of 2026-09-28 in fallback mode: the C3 (by-id match, ttyACM1) and the
+/// MKR's console (ttyACM0, named by a non-matching by-id entry, never answers).
+/// With the C3 unplugged the MKR is probed and fails once, which advanced the
+/// cursor to 1; after the replug that cursor picked the MKR again, ahead of the C3.
+static void testFallbackReplug() {
+    std::printf("\n--- fallback discovery: a replug does not re-probe the MKR console first ---\n");
+    TempDir dev;
+    FakeBridge mkr, c3;
+    mkr.plug();
+    mkr.answerHello = false;
+    c3.plug();
+    const std::string jtag = "serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_BB-if00";
+    const std::string mkrNode = (dev.path / "ttyACM0").string();
+    dev.link("ttyACM0", mkr.slave());
+    dev.link("serial/by-id/usb-Arduino_LLC_Arduino_MKRZero_CC-if00", "../../ttyACM0");
+    dev.link("ttyACM1", c3.slave());
+    dev.link(jtag, "../../ttyACM1");
+
+    LogSink log;
+    CommLink link;
+    CommLinkConfig cfg = fastConfig("");
+    cfg.devRoot          = dev.path.string();
+    cfg.allowAcmFallback = true;
+    cfg.handshakeMs      = 300;
+    // The next attempt comes reconnectMs after the failed probe's open, which
+    // leaves ~700 ms after its "did not identify" line for the replug to land in.
+    cfg.reconnectMs      = 1000;
+    link.open(cfg, log.callback());
+    link.start();
+    check(waitFor([&] { return link.isConnected() && link.devicePath() == c3.slave(); }, 2000) &&
+              mkr.count(hostproto::CMD_HELLO) == 0,
+          "fallback mode: the by-id match connects, the MKR console is not probed");
+
+    // Cable out: udev removes the C3's links, then the node goes.
+    fs::remove(dev.path / jtag);
+    fs::remove(dev.path / "ttyACM1");
+    c3.unplug();
+    check(waitFor([&] { return log.count(mkrNode + " did not identify itself") == 1; }, 2000),
+          "C3 unplugged: fallback probes the MKR console, which fails the handshake");
+
+    c3.plug();
+    dev.link("ttyACM1", c3.slave());
+    dev.link(jtag, "../../ttyACM1");
+    size_t mark = 0;
+    { std::lock_guard<std::mutex> lk(log.m); mark = log.lines.size(); }
+    check(waitFor([&] { return link.isConnected() && link.devicePath() == c3.slave(); }, 3000),
+          "replug: reconnected to the C3");
+    std::string firstOpen;
+    {
+        std::lock_guard<std::mutex> lk(log.m);
+        for (size_t i = mark; i < log.lines.size() && firstOpen.empty(); ++i) {
+            const size_t at = log.lines[i].find("bridge port open: ");
+            if (at != std::string::npos) firstOpen = log.lines[i].substr(at + 18);
+        }
+    }
+    check(firstOpen == c3.slave(), "... and the first port opened after the replug is the C3, not the MKR console "
+                                   "(opened: " + firstOpen + ")");
+    link.close();
+}
+
 static void testLogCallbackMayCallBack() {
     std::printf("\n--- a log callback that calls back into the link ---\n");
     FakeBridge br;
     br.plug();
     LogSink log;
     CommLink link;
-    std::atomic<int> calls{0};
+    std::atomic<int> calls{0}, statsCalls{0};
     // What an application might do: annotate a port line with the link's state.
     // The callback used to run with the port mutex held, so this deadlocked.
     log.hook = [&](LogLevel, const std::string& msg) {
@@ -624,10 +790,25 @@ static void testLogCallbackMayCallBack() {
             (void)link.devicePath();
             ++calls;
         }
+        // The malformed-telemetry WARN used to run with m_statsMtx held.
+        if (msg.find("MSG_TELEMETRY length") != std::string::npos) {
+            (void)link.stats();
+            ++statsCalls;
+        }
     };
     link.open(fastConfig(br.slave()), log.callback());   // logs "bridge port open"
     link.start();
     waitFor([&] { return link.isConnected(); }, 1000);
+
+    const uint8_t shortTlm[10] = {};
+    br.send(hostproto::MSG_TELEMETRY, shortTlm, sizeof(shortTlm));
+    const bool returned = waitFor([&] { return statsCalls >= 1; }, 1000);
+    check(returned, "malformed telemetry logged, and the callback's stats() returned (no deadlock)");
+    if (!returned) {
+        // The RX thread is stuck on m_statsMtx: close() would join it forever.
+        std::printf("\nRESULT: FAIL (RX thread deadlocked; cannot tear down)\n");
+        ::_exit(1);
+    }
     br.unplug();                                          // logs "bridge port closed"
     check(waitFor([&] { return calls >= 2; }, 1500), "port open and port closed logged, and the callback's "
                                                       "calls into the link returned (no deadlock)");
@@ -688,6 +869,125 @@ static void testUart() {
     u.close();
     check(!u.isOpen() && u.read(buf, 1, 0) == -1, "closed: read() returns -1");
     ::close(master);
+
+    // close() discards output nobody read (TCOFLUSH), so a USB-CDC peer that
+    // stopped reading cannot hold it for the kernel's 30 s closing_wait.  A pty
+    // cannot reproduce that wait (its close never waits, TIOCOUTQ reads 0); the
+    // drain and closing_wait/TIOCSSERIAL steps run against a scripted queue in
+    // testUartCloseDrain(), and the real wait needs cdc-acm: the rig.  What
+    // a pty does show is the flush.  On a pty, TCOFLUSH empties the master's
+    // input queue but not the master's line discipline, which a kernel worker
+    // fills from that queue at its own pace.  So the 200 marker bytes go
+    // behind 4096 filler bytes: the line discipline holds at most 4095, so the
+    // markers are still queued at close() however the worker is scheduled.
+    // Unflushed, the master reads them after the slave has closed.
+    {
+        const int m = ::posix_openpt(O_RDWR | O_NOCTTY);
+        ::grantpt(m);
+        ::unlockpt(m);
+        ::fcntl(m, F_SETFL, ::fcntl(m, F_GETFL, 0) | O_NONBLOCK);
+        dashcam::uart::Uart p;
+        p.open(::ptsname(m), {}, {});
+        std::vector<uint8_t> unread(4096, 0x00);
+        unread.insert(unread.end(), 200, 0xA5);
+        const bool queued = p.write(unread.data(), unread.size());
+        sleepMs(10);   // let the worker run: the outcome must not depend on it
+        const auto t2 = std::chrono::steady_clock::now();
+        p.close();
+        const long closeMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t2).count());
+        // Read until the master reports the slave gone (EIO) with nothing left.
+        size_t markers = 0;
+        uint8_t got[512];
+        for (int idle = 0; idle < 100; ) {
+            const ssize_t n = ::read(m, got, sizeof(got));
+            if (n > 0) { markers += static_cast<size_t>(std::count(got, got + n, 0xA5)); idle = 0; continue; }
+            if (n < 0 && errno == EAGAIN) { ++idle; sleepMs(2); continue; }
+            break;
+        }
+        check(queued && markers == 0, "close() discards output the peer never read (master reads " +
+                                      std::to_string(markers) + " of the 200 queued marker bytes)");
+        check(closeMs < 200, "... and does not wait when the driver reports nothing in flight (" +
+                             std::to_string(closeMs) + " ms)");
+        ::close(m);
+    }
+
+    // close() drops TIOCEXCL.  The flag belongs to the tty, and a pty slave's
+    // tty lives as long as its master: left set, it refused every reopen
+    // without CAP_SYS_ADMIN (root in a plain container included), so the
+    // silent-device retry above saw EBUSY.  CAP_SYS_ADMIN ignores TIOCEXCL, so
+    // in a --privileged container this check cannot fail.
+    {
+        const int m = ::posix_openpt(O_RDWR | O_NOCTTY);
+        ::grantpt(m);
+        ::unlockpt(m);
+        const std::string s = ::ptsname(m);
+        dashcam::uart::UartConfig ex;
+        ex.exclusive = true;
+        dashcam::uart::Uart p;
+        p.open(s, ex, {});
+        const int second = ::open(s.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (second >= 0) {
+            std::printf("  note  CAP_SYS_ADMIN here: TIOCEXCL is not enforced, the next check cannot fail\n");
+            ::close(second);
+        }
+        p.close();
+        const int again = ::open(s.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC);
+        check(again >= 0, std::string("an exclusive port can be opened again after close()") +
+                          (again < 0 ? std::string(" (") + ::strerror(errno) + ")" : std::string()));
+        if (again >= 0) ::close(again);
+        ::close(m);
+    }
+}
+
+// Uart::close()'s drain against the scripted driver queue (fakeq): one close()
+// of a pty Uart per driver behaviour.
+static void testUartCloseDrain() {
+    std::printf("\n--- Uart::close() against a scripted driver queue ---\n");
+    struct Run { long ms; int queuedAtFlush; int serialSets; int closingWait; };
+    auto closeWith = [](uint32_t baud, int queued, int hold, int drop, int every) {
+        const int m = ::posix_openpt(O_RDWR | O_NOCTTY);
+        ::grantpt(m);
+        ::unlockpt(m);
+        dashcam::uart::UartConfig cfg;
+        cfg.baudRate = baud;
+        dashcam::uart::Uart p;
+        p.open(::ptsname(m), cfg, {});
+        fakeq::arm(p.fd(), queued, hold, drop, every);
+        const auto t0 = std::chrono::steady_clock::now();
+        p.close();
+        const Run r{static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count()),
+                    fakeq::queuedAtFlush, fakeq::serialSets, fakeq::closingWait};
+        fakeq::disarm();
+        ::close(m);
+        return r;
+    };
+
+    // serial-tegra (ttyTHS*) sends a run of the queue as one DMA transfer and
+    // reports no progress until it completes.  A TCOFLUSH before then aborts
+    // it: the end of the last write() never goes out.
+    Run r = closeWith(9600, 384, 400, 0, 0);
+    check(r.queuedAtFlush == 0 && r.ms >= 390 && r.ms < 3000,
+          "one 384-byte DMA transfer at 9600 baud (no progress for 400 ms) is waited for, not flushed (" +
+          std::to_string(r.ms) + " ms, " + std::to_string(r.queuedAtFlush) + " bytes queued at the TCOFLUSH)");
+    check(r.serialSets == 0, "... and closing_wait is left alone");
+
+    // The MKR Zero's console on the rig: cdc-acm reports 1280 bytes queued,
+    // and the firmware never reads them.
+    r = closeWith(115200, 1280, -1, 0, 0);
+    check(r.queuedAtFlush == 1280 && r.ms >= 250 && r.ms < 1500,
+          "a peer that stopped reading (1280 bytes at 115200) is given closeDrainMs plus their line time, "
+          "then flushed (" + std::to_string(r.ms) + " ms; about 360 expected)");
+    check(r.serialSets == 1 && r.closingWait == ASYNC_CLOSING_WAIT_NONE,
+          "... and closing_wait is set to NONE for what the flush cannot reach");
+
+    // A FIFO-paced UART: the queue keeps shrinking, slower than closeDrainMs
+    // alone would allow for the whole of it.
+    r = closeWith(115200, 384, -1, 32, 100);
+    check(r.queuedAtFlush == 0 && r.ms >= 1100 && r.serialSets == 0,
+          "output that keeps moving (32 bytes every 100 ms, 1.2 s in all) is waited for in full (" +
+          std::to_string(r.ms) + " ms)");
 }
 
 int main() {
@@ -698,16 +998,18 @@ int main() {
         (void)!::write(STDOUT_FILENO, msg, sizeof(msg) - 1);
         ::_exit(2);
     });
-    ::alarm(60);   // the whole run takes about 6 s
+    ::alarm(60);   // the whole run takes about 8 s
     std::printf("commlink_sim_test — CommLink against a simulated ESP32-C3 bridge (pty)\n");
     testHandshakeAndStream();
     testCommands();
     testWatchdogAndHotplug();
     testForeignDevices();
     testDiscovery();
+    testFallbackReplug();
     testLogCallbackMayCallBack();
     testProtocolHelpers();
     testUart();
+    testUartCloseDrain();
     std::printf("\nRESULT: %s (%d failure%s)\n", g_fails ? "FAIL" : "PASS", g_fails,
                 g_fails == 1 ? "" : "s");
     return g_fails ? 1 : 0;

@@ -1,11 +1,11 @@
-# Handover — branch `camera`, 2026-10-01
+# Handover — branch `camera`, 2026-10-03
 
 ## Where things stand
 
 | Item | Commit | Status | Still needs |
 |---|---|---|---|
 | Platform | — | **Upgraded to L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra on 2026-10-01; UEFI also 36.5.2.** Existing 16:18 verification log: 24 PASS, 0 FAIL, 1 SKIP; all 65 target packages at target versions and held. See the evening update below. | `usb_test` was skipped while the recorder owned the USB camera; evening paired USB captures succeeded, but do not substitute for that full test. |
-| IMX296 driver for any kernel | — | Rebuilt from the vendor's source plus FRC 971's mode table; 41/41 CRCs match 36.5.2. **Now loaded and hardware-tested on 5.15.199:** platform log has `csi_test` 5/5, CSI RTP and Camera_GST PASS; evening tuning captured from the IMX296 through Argus. Build/upgrade/rollback tools remain outside the repo in `/home/jetson/drive_logs/tools/`. | Road-use validation after the platform/tuning changes. |
+| IMX296 driver for any kernel | — | Rebuilt from the vendor's source plus FRC 971's mode table; 41/41 CRCs match 36.5.2. **Now loaded and hardware-tested on 5.15.199:** platform log has `csi_test` 5/5, CSI RTP and Camera_GST PASS; evening tuning captured from the IMX296 through Argus. Build/upgrade/rollback tools remain outside the repo in `/home/jetson/drive_logs/tools/`. | The 2026-10-03 probe failure (`-121`, no I2C ACK) was a loose ribbon, fixed by a reseat. Road-use validation is still open. |
 | CSI image tuning | — | **c8_sh15 is installed (2026-10-02 06:53, verified live)**: c5_rpi100T's colour (black level 50 + the IMX296 colour matrix the vendor file had transposed) plus the sharpness table set to its weakest index, so the ISP's default output matches ee-mode=0. The c7 A/B brings it closer to the USB camera (ΔE 11.7 → 6.7 once the CSI JPEGs are decoded correctly; first reported as 8.56 → 4.79). A review found that gain is mostly in-sample and about zero against the chart's own values, so **do not install c7 as it is**. The app sets no CSI properties, and with c8_sh15 that default is now clean (no halos). Details in "Review of the c7 work" and the c8 sections below. | A daylight A/B (`--auto`) before calling it production; the CSI saturation in the app's config. |
 | High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
 | CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
@@ -19,13 +19,162 @@
 | libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The EINTR retry is defensive only: the apps install handlers with `std::signal`, which sets SA_RESTART, so it never fires on the Jetson. **Run on the Jetson 2026-09-28:** `scan_cameras` output is byte-identical to the previous build's, and v0.4 starts, records and stops as before (results below). | — |
 | libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. **Run on the Jetson 2026-09-28:** `camera_gst_test` passes on GStreamer 1.20.3. The fix for branches that start disabled works only when the sink sees GAP events directly, so not for this project's real branches (review item C, fixed in `f03a13f`). | — |
 | libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). A write is checked against the **element's** property type and range, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. That does not check the **device's** range: the driver clamps out-of-range USB values, and those still report NONE (review item F). **Run on the Jetson 2026-09-28:** `usb_test` Test 4b reads back every control it sets, and the CSI dictionary check passes. `usb_test` changes the camera's settings and leaves them changed (review item A, fixed in `782bdfd`). | — |
-| libcommlink: fixes | `68fcceb` | CommLink logged its port open/close lines with the port mutex held, so a log callback that asked the link anything deadlocked (latent; v0.4's does not). The bridge tty and the wake pipe are now close-on-exec (children such as `nmcli` inherited them). `typeName()` now names `CMD_SET_IMU_MODE` in both `HostProtocol.h` copies, which stay byte-identical; the wire is unchanged. Discovery keeps partial results when a node vanishes mid-scan. `Uart::read(0)` no longer makes two `fcntl()` calls per read. New `logPrintf()` in liblog replaces three private log helpers. | **Run on the Jetson 2026-09-28:** `commlink_test` recovers from a cable pull on the C3's by-id path (what v0.4 uses), and v0.4's bridge line is as before. Auto-discover mode fails on this rig, which predates the pass (item U). Open: items U, V. |
+| libcommlink: fixes | `68fcceb` | CommLink logged its port open/close lines with the port mutex held, so a log callback that asked the link anything deadlocked (latent; v0.4's does not). The bridge tty and the wake pipe are now close-on-exec (children such as `nmcli` inherited them). `typeName()` now names `CMD_SET_IMU_MODE` in both `HostProtocol.h` copies, which stay byte-identical; the wire is unchanged. Discovery keeps partial results when a node vanishes mid-scan. `Uart::read(0)` no longer makes two `fcntl()` calls per read. New `logPrintf()` in liblog replaces three private log helpers. | **Run on the Jetson 2026-09-28:** `commlink_test` recovers from a cable pull on the C3's by-id path (what v0.4 uses), and v0.4's bridge line is as before. Auto-discover mode fails on this rig, which predates the pass (item U). Items U, V fixed 2026-10-03; C3 runs pass, the replug check needs sudo. |
 | libbus | `5be7a5b` | `ibus.h` (the base of libuart, libspi and libi2c) moved from `lib/libgpio` to `lib/libbus`. There is no code change. | — |
-| CSI driver loader | `aa9deb1` | The Jetson's own IMX296 unit (`imx296-reload.service`) stopped nvargus-daemon, then failed at `modprobe -r imx296`, because 5.15.199-tegra has no imx296 module at all (only 5.15.185-tegra has one), and left Argus stopped (found by the 2026-09-28 review; corrected by the Jetson run). `docker_dev/csi_driver.sh` checks the module against the running kernel before touching Argus, and restarts Argus on every exit path; `csi-driver.service` (in the repo, not installed) would load it before Argus at boot. The script does not fix a kernel/module mismatch by itself: on 5.15.199 the module would have had to be rebuilt, and the 2026-09-30 rollback to 5.15.185 removed the mismatch instead. Host test: `test_csi_driver.sh`, 31 checks. | Not needed on R36.5.0: there, the vendor's `imx296-reload.service` works as intended (active since the rollback). Items K–P before `csi-driver.service` replaces it, if ever. |
-| libcamera: review fixes | `f03a13f` | Shutdown is bounded when a branch stops consuming (it hung, reproduced on the Jetson) or the source's thread is stuck. A stream that ends reports ERROR (it stayed RUNNING). Branches that start disabled start (item C). frameCount restarts at `start()`. Items B, D, E, F (docs), G, H, J and both older races fixed. `camera_gst_test` 72 → 120 checks. | **Run on the Jetson 2026-09-28:** `camera_gst_test` PASS 14/14; the reviewer's shapes redone on the UGREEN. **2026-09-30 on CSI:** `csi_test` 5/5, `csi_rtp_test` PASS, and Camera_CSI stops no slower than before, with no WARN (below). Open: items Q–T. |
-| usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Open: item Z. |
-| Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Open: items X, Y. |
-| commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Open: item W. |
+| CSI driver loader | `aa9deb1` | The Jetson's own IMX296 unit (`imx296-reload.service`) stopped nvargus-daemon, then failed at `modprobe -r imx296`, because 5.15.199-tegra has no imx296 module at all (only 5.15.185-tegra has one), and left Argus stopped (found by the 2026-09-28 review; corrected by the Jetson run). `docker_dev/csi_driver.sh` checks the module against the running kernel before touching Argus, and restarts Argus on every exit path; `csi-driver.service` (in the repo, not installed) would load it before Argus at boot. The script does not fix a kernel/module mismatch by itself: on 5.15.199 the module would have had to be rebuilt, and the 2026-09-30 rollback to 5.15.185 removed the mismatch instead. Host test: `test_csi_driver.sh`, 31 checks. | Not needed on R36.5.0: there, the vendor's `imx296-reload.service` works as intended (active since the rollback). **Items K–P fixed 2026-10-03.** `csi-driver.service` (the `reload` mode) is installed and enabled in place of the vendor unit; start/restart and `csi_test` 5/5 are checked. The first boot with it passed (2026-10-03 20:25: ordered after Argus, `Result=success`, `csi_test` 5/5). |
+| libcamera: review fixes | `f03a13f` | Shutdown is bounded when a branch stops consuming (it hung, reproduced on the Jetson) or the source's thread is stuck. A stream that ends reports ERROR (it stayed RUNNING). Branches that start disabled start (item C). frameCount restarts at `start()`. Items B, D, E, F (docs), G, H, J and both older races fixed. `camera_gst_test` 72 → 120 checks. | **Run on the Jetson 2026-09-28:** `camera_gst_test` PASS 14/14; the reviewer's shapes redone on the UGREEN. **2026-09-30 on CSI:** `csi_test` 5/5, `csi_rtp_test` PASS, and Camera_CSI stops no slower than before, with no WARN (below). Items Q–T fixed 2026-10-03; R confirmed on Argus (`csi_test` 5/5, `csi_rtp_test`, no WARN). |
+| usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Item Z fixed 2026-10-03, confirmed on the UGREEN. |
+| Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Items X, Y fixed 2026-10-03; X confirmed on the UGREEN. |
+| commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Item W fixed 2026-10-03. |
+
+## Done 2026-10-03 (Jetson): items K–Z resolved
+
+All sixteen items from "Next: items from the Jetson run and a second review" are fixed in the working tree.
+- Four agents implemented them, one per area, on file-disjoint changes.
+- An adversarial reviewer then checked each area: it read the diff, re-ran the tests, and reverted each fix in a
+  private copy to confirm a test fails.
+- A fixer applied every finding it could reproduce.
+
+The full agent reports are in `~/drive_logs/tools/kz_agent_reports_20261003.json`. Committed after the boot check below.
+
+**Build and host tests**
+- Plain `make -j4` in l4t-ml-gpio builds `bin/build_20261003_124421`, rc 0. The only warnings are the two old
+  `-Wunused-result` ones in `libcan.cpp` and `libgpio.cpp`, files nobody touched.
+
+| Suite | Result |
+|---|---|
+| `camera_gst_test` | 178/178 (was 120); also clean under ASan and TSan builds |
+| `focus_test` | 43/43 (was 22) |
+| `usb_test --self-test` | new, PASS |
+| `commlink_sim_test` | 88/88 (was 73) |
+| `test_csi_driver.sh` | 123 checks (was 31); every reviewer mutant (38) is caught |
+| `dashcam_v0_4 --self-test`, `config_test`, `bridge_overlay_test` | PASS |
+
+**What changed**
+- **CSI loader (K–P)**, `docker_dev/csi_driver.sh`, `csi-driver.service`, `test_csi_driver.sh`:
+  - **K:** the default module is `imx296`, and both headers now give the real root cause.
+  - **L:** the unit is ordered `After=nvargus-daemon`, not `Before=`. Under systemd (`$INVOCATION_ID`) Argus is
+    started with `--no-block` and then polled. The unit gets `TimeoutStartSec=180`.
+  - **M:** a new `reload` mode does the vendor unit's job: run every check first, wait `CSI_RELOAD_DELAY`, stop
+    Argus, `modprobe -r` + `modprobe`, start Argus. The unit runs it, so it can replace `imx296-reload.service`.
+    A failed unload is re-checked, and a still-enabled vendor unit is noted.
+  - **N:** the judged file is `modinfo -k <kernel> -F filename imx296`. Files depmod does not know are detected,
+    and "built-in" is handled.
+  - **O:** a failed Argus restart exits 5.
+  - **P:** `test_csi_driver.sh` is executable (mode 100755).
+- **Camera_GST (Q–T)**, `libcamera_gst.{h,cpp}`:
+  - **Q:** whenever the pipeline's EOS does not complete, the branch flush runs on a helper thread under the state
+    timer. A sink stuck in `write()` (tested with a filesink on a FIFO nobody reads) no longer holds teardown past
+    the bound.
+  - **R:** after an early ERROR, the send gets until the deadline. A WARN appears only if the send is really
+    stuck, and it gives the real waited time.
+  - **S:** a `tearingDown_` flag, which `stop()`, `close()` and `start()` wait on. `close()` of a running camera
+    is one teardown, and the false comment is fixed.
+  - **T:** "auto controls first" is qualified in `camera_attributes.xml`, `libcamera.h` and `libcamera_gst`.
+- **libcommlink (U–W)**, `libuart`, `libcommlink`:
+  - **U, the close:** `Uart::close()` lets output that is still moving drain. It gives stalled output
+    `closeDrainMs` (250 ms) plus the line time of the queued bytes, then runs `tcflush`. If bytes remain, it sets
+    `closing_wait` to NONE (L4T's cdc-acm has no flush_buffer; needs CAP_SYS_ADMIN, which the privileged
+    container has). The Jetson's DMA ttyTHS UARTs still send their last write.
+  - **U, discovery:** the probe cursor resets when the candidate list changes, by-id matches come first, and
+    `commlink_test --by-id` gives by-id-only discovery.
+  - **V:** no log call is made under `m_statsMtx`.
+  - **W:** `enumerate()` sorts the by-id names before resolving them.
+- **Focus and usb_test (X–Z):**
+  - **X:** a camera found with autofocus on gets its stored lens position back, written while autofocus is still
+    off.
+  - **Y:** a failed rollback sets `leftChanged()`. v0.4 then warns "could not hand the focus back" every time
+    instead of "left to the camera". A later open retries the owed autofocus.
+  - **Z:** usb_test prints the restore command at start. SIGINT, SIGTERM and SIGHUP stop it between tests and
+    inside capture loops, and the controls are restored exactly once. A duplicate signal (from `timeout`, or an
+    SSH drop) is absorbed, and SIGPIPE is ignored. The exit codes are 130, 143 and 129.
+  - **v0.4:** only the focus log lines changed. The SIGINT/SIGTERM → finalise + exit 0 contract is untouched,
+    and the rc=0 below confirms it.
+
+**Run on the rig 2026-10-03**
+- **Z, usb_test on the UGREEN:**
+  - The full run is 8/8 PASS, and the `--list-ctrls` diff is empty.
+  - Interrupted with `timeout --preserve-status` at 4, 5, 6 and 7 s, which lands during Tests 2, 3, 4 and 4b:
+    every run restored the controls (empty diff) and exited 130 for SIGINT or 143 for SIGTERM.
+- **X, v0.4 for 25 s with `FocusMode=fixed`, `FocusAbsolute=300`:**
+  - This used a temporary config mounted at `/user/output/configs/dashcam.xml`, the path v0.4 reads; the deployed
+    file was not touched. Footage went to a scratch dir.
+  - Focus went from autofocus on, lens 694, to off at 300, then back on at 694 after SIGINT. The log reads
+    "handed back to the camera … (autofocus on, stored lens position 694)", and rc=0.
+- **U, the C3 without a replug:**
+  - `commlink_test --by-id 20`: all [ OK ], rc 0.
+  - `commlink_test "" 20`: the C3's by-id match comes first and is chosen directly. All [ OK ], prompt close,
+    rc 0.
+- **After the CSI ribbon was reseated (power off, boot 20:08):** the IMX296 probes again (`found IMX296LQ`, bound to
+  tegra-capture-vi, `/dev/video0`).
+  - **R:** `csi_test 0` 5/5 and `csi_rtp_test` PASS on this build, with no `EOS not delivered` or other WARN.
+  - **M, O (stage A, user's sudo):** `sudo docker_dev/csi_driver.sh reload` gave rc 0, with "stopping
+    nvargus-daemon.service to reload imx296", "reloaded …/5.15.199-tegra/kernel/drivers/media/i2c/imx296.ko",
+    "nvargus-daemon.service started again", and the vendor-unit note. The sensor re-probed at 20:13:27, and
+    `csi_test 0` gave 5/5 afterwards. Outside the unit the reload delay is 0; the unit sets 5.
+  - **K, N refusal:** `CSI_MODULE=nv_imx296 … reload` gave rc 2 ("no nv_imx296 under /lib/modules … left as they
+    were"), and Argus kept its MainPID (3720 before and after).
+- **Stage B (user's sudo): `csi-driver.service` installed and enabled at 20:21, replacing `imx296-reload.service`,
+  which is disabled.** The script is installed as `/usr/local/sbin/dashcam-csi-driver`.
+  - **L:** `systemctl start csi-driver` took 5.6 s and `systemctl restart csi-driver` 5.5 s, with Argus active
+    both times, where both used to hang with Argus down.
+  - The journal shows "waiting 5 s before the reload", "stopping nvargus-daemon.service to reload imx296",
+    "reloaded …imx296.ko" and "nvargus-daemon.service started again".
+  - The unit ends with `Result=success`, and `csi_test 0` gives 5/5 afterwards.
+- **Step 5, the first boot with `csi-driver.service` (20:25):** Argus started at 13.67 s (monotonic); the unit started
+  right after it, waited 5 s, stopped Argus at 18.90 s, reloaded `imx296.ko`, and Argus was back at 19.27 s. The unit
+  finished at 19.28 s, active (exited), `Result=success`, exit 0; Argus `NRestarts=0`. The sensor re-probed (`found
+  IMX296LQ`, bound), `imx296-reload.service` is disabled, nothing is failed, and `csi_test 0` gave 5/5.
+- **K, N:** `docker_dev/csi_driver.sh check`, with no `CSI_MODULE`, exits 0. It judges
+  `kernel/drivers/media/i2c/imx296.ko`, vermagic 5.15.199-tegra, and notes that `imx296-reload.service` is still
+  enabled.
+
+**Not run yet**
+- **Hardware fault, RESOLVED by reseating the ribbon (see above): the IMX296 did not probe at the first boot of 2026-10-03.** The kernel log shows `imx296 9-001a: 8-bit write to
+  0x3000 failed: -121` and `probe of 9-001a failed with error -121`: no I2C acknowledge from the sensor.
+  - There is no CSI device. The UGREEN took `/dev/video0` and `/dev/video1`.
+  - So `csi_test` gets "No cameras available" from Argus, and the 2026-09-28 build's `csi_test` fails the same
+    way: this is not the code.
+  - Power the rig off, reseat the CSI ribbon at both ends, and boot. The loader can't help: the module loads,
+    the sensor doesn't answer.
+- ~~R on Argus~~: done, see above.
+- **The CSI loader on real systemd (needs the user's sudo; the sensor must probe first):**
+  Steps 1–5 are done (above). Only the optional step 6 is left.
+  1. `sudo docker_dev/csi_driver.sh reload; echo rc=$?`
+     - Pass: rc 0, with "stopping nvargus-daemon.service to reload imx296", "reloaded …imx296.ko" and
+       "nvargus-daemon.service started again" in the output.
+     - Then `csi_test 0` 5/5.
+  2. `A=$(systemctl show -p MainPID --value nvargus-daemon); sudo CSI_MODULE=nv_imx296 docker_dev/csi_driver.sh reload; echo rc=$?`
+     - Pass: rc 2, the same Argus MainPID, imx296 still loaded.
+  3. Install, replacing the vendor unit:
+     ```bash
+     sudo systemctl disable imx296-reload.service
+     sudo install -m 755 docker_dev/csi_driver.sh /usr/local/sbin/dashcam-csi-driver
+     sudo cp docker_dev/csi-driver.service /etc/systemd/system/
+     sudo systemctl daemon-reload
+     sudo systemctl enable csi-driver.service
+     ```
+     Rollback: `sudo systemctl disable csi-driver.service; sudo systemctl enable imx296-reload.service`.
+  4. Item L: run `time sudo systemctl start csi-driver.service`, then `time sudo systemctl restart csi-driver.service`.
+     - Pass: each returns in about 6–15 s, both units end active, and the journal shows the four reload lines.
+     - Before the fix, both hung with Argus down.
+  5. Reboot.
+     - Pass: `csi-driver` is active (exited) and started after Argus (`systemd-analyze critical-chain csi-driver.service`),
+       and `csi_test 0` gives 5/5.
+  6. Optional, item O.
+     - On this rig `systemctl mask --runtime nvargus-daemon` is shadowed by `/etc/systemd/system`. Use a runtime
+       drop-in instead: `/run/systemd/system/nvargus-daemon.service.d/zz-fail.conf` with `[Service]` and
+       `ExecStartPre=/bin/false`, then `daemon-reload`.
+     - `sudo docker_dev/csi_driver.sh reload` must then exit 5, with "Argus is down".
+     - Remove the drop-in, `daemon-reload`, and start Argus.
+- **U with a replug (needs sudo to de-authorise the C3: `echo 0`, 6 s, `echo 1` to `/sys/bus/usb/devices/1-1/authorized`):**
+  - `commlink_test --by-id 50`: expect a hangup, a reopen about 1 s after the replug, `reconnects=1`, all [ OK ].
+  - `commlink_test "" 50`: expect one "did not identify itself" line for the MKR console, a close of about 360 ms
+    (it was 30.9 s), the C3 first after the replug, and a prompt `stop()`.
+- **Y on hardware:** it needs two control writes to fail with the camera attached, so it is covered only by
+  `focus_test`.
+- **The deployed v0.4 already runs this build.** The launcher starts the newest `bin/build_*/dashcam_v0_4`, and the
+  20:25 boot started `bin/build_20261003_124421` (journal: "starting bin/build_20261003_124421/dashcam_v0_4").
 
 ## 2026-10-01 evening (Jetson): CSI/USB chart tuning and current rig state
 
@@ -943,7 +1092,7 @@ This build's v0.4 ran for 25 s with a temporary copy of the deployed `dashcam.xm
 **Also run, all PASS:** `--self-test`, `config_test`, `bridge_overlay_test`, `exposure_test`, `liblog_test`,
 `record_test` Parts A and B, and `scan_cameras` (output identical to the 2026-09-27 build's).
 
-## Next: items from the Jetson run and a second review
+## Items from the Jetson run and a second review (K–Z): all fixed 2026-10-03, see "Done 2026-10-03"
 
 These come from the Jetson run plus a second 8-agent review of `68fcceb..1888a94`, where each finding went to a
 skeptic told to refute it. **Deployed v0.4 cannot reach any of them.** The letters continue from the first
@@ -1319,10 +1468,12 @@ B=$(ls -td bin/build_* | head -1)                    # the build just made; run 
 $B/dashcam_v0_4 --self-test && $B/config_test && $B/bridge_overlay_test
 $B/camera_gst_test [name]                            # Camera_GST over videotestsrc: no camera needed
 $B/focus_test                                        # the fixed-focus hold against a simulated camera
-bash docker_dev/test_csi_driver.sh                   # csi_driver.sh against stubs (not executable yet, item P)
-CSI_MODULE=imx296 docker_dev/csi_driver.sh check     # on the Jetson: the IMX296 module vs the running kernel (item K)
+$B/usb_test --self-test                              # usb_test's stop-and-restore path on a simulated camera
+docker_dev/test_csi_driver.sh                        # csi_driver.sh against stubs (123 checks)
+docker_dev/csi_driver.sh check                       # on the Jetson, read-only: the IMX296 module vs the running kernel
 $B/commlink_sim_test                                 # CommLink + libuart against a simulated C3 on a pty: no hardware
-$B/commlink_test "" 30                               # the real C3 bridge (stop dashcam-v04 first)
+$B/commlink_test --by-id 30                          # the real C3 bridge, by-id only as v0.4 (stop dashcam-v04 first)
+$B/commlink_test "" 30                               # auto-discover with the ttyACM fallback
 $B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
 $B/usb_test                                          # a USB camera (stop dashcam-v04 first); puts its controls back
 $B/scan_cameras                                      # lists the cameras, their controls and formats
@@ -1340,7 +1491,7 @@ The Wire changes have no host test: they are register-level SAMD21 code, proven 
 
 Where each test can run:
 - **Anywhere, cloud included:** the host suites, `mutations`, `--self-test`, `config_test`,
-  `bridge_overlay_test`, `camera_gst_test`, `focus_test`, `commlink_sim_test`, `test_csi_driver.sh` and
-  `record_test` Part A.
+  `bridge_overlay_test`, `camera_gst_test`, `focus_test`, `usb_test --self-test`, `commlink_sim_test`,
+  `test_csi_driver.sh` and `record_test` Part A.
 - **Jetson only:** CUDA targets, `record_test` Part B, `usb_test`, `csi_test`, `scan_cameras` (with a camera),
   `commlink_test` (with the C3), `csi_driver.sh`, and everything on the rig or the car.

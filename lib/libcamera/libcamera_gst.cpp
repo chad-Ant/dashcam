@@ -41,8 +41,10 @@ constexpr unsigned kMaxWarningsLogged = 10;
 
 /// V4L2 auto controls, written ahead of every other control in one
 /// extra-controls write: uvcvideo refuses a manual value (EACCES) while its
-/// auto control is on, and v4l2src writes the fields in order.  Kernel 5.15
-/// names first, then the older ones.
+/// auto control is on, and v4l2src writes the fields in order.  That orders
+/// start()'s batch only; a write while running carries one control, and its
+/// caller sets the auto control first.  Kernel 5.15 names first, then the
+/// older ones.
 constexpr const char* kAutoControls[] = {
     "auto_exposure", "white_balance_automatic", "focus_automatic_continuous", "hue_automatic",
     "exposure_auto", "white_balance_temperature_auto", "focus_auto",
@@ -86,15 +88,33 @@ void unsetSinksAsync(GstElement* el) {
     gst_iterator_free(it);
 }
 
-/// The EOS send of one teardown, shared with the thread that makes it: that
-/// thread outlives the teardown when the pipeline is left behind (see
-/// Camera_GST::finishStream()).
+/// The EOS send of one teardown, and its branch flush, shared with the threads
+/// that make them: they outlive the teardown when the pipeline is left behind
+/// (see Camera_GST::finishStream()).
 struct EosSend {
     std::mutex              m;
     std::condition_variable cv;
-    bool done      = false;   ///< gst_element_send_event() returned.
-    bool abandoned = false;   ///< The teardown gave up: the thread releases the pipeline.
+    bool done     = false;        ///< gst_element_send_event() returned.
+    bool flushing = false;        ///< The flush thread is still sending FLUSH_START.
+    GstElement* left = nullptr;   ///< The teardown gave up: a ref on the pipeline, which
+                                  ///< the last of those threads to return sets to NULL and drops.
+
+    /// With m held, as a thread returns: the pipeline to release, if the
+    /// teardown left it behind and no other thread is still inside it.
+    GstElement* takeLeft() {
+        if (!left || !done || flushing) return nullptr;
+        GstElement* p = left;
+        left = nullptr;
+        return p;
+    }
 };
+
+/// Sets a pipeline left behind to NULL and drops its ref (no-op for nullptr).
+void releaseLeft(GstElement* pipe) {
+    if (!pipe) return;
+    gst_element_set_state(pipe, GST_STATE_NULL);
+    gst_object_unref(pipe);
+}
 
 } // namespace
 
@@ -103,8 +123,8 @@ namespace dashcam::camera {
 // ─── private helpers ────────────────────────────────────────────────────────
 
 /// Destruction order matters for GStreamer reference counting:
-///   1. Atomically claim pipeline_, and the branch lists, under stateMutex_
-///      (re-entrancy guard; setBranchEnabled() then finds no valves).
+///   1. Take pipeline_, and the branch lists, under stateMutex_ (the readers
+///      that hold only the lock, e.g. setBranchEnabled(), then find none).
 ///   2. If the pipeline reached PLAYING and its stream has not already ended:
 ///      finishStream() sends EOS and waits, bounded, for the muxers to finalise
 ///      their containers.  It may leave a stuck pipeline behind (see there).
@@ -122,12 +142,15 @@ namespace dashcam::camera {
 /// pads while the streaming thread is still running (i.e. before NULL state)
 /// is a GStreamer API violation and can cause the streaming thread to crash.
 /// A pipeline left behind in step 2 is therefore not touched past step 1: its
-/// EOS thread sets it to NULL and drops the last ref when it frees.
+/// EOS or flush thread, whichever returns last, sets it to NULL and drops the
+/// last ref.
 void Camera_GST::teardownPipeline() {
-    // Atomically claim the pipeline pointer so a concurrent re-entrant call
-    // (e.g. a future bus-watch callback racing a lifecycle stop) gets nullptr
-    // and exits immediately rather than double-freeing.  The branch lists go
-    // with it: setBranchEnabled() and addBranch() read them under the lock.
+    // Never two at once: stop() and close() claim tearingDown_, and start()
+    // (whose failures land here) starting_, and each waits for the other two.
+    // A second call would not be a no-op: past this swap it still releases
+    // teePads_ (unlocked) and nulls the element handles, a new start()'s too.
+    // The swap takes the pipeline and the branch lists away from the readers
+    // that hold only the lock (captureFrame(), setBranchEnabled(), addBranch()).
     GstElement* pipe = nullptr;
     GstElement* sinkRef = nullptr;
     std::vector<BranchEntry> branches;
@@ -141,7 +164,7 @@ void Camera_GST::teardownPipeline() {
         valves.swap(branchValves_);
     }
 
-    bool released = true;   // false: finishStream() left the pipeline to its EOS thread
+    bool released = true;   // false: finishStream() left the pipeline to its EOS / flush threads
     if (pipe) {
         // EOS only to a pipeline that reached PLAYING.  One still short of it
         // (a start() that timed out: a sink that never prerolled, Argus slow to
@@ -227,23 +250,34 @@ void Camera_GST::teardownPipeline() {
 ///   thread may be stuck in a push: a branch that stopped taking buffers fills
 ///   its blocking queue, and the tee then waits on it for good.  The send also
 ///   holds the pipeline's state lock, so the NULL transition cannot run either.
-/// - If the send is still stuck at the deadline, each branch is flushed from
-///   its head (FLUSH_START on the pad after its valve, which a dropping valve
-///   would not pass on).  That unblocks a GStreamer wait anywhere downstream: a
-///   sink, a queue, a clock.  The tee's push then fails, the source's thread
-///   lets go, and the send completes.  Healthy branches get the EOS that late,
-///   with no time left to finalise: their frames had stopped with the tee.
-/// - If even that does not free it within params_.stateChangeTimeoutMs, the
-///   source's thread is stuck where no flush reaches (a driver call).  The
-///   pipeline is left to the EOS thread, which sets it to NULL and drops its
-///   ref once the send returns; returns false, and the caller must not touch
-///   the pipeline again.
+/// - If the pipeline's EOS has not come by the deadline, each branch is flushed
+///   from its head (FLUSH_START on the pad after its valve, which a dropping
+///   valve would not pass on).  That unblocks a GStreamer wait anywhere
+///   downstream: a sink, a queue, a clock.  A stuck send then completes: the
+///   tee's push fails and the source's thread lets go.  Healthy branches get
+///   the EOS that late, with no time left to finalise: their frames had
+///   stopped with the tee (a WARN says so).  A send that did return means a
+///   branch still holds the EOS: an appsink nobody pulls, a slow muxer, or a
+///   sink stuck in a system call (a filesink in a write() to a stalled SD
+///   card) behind a queue that has not filled.  Such a sink holds its preroll
+///   lock, which the NULL transition needs as much as the flush does.  So the
+///   flush goes out on a thread of its own, and only the call returning frees
+///   it; when the send returned, it goes out without a WARN.
+/// - If the send and the flush have not both returned within
+///   params_.stateChangeTimeoutMs, something is stuck where no flush reaches:
+///   the source's thread in a driver call, or a sink in a system call.  The
+///   pipeline is left to those threads (EosSend::left): the last to return
+///   sets it to NULL and drops its ref.  Returns false, and the caller must not
+///   touch the pipeline again.
 ///
 /// Meanwhile the capture appsink is drained, as teardown always did: the
 /// captureFrame() consumer has stopped, and an appsink left at wait-on-eos=true
 /// holds its EOS until its queue is pulled.  The wait also ends on an ERROR:
 /// nvarguscamerasrc sometimes posts one (Argus CANCELLED) instead of
 /// forwarding EOS, and draining first would burn the budget before seeing it.
+/// The send is then still given the rest of the EOS window: it returns once
+/// the source's thread lets go, which takes a moment, and nothing has stalled.
+/// Only a send still stuck at the deadline is warned about.
 bool Camera_GST::finishStream(GstElement* pipe, GstElement* sinkRef,
                               const std::map<std::string, GstElement*>& valves) {
     auto send = std::make_shared<EosSend>();
@@ -252,14 +286,14 @@ bool Camera_GST::finishStream(GstElement* pipe, GstElement* sinkRef,
         GstElement* senderPipe = static_cast<GstElement*>(gst_object_ref(pipe));
         sender = std::thread([send, senderPipe] {
             gst_element_send_event(senderPipe, gst_event_new_eos());
-            bool abandoned;
+            GstElement* left;
             {
                 std::lock_guard<std::mutex> lk(send->m);
                 send->done = true;
-                abandoned  = send->abandoned;
+                left = send->takeLeft();
             }
             send->cv.notify_all();
-            if (abandoned) gst_element_set_state(senderPipe, GST_STATE_NULL);
+            releaseLeft(left);
             gst_object_unref(senderPipe);
         });
     } catch (const std::system_error& e) {
@@ -274,7 +308,8 @@ bool Camera_GST::finishStream(GstElement* pipe, GstElement* sinkRef,
     // pre-buffer, matroskamux can need >1.5 s to flush on a CPU-encoder path.
     // Every iteration waits <= 50 ms or pulls a sample (finite after EOS).
     GstBus* bus = gst_element_get_bus(pipe);
-    const gint64 deadline = g_get_monotonic_time()
+    const gint64 begin = g_get_monotonic_time();
+    const gint64 deadline = begin
         + static_cast<gint64>(params_.eosTimeoutMs) * G_TIME_SPAN_MILLISECOND;
     const GstMessageType eosMask = static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
     bool ended = false, sawEos = false;
@@ -296,42 +331,96 @@ bool Camera_GST::finishStream(GstElement* pipe, GstElement* sinkRef,
     if (bus) gst_object_unref(bus);
 
     auto sent = [&] { return send->done; };
+    auto settled = [&] { return send->done && !send->flushing; };
+    const bool eosDone = sawEos || eosSeen_;
     std::unique_lock<std::mutex> lk(send->m);
-    // The EOS reached every sink, so the send is returning: its message can
-    // beat that by a moment.
-    if (sawEos || eosSeen_)
+    if (eosDone) {
+        // The EOS reached every sink, so the send is returning: its message can
+        // beat that by a moment.
         send->cv.wait_for(lk, std::chrono::milliseconds(params_.stateChangeTimeoutMs), sent);
-    if (!sent()) {
-        lk.unlock();
-        logPrintf(log_, dashcam::log::LogLevel::WARN,
-              "EOS not delivered on %s within %u ms: a branch has stopped taking frames; "
-              "flushing the branches (their files are not finalised)",
-              info_.address.c_str(), params_.eosTimeoutMs);
-        for (const auto& [name, valve] : valves) {
-            GstPad* valveSrc = gst_element_get_static_pad(valve, "src");
-            GstPad* head = valveSrc ? gst_pad_get_peer(valveSrc) : nullptr;
-            if (head) {
-                gst_pad_send_event(head, gst_event_new_flush_start());
-                gst_object_unref(head);
-            }
-            if (valveSrc) gst_object_unref(valveSrc);
-        }
-        lk.lock();
-        send->cv.wait_for(lk, std::chrono::milliseconds(params_.stateChangeTimeoutMs), sent);
+    } else if (ended) {
+        // An ERROR replaced the EOS: the send returns once the source's thread
+        // lets go.  Only a send still stuck at the deadline means a stall.
+        const gint64 rest = deadline - g_get_monotonic_time();
+        if (rest > 0) send->cv.wait_for(lk, std::chrono::microseconds(rest), sent);
     }
-    const bool freed = sent();
-    if (!freed) send->abandoned = true;
+    const bool sendStuck = !sent();
     lk.unlock();
-
-    if (freed) {
+    if (eosDone && !sendStuck) {
         sender.join();
         return true;
     }
-    sender.detach();
+
+    // Short of the EOS, a branch's sink may still be inside a call, holding the
+    // preroll lock that both the flush and the NULL transition need.  A send
+    // that returned is no stall: the stream ended on an ERROR, or a branch
+    // still holds the EOS (an appsink nobody pulls, a slow muxer), and the
+    // flush is quiet.
+    if (sendStuck)
+        logPrintf(log_, dashcam::log::LogLevel::WARN,
+              "EOS not delivered on %s within %u ms (waited %lld ms): a branch has stopped "
+              "taking frames; flushing the branches (their files are not finalised)",
+              info_.address.c_str(), params_.eosTimeoutMs,
+              static_cast<long long>((g_get_monotonic_time() - begin) / G_TIME_SPAN_MILLISECOND));
+    std::vector<GstPad*> heads;
+    for (const auto& [name, valve] : valves) {
+        GstPad* valveSrc = gst_element_get_static_pad(valve, "src");
+        if (GstPad* head = valveSrc ? gst_pad_get_peer(valveSrc) : nullptr) heads.push_back(head);
+        if (valveSrc) gst_object_unref(valveSrc);
+    }
+    std::thread flusher;
+    if (!heads.empty()) {
+        lk.lock();
+        send->flushing = true;   // before the thread: the EOS thread reads it too
+        lk.unlock();
+        try {
+            flusher = std::thread([send, heads] {
+                for (GstPad* head : heads) {
+                    gst_pad_send_event(head, gst_event_new_flush_start());
+                    gst_object_unref(head);
+                }
+                GstElement* left;
+                {
+                    std::lock_guard<std::mutex> flk(send->m);
+                    send->flushing = false;
+                    left = send->takeLeft();
+                }
+                send->cv.notify_all();
+                releaseLeft(left);
+            });
+        } catch (const std::system_error& e) {
+            lk.lock();
+            send->flushing = false;
+            lk.unlock();
+            for (GstPad* head : heads) gst_object_unref(head);
+            logPrintf(log_, dashcam::log::LogLevel::ERROR,
+                  "cannot start the flush thread for %s (%s): not flushing",
+                  info_.address.c_str(), e.what());
+        }
+    }
+    lk.lock();
+    send->cv.wait_for(lk, std::chrono::milliseconds(params_.stateChangeTimeoutMs), settled);
+    // A thread that has returned is past its takeLeft(): joining it is quick.
+    const bool freed = settled(), sendReturned = send->done, flushReturned = !send->flushing;
+    if (!freed) send->left = static_cast<GstElement*>(gst_object_ref(pipe));
+    lk.unlock();
+
+    if (sendReturned) sender.join();
+    else              sender.detach();
+    if (flusher.joinable()) {
+        if (flushReturned) flusher.join();
+        else               flusher.detach();
+    }
+    if (freed) return true;
+    const char* why = !flushReturned && !sendReturned
+                        ? "EOS could not be sent, and a branch's sink did not take the flush"
+                    : !flushReturned ? "a branch's sink did not take the flush"
+                                     : "EOS could not be sent";
     logPrintf(log_, dashcam::log::LogLevel::ERROR,
-          "pipeline on %s is stuck: EOS could not be sent within %u ms of flushing; "
+          "pipeline on %s is stuck: %s within %u ms of flushing%s; "
           "left behind, released when its streaming thread frees",
-          info_.address.c_str(), params_.stateChangeTimeoutMs);
+          info_.address.c_str(), why, params_.stateChangeTimeoutMs,
+          flushReturned ? "" : " (a sink stuck in a system call, e.g. a write to a stalled disk)");
     return false;
 }
 
@@ -343,9 +432,9 @@ void Camera_GST::setPipelineError() {
         std::lock_guard<std::mutex> lock(stateMutex_);
         status_.status       = CAMERA_STATUS::ERROR;
         status_.currentError = pipelineError();
-        starting_ = false;  // construction phase over (failed); unblock stop()
+        starting_ = false;  // construction phase over (failed); unblock stop() / close()
     }
-    startCv_.notify_all();
+    lifecycleCv_.notify_all();
 }
 
 void Camera_GST::logFirstBusError(GstElement* pipe, const char* what) {
@@ -684,32 +773,40 @@ void Camera_GST::open() {
 }
 
 void Camera_GST::close() {
-    bool requiresStop = false;
+    bool running = false;
     {
         std::unique_lock<std::mutex> lock(stateMutex_);
-        // As in stop(): never tear down a pipeline start() is still building.
-        // The status alone does not say so: it can read ERROR by then.
-        startCv_.wait(lock, [this] { return !starting_; });
+        // As in stop(): never tear down a pipeline start() is still building
+        // (the status alone does not say so: it can read ERROR by then), nor
+        // one a stop() is still tearing down (the status reads OPEN by then).
+        lifecycleCv_.wait(lock, [this] { return !starting_ && !tearingDown_; });
         if (status_.status == CAMERA_STATUS::CLOSED) {
             status_.currentError = ERROR_CODE::CAMERA_ALREADY_CLOSED;
             return;
         }
-        requiresStop = (status_.status == CAMERA_STATUS::RUNNING);
+        // The stop() and the close are one teardown under one claim, so no
+        // start() can slip in between them.
+        running = (status_.status == CAMERA_STATUS::RUNNING);
+        if (running) status_.status = CAMERA_STATUS::OPEN;
+        tearingDown_ = true;
     }
     logPrintf(log_, dashcam::log::LogLevel::INFO,
           "camera closing: %s", info_.address.c_str());
+    if (running)
+        logPrintf(log_, dashcam::log::LogLevel::INFO,
+              "stopping pipeline: %s", info_.address.c_str());
 
-    // Drop lock before hitting GStreamer teardown logic to prevent deadlocks
-    if (requiresStop) {
-        stop();
-    } else {
-        teardownPipeline();
+    // Outside the lock: teardown waits on GStreamer threads that may log.
+    teardownPipeline();
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        status_.status          = CAMERA_STATUS::CLOSED;
+        status_.currentError    = ERROR_CODE::NONE;
+        status_.freeBufferCount = 0;
+        tearingDown_ = false;
     }
-
-    // Re-acquire to finalize state
-    std::lock_guard<std::mutex> lock(stateMutex_);
-    status_.status = CAMERA_STATUS::CLOSED;
-    status_.currentError = ERROR_CODE::NONE;
+    lifecycleCv_.notify_all();
 }
 
 bool Camera_GST::isOpen() const {
@@ -764,7 +861,11 @@ void Camera_GST::getCameraStatus(cameraStatus& status) const {
 void Camera_GST::start() {
     uint16_t formatIndex = 0;
     {
-        std::lock_guard<std::mutex> lock(stateMutex_);
+        std::unique_lock<std::mutex> lock(stateMutex_);
+        // A stop() or close() still tearing down has already said OPEN, but its
+        // teardown would take this start()'s handles and tee pads: wait for it.
+        // It ends within its own bounds (see stop()).
+        lifecycleCv_.wait(lock, [this] { return !tearingDown_; });
         if (status_.status == CAMERA_STATUS::RUNNING) {
             status_.currentError = ERROR_CODE::CAMERA_ALREADY_RUNNING;
             return;
@@ -785,7 +886,7 @@ void Camera_GST::start() {
         formatIndex = status_.currentFormatIndex;
         status_.status = CAMERA_STATUS::RUNNING;  // Optimistic claim; Phase 2 proceeds, or setPipelineError() reverts.
         status_.frameCount = 0;                   // "since start()"
-        starting_ = true;  // Cleared (with startCv_ notify) on every exit path:
+        starting_ = true;  // Cleared (with lifecycleCv_ notify) on every exit path:
                            // setPipelineError() for failures, end of start() on success.
         // Clear any stale error (e.g. a prior out-of-range setCameraVideoFormat)
         // so a successful start() reports NONE.  Genuine failures below override
@@ -1071,9 +1172,9 @@ void Camera_GST::start() {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         flushPendingAttributes(rejected);
-        starting_ = false;  // construction phase over (success); unblock stop()
+        starting_ = false;  // construction phase over (success); unblock stop() / close()
     }
-    startCv_.notify_all();
+    lifecycleCv_.notify_all();
     logRejected();
 }
 
@@ -1084,9 +1185,12 @@ void Camera_GST::stop() {
         // the lock (optimistic RUNNING claim).  Tearing down now would free a
         // half-built pipeline start() is still using.  start() always finishes
         // (bounded by its state-change timeouts), so this wait terminates.
-        startCv_.wait(lock, [this] { return !starting_; });
+        // Another stop() or close() still tearing down is waited for too: this
+        // one then returns with the pipeline gone, not while it is going.
+        lifecycleCv_.wait(lock, [this] { return !starting_ && !tearingDown_; });
         if (status_.status != CAMERA_STATUS::RUNNING) return;
         status_.status = CAMERA_STATUS::OPEN;
+        tearingDown_ = true;   // close() and start() wait for it
     }
     logPrintf(log_, dashcam::log::LogLevel::INFO,
           "stopping pipeline: %s", info_.address.c_str());
@@ -1094,7 +1198,9 @@ void Camera_GST::stop() {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         status_.freeBufferCount = 0;
+        tearingDown_ = false;
     }
+    lifecycleCv_.notify_all();
 }
 
 void Camera_GST::captureFrame(uint8_t* buffer, uint32_t bufferSize, uint32_t& bytesWritten) {

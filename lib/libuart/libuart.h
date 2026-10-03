@@ -62,6 +62,19 @@ struct UartConfig {
      * HUPCL left set, every close() of the port can bounce the microcontroller.
      */
     bool     hangupOnClose = true;
+
+    /**
+     * How long close() waits on unsent output that has stopped moving before
+     * it discards the rest, on top of the line time of what is still queued
+     * at @c baudRate (a DMA-fed UART such as ttyTHS* reports no progress until
+     * a whole transfer of up to 4 KiB completes).  Output that keeps draining
+     * is waited for in full (up to 30 s), so a write() just before close()
+     * still goes out, even on a slow UART; a peer that has stopped reading
+     * holds close() for this long plus that line time instead of the kernel's
+     * closing_wait (30 s): about 360 ms for the 1280 bytes cdc-acm reports
+     * queued on the MKR Zero at 115200.  See close().
+     */
+    int      closeDrainMs = 250;
 };
 
 // ─── Uart ─────────────────────────────────────────────────────────────────────
@@ -124,6 +137,24 @@ public:
     bool writeTimeout(const uint8_t* buf, size_t len, int timeoutMs);
 
     void flush()    override; ///< Discard both RX and TX buffers.
+
+    /**
+     * @brief Close the port without waiting on a peer that stopped reading.
+     *
+     * A plain ::close() waits for unsent output for the driver's closing_wait,
+     * 30 s by default, and a USB-CDC device whose firmware never reads its
+     * port never takes it.  So close() waits while the output keeps draining
+     * (at most 30 s), gives output that has stopped moving
+     * @c UartConfig::closeDrainMs plus its line time at the configured baud,
+     * then discards the rest (TCOFLUSH).  cdc-acm in the L4T 5.15 kernel
+     * cannot discard bytes already handed to the USB host; when some remain,
+     * it also sets the port's closing_wait to NONE
+     * (TIOCSSERIAL).  That needs CAP_SYS_ADMIN (the --privileged containers
+     * have it), lasts until the device re-enumerates, and is only done on a
+     * port that has stopped draining.  Without the capability the close waits
+     * as before, and a WARN says so.  The exclusive lock taken by open() is
+     * dropped first, so a tty that outlives the close can be opened again.
+     */
     void close()    override;
     bool isOpen()   const override;
     int  fd()       const;    ///< Raw fd — use for poll/select in application code.
@@ -134,7 +165,10 @@ public:
     int  receive(uint8_t* buf, size_t len, int timeoutMs = 1000) override { return read(buf, len, timeoutMs); }
 
 private:
-    int m_fd = -1;
+    int  m_fd = -1;
+    bool m_exclusive    = false; ///< TIOCEXCL is set on m_fd; close() clears it.
+    int  m_closeDrainMs = 0;     ///< UartConfig::closeDrainMs of the open port.
+    int64_t m_charNs    = 0;     ///< Line time of one character at the open port's framing.
     dashcam::log::LogCallback m_log;
 };
 

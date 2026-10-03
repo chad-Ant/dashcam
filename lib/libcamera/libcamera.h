@@ -352,11 +352,13 @@ enum class AttributeValueType {
     V4l2Control,  ///< An integer V4L2 control, not a property: gstProperty is the control's
                   ///< normalised name (v4l2-ctl --list-ctrls, e.g. "white_balance_temperature"),
                   ///< written through v4l2src's "extra-controls" (kept while the device is
-                  ///< closed and applied when it opens, auto controls first).  Only "is an
-                  ///< integer" is checked: v4l2src gives no feedback, the driver clamps a value
-                  ///< outside the control's range, and a missing control, a bad menu value or
-                  ///< a refused write is dropped with a GStreamer warning.  All of these
-                  ///< report NONE; check with v4l2-ctl.
+                  ///< closed and applied when it opens; start()'s batch puts the auto controls
+                  ///< first, but a write while running carries only its own control, so the
+                  ///< caller sets e.g. auto_exposure=1 (manual) before exposure_time_absolute).
+                  ///< Only "is an integer" is checked: v4l2src gives no feedback, the driver
+                  ///< clamps a value outside the control's range, and a missing control, a bad
+                  ///< menu value or a refused write is dropped with a GStreamer warning.  All
+                  ///< of these report NONE; check with v4l2-ctl.
 };
 
 /**

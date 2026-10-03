@@ -1815,10 +1815,14 @@ int main(int argc, char* argv[]) {
         if (fixedFocus) {
             // Warned once (a camera without focus controls would repeat it at
             // every restart), then quietly: recording does not depend on it.
+            // A camera left with autofocus off (a refused hand-back, retried at
+            // every open) is warned every time: it was changed, not left to itself.
             std::string whyNot;
             if (!focus.open(rc.cam->address, (int)r.focusAbsolute, recLog, whyNot)) {
-                const std::string msg = "focus: left to the camera — " + whyNot;
-                log(notesSeen.insert(msg).second ? LogLevel::WARN : LogLevel::DEBUG, msg);
+                const bool changed    = focus.leftChanged();
+                const std::string msg = (changed ? "focus: could not hand the focus back — "
+                                                 : "focus: left to the camera — ") + whyNot;
+                log(changed || notesSeen.insert(msg).second ? LogLevel::WARN : LogLevel::DEBUG, msg);
             }
         }
         runRetention();

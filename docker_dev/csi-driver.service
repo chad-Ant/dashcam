@@ -1,35 +1,50 @@
-# systemd unit: load the IMX296 CSI sensor driver at boot, before Argus starts.
+# systemd unit: reload the IMX296 CSI sensor driver after Argus has started,
+# with the module checked against the running kernel first.
 #
-# Replaces the Jetson's own driver unit, which stopped nvargus-daemon, failed to
-# load a module built for another kernel, and left Argus stopped (2026-09-28).
-# Ordered before nvargus-daemon, so at boot Argus is never stopped at all: the
-# module loads first and Argus finds the sensor when it starts.  Run by hand
-# (`sudo csi_driver.sh load`) it stops Argus around the load and always starts
-# it again.  A module that cannot load (none for this kernel, or built for
-# another) is refused before Argus is touched; the unit then fails, and
+# Replaces the vendor's imx296-reload.service (docker_dev/imx296-reload.service.jetson)
+# and does the same job: after boot, wait 5 s, stop nvargus-daemon, unload and
+# load imx296, start Argus again.  The reload is for a black screen when Argus
+# starts before the sensor is ready; /etc/modules-load.d/imx296.conf has already
+# loaded the module by then.  The vendor unit checks nothing: on 5.15.199-tegra,
+# before that kernel had an imx296, its `modprobe -r` failed and it exited with
+# Argus stopped (2026-09-28); it never tried to load the 5.15.185 module.  On a
+# kernel that has the module it works.  This unit refuses a module that cannot
+# load (none for this kernel, one depmod does not know, or one built for another
+# kernel) before Argus or the loaded copy is touched, starts Argus again on every
+# exit once it has stopped it, and fails if Argus does not come back;
 # `journalctl -u csi-driver` says why.
 #
-# Install (once, needs sudo), after disabling the old unit:
+# Ordered after nvargus-daemon, like the vendor unit, so Argus's start job never
+# waits for this one, at boot or by hand (`sudo systemctl restart csi-driver`).
+# Under systemd the script queues its start of Argus with --no-block anyway, and
+# watches it come up (HANDOVER item L).
+#
+# Install (once, needs sudo), replacing the vendor unit:
+#   sudo systemctl disable imx296-reload.service
 #   sudo install -m 755 /home/jetson/dashcam/docker_dev/csi_driver.sh /usr/local/sbin/dashcam-csi-driver
 #   sudo cp /home/jetson/dashcam/docker_dev/csi-driver.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable csi-driver.service
 # Check without changing anything: /usr/local/sbin/dashcam-csi-driver check
+# Reload now (restarts Argus): sudo systemctl restart csi-driver.service
 #
 # The script is installed under /usr/local/sbin because root runs it: a copy in
 # the user's clone could be edited by that user.  Set CSI_MODULE below if the
-# driver is not named nv_imx296.
+# driver is not named imx296.
 
 [Unit]
-Description=IMX296 CSI sensor driver (checked against the running kernel)
-Before=nvargus-daemon.service
-After=systemd-modules-load.service
+Description=IMX296 CSI sensor driver reload after Argus starts (checked against the running kernel)
+After=nvargus-daemon.service systemd-modules-load.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-Environment=CSI_MODULE=nv_imx296
-ExecStart=/usr/local/sbin/dashcam-csi-driver load
+Environment=CSI_MODULE=imx296
+Environment=CSI_RELOAD_DELAY=5
+ExecStart=/usr/local/sbin/dashcam-csi-driver reload
+# A oneshot has no start timeout by default.  A step that hangs gets SIGTERM
+# here, and the script still starts Argus again on its way out.
+TimeoutStartSec=180
 
 [Install]
 WantedBy=multi-user.target

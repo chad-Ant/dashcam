@@ -80,7 +80,7 @@ using Hello        = hostproto::Hello;
 struct CommLinkConfig {
     /**
      * Device node to open.  Empty = auto-discover via /dev/serial/by-id using
-     * @c idMatch, then fall back to scanning /dev/ttyACM*.
+     * @c idMatch, then (only with @c allowAcmFallback) /dev/ttyACM*.
      */
     std::string device;
 
@@ -92,13 +92,21 @@ struct CommLinkConfig {
     std::string idMatch = "USB_JTAG";
 
     /**
-     * Also probe bare /dev/ttyACM* nodes when the by-id lookup finds nothing.
+     * Also probe bare /dev/ttyACM* nodes, after the by-id matches.
+     *
+     * The by-id matches are tried first, and again first whenever the
+     * candidate list changes (a replug); the bare nodes get a turn only after
+     * the matches have failed the handshake.  A node that a non-matching by-id
+     * entry identifies as another device comes last.
      *
      * Off by default: probing opens each candidate exclusively for up to
-     * @c handshakeMs, which would briefly steal an unrelated modem or Arduino
-     * from whatever else is using it.  by-id identifies the bridge by its own
-     * USB descriptor strings and is the correct path on any udev system; turn
-     * this on only for a bench rig where the C3 is the sole ACM device.
+     * @c handshakeMs and sends it CMD_HELLO, which briefly steals an unrelated
+     * modem or Arduino from whatever else is using it, and writes into it.
+     * Closing such a device can also take the kernel's closing_wait (30 s)
+     * when it does not read its port, unless the process has CAP_SYS_ADMIN
+     * (see dashcam::uart::Uart::close()).  by-id identifies the bridge by its
+     * own USB descriptor strings and is the correct path on any udev system;
+     * turn this on only for a bench rig where the C3 is the sole ACM device.
      */
     bool allowAcmFallback = false;
 
@@ -281,10 +289,12 @@ public:
     /**
      * @brief List candidate bridge device nodes, most specific first.
      *
-     * Scans @p devRoot/serial/by-id for entries containing @p idMatch and
-     * resolves each symlink, then — only if @p includeAcmFallback — appends any
-     * @p devRoot/ttyACM* not already listed.  Never throws; a scan cut short by
-     * a node vanishing keeps what it found before.
+     * Scans @p devRoot/serial/by-id for entries containing @p idMatch, in
+     * entry-name order, and resolves each symlink.  Then — only if
+     * @p includeAcmFallback — appends any @p devRoot/ttyACM* not already
+     * listed: first the ones no by-id entry names, then the ones a
+     * non-matching by-id entry names (another device).  Never throws; a scan
+     * cut short by a node vanishing keeps what it found before.
      */
     static std::vector<std::string> enumerate(const std::string& idMatch = "USB_JTAG",
                                               bool includeAcmFallback = true,
@@ -344,6 +354,9 @@ private:
     /// never answers the handshake is not retried ahead of the others forever.
     /// Atomic: the RX thread advances it while openPort() reads it.
     std::atomic<size_t> m_probeCursor{0};
+    /// The list the cursor counts against; when enumerate() returns a
+    /// different one, the cursor restarts at 0.  Guarded by m_portMtx.
+    std::vector<std::string> m_lastCandidates;
 
     TelemetryCallback  m_telemetryCb;
     StatusCallback     m_statusCb;

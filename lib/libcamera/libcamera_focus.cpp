@@ -27,6 +27,7 @@ bool UvcFocusControl::open(const std::string& device, int position,
                            dashcam::log::LogCallback log, std::string& why) {
     close();
     log_ = std::move(log);
+    if (device != owedDevice_) owedAuto_ = 0;   // owed to a camera this object no longer drives
     // Owned locally until everything is in place: every early return closes it.
     v4l2::Fd fd = v4l2::openNode(device, O_RDWR);
     if (!fd.valid()) { why = "cannot open " + device + ": " + std::strerror(errno); return false; }
@@ -49,6 +50,13 @@ bool UvcFocusControl::open(const std::string& device, int position,
               "), so it could not be restored; focus left as it is";
         return false;
     }
+    // Autofocus off as this object left it (a refused hand-back, leftChanged()):
+    // what was found before that is still owed.  Found on again (a power cycle,
+    // or by hand), nothing is.
+    if (prevAuto != 0)
+        owedAuto_ = 0;
+    else if (owedAuto_ != 0)
+        prevAuto = owedAuto_;
     const bool prevAbsOk = v4l2::getControl(fd.get(), V4L2_CID_FOCUS_ABSOLUTE, prevAbs);
     if (!prevAbsOk && prevAuto == 0) {
         why = device + ": autofocus is off and the lens position cannot be read (" +
@@ -72,9 +80,22 @@ bool UvcFocusControl::open(const std::string& device, int position,
     }
     if (!v4l2::setControl(fd.get(), V4L2_CID_FOCUS_ABSOLUTE, pos)) {
         why = device + ": cannot set focus to " + std::to_string(pos) + ": " + std::strerror(errno);
-        v4l2::setControl(fd.get(), V4L2_CID_FOCUS_AUTO, prevAuto);   // leave it as found
+        // Leave it as found: autofocus back on if it was on (found off, the
+        // refused lens write changed nothing).  If that is refused too, the
+        // camera is left in manual, and the caller must not say otherwise.
+        if (prevAuto != 0) {
+            if (v4l2::setControl(fd.get(), V4L2_CID_FOCUS_AUTO, prevAuto)) {
+                owedAuto_ = 0;
+            } else {
+                why += std::string("; autofocus could not be turned back on (") + std::strerror(errno) +
+                       "), so it is left off";
+                owedAuto_   = prevAuto;
+                owedDevice_ = device;
+            }
+        }
         return false;
     }
+    owedAuto_  = 0;   // the hold's close() hands it back now
     fd_        = fd.release();
     device_    = device;
     position_  = pos;
@@ -90,20 +111,30 @@ bool UvcFocusControl::open(const std::string& device, int position,
 
 void UvcFocusControl::close() {
     if (fd_ < 0) return;
-    // The lens position only matters if autofocus was off when found (open()
-    // then required it to be readable): restore it while autofocus is still
-    // off, then the autofocus state itself.
+    // The lens position first, while autofocus is still off (cameras refuse or
+    // ignore it under their own autofocus), then the autofocus state.  With
+    // autofocus off when found, the position is the focus (open() required it
+    // to be readable); with autofocus on, it is the stored manual position a
+    // later switch to manual moves the lens to — handed back when it was read.
     std::string failed;
-    if (prevAuto_ == 0 && prevAbsOk_ && !setCtrl(V4L2_CID_FOCUS_ABSOLUTE, prevAbs_))
+    if (prevAbsOk_ && !setCtrl(V4L2_CID_FOCUS_ABSOLUTE, prevAbs_))
         failed = std::string(" (lens position: ") + std::strerror(errno) + ")";
-    if (!setCtrl(V4L2_CID_FOCUS_AUTO, prevAuto_))
+    if (!setCtrl(V4L2_CID_FOCUS_AUTO, prevAuto_)) {
         failed += std::string(" (autofocus state: ") + std::strerror(errno) + ")";
+        if (prevAuto_ != 0) {   // left off: the next open() of this device hands it back
+            owedAuto_   = prevAuto_;
+            owedDevice_ = device_;
+        }
+    }
     ::close(fd_);
     fd_ = -1;
     if (!log_) return;
+    std::string state = " (autofocus off at " + std::to_string(prevAbs_) + ", as found)";
+    if (prevAuto_)
+        state = prevAbsOk_ ? " (autofocus on, stored lens position " + std::to_string(prevAbs_) + ")"
+                           : " (autofocus on; its stored lens position could not be read)";
     if (failed.empty())
-        log_(LogLevel::INFO, std::string("focus: handed back to the camera on ") + device_ +
-                             (prevAuto_ ? " (autofocus on)" : " (autofocus off, as found)"));
+        log_(LogLevel::INFO, "focus: handed back to the camera on " + device_ + state);
     else   // e.g. unplugged: it comes back with its power-on defaults anyway
         log_(LogLevel::WARN, "focus: could not hand the focus back on " + device_ + failed);
 }

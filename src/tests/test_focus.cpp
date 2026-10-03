@@ -9,7 +9,12 @@
 // Checks that the camera's focus is handed back exactly as found, and that
 // nothing is taken over when the state to hand back cannot be read (a failed
 // read of the autofocus state used to "restore" autofocus on for a camera found
-// in manual; a failed read of the lens position left it unrestored).
+// in manual; a failed read of the lens position left it unrestored).  A camera
+// found in autofocus gets its stored manual position back too (it was left at
+// the held one), and a half-done hold that cannot be undone is reported (it
+// was ignored: autofocus stayed off while the caller logged "left to the
+// camera") and remembered: the object v0.4 reuses at its next restart hands
+// that autofocus back (it took the state it had left for the state found).
 //
 // Usage: focus_test
 
@@ -49,6 +54,8 @@ struct FakeCamera {
     int   absMin = 0, absMax = 1023, absStep = 1;
     bool  failGetAuto = false, failGetAbs = false;
     bool  failSetAuto = false, failSetAbs = false;
+    bool  failSetAutoOn = false;       ///< refuse only turning autofocus on
+    bool  busyWhileAuto = false;       ///< refuse a lens write under autofocus (EBUSY)
     int   writes = 0;                  ///< S_CTRL calls that changed something
 };
 static FakeCamera g_cam;
@@ -105,13 +112,13 @@ extern "C" int ioctl(int fd, unsigned long request, ...) __THROW {
     if (request == VIDIOC_S_CTRL) {
         auto* c = static_cast<struct v4l2_control*>(arg);
         if (c->id == V4L2_CID_FOCUS_AUTO) {
-            if (g_cam.failSetAuto) return fail(EIO);
+            if (g_cam.failSetAuto || (g_cam.failSetAutoOn && c->value != 0)) return fail(EIO);
             if (c->value != g_cam.autoFocus) ++g_cam.writes;
             g_cam.autoFocus = c->value;
             return 0;
         }
         if (c->id == V4L2_CID_FOCUS_ABSOLUTE) {
-            if (g_cam.failSetAbs) return fail(EBUSY);
+            if (g_cam.failSetAbs || (g_cam.busyWhileAuto && g_cam.autoFocus != 0)) return fail(EBUSY);
             if (c->value != g_cam.absolute) ++g_cam.writes;
             g_cam.absolute = c->value;
             return 0;
@@ -168,9 +175,8 @@ static void testHandBack() {
         check(ok && f.isOpen() && g_cam.autoFocus == 0 && g_cam.absolute == 700,
               found + ": held at 700 with autofocus off (" + state() + ")");
         f.close();
-        check(!f.isOpen() && g_cam.autoFocus == (foundManual ? 0 : 1) &&
-                  (!foundManual || g_cam.absolute == 300),
-              found + ": handed back as found (" + state() + ")");
+        check(!f.isOpen() && g_cam.autoFocus == (foundManual ? 0 : 1) && g_cam.absolute == 300,
+              found + ": handed back as found, lens position included (" + state() + ")");
         check(log.has("I focus: handed back"), found + ": logged");
     }
 }
@@ -207,9 +213,162 @@ static void testUnreadableState() {
         std::string why;
         const bool ok = f.open(g_device, 700, {}, why);
         check(ok && g_cam.autoFocus == 0 && g_cam.absolute == 700,
-              "autofocus on, lens position unreadable: held (the position is not state)");
+              "autofocus on, lens position unreadable: held (the stored position is not the focus)");
         f.close();
-        check(g_cam.autoFocus == 1, "... and autofocus is back on at close");
+        check(g_cam.autoFocus == 1 && g_cam.absolute == 700,
+              "... and autofocus is back on at close, no unread position written (" + state() + ")");
+    }
+}
+
+// On the UGREEN, focus_absolute under autofocus is the stored manual position:
+// it does not follow the autofocus, and a later switch to manual moves the lens
+// there.  It used to be left at the held position.
+static void testStoredPosition() {
+    std::printf("\n--- found in autofocus: the stored manual position ---\n");
+    {
+        reset(1, 449);
+        g_cam.busyWhileAuto = true;   // the lens is only writable with autofocus off
+        Log log;
+        UvcFocusControl f;
+        std::string why;
+        check(f.open(g_device, 300, log.callback(), why) && g_cam.autoFocus == 0 && g_cam.absolute == 300,
+              "found in autofocus, stored position 449: held at 300 (" + state() + ")");
+        f.close();
+        check(g_cam.autoFocus == 1 && g_cam.absolute == 449,
+              "handed back: the stored position 449, written before autofocus went on (" + state() + ")");
+        check(log.has("I focus: handed back to the camera on " + g_device +
+                      " (autofocus on, stored lens position 449)") &&
+                  !log.has("W focus:"),
+              "... logged with the position, no WARN");
+    }
+    {
+        reset(1, 449);
+        Log log;
+        UvcFocusControl f;
+        std::string why;
+        f.open(g_device, 300, log.callback(), why);
+        g_cam.failSetAbs = true;   // the stored position refused, the autofocus write not
+        f.close();
+        check(g_cam.autoFocus == 1,
+              "stored position refused: autofocus is still turned back on (" + state() + ")");
+        check(log.has("W focus: could not hand the focus back") && log.has("lens position") &&
+                  !log.has("autofocus state"),
+              "... and the WARN names the lens position only");
+    }
+}
+
+// The lens write refused after autofocus went off: open() turns autofocus back
+// on.  When that is refused too, the camera is left in manual, and open() must
+// say so (it ignored the result, and v0.4 logged "left to the camera").
+static void testFailedRollback() {
+    std::printf("\n--- a half-done hold that cannot be undone ---\n");
+    {
+        reset(1, 300);
+        g_cam.failSetAbs    = true;   // the lens write refused...
+        g_cam.failSetAutoOn = true;   // ...and turning autofocus back on as well
+        UvcFocusControl f;
+        std::string why;
+        const bool ok = f.open(g_device, 700, {}, why);
+        check(!ok && !f.isOpen() && g_cam.autoFocus == 0,
+              "lens write and rollback refused: refused, autofocus left off (" + state() + ")");
+        check(f.leftChanged(), "... and reported: leftChanged()");
+        check(why.find("cannot set focus to 700") != std::string::npos &&
+                  why.find("autofocus could not be turned back on") != std::string::npos &&
+                  why.find("left off") != std::string::npos,
+              "... and says so: " + why);
+        g_cam.failSetAbs    = false;
+        g_cam.failSetAutoOn = false;
+        check(f.open(g_device, 700, {}, why) && !f.leftChanged(), "... cleared by the next open()");
+    }
+    {
+        reset(1, 300);
+        g_cam.failSetAbs = true;   // the rollback itself works
+        UvcFocusControl f;
+        std::string why;
+        check(!f.open(g_device, 700, {}, why) && !f.leftChanged() && g_cam.autoFocus == 1 &&
+                  why.find("turned back on") == std::string::npos,
+              "lens write refused, rollback done: not reported as changed (" + state() + ")");
+    }
+    {
+        reset(0, 300);   // found in manual: the refused lens write changed nothing
+        g_cam.failSetAbs    = true;
+        g_cam.failSetAutoOn = true;
+        UvcFocusControl f;
+        std::string why;
+        check(!f.open(g_device, 700, {}, why) && !f.leftChanged() && g_cam.autoFocus == 0 &&
+                  g_cam.absolute == 300,
+              "found in manual, lens write refused: nothing to undo, not reported (" + state() + ")");
+    }
+}
+
+// v0.4 reuses the object at its next restart.  The autofocus it left off is
+// what that open() reads, and it was taken for the state found: "left to the
+// camera" was logged, or a later hold handed the camera back in manual.
+static void testOwedAutofocus() {
+    std::printf("\n--- autofocus left off, the object reused ---\n");
+    auto leaveOff = [](UvcFocusControl& f, Log& log) {   // found in autofocus, stored position 449
+        reset(1, 449);
+        g_cam.failSetAbs    = true;
+        g_cam.failSetAutoOn = true;
+        std::string why;
+        return !f.open(g_device, 300, log.callback(), why) && f.leftChanged() && g_cam.autoFocus == 0;
+    };
+    {
+        Log log;
+        UvcFocusControl f;
+        check(leaveOff(f, log), "the first open() left autofocus off (" + state() + ")");
+        std::string why;
+        check(!f.open(g_device, 300, {}, why) && f.leftChanged() && g_cam.autoFocus == 0,
+              "... both writes still refused at the next open(): still reported (" + state() + ")");
+        g_cam.failSetAutoOn = false;   // the lens still refused, autofocus writable again
+        check(!f.open(g_device, 300, {}, why) && !f.leftChanged() && g_cam.autoFocus == 1 &&
+                  g_cam.absolute == 449 && why.find("left off") == std::string::npos,
+              "... then its rollback turns autofocus back on, as found before (" + state() + ")");
+    }
+    {
+        Log log;
+        UvcFocusControl f;
+        leaveOff(f, log);
+        g_cam.failSetAbs    = false;   // the faults clear
+        g_cam.failSetAutoOn = false;
+        std::string why;
+        check(f.open(g_device, 300, log.callback(), why) && !f.leftChanged() && g_cam.absolute == 300,
+              "faults cleared at the next open(): held at 300 (" + state() + ")");
+        f.close();
+        check(g_cam.autoFocus == 1 && g_cam.absolute == 449 &&
+                  log.has("I focus: handed back to the camera on " + g_device +
+                          " (autofocus on, stored lens position 449)"),
+              "... and handed back as found before the first open() (" + state() + ")");
+    }
+    {
+        Log log;
+        UvcFocusControl f;
+        leaveOff(f, log);
+        g_cam.autoFocus   = 1;      // power-cycled: autofocus on again, its own default
+        g_cam.failSetAuto = true;   // (this open() then fails before any write)
+        std::string why;
+        check(!f.open(g_device, 300, {}, why) && !f.leftChanged(),
+              "found on again at the next open() (a power cycle): nothing owed, not reported");
+        g_cam.failSetAuto = false;
+        leaveOff(f, log);
+        check(!f.open("/nonexistent/video9", 300, {}, why) && !f.leftChanged(),
+              "another device opened: not reported for it");
+    }
+    {
+        reset(1, 449);
+        Log log;
+        UvcFocusControl f;
+        std::string why;
+        f.open(g_device, 300, log.callback(), why);
+        g_cam.failSetAutoOn = true;   // the camera stalls at the hand-back
+        f.close();
+        check(f.leftChanged() && g_cam.autoFocus == 0 && log.has("W focus: could not hand the focus back"),
+              "autofocus-on refused at close(): WARN, and reported (" + state() + ")");
+        g_cam.failSetAutoOn = false;
+        check(f.open(g_device, 300, {}, why) && !f.leftChanged(), "... the next open() holds");
+        f.close();
+        check(g_cam.autoFocus == 1 && g_cam.absolute == 449,
+              "... and its close() turns autofocus back on, as found at first (" + state() + ")");
     }
 }
 
@@ -289,6 +448,9 @@ int main() {
 
     testHandBack();
     testUnreadableState();
+    testStoredPosition();
+    testFailedRollback();
+    testOwedAutofocus();
     testRefusedWrites();
     testLimits();
 

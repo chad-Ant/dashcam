@@ -3,12 +3,22 @@
 // Plug the C3's USB-C port into any USB port on the Jetson, then run.  With no
 // arguments it auto-discovers the device and streams until Ctrl-C.
 //
-//   ./commlink_test                    auto-discover, stream forever
+//   ./commlink_test                    auto-discover (by-id, then any ttyACM), stream forever
+//   ./commlink_test "" 30              ... and exit after 30 s
+//   ./commlink_test --by-id 30         auto-discover through /dev/serial/by-id only
 //   ./commlink_test /dev/ttyACM0       explicit device node
 //   ./commlink_test /dev/ttyACM0 30    ... and exit after 30 s
 //
 // Unplug and replug the cable while it runs: the link must recover on its own,
 // with a reconnect counted and a fresh MSG_HELLO in the log.
+//
+// Plain auto-discover also probes ttyACM nodes that are not the C3 (on the
+// rig: the MKR Zero's USB console) while the C3 is unplugged.  Each probe
+// writes CMD_HELLO into that device and costs handshakeMs.  The MKR does not
+// read its console, so closing it needs CAP_SYS_ADMIN (the --privileged dev
+// container) to skip the kernel's 30 s closing_wait; without it each probe
+// stalls the reconnect for 30 s.  --by-id never touches another device:
+// it is what v0.4 does (by-id path, no ttyACM fallback).
 
 #include "libcommlink.h"
 #include "liblog.h"
@@ -91,15 +101,18 @@ int main(int argc, char* argv[]) {
 
     log(LvL::INFO, "=== ESP32-C3 bridge link test ===");
 
-    const std::string device   = (argc > 1) ? argv[1] : "";
+    const std::string arg1     = (argc > 1) ? argv[1] : "";
+    const bool        byIdOnly = (arg1 == "--by-id");
+    const std::string device   = byIdOnly ? "" : arg1;
     const int         runSecs  = (argc > 2) ? std::atoi(argv[2]) : 0;
 
     // ── [1] Discovery ─────────────────────────────────────────────────────────
     log(LvL::INFO, "--------------------------------------------");
-    log(LvL::INFO, "[1] enumerate");
+    log(LvL::INFO, byIdOnly ? "[1] enumerate (by-id only)" : "[1] enumerate");
     log(LvL::INFO, "--------------------------------------------");
 
-    const auto found = dashcam::commlink::CommLink::enumerate();
+    dashcam::commlink::CommLinkConfig cfg;
+    const auto found = dashcam::commlink::CommLink::enumerate(cfg.idMatch, !byIdOnly);
     if (found.empty()) {
         log(LvL::WARN, "  no candidate device found — is the C3 plugged into a USB port?");
     } else {
@@ -111,13 +124,13 @@ int main(int argc, char* argv[]) {
     log(LvL::INFO, "[2] open + start");
     log(LvL::INFO, "--------------------------------------------");
 
-    dashcam::commlink::CommLinkConfig cfg;
     cfg.device = device;            // empty = auto-discover
     cfg.autoStream = true;          // stream resumes by itself after a bridge reset
     // This is a bench test, so allow the bare-ttyACM fallback that the
-    // application deliberately leaves off.  The handshake gate rejects anything
-    // that does not answer CMD_HELLO, so a wrong guess costs 2 s, not the run.
-    cfg.allowAcmFallback = true;
+    // application deliberately leaves off (unless --by-id).  The handshake gate
+    // rejects anything that does not answer CMD_HELLO, so a wrong guess costs
+    // 2 s, not the run — plus the closing_wait described at the top of the file.
+    cfg.allowAcmFallback = !byIdOnly;
 
     // Declared before `bridge` on purpose: ~CommLink() joins the RX thread, so
     // anything its callbacks capture must still be alive at that point.

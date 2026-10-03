@@ -1,6 +1,7 @@
 #include "libuart.h"
 
 #include <fcntl.h>
+#include <linux/serial.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -54,6 +55,22 @@ static speed_t baudToSpeed(uint32_t baud) {
     default:      return B0;  // Invalid — open() will reject it.
     }
 }
+
+static int64_t monotonicMs() {
+    struct timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+/// Bytes the driver still holds for transmission; 0 when it cannot say.
+static int queuedOutput(int fd) {
+    int n = 0;
+    return (::ioctl(fd, TIOCOUTQ, &n) == 0) ? n : 0;
+}
+
+/// Upper bound on close()'s drain while the output is still moving: the
+/// kernel's default closing_wait, so a close never waits longer than before.
+constexpr int64_t CLOSE_DRAIN_CAP_MS = 30000;
 
 } // namespace
 
@@ -149,11 +166,19 @@ bool Uart::open(const std::string& device, const UartConfig& cfg,
 
     // Exclusive access is advisory-but-enforced for open(): other processes get
     // EBUSY.  Non-fatal if the driver rejects it — log and carry on.
-    if (cfg.exclusive && ::ioctl(m_fd, TIOCEXCL) < 0) {
-        logPrintf(m_log, dashcam::log::LogLevel::WARN,
-              "Uart::open: TIOCEXCL failed on '%s': %s",
-              device.c_str(), ::strerror(errno));
+    if (cfg.exclusive) {
+        m_exclusive = (::ioctl(m_fd, TIOCEXCL) == 0);
+        if (!m_exclusive)
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
+                  "Uart::open: TIOCEXCL failed on '%s': %s",
+                  device.c_str(), ::strerror(errno));
     }
+    m_closeDrainMs = cfg.closeDrainMs < 0 ? 0 : cfg.closeDrainMs;
+
+    // Line time of one character (start, data, parity and stop bits), for close().
+    const int64_t charBits = 1 + ((cfg.dataBits >= 5 && cfg.dataBits <= 8) ? cfg.dataBits : 8) +
+                             ((cfg.parityOdd || cfg.parityEven) ? 1 : 0) + (cfg.stopBits == 2 ? 2 : 1);
+    m_charNs = charBits * 1000000000LL / cfg.baudRate;
 
     ::tcflush(m_fd, TCIOFLUSH);
 
@@ -331,7 +356,65 @@ void Uart::flush() {
 }
 
 void Uart::close() {
-    if (m_fd >= 0) { ::close(m_fd); m_fd = -1; }
+    if (m_fd < 0) return;
+
+    // TIOCEXCL marks the tty, not this fd.  A tty that outlives this close —
+    // a pty while its master is open, or a port another process also holds —
+    // would otherwise refuse (EBUSY) every later open() by a process without
+    // CAP_SYS_ADMIN, ours included.
+    if (m_exclusive) ::ioctl(m_fd, TIOCNXCL);
+    m_exclusive = false;
+
+    // ::close() waits for unsent output for the driver's closing_wait (30 s by
+    // default).  A peer that stopped reading never takes it: probing the MKR
+    // Zero's USB console, whose firmware does not read it, stalled a close for
+    // 30.9 s on the rig.  So wait only while the output keeps moving (a slow
+    // UART still drains in full), give a stalled peer closeDrainMs, then discard.
+    //
+    // Silence for the line time of what is still queued is not a stall.  A
+    // DMA-fed UART (serial-tegra: the Jetson's ttyTHS*) hands a whole run of
+    // the queue, up to 4 KiB, to one transfer and reports no progress until
+    // it completes: 384 bytes at 9600 baud read as 400 ms of silence, and a
+    // TCOFLUSH within that time aborts the transfer partway.
+    int           left    = queuedOutput(m_fd);
+    int64_t       movedAt = monotonicMs();
+    const int64_t giveUp  = movedAt + CLOSE_DRAIN_CAP_MS;
+    while (left > 0) {
+        const int64_t now    = monotonicMs();
+        const int64_t lineMs = static_cast<int64_t>(left) * m_charNs / 1000000;
+        if (now - movedAt >= m_closeDrainMs + lineMs || now >= giveUp) break;
+        ::poll(nullptr, 0, 5);
+        const int n = queuedOutput(m_fd);
+        if (n < left) movedAt = monotonicMs();
+        left = n;
+    }
+    ::tcflush(m_fd, TCOFLUSH);
+
+    // TCOFLUSH empties the queue only on drivers with a flush_buffer operation
+    // (the serial core UARTs, ptys).  cdc-acm in L4T's 5.15 kernel has none, so
+    // its in-flight URBs still count.  For those, take away the wait itself.
+    // TIOCSSERIAL needs CAP_SYS_ADMIN (EPERM otherwise); a tty without serial
+    // ioctls says ENOTTY.  Either way the close then waits as it always did.
+    left = queuedOutput(m_fd);
+    if (left > 0) {
+        struct serial_struct ss{};
+        bool cleared = false;
+        if (::ioctl(m_fd, TIOCGSERIAL, &ss) == 0) {
+            cleared = (ss.closing_wait == ASYNC_CLOSING_WAIT_NONE);
+            if (!cleared) {
+                ss.closing_wait = ASYNC_CLOSING_WAIT_NONE;
+                cleared = (::ioctl(m_fd, TIOCSSERIAL, &ss) == 0);
+            }
+        }
+        if (!cleared)
+            logPrintf(m_log, dashcam::log::LogLevel::WARN,
+                  "Uart::close: %d bytes the peer never took, and closing_wait could not be "
+                  "cleared (%s): close() may block for the driver's closing_wait",
+                  left, ::strerror(errno));
+    }
+
+    ::close(m_fd);
+    m_fd = -1;
 }
 
 bool Uart::isOpen() const { return m_fd >= 0; }

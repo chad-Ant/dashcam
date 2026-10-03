@@ -62,34 +62,53 @@ std::vector<std::string> CommLink::enumerate(const std::string& idMatch,
 
     // Preferred: the stable by-id symlink, which encodes the device's own
     // USB descriptor strings rather than the kernel's enumeration order.
-    std::vector<std::string> matches;
+    // Sorted by entry name BEFORE resolving: sorting the resolved nodes as
+    // strings put ttyACM10 (or /dev/pts/10) ahead of ttyACM9, so the order
+    // followed the kernel's numbering after all.
+    std::vector<fs::path> entries;
     std::error_code ec;
     for (fs::directory_iterator it(root / "serial" / "by-id", ec), end;
-         !ec && it != end; it.increment(ec)) {
-        const std::string name = it->path().filename().string();
-        if (!idMatch.empty() && name.find(idMatch) == std::string::npos) continue;
+         !ec && it != end; it.increment(ec))
+        entries.push_back(it->path());
+    std::sort(entries.begin(), entries.end());
+
+    std::vector<std::string> foreign;  ///< Nodes a non-matching by-id entry names.
+    for (const fs::path& entry : entries) {
+        const std::string name = entry.filename().string();
         std::error_code rec;
-        const fs::path real = fs::canonical(it->path(), rec);
-        matches.push_back(rec ? it->path().string() : real.string());
+        const fs::path real = fs::canonical(entry, rec);
+        if (idMatch.empty() || name.find(idMatch) != std::string::npos)
+            out.push_back(rec ? entry.string() : real.string());
+        else if (!rec)
+            foreign.push_back(real.string());
     }
-    std::sort(matches.begin(), matches.end());
-    out.insert(out.end(), matches.begin(), matches.end());
 
     // Fallback: any CDC-ACM node.  Correct on a rig where the C3 is the only
     // ACM device; ambiguous otherwise, which is why by-id is tried first and
     // why this is opt-in — probing takes each candidate exclusively.
     if (!includeAcmFallback) return out;
 
-    std::vector<std::string> acm;
+    // A node that a non-matching by-id entry names is positively some other
+    // device (on the rig, the MKR Zero's console), so it goes after the nodes
+    // nothing identifies.  That matters when the C3 re-enumerates: its ttyACM
+    // node exists a moment before udev adds its by-id link.
+    std::vector<std::string> unknown, other;
     ec.clear();
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string name = it->path().filename().string();
         if (name.rfind("ttyACM", 0) != 0) continue;
         const std::string path = it->path().string();
-        if (std::find(out.begin(), out.end(), path) == out.end()) acm.push_back(path);
+        std::error_code rec;
+        const fs::path real = fs::canonical(it->path(), rec);
+        const std::string node = rec ? path : real.string();
+        if (std::find(out.begin(), out.end(), node) != out.end()) continue;
+        const bool isForeign = std::find(foreign.begin(), foreign.end(), node) != foreign.end();
+        (isForeign ? other : unknown).push_back(path);
     }
-    std::sort(acm.begin(), acm.end());
-    out.insert(out.end(), acm.begin(), acm.end());
+    std::sort(unknown.begin(), unknown.end());
+    std::sort(other.begin(), other.end());
+    out.insert(out.end(), unknown.begin(), unknown.end());
+    out.insert(out.end(), other.begin(), other.end());
     return out;
 }
 
@@ -126,6 +145,11 @@ bool CommLink::open(const CommLinkConfig& cfg, const dashcam::log::LogCallback& 
     m_decimation.store(m_cfg.decimation);
     m_helloOk.store(false);
     {
+        // The first openPort() then sees a changed list and starts at its head.
+        std::lock_guard<std::mutex> lk(m_portMtx);
+        m_lastCandidates.clear();
+    }
+    {
         std::lock_guard<std::mutex> lk(m_statsMtx);
         m_stats     = LinkStats{};
         m_openCount = 0;
@@ -161,6 +185,14 @@ bool CommLink::openPortLocked(std::string& opened) {
     if (!m_cfg.device.empty()) candidates.push_back(m_cfg.device);
     else candidates = enumerate(m_cfg.idMatch, m_cfg.allowAcmFallback, m_cfg.devRoot);
 
+    // A changed list (a replug, a node appearing or vanishing) restarts the
+    // rotation at its head, i.e. at the by-id matches.  A cursor advanced by
+    // failures against the old list points anywhere in the new one: after a
+    // replug it pointed at the MKR's console again, ahead of the C3.
+    if (candidates != m_lastCandidates) {
+        m_lastCandidates = candidates;
+        m_probeCursor.store(0);
+    }
     if (candidates.empty()) return false;
 
     // Start at the probe cursor and wrap.  A candidate that opens but fails the
@@ -184,7 +216,9 @@ bool CommLink::openPortLocked(std::string& opened) {
 
     for (const auto& path : candidates) {
         // Pass no log callback: a failed probe during auto-discovery is an
-        // expected outcome, not an error worth a line per second.
+        // expected outcome, not an error worth a line per second.  It also
+        // keeps Uart's own lines (close(), writeTimeout()) from running under
+        // m_portMtx, where they are called.
         if (!m_uart.open(path, ucfg, {})) continue;
 
         m_devicePath = path;
@@ -444,7 +478,9 @@ void CommLink::onFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
     switch (type) {
     case hostproto::MSG_TELEMETRY: {
         if (static_cast<size_t>(len) != sizeof(Telemetry)) {
-            std::lock_guard<std::mutex> lk(m_statsMtx); ++m_stats.malformedRx;
+            { std::lock_guard<std::mutex> lk(m_statsMtx); ++m_stats.malformedRx; }
+            // Logged after m_statsMtx is released, as the port lines are: a log
+            // callback that calls stats() would deadlock on it otherwise.
             logPrintf(m_log, dashcam::log::LogLevel::WARN,
                   "CommLink: MSG_TELEMETRY length %u, expected %zu",
                   static_cast<unsigned>(len), sizeof(Telemetry));

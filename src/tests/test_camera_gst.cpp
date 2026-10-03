@@ -11,8 +11,10 @@
 // config/camera_attributes.xml against the real element),
 // start failures and runtime bus errors (with the element and GStreamer's
 // detail in the log), and the USB / CSI pipeline strings.
-// Shutdown stays bounded when a branch stops consuming or the source's thread
-// is stuck; a stream that ends is reported; branches that start disabled
+// Shutdown stays bounded when a branch stops consuming, the source's thread
+// is stuck, or a branch's sink is stuck in write(); an ERROR in place of the
+// EOS logs no false WARN; stop() never overlaps close(), start() or another
+// stop(); a stream that ends is reported; branches that start disabled
 // (videorate, x264enc) still let start() reach PLAYING.
 //
 // A watchdog fails the run (exit 2) if one test hangs, naming it.
@@ -29,6 +31,9 @@
 #include <linux/videodev2.h>
 
 #include <csignal>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -36,6 +41,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -862,15 +868,26 @@ struct Wedge {
     std::condition_variable cv;
     bool wedge = false;
     bool inside = false;
+    bool postError = false;   ///< Post one ERROR from the source on wedging (Argus CANCELLED).
 };
 // Global: the probe stays on the old pipeline's pad until that pipeline is
 // freed, which may be after the test returns.
 static Wedge g_wedge;
 
-static GstPadProbeReturn wedgeProbe(GstPad*, GstPadProbeInfo*, gpointer data) {
+static GstPadProbeReturn wedgeProbe(GstPad* pad, GstPadProbeInfo*, gpointer data) {
     auto* w = static_cast<Wedge*>(data);
     std::unique_lock<std::mutex> lk(w->m);
     if (w->wedge) {
+        if (w->postError) {
+            w->postError = false;
+            GstObject* src = gst_pad_get_parent(pad);
+            GError* err = g_error_new_literal(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_READ,
+                                              "simulated session end");
+            gst_element_post_message(GST_ELEMENT(src),
+                                     gst_message_new_error(src, err, "an error instead of EOS"));
+            g_error_free(err);
+            gst_object_unref(src);
+        }
         w->inside = true;
         w->cv.notify_all();
         w->cv.wait(lk, [w] { return !w->wedge; });
@@ -935,6 +952,291 @@ static void testWedgedSourceShutdown() {
     while (!g_pipelineFinalized && secondsSince(t1) < 5.0)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     check(g_pipelineFinalized, "the stuck pipeline is released once its thread frees (" + secs(secondsSince(t1)) + ")");
+    cam.close();
+}
+
+/// Wedges the running source's thread in the probe (posting an ERROR first
+/// when @p postError) and waits until it is inside.
+static bool wedgeSource(TestCamera& cam, Wedge& w, bool postError) {
+    GstPad* pad = cam.sourcePad();
+    if (!pad) return false;
+    {
+        std::lock_guard<std::mutex> lk(w.m);
+        w.wedge = w.inside = false;
+    }
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, wedgeProbe, &w, nullptr);
+    gst_object_unref(pad);
+    std::unique_lock<std::mutex> lk(w.m);
+    w.wedge = true;
+    w.postError = postError;
+    return w.cv.wait_for(lk, std::chrono::seconds(3), [&] { return w.inside; });
+}
+static void releaseSource(Wedge& w) {
+    {
+        std::lock_guard<std::mutex> lk(w.m);
+        w.wedge = false;
+    }
+    w.cv.notify_all();
+}
+
+// Global, as g_wedge: the probe stays on its pad until that pipeline is freed.
+static Wedge g_errorWedge;
+
+/// Where "(waited <n> ms)" appears in a line of @p log, n; else -1.
+static long waitedMs(LogSink& log, const std::string& needle) {
+    std::lock_guard<std::mutex> lk(log.m);
+    for (const auto& l : log.lines) {
+        const size_t at = l.find(needle);
+        const size_t w  = l.find("(waited ");
+        if (at != std::string::npos && w != std::string::npos) return std::atol(l.c_str() + w + 8);
+    }
+    return -1;
+}
+
+static void testErrorInsteadOfEos() {
+    std::printf("\n--- an ERROR instead of the EOS at stop() (the Argus CANCELLED case) ---\n");
+    gst_init(nullptr, nullptr);
+    std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+    Wedge& w = g_errorWedge;
+
+    // The source's thread posts the ERROR and lets go 300 ms later: the EOS
+    // send waits that long for it, well inside the 2 s window.  The branch is
+    // then flushed before NULL, without a WARN.
+    {
+        LogSink log;
+        TestCamera cam;
+        cam.setLogCallback(log.callback());
+        cam.setPipelineParams(fastParams());   // eosTimeoutMs 2000
+        cam.addBranch("rec", countingBranch());
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        cam.start();
+        check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(), "running");
+        // No status poll from here to stop(): it would take the ERROR off the bus.
+        check(wedgeSource(cam, w, true), "the source posted an ERROR, and its thread is held");
+        std::thread releaser([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            releaseSource(w);
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        cam.stop();
+        const double sec = secondsSince(t0);
+        releaser.join();
+        check(cam.state() == CAMERA_STATUS::OPEN && !log.has("EOS not delivered"),
+              "an ERROR ending the EOS wait early logs no 'EOS not delivered' WARN (it did, at once)");
+        check(sec > 0.25 && sec < 1.5 && !log.has("is stuck"),
+              "... stop() waits for the send instead, and returns once it does (" + secs(sec) + ")");
+        if (log.has("EOS not delivered")) log.dump();
+        cam.close();
+    }
+
+    // The send is still stuck at the deadline: the WARN comes then, not at the
+    // ERROR, and gives the time actually waited.
+    {
+        LogSink log;
+        TestCamera cam;
+        auto t0 = std::chrono::steady_clock::now();
+        double warnAt = -1.0;   // set on the stop() thread, read after it
+        auto sink = log.callback();
+        cam.setLogCallback([&](LogLevel lvl, const std::string& msg) {
+            if (warnAt < 0 && msg.find("EOS not delivered") != std::string::npos) warnAt = secondsSince(t0);
+            sink(lvl, msg);
+        });
+        PipelineParams p = fastParams();
+        p.eosTimeoutMs = 300;
+        cam.setPipelineParams(p);
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        cam.start();
+        check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(), "running");
+        check(wedgeSource(cam, w, true), "the source posted an ERROR, and its thread is held");
+        std::thread releaser([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(900));
+            releaseSource(w);
+        });
+        t0 = std::chrono::steady_clock::now();
+        cam.stop();
+        const double sec = secondsSince(t0);
+        releaser.join();
+        const long waited = waitedMs(log, "W EOS not delivered on videotestsrc within 300 ms");
+        check(warnAt >= 0.28, "a send still stuck at the 300 ms deadline is reported then (" +
+                              (warnAt < 0 ? std::string("no WARN") : secs(warnAt)) + "; at the ERROR before)");
+        check(waited >= 280 && warnAt >= 0 && std::labs(waited - long(warnAt * 1000)) < 100,
+              "... with the time actually waited (" + std::to_string(waited) + " ms)");
+        check(cam.state() == CAMERA_STATUS::OPEN && sec < 1.6 && !log.has("is stuck"),
+              "... and stop() returns once the send does (" + secs(sec) + ")");
+        cam.close();
+    }
+}
+
+/// One shutdown with a branch whose sink is stuck in a system call: a filesink
+/// writing into a FIFO whose reader never reads.  One frame (113 KiB) fills
+/// the pipe (64 KiB), and write() blocks with the sink's preroll lock held,
+/// which FLUSH_START and the NULL transition both need.
+struct StuckWrite {
+    const char* what;
+    bool leaky;        ///< false: a recording branch, whose queue fills and stalls the tee
+    bool errorFirst;   ///< the source posts an ERROR in place of the EOS, held 200 ms
+};
+// Global, as g_wedge: the probe stays on its pad until that pipeline is freed.
+static Wedge g_writeWedge;
+
+static void sinkStuckInWrite(const StuckWrite& c) {
+    const std::string w = std::string(c.what) + ": ";
+    char dir[] = "/tmp/camera_gst_test.XXXXXX";
+    if (!::mkdtemp(dir)) {
+        check(false, w + "test setup: a temporary directory");
+        return;
+    }
+    const std::string fifo = std::string(dir) + "/rec.fifo";
+    int rd = ::mkfifo(fifo.c_str(), 0600) == 0 ? ::open(fifo.c_str(), O_RDONLY | O_NONBLOCK) : -1;
+    if (rd < 0) {
+        check(false, w + "test setup: a FIFO with a reader");
+        ::rmdir(dir);
+        return;
+    }
+
+    PipelineParams p = fastParams();
+    p.eosTimeoutMs = c.errorFirst ? 1000 : 250;   // after an ERROR, the send has until then
+    p.stateChangeTimeoutMs = 600;
+    p.captureTimeoutMs = 300;
+    LogSink log;
+    TestCamera cam;
+    cam.setLogCallback(log.callback());
+    cam.setPipelineParams(p);
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    GError* err = nullptr;
+    cam.addBranch("rec", gst_parse_bin_from_description(
+                             ("filesink location=" + fifo + " sync=false").c_str(), TRUE, &err),
+                  c.leaky);
+    if (err) g_error_free(err);
+    cam.start();
+    std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+    check(cam.state() == CAMERA_STATUS::RUNNING, w + "start() -> RUNNING");
+
+    // The pipe full means the sink is inside write(): its frame does not fit.
+    const int pipeSize = ::fcntl(rd, F_GETPIPE_SZ);
+    int queued = 0;
+    for (auto t0 = std::chrono::steady_clock::now(); secondsSince(t0) < 3.0;) {
+        if (::ioctl(rd, FIONREAD, &queued) == 0 && queued >= pipeSize) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    check(pipeSize > 0 && queued >= pipeSize, w + "the sink blocks in write() (" +
+                                              std::to_string(queued) + " bytes in the pipe)");
+    if (c.leaky)
+        check(pull(cam, buf) == buf.size(), w + "... while the tee still feeds capture");
+    else
+        check(waitForStall(cam, buf, 6.0), w + "... and the tee stalls behind it");
+    GstElement* pipe = cam.pipelineRef();
+    g_pipelineFinalized = false;
+    if (pipe) {
+        g_object_weak_ref(G_OBJECT(pipe), onPipelineFinalized, nullptr);
+        gst_object_unref(pipe);
+    }
+    std::thread releaser;
+    if (c.errorFirst) {
+        // No status poll from here to stop(): it would take the ERROR off the bus.
+        check(wedgeSource(cam, g_writeWedge, true), w + "the source posted an ERROR, and its thread is held");
+        releaser = std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            releaseSource(g_writeWedge);
+        });
+    }
+
+    // On a thread: stop() used to stay in the flush, or in the NULL
+    // transition, until the write returned.
+    std::atomic<bool> stopped{false};
+    std::atomic<double> stopSec{-1.0};
+    std::thread stopper([&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        cam.stop();
+        stopSec = secondsSince(t0);
+        stopped = true;
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!stopped && secondsSince(t0) < 3.0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    check(stopped && stopSec < 1.6,
+          w + "stop() returns within the EOS wait and one state-change wait (" +
+          (stopped ? secs(stopSec) : std::string("still in stop() after 3 s")) +
+          "; held until the write returned before)");
+    check(log.has("E pipeline on videotestsrc is stuck") && log.has("did not take the flush"),
+          w + "... and says a sink is stuck, the pipeline left behind");
+    if (c.leaky)
+        check(!log.has("EOS not delivered"),
+              w + "... with no 'EOS not delivered' WARN: the send returned, nothing upstream stalled");
+    else
+        check(log.has("W EOS not delivered on videotestsrc within 250 ms"),
+              w + "... after the WARN for the stuck EOS send");
+
+    // The reader reads at last: the write returns, the flush and the EOS go
+    // through, and whichever of their threads is last releases the pipeline.
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<char> sinkBuf(1 << 16);
+    while ((!g_pipelineFinalized || !stopped) && secondsSince(t1) < 5.0) {
+        if (::read(rd, sinkBuf.data(), sinkBuf.size()) <= 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    stopper.join();
+    if (releaser.joinable()) releaser.join();
+    check(g_pipelineFinalized, w + "the pipeline left behind is released once the write returns (" +
+                               secs(secondsSince(t1)) + ")");
+
+    cam.start();
+    check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(),
+          w + "the camera starts and captures again afterwards");
+    cam.close();
+    ::close(rd);
+    ::unlink(fifo.c_str());
+    ::rmdir(dir);
+}
+
+static void testSinkStuckInWrite() {
+    std::printf("\n--- shutdown with a branch sink stuck in write() ---\n");
+    gst_init(nullptr, nullptr);
+    // The EOS send sticks behind the full queue; the flush cannot reach the sink.
+    sinkStuckInWrite({"recording branch", false, false});
+    // The send returns, but the sink never takes the EOS, and the NULL
+    // transition would wait for it as the flush does.
+    sinkStuckInWrite({"leaky branch", true, false});
+    // The same after an ERROR in place of the EOS.
+    sinkStuckInWrite({"leaky branch, ERROR", true, true});
+
+    // The flush on that path is quiet, and frees a branch that only holds the
+    // EOS back: an appsink nobody pulls (wait-on-eos, as an inference branch
+    // whose worker has stopped).  The stop waits out the EOS window, as it
+    // always did, with no WARN or ERROR (the CSI check expects none).
+    PipelineParams p = fastParams();
+    p.eosTimeoutMs = 250;
+    LogSink log;
+    TestCamera cam;
+    cam.setLogCallback(log.callback());
+    cam.setPipelineParams(p);
+    cam.open();
+    cam.setCameraVideoFormat(0);
+    GError* err = nullptr;
+    cam.addBranch("infer", gst_parse_bin_from_description(
+                               "appsink max-buffers=1 drop=true sync=false emit-signals=false", TRUE, &err),
+                  true);
+    if (err) g_error_free(err);
+    cam.start();
+    std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+    check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(),
+          "an appsink branch nobody pulls: running");
+    GstElement* pipe = cam.pipelineRef();
+    g_pipelineFinalized = false;
+    if (pipe) {
+        g_object_weak_ref(G_OBJECT(pipe), onPipelineFinalized, nullptr);
+        gst_object_unref(pipe);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    cam.stop();
+    const double sec = secondsSince(t0);
+    check(cam.state() == CAMERA_STATUS::OPEN && sec >= 0.2 && sec < 1.0 && g_pipelineFinalized,
+          "... stop() waits out the 250 ms EOS window and releases the pipeline (" + secs(sec) + ")");
+    check(!log.has("W ") && !log.has("E "), "... with no WARN or ERROR");
+    if (log.has("W ") || log.has("E ")) log.dump();
     cam.close();
 }
 
@@ -1156,6 +1458,139 @@ static void testBranchTogglesRacingStop() {
     cam.close();
 }
 
+// Global, as g_wedge: the probe stays on its pad until that pipeline is freed.
+static Wedge g_holdWedge;
+static std::atomic<bool> g_heldFinalized{false};
+static void onHeldFinalized(gpointer, GObject*) { g_heldFinalized = true; }
+
+static void testTeardownOverlaps() {
+    std::printf("\n--- stop() racing close(), start() and a second stop() ---\n");
+    gst_init(nullptr, nullptr);
+    const char* names[] = {"close", "start", "stop"};
+    std::vector<uint8_t> buf(size_t(kW) * kH * 3);
+
+    // stop()'s teardown is held in its EOS send (the source's thread is held)
+    // while the other call comes in.  It used to see OPEN and run at once: a
+    // second teardownPipeline() (tee pads, handles), a start() whose handles
+    // the first teardown then took, or a stop() returning mid-teardown.
+    for (int round = 0; round < 9; ++round) {
+        const int kind = round % 3;
+        const std::string r = "round " + std::to_string(round + 1) + ": " + names[kind] + "() ";
+        LogSink log;
+        TestCamera cam;
+        cam.setLogCallback(log.callback());
+        cam.setPipelineParams(fastParams());   // nothing times out within the hold
+        cam.addBranch("rec", countingBranch());   // tee pads for a second teardown to release
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        cam.start();
+        GstElement* pipe = cam.pipelineRef();
+        if (cam.state() != CAMERA_STATUS::RUNNING || !pipe || pull(cam, buf) != buf.size()) {
+            if (pipe) gst_object_unref(pipe);
+            check(false, r + "test setup: running");
+            continue;
+        }
+        g_heldFinalized = false;
+        g_object_weak_ref(G_OBJECT(pipe), onHeldFinalized, nullptr);
+        gst_object_unref(pipe);
+        if (!wedgeSource(cam, g_holdWedge, false)) {
+            check(false, r + "test setup: the source's thread held");
+            continue;
+        }
+
+        std::thread stopper([&] { cam.stop(); });
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!log.has("stopping pipeline") && secondsSince(t0) < 3.0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::atomic<bool> racerDone{false};
+        bool freedFirst = false;   // written by the racer before racerDone
+        std::thread racer([&] {
+            if (kind == 0)      cam.close();
+            else if (kind == 1) cam.start();
+            else                cam.stop();
+            freedFirst = g_heldFinalized;
+            racerDone  = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const bool early = racerDone;
+        releaseSource(g_holdWedge);
+        stopper.join();
+        racer.join();
+        check(!early && freedFirst, r + "waits until stop() has released the pipeline (" +
+                                    (early ? "returned while it ran" : freedFirst ? "it had" : "it had not") + ")");
+        if (kind == 0) check(cam.state() == CAMERA_STATUS::CLOSED, r + "... then closes");
+        if (kind == 1) check(cam.state() == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size(),
+                             r + "... then starts a pipeline that captures");
+        if (kind == 2) check(cam.state() == CAMERA_STATUS::OPEN, r + "... then returns, stopped");
+        cam.close();
+    }
+
+    // The same calls with nothing held, started together: whichever wins,
+    // the end state is one of the valid ones.  A close() or stop() against
+    // stop() returns with the pipeline released, whichever of the two tore it
+    // down: the other waited.  (A start() that comes first returns at once,
+    // with CAMERA_ALREADY_RUNNING.)  Before, the loser saw OPEN and returned
+    // while the winner was still tearing down.
+    constexpr int kRounds = 45;
+    int bad = 0, early = 0;
+    std::string what;
+    for (int round = 0; round < kRounds; ++round) {
+        const int kind = round % 3;
+        TestCamera cam;
+        cam.setPipelineParams(fastParams());
+        cam.addBranch("rec", countingBranch());
+        cam.open();
+        cam.setCameraVideoFormat(0);
+        cam.start();
+        GstElement* pipe = cam.pipelineRef();
+        if (!pipe) {
+            ++bad;
+            what += " setup";
+            cam.close();
+            continue;
+        }
+        g_heldFinalized = false;
+        g_object_weak_ref(G_OBJECT(pipe), onHeldFinalized, nullptr);
+        gst_object_unref(pipe);
+        std::atomic<int> ready{0};
+        auto together = [&] {
+            ++ready;
+            while (ready < 2) {}
+        };
+        bool aFreed = false, bFreed = false;   // each written by its thread, read after the joins
+        std::thread a([&] {
+            together();
+            cam.stop();
+            aFreed = g_heldFinalized;
+        });
+        std::thread b([&] {
+            together();
+            if (kind == 0)      cam.close();
+            else if (kind == 1) cam.start();
+            else                cam.stop();
+            bFreed = g_heldFinalized;
+        });
+        a.join();
+        b.join();
+        const CAMERA_STATUS s = cam.state();
+        const bool ok = kind == 0 ? s == CAMERA_STATUS::CLOSED
+                      : kind == 1 ? (s == CAMERA_STATUS::OPEN ||
+                                     (s == CAMERA_STATUS::RUNNING && pull(cam, buf) == buf.size()))
+                                  : s == CAMERA_STATUS::OPEN;
+        if (!ok) {
+            ++bad;
+            what += std::string(" ") + names[kind] + "(" + std::to_string(int(s)) + ")";
+        }
+        if (kind != 1 && !(aFreed && bFreed)) ++early;
+        cam.close();
+    }
+    const std::string n = std::to_string(kRounds);
+    check(bad == 0, n + " unsynchronised rounds of stop() against close() / start() / stop() end valid" +
+                    (bad ? " — bad:" + what : std::string()));
+    check(early == 0, "... and no close() or stop() returns before the pipeline is released (" +
+                      std::to_string(early) + " of " + std::to_string(kRounds * 2 / 3) + " did)");
+}
+
 static void testPipelineStrings() {
     std::printf("\n--- USB / CSI pipeline strings ---\n");
     cameraInfo usb;
@@ -1210,11 +1645,14 @@ int main(int argc, char** argv) {
         {"capture racing stop",        30, testConcurrentCaptureAndStop},
         {"stalled branch shutdown",    40, testStalledBranchShutdown},
         {"wedged source shutdown",     40, testWedgedSourceShutdown},
+        {"error instead of EOS",       40, testErrorInsteadOfEos},
+        {"sink stuck in write",        40, testSinkStuckInWrite},
         {"finite stream",              40, testFiniteStream},
         {"disabled branches",          40, testDisabledProcessingBranches},
         {"attributes during start",    40, testAttributesDuringStart},
         {"polls during a failing start", 40, testPollsDuringFailingStart},
         {"branch toggles racing stop", 30, testBranchTogglesRacingStop},
+        {"teardown overlaps",          60, testTeardownOverlaps},
         {"pipeline strings",           30, testPipelineStrings},
     };
     int ran = 0;

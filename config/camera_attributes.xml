@@ -18,8 +18,15 @@
                      v4l2_control  an integer V4L2 control, written through v4l2src's
                                    extra-controls; gstProperty is the control's name as
                                    v4l2-ctl lists it (lower case, "_" for separators).
-                                   Auto controls (auto_exposure, white_balance_automatic,
-                                   ...) are written before the manual values they gate.
+                                   start() sends the controls queued before it in one
+                                   write, auto controls (auto_exposure,
+                                   white_balance_automatic, ...) before the manual values
+                                   they gate.  A write while running carries only its own
+                                   control, so the order is then the caller's: set the auto
+                                   control first, in a write of its own (auto_exposure=1,
+                                   manual mode, before exposure_time_absolute;
+                                   white_balance_automatic=0 before
+                                   white_balance_temperature).
                    A property value is converted to the property's own type and
                    range-checked; one that does not fit is refused with a WARN.
                    A v4l2_control value is checked for being an integer only: v4l2src

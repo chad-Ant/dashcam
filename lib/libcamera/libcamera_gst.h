@@ -65,6 +65,9 @@ namespace dashcam::camera {
  *
  * **Concurrent safety:**
  * - Concurrent start() calls are serialized by the state machine (optimistic RUNNING claim).
+ * - stop() and close() wait for a start() still building; stop(), close() and
+ *   start() wait for a teardown still running (tearingDown_).  No two of them
+ *   ever touch the pipeline at once.
  * - captureFrame() can run on another thread during start() and returns zero bytes
  *   until the pipeline is fully constructed.
  * - Attribute writes during RUNNING may temporarily block; see applyAttributeGStreamer().
@@ -79,7 +82,8 @@ namespace dashcam::camera {
 struct PipelineParams {
     uint32_t captureTimeoutMs     = 1000;  ///< captureFrame() max wait for a frame.
     uint32_t stateChangeTimeoutMs = 5000;  ///< Async PLAYING / NULL state-change wait; also how long
-                                           ///< teardown waits for a stuck EOS after flushing branches.
+                                           ///< teardown waits, after flushing the branches, for a
+                                           ///< stuck EOS send and for the flush itself.
     uint32_t eosTimeoutMs         = 5000;  ///< Teardown EOS flush wait.  A branch still holding the
                                            ///< EOS back then is flushed (its file not finalised).
     uint32_t captureQueueDepth    = 2;     ///< appsink-branch leaky queue max-size-buffers.
@@ -156,14 +160,22 @@ protected:
 
     /// True from the optimistic RUNNING claim in start() until construction
     /// finishes (success path or setPipelineError()).  Guarded by stateMutex_.
-    /// stop() waits for this to clear (via startCv_) so a concurrent
+    /// stop() waits for this to clear (via lifecycleCv_) so a concurrent
     /// stop()/close() can never tear down a pipeline that start() is still
     /// assembling outside the lock (use-after-free on the half-built pipeline).
     bool starting_ = false;
 
-    /// Signalled when starting_ clears.  The wait is bounded in practice:
-    /// start() always terminates via its state-change timeouts.
-    mutable std::condition_variable startCv_;
+    /// True while stop() or close() runs teardownPipeline() outside the lock.
+    /// Guarded by stateMutex_.  stop(), close() and start() wait for it to
+    /// clear (via lifecycleCv_): the status already reads OPEN then, and a
+    /// second teardown, or a new pipeline's handles and tee pads, would collide
+    /// with the one still being released.
+    bool tearingDown_ = false;
+
+    /// Signalled when starting_ or tearingDown_ clears.  The waits are bounded:
+    /// start() always terminates via its state-change timeouts, and a teardown
+    /// via its own (see stop()).
+    mutable std::condition_variable lifecycleCv_;
 
     /// Loaded attribute dictionary used by applyAttributeGStreamer() to resolve
     /// capability names to GStreamer property names.  Set via setAttributeDictionary()
@@ -271,6 +283,10 @@ protected:
      * with each write, applying it at once if the device is open, else when it
      * opens: start()'s flushes therefore write every queued control in one
      * structure, and a write while running carries only its own control.
+     * The auto-first order thus holds within start()'s batch only: while
+     * running, a manual value sent while its auto control is still on is
+     * refused, so the caller sets the auto control first (auto_exposure=1,
+     * manual mode, before exposure_time_absolute).
      *
      * @return @c false when @p src has no "extra-controls" structure property.
      */
@@ -315,7 +331,10 @@ private:
      * and unrefs the pipeline.  Safe to call when any subset of those pointers
      * is null.  Called from stop(), close(), and every error path in start().
      *
-     * @note Not thread-safe; must be called only from lifecycle methods.
+     * @note Not re-entrant: a second call while one runs is not a no-op (it
+     *       releases teePads_ and nulls the handles).  Callers hold the claim
+     *       that excludes the others: tearingDown_ (stop(), close()) or
+     *       starting_ (start()'s setPipelineError()); the destructor runs alone.
      */
     void teardownPipeline();
 
@@ -331,9 +350,10 @@ private:
 
     /**
      * @brief Sends EOS to a PLAYING pipeline and waits for it, bounded even when
-     *        a branch or the source has stopped moving; see the definition.
-     * @return false when the pipeline was left to the EOS thread: the caller
-     *         must not set its state or release its pads.
+     *        a branch, a branch's sink (in a system call) or the source has
+     *        stopped moving; see the definition.
+     * @return false when the pipeline was left to the EOS and flush threads:
+     *         the caller must not set its state or release its pads.
      */
     bool finishStream(GstElement* pipe, GstElement* sinkRef,
                       const std::map<std::string, GstElement*>& valves);
@@ -437,7 +457,12 @@ public:
     /** @copydoc iCamera::open() */
     void open() override;
 
-    /** @copydoc iCamera::close() */
+    /**
+     * @copydoc iCamera::close()
+     * @note Waits, as stop() does, for a start() still building and for a
+     *       teardown still running.  Closing a running camera stops it in the
+     *       same teardown, so no start() can run between the stop and the close.
+     */
     void close() override;
 
     /** @copydoc iCamera::isOpen() */
@@ -479,10 +504,23 @@ public:
      * @note If a concurrent start() is still constructing the pipeline, stop()
      *       blocks until that construction finishes (bounded by the start()
      *       state-change timeouts), then tears the pipeline down normally.
+     * @note The teardown is never overlapped: a concurrent stop(), close() or
+     *       start() waits until it has finished (and a second stop() then
+     *       returns, the pipeline already gone).
      * @note Bounded by PipelineParams: eosTimeoutMs for the EOS, then at most
      *       stateChangeTimeoutMs more if a branch or the source is stuck, plus
-     *       the NULL transition.  A pipeline whose source thread stays stuck is
-     *       left behind and released when that thread frees (logged as ERROR).
+     *       the NULL transition.  That includes a branch sink stuck in a system
+     *       call (a filesink in a write() to a stalled SD card), whether or not
+     *       its queue has filled and stalled the tee.  Such a sink holds its
+     *       preroll lock, which both the branch flush and the NULL transition
+     *       need.  So when the EOS has not come by then, the branches are
+     *       flushed on a thread of their own, under the same timer.  A pipeline
+     *       whose source thread, or a sink, stays stuck is left behind and
+     *       released when that call returns (logged as ERROR); it keeps its
+     *       device and files until then.  Not covered: a wait inside an
+     *       element's own state change on the way to NULL, with nothing stuck
+     *       before it (nvarguscamerasrc's Argus teardown, see
+     *       teardownPipeline(); a sink closing its file).
      */
     void stop() override;
 
