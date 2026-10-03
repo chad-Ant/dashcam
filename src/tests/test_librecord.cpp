@@ -307,6 +307,32 @@ static void testGoldenSingleFile() {
           nopos.str().find("LAT --\\NLON --\\NALT --") != std::string::npos &&
           nopos.str().find(",BR,,0,0,0,,") != std::string::npos,
           "clock-only snapshot renders dashes, clock kept");
+
+    // Detail block: absent unless the application supplies text.
+    check(f.find(",DET,,") == std::string::npos, "no detail block without detailText");
+    rec::OverlayData odd;
+    odd.detailText = "VSS 52.34 CAN  RPM 1200\nBRAKE off, {\\b1}x";
+    odd.detailTimestampMs = 10'000;
+    std::ostringstream det;
+    rec::detail::writeAssSample(det, 0, 200'000'000LL, odd, 10'500, true, true, true, true, false);
+    check(det.str().find(",DET,,0,0,0,,VSS 52.34 CAN  RPM 1200\\NBRAKE off; (/b1)x\n") != std::string::npos,
+          "detail block: lines joined with \\N, comma/brace/backslash replaced");
+    const auto stOld = rec::detail::assStaleness(odd, 10'000 + 2'001, 2000);
+    const auto stNew = rec::detail::assStaleness(odd, 10'000 + 2'000, 2000);
+    check(stOld.detail && !stNew.detail, "detail stale past StaleTimeoutMs only");
+    check(!rec::detail::assStaleness(odd, 99'000'000, 0).detail, "StaleTimeoutMs 0: detail never stale");
+    std::ostringstream detStale;
+    rec::detail::writeAssSample(detStale, 0, 200'000'000LL, odd, 12'500, true, true, true, true, stOld.detail);
+    check(detStale.str().find(",DET,,0,0,0,,TLM --\n") != std::string::npos &&
+          detStale.str().find("VSS") == std::string::npos, "stale detail block becomes TLM --, old text gone");
+    std::ostringstream hdr;
+    rec::detail::writeAssHeader(hdr, dashcam::config::OverlayConfig{}, 1920, 1080);
+    const std::string h = hdr.str();
+    const size_t dpos = h.find("Style: DET,");
+    const std::string detStyle = dpos == std::string::npos ? "" : h.substr(dpos, h.find('\n', dpos) - dpos);
+    // ... BorderStyle 3, Outline n, Shadow 0, Alignment 4 (middle-left), margins, encoding 1
+    check(detStyle.find(",0,0,3,3,0,4,18,18,12,1") != std::string::npos,
+          "header defines the DET style (middle-left, box): " + detStyle);
 }
 
 // ─── A2: segment naming ───────────────────────────────────────────────────────
@@ -398,7 +424,7 @@ static void testSegmented(const char* label, const std::string& srcDesc, uint32_
         total += mi.frames;
         allOk   = allOk && mi.ok && mi.frames > 0;
         allZero = allZero && mi.firstPts >= 0 && mi.firstPts < 100'000'000LL;
-        allAss  = allAss && ai.exists && ai.styles == 5;
+        allAss  = allAss && ai.exists && ai.styles == 6;
         const double durS = (mi.lastPts - mi.firstPts) / 1e9 + 1.0 / 30;
         // Sidecar must cover the segment from its very start (first GOP replay)
         // and carry most of the ideal 5 Hz samples.
@@ -411,7 +437,7 @@ static void testSegmented(const char* label, const std::string& srcDesc, uint32_
     }
     check(allOk, "every segment demuxes to EOS with frames");
     check(allZero, "every segment starts at t~0");
-    check(allAss, "every segment has its own .ass (5 styles)");
+    check(allAss, "every segment has its own .ass (6 styles)");
     check(allCovered, "every sidecar covers its segment start (< 0.5 s)");
     check(dense, "sidecar density >= 80% of 5 Hz in every full segment");
     check(dashes, "clock-only sidecar: SPD/position dashed, no ADAS banner");
@@ -1131,7 +1157,7 @@ int main(int argc, char* argv[]) {
         }
         if (line == "PlayResX: " + std::to_string(f.width)) playRes = true;
     }
-    check(styles == 5, "five styles (TL/TR/BL/BR + ADAS banner)");
+    check(styles == 6, "six styles (TL/TR/BL/BR + ADAS banner + DET block)");
     check(adasStyle == 1, "ADAS banner style present in header");
     check(adasEvents > 0, "ADAS telemetry banner rendered (" +
           std::to_string(adasEvents) + " events)");

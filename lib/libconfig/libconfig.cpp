@@ -151,6 +151,7 @@ static void parseOverlay(pugi::xml_node node, OverlayConfig& ovl,
     readVar(node, ovl.labelPadY,         log);
     readVar(node, ovl.subtitleRateHz,    log);
     readVar(node, ovl.staleTimeoutMs,    log);
+    readVar(node, ovl.vehicleDetail,     log);
 }
 
 static void parseCamera(pugi::xml_node node, CameraConfig& cam,
@@ -214,6 +215,7 @@ static void parseLog(pugi::xml_node node, LogConfig& l,
     readVar(node, l.flushEverySec, log);
     readVar(node, l.level,         log);
     readVar(node, l.flushOn,       log);
+    readVar(node, l.telemetryCsv,  log);
 }
 
 static void parseRecording(pugi::xml_node node, RecordingConfig& r,
@@ -340,6 +342,7 @@ static void writeOverlay(pugi::xml_node parent, const OverlayConfig& ovl) {
     writeVar(n, ovl.labelPadY);
     writeVar(n, ovl.subtitleRateHz);
     writeVar(n, ovl.staleTimeoutMs);
+    writeVar(n, ovl.vehicleDetail);
 }
 
 static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
@@ -403,6 +406,7 @@ static void writeLog(pugi::xml_node parent, const LogConfig& l) {
     writeVar(n, l.flushEverySec);
     writeVar(n, l.level);
     writeVar(n, l.flushOn);
+    writeVar(n, l.telemetryCsv);
 }
 
 static void writeRecording(pugi::xml_node parent, const RecordingConfig& r) {

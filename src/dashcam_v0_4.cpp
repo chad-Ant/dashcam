@@ -67,6 +67,7 @@
 #include "libnetwork.h"
 #include "librecord.h"
 #include "libtimesync.h"
+#include "telemetry_log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1580,6 +1581,7 @@ int main(int argc, char* argv[]) {
     rec::SegmentedRecorder recorder;
     recorder.setLogCallback(recLog);
     recorder.setOverlayConfig(cfg.overlay);
+    const bool vehicleDetail = (bool)cfg.overlay.vehicleDetail && (bool)cfg.overlay.enabled;
 
     UvcExposureControl exposure;
     UvcFocusControl    focus;                 // FocusMode=fixed only
@@ -1677,15 +1679,30 @@ int main(int argc, char* argv[]) {
     // thread and those fields stay dashed; recording never depends on it.
     // Opened whatever the time settings say: gating it on GPS time (as it was)
     // left the overlay without vehicle data whenever the fallback was off.
+    //
+    // <Log><TelemetryCsv> also logs every bridge frame (the decoded vehicle
+    // parameters at the bridge's full rate) to CSV beside the log file. Declared
+    // before the link so it outlives the RX thread that feeds it.
+    dashcam::app::TelemetryCsvLog telemetryCsv;
+    if ((bool)cfg.log.telemetryCsv && telemetryCsv.open(logDir, log))
+        log(LogLevel::INFO, "telemetry: every bridge frame logged to " + telemetryCsv.path() +
+                            " (+ bridge_status_*.csv)");
     dashcam::commlink::CommLink bridge;
-    if (clockSet && (bool)net.gpsTimeFallback) {
-        bridge.setTelemetryCallback([&timeKeeper](const dashcam::commlink::Telemetry& t) {
+    const bool gpsTime = clockSet && (bool)net.gpsTimeFallback;
+    if (gpsTime || telemetryCsv.isOpen()) {
+        bridge.setTelemetryCallback([&timeKeeper, &telemetryCsv, gpsTime](const dashcam::commlink::Telemetry& t) {
+            telemetryCsv.pushTelemetry(t, epochMs());
+            if (!gpsTime) return;
             dashcam::timesync::UtcFields u;
             u.year = t.year; u.month = t.month; u.day = t.day;
             u.hour = t.hour; u.minute = t.minute; u.second = t.second;
             timeKeeper.offerGps(u, (t.flags & hostproto::TLM_FLAG_TIME_VALID) != 0);
         });
     }
+    if (telemetryCsv.isOpen())
+        bridge.setStatusCallback([&telemetryCsv](const dashcam::commlink::BridgeStatus& st) {
+            telemetryCsv.pushStatus(st, epochMs());
+        });
     {
         dashcam::commlink::CommLinkConfig bcfg;          // by-id discovery, auto-stream
         auto bridgeLog = quietRepeats(recLog);
@@ -1873,8 +1890,11 @@ int main(int argc, char* argv[]) {
             // as dashes, never as a stale value. No ADAS in v0.4.
             rec::OverlayData od;
             od.timestampMs = epochMs();
-            dashcam::app::applyBridgeTelemetry(od, bridge.telemetry(),
-                                               !bridge.isStale(kBridgeFreshnessMs), od.timestampMs);
+            const dashcam::commlink::Telemetry tlm = bridge.telemetry();
+            const bool tlmFresh = !bridge.isStale(kBridgeFreshnessMs);
+            dashcam::app::applyBridgeTelemetry(od, tlm, tlmFresh, od.timestampMs);
+            if (vehicleDetail)   // every telemetry field, middle-left (<Overlay><VehicleDetail>)
+                dashcam::app::applyBridgeDetail(od, tlm, tlmFresh, od.timestampMs);
             od.adasValid   = false;
             recorder.setOverlayData(od);
 
@@ -1921,6 +1941,7 @@ int main(int argc, char* argv[]) {
     heartbeat.beat();
     timeRun.store(false);
     bridge.close();
+    telemetryCsv.close();
     heartbeat.beat();
     if (ntpThread.joinable()) ntpThread.join();
     retention.stop();                          // a pass stuck on a dead disk is left behind

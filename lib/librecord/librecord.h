@@ -166,6 +166,17 @@ struct OverlayData {
     int   fatigueLevel    = 0;       ///< 0 OK, 1 CAUTION, 2 WARNING, 3 FATIGUE.
     bool  driverDrowsy    = false;   ///< Most recent classification is drowsy.
     bool  faceDetected    = true;    ///< Driver's face currently visible to the cabin cam.
+
+    // ── detail block (every telemetry field, composed by the application) ────
+    // Plain text, '\n' between lines, drawn middle-left in a smaller font.  The
+    // application gates each field on its own source while composing it (a dead
+    // source is a dash there), so librecord stays ignorant of the protocol.
+    // Empty = no block.  Stale (detailTimestampMs older than StaleTimeoutMs) =
+    // the block is replaced by "TLM --": the text was true when composed, and a
+    // block the application stopped refreshing must not be drawn as current.
+    // Commas, braces and backslashes are replaced when written (ASS syntax).
+    std::string detailText;
+    int64_t     detailTimestampMs = 0; ///< Epoch ms detailText was composed.
 };
 
 // ─── recording format ─────────────────────────────────────────────────────────
@@ -339,9 +350,10 @@ private:
     /// a stationary vehicle has a good fix and no trustworthy course.  Any flag
     /// covering two of these necessarily lies about one of them, and a frozen
     /// reading rendered as current is fabricated evidence.
+    /// @p detailStale replaces OverlayData::detailText with "TLM --".
     void writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
                         int64_t wallNowMs, bool speedStale, bool accelStale,
-                        bool positionStale, bool headingStale);
+                        bool positionStale, bool headingStale, bool detailStale = false);
 };
 
 // ─── shared internals (librecord.cpp) ─────────────────────────────────────────
@@ -353,14 +365,20 @@ std::string gstQuoted(const std::string& value);
 void writeAssHeader(std::ostream& out, const dashcam::config::OverlayConfig& cfg,
                     uint32_t videoW, uint32_t videoH);
 /// One telemetry sample (corner Dialogue events) at video time @p posNs; each
-/// stale flag dashes its own field (see Recorder::writeAssSample).
+/// stale flag dashes its own field (see Recorder::writeAssSample).  A non-empty
+/// OverlayData::detailText adds the DET block ("TLM --" when @p detailStale).
 void writeAssSample(std::ostream& out, int64_t posNs, int64_t durNs,
                     const OverlayData& od, int64_t wallNowMs, bool speedStale,
-                    bool accelStale, bool positionStale, bool headingStale);
+                    bool accelStale, bool positionStale, bool headingStale,
+                    bool detailStale = false);
 /// Per-source staleness of one telemetry snapshot.
 struct AssStaleness {
     bool speed = true, accel = true, position = true, heading = true;
+    bool detail = true;   ///< detailText older than the window (0 = no age limit).
 };
+/// detailText as one ASS Text field: '\n' becomes \N; commas, braces and
+/// backslashes (Dialogue field separator, override tags, escapes) are replaced.
+std::string assDetailText(const std::string& text);
 /// Judge each source: invalid flag, non-finite / out-of-range value, or older
 /// than @p staleMs (0 = no age limit) → stale.
 AssStaleness assStaleness(const OverlayData& od, int64_t nowMs, int64_t staleMs);

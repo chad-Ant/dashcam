@@ -354,7 +354,7 @@ void SegmentedRecorder::onFragmentOpened(const std::string& location, int64_t rt
     for (const Sample& s : ring_)
         if (s.rtNs >= rtNs)
             detail::writeAssSample(assFile_, s.rtNs - rtNs, durNs, s.od, s.wallMs, s.stale.speed,
-                                   s.stale.accel, s.stale.position, s.stale.heading);
+                                   s.stale.accel, s.stale.position, s.stale.heading, s.stale.detail);
 }
 
 void SegmentedRecorder::onFragmentClosed(const std::string& location) {
@@ -599,7 +599,7 @@ void SegmentedRecorder::takeSample(int64_t durNs, int64_t staleMs) {
 
     if (assFile_.is_open() && fragStartRtNs_ >= 0 && rt >= fragStartRtNs_)
         detail::writeAssSample(assFile_, rt - fragStartRtNs_, durNs, s.od, s.wallMs, s.stale.speed,
-                               s.stale.accel, s.stale.position, s.stale.heading);
+                               s.stale.accel, s.stale.position, s.stale.heading, s.stale.detail);
 }
 
 void SegmentedRecorder::workerLoop() {

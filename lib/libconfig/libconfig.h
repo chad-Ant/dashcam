@@ -203,6 +203,7 @@ struct OverlayConfig {
     ConfigVar<float>       labelPadY         {"LabelPadY",         8.0f,  0.0f,  64.0f, 1.0f,   "Vertical label margin / box padding (px at 720p)"};
     ConfigVar<float>       subtitleRateHz    {"SubtitleRateHz",    5.0f,  0.5f,  30.0f, 0.5f,   "Telemetry samples per second written to the ASS sidecar"};
     ConfigVar<int>         staleTimeoutMs    {"StaleTimeoutMs",    2000,  0,     60000, 100,    "Telemetry age (ms) past which motion/position fields render as a dash; 0 = never stale (the clock always stays live)"};
+    ConfigVar<bool>        vehicleDetail     {"VehicleDetail",     true,                           "Add a middle-left block to the ASS sidecar with every bridge telemetry field (powertrain, brake, indicators, wheels, GNSS, IMU, OBD-II, CAN map, switches); each field dashed when its source is not live"};
 };
 
 /**
@@ -323,6 +324,7 @@ struct LogConfig {
     ConfigVar<int>         flushEverySec {"FlushEverySec", 1,    0,   60,    1,   "Periodic flush-to-disk interval (s); 0 = only FlushOn-level flushes"};
     ConfigVar<std::string> level         {"Level",         "debug",              "Minimum level written (debug|info|warn|error|off); DASHCAM_LOG_LEVEL env overrides"};
     ConfigVar<std::string> flushOn       {"FlushOn",       "warn",               "Level that forces an immediate flush to disk (debug|info|warn|error|off)"};
+    ConfigVar<bool>        telemetryCsv  {"TelemetryCsv",  false,                "Log every bridge telemetry frame (~10 Hz, decoded vehicle parameters) and status frame (1 Hz) to telemetry_<start>.csv and bridge_status_<start>.csv in the log directory (~20 MB per hour of driving; not rotated)"};
 };
 
 /**

@@ -147,9 +147,9 @@ void Recorder::writeAssHeader() {
 
 void Recorder::writeAssSample(int64_t posNs, int64_t durNs, const OverlayData& od,
                               int64_t wallNowMs, bool speedStale, bool accelStale,
-                              bool positionStale, bool headingStale) {
+                              bool positionStale, bool headingStale, bool detailStale) {
     detail::writeAssSample(assFile_, posNs, durNs, od, wallNowMs, speedStale, accelStale,
-                           positionStale, headingStale);
+                           positionStale, headingStale, detailStale);
 }
 
 namespace detail {
@@ -215,14 +215,42 @@ void writeAssHeader(std::ostream& out, const dashcam::config::OverlayConfig& cfg
              << ",0,0,0,100,100,0,0,3," << boxPad << ",0,8,"
              << marginX << "," << marginX << "," << marginY << ",1\n";
 
+    // Detail block (middle-left, alignment 4): every telemetry field, in a
+    // smaller font so the many lines leave the road visible.  Only drawn when
+    // the application supplies OverlayData::detailText.
+    const int detailPx = std::max(4, static_cast<int>(std::lround(fontPx * 0.6f)));
+    out << "Style: DET," << face << "," << detailPx
+             << ",&H00FFFFFF,&H00FFFFFF,&H" << alphaHex << "000000,&H"
+             << alphaHex << "000000," << bold
+             << ",0,0,0,100,100,0,0,3," << std::max(1, boxPad / 2) << ",0,4,"
+             << marginX << "," << marginX << "," << marginY << ",1\n";
+
     out << "\n[Events]\n"
                 "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
                 "MarginV, Effect, Text\n";
 }
 
+std::string assDetailText(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 16);
+    for (const char c : text) {
+        switch (c) {
+            case '\n': out += "\\N"; break;
+            case '\r': break;
+            case ',':  out += ';';    break;   // Dialogue fields are comma-separated
+            case '{':  out += '(';    break;   // override-tag block
+            case '}':  out += ')';    break;
+            case '\\': out += '/';    break;   // \N, \h and friends
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
 void writeAssSample(std::ostream& out, int64_t posNs, int64_t durNs,
                     const OverlayData& od, int64_t wallNowMs, bool speedStale,
-                    bool accelStale, bool positionStale, bool headingStale) {
+                    bool accelStale, bool positionStale, bool headingStale,
+                    bool detailStale) {
     const std::string t0 = assTime(posNs);
     const std::string t1 = assTime(posNs + durNs);
     char buf[192];
@@ -328,6 +356,13 @@ void writeAssSample(std::ostream& out, int64_t posNs, int64_t durNs,
         std::snprintf(adas, sizeof(adas), "%s   %s", lane, fat);
         out << "Dialogue: 0," << t0 << "," << t1 << ",ADAS,,0,0,0,," << adas << "\n";
     }
+
+    // Detail block: the application's own text, or "TLM --" once it stopped
+    // being refreshed — never the last text drawn as if it were current.
+    if (!od.detailText.empty()) {
+        out << "Dialogue: 0," << t0 << "," << t1 << ",DET,,0,0,0,,"
+            << (detailStale ? std::string("TLM --") : assDetailText(od.detailText)) << "\n";
+    }
 }
 
 
@@ -368,6 +403,7 @@ AssStaleness assStaleness(const OverlayData& od, int64_t nowMs, int64_t staleMs)
     st.heading =
         !od.headingValid || !headingRenderable(od.headingDeg) ||
         (staleMs > 0 && (nowMs - od.headingTimestampMs) > staleMs);
+    st.detail = staleMs > 0 && (nowMs - od.detailTimestampMs) > staleMs;
 
     return st;
 }
@@ -430,7 +466,7 @@ void Recorder::subtitleLoop() {
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
         const detail::AssStaleness st = detail::assStaleness(od, nowMs, staleMs);
-        writeAssSample(pos, durNs, od, nowMs, st.speed, st.accel, st.position, st.heading);
+        writeAssSample(pos, durNs, od, nowMs, st.speed, st.accel, st.position, st.heading, st.detail);
         if (std::chrono::steady_clock::now() >= nextAssFlush) {
             assFile_.flush();
             nextAssFlush = std::chrono::steady_clock::now()

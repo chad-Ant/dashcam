@@ -77,6 +77,8 @@ static bool test_load_real_file() {
     check(cfg.log.queueSize == 8192,               "log.queueSize default 8192 (section may be absent)");
     check(cfg.log.level == "debug",                "log.level default \"debug\"");
     check(cfg.log.flushOn == "warn",               "log.flushOn default \"warn\"");
+    check(cfg.log.telemetryCsv == false,           "log.telemetryCsv default false");
+    check(cfg.overlay.vehicleDetail == true,       "overlay.vehicleDetail default true");
     check(cfg.pipeline.branchQueueDepth == 2,      "pipeline.branchQueueDepth default 2");
 
     return g_fails == before;
@@ -98,6 +100,7 @@ static bool test_roundtrip() {
     src.overlay.labelPadY   = 16.0f;
     src.overlay.subtitleRateHz = 2.0f;
     src.overlay.staleTimeoutMs = 1500;
+    src.overlay.vehicleDetail  = false;
     src.recording.segmentSec          = 60;
     src.recording.maxFootageGB        = 123.0f;
     src.recording.minFreeGB           = 7.0f;
@@ -118,6 +121,7 @@ static bool test_roundtrip() {
     src.log.flushEverySec = 3;
     src.log.level         = "info";
     src.log.flushOn       = "error";
+    src.log.telemetryCsv  = true;
     src.detection.laneEnginePath   = "models/custom_lane.engine";
     src.detection.laneTargetHz     = 15;
     src.detection.laneBranchMaxFps = 30;
@@ -211,6 +215,7 @@ static bool test_roundtrip() {
     check(eq(dst.overlay.labelPadY, 16.0f),   "overlay.labelPadY round-trip");
     check(eq(dst.overlay.subtitleRateHz, 2.0f), "overlay.subtitleRateHz round-trip");
     check(dst.overlay.staleTimeoutMs == 1500,   "overlay.staleTimeoutMs round-trip");
+    check(dst.overlay.vehicleDetail == false,   "overlay.vehicleDetail round-trip");
     check(dst.recording.segmentSec          == 60,     "recording.segmentSec round-trip");
     check(dst.recording.maxFootageGB        == 123.0f, "recording.maxFootageGB round-trip");
     check(dst.recording.minFreeGB           == 7.0f,   "recording.minFreeGB round-trip");
@@ -231,6 +236,7 @@ static bool test_roundtrip() {
     check(dst.log.flushEverySec == 3,         "log.flushEverySec round-trip");
     check(dst.log.level         == "info",    "log.level round-trip");
     check(dst.log.flushOn       == "error",   "log.flushOn round-trip");
+    check(dst.log.telemetryCsv  == true,      "log.telemetryCsv round-trip");
     check(dst.detection.laneEnginePath == "models/custom_lane.engine",
                                               "detection.laneEnginePath round-trip");
     check(dst.detection.laneTargetHz     == 15, "detection.laneTargetHz round-trip");
