@@ -1,4 +1,4 @@
-# Handover — branch `camera`, 2026-10-03
+# Handover — branch `camera`, 2026-10-03 (night drive prepared; see the 21:10 section)
 
 ## Where things stand
 
@@ -26,6 +26,208 @@
 | usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Item Z fixed 2026-10-03, confirmed on the UGREEN. |
 | Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Items X, Y fixed 2026-10-03; X confirmed on the UGREEN. |
 | commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Item W fixed 2026-10-03. |
+
+## 2026-10-04 00:25 (Jetson): raw CAN over the MKR's USB — decided, baseline captured, firmware NOT started yet
+
+**What the user asked** (after the drive): "stream raw CAN frames to the orin nano without logging CAN related sidecar
+info". Clarified by questions:
+- transport = **the MKR's native USB**, direct to the Orin, so that link is no longer development-only;
+- **all IDs**, accept-all;
+- **no CAN decoding on the MKR**: decoding moves offline to the Orin, and telemetry's CAN fields read as unavailable.
+- *Not* chosen: removing the CAN lines from the `.ass` (they will just show dashes), or removing CAN status lines.
+
+**Design (fixed in the workflow script):**
+- **Drain:** a hardware-timer ISR polls the MCP2515 (INT is not wired) into an SPSC RAM ring with a `micros()` stamp
+  per frame. Every main-loop MCP2515 SPI access is masked.
+- **Modes:** boot into `CanMode::DISCOVER` (listen-only, accept-all, raw stream, no decode); no probe and no
+  automatic OBD2. SNIFF only by host command, decoding from the ring through a new public
+  `canDecodeFrame(VehicleSignals&, YawEstimator&, uint32_t id, uint8_t dlc, const uint8_t*, uint32_t nowMs)`.
+- **USB lines** (main loop, never blocking: `availableForWrite`, DTR gate):
+  - `F tttttttt iii d hh..` (8-hex `micros()`, 3-hex standard / 8-hex extended id, `R d` for RTR);
+  - once a second, `FS t drained streamed ovf ringdrop nohost`.
+- **Unchanged:** the C3 and the wire protocol. DISCOVER stamps vehicle liveness, so the IMU low-power logic still
+  sees a running car.
+- **Orin tools:** in `peripherals/mkr_zero/tools/canstream/`:
+  - `mkr_stream_log.py` writes candump-format `can_raw.log` (MKR clock → host epoch via a sliding-minimum offset),
+    `can_stats.csv`, `can_sync.csv` and `mkr_console.txt`;
+  - `can_decode` is a host C++ build of the unmodified firmware decode;
+  - `drive_session.sh` switches to the new logger.
+
+**Status:**
+- Workflow `wf_e2433458-e09` (4 agents) was cut off when the session ended. Its first agent (firmware implementer)
+  only researched (23:50–00:13): **no file in the repo was changed.**
+- The script is saved at `~/drive_logs/tools/mkr_raw_can_stream_workflow.js`. Relaunch it with
+  `Workflow({scriptPath})`: nothing is cached, so the agents start fresh.
+- The agent's baseline helpers (flash/RAM and stack baseline of HEAD) are in
+  `~/drive_logs/tools/session_scratch_20261003/` (`stack_*.txt`, `build_baseline.sh`, `test_baseline.sh`,
+  `find_core.sh`).
+- Before relaunching, add to its prompts: use the real baseline log below as the decoder's real-data input
+  (read-only, outside the repo, never copied in), and the 0.4 % loss as the target.
+
+**Real all-IDs baseline, captured parked with the engine on (23:55):**
+- The MKR was flashed with CANRawLog from a clean `git archive HEAD` copy, then production was flashed back at 00:00
+  from the same copy: 121,684 bytes, identical to the 2026-09-27 production flash. The probe passed, sniffing
+  resumed, and the C3 reported "master link up" at 00:00:10.
+- **The MKR now runs production again.**
+- `~/drive_logs/can_baseline_20261003/` (README there) holds `canrawlog_engine_on_20261003.log`: 333k frames,
+  1229 fr/s, 39 IDs, ≥ 0.4 % loss. During the capture the user did, in order:
+  - brake ×5;
+  - left indicator, right indicator, hazards;
+  - gear P-R-N-D and back;
+  - throttle blips, and a hold at 2500 rpm;
+  - steering full left and full right.
+- Also in that dir: the restore script `flash_production.sh` and `journal_boot_final_0024.txt` (the full journal of
+  the drive boot, taken at 00:24).
+
+**v0.4 at the end of the night:**
+- **Stop:** stopped with `systemctl stop` at 00:10:35, cleanly. The last segment `dashcam_000342` closed, and the
+  service ends inactive but still enabled.
+- **Session:** 138,752 frames from 22:14:49 = about 20 fps average, which is night mode's camera auto-exposure as
+  documented.
+- **Focus hand-back confirmed on the road (item X):** "focus: handed back to the camera … (autofocus on, stored lens
+  position 650)". That is exactly the state it found at its 22:14 start, after the parked sweep.
+
+**Housekeeping:**
+- The drive-logging crontab line is **disarmed** (saved copy:
+  `~/drive_logs/tools/drive_session/crontab_before_disarm_20261004.txt`). Re-arm with
+  `(crontab -l; tail -2 ~/drive_logs/tools/drive_session/crontab_before_disarm_20261004.txt) | crontab -`.
+- The uncommitted v0.4 telemetry work (11 files, including HANDOVER) has a patch backup:
+  `~/drive_logs/tools/drive_session/telemetry_ass_csv_working_tree_20261004.patch`.
+- The deployed config keeps `FocusMode=fixed` 690, `TelemetryCsv` on, and logs at 16 MB × 8.
+
+## 2026-10-03 night drive: results (22:17–23:38, about 85 min, 83 km, max 106 km/h)
+
+Everything recorded for the whole drive. The watchdog (`drive_watch.sh`, read-only, 30 s checks) never fired. The
+session was stopped by hand at 23:39, and the CSI segment closed with EOS. The data is in:
+- `/media/jetson/backup/drive_sessions/session_001/` (with `journal_final.txt` + `journal_final_monotonic.txt`, full
+  snapshots taken at 23:39);
+- `/media/jetson/backup/footage/dashcam_000301…`;
+- `/media/jetson/backup/logs/{log,telemetry,bridge_status}_20261003_2{11445,21449}.*`.
+
+The first file pair spans the clock step, so its wall-clock span reads 60 min; really it is about 6 min, at the same
+~9.8 rows/s.
+
+| Area | Result |
+|---|---|
+| v0.4 | 29 segments, **0 warnings or errors during the drive** (the only WARN is the 22:14:44 port close at the planned restart); night mode the whole way |
+| UGREEN focus | Held at 690 with autofocus off for 5031 s (`ugreen.csv`); auto exposure (night mode) throughout |
+| CSI | **92 segments, one pipeline part (no restart)**, 100 GB, median 1.1 GB/min |
+| Telemetry CSV | 50,187 rows over 85.4 min = 9.79/s; max gap 912 ms (2 gaps over 500 ms) |
+| GNSS | Fix 100% of the drive, median 19 sats |
+| Distance / speed | Integrated CAN speed 83.1 km; moving 90%; engine on 93% |
+| C3 bridge | 0 CRC errors on the MKR hop; `host_tx_dropped` 4 → 66 (62 frames not sent to the Jetson in 85 min); telemetry age max 108 ms; C3 ≤ 35.7 °C |
+| CAN (MKR console, 5078 engine-on seconds) | 401 fr/s received, `ovf` 62/s → **lower-bound loss 13.4%** (same as 2026-09-26); `turn=--` 7.4% of seconds; turn bits valid 85.7% and brake bits valid 93.0% of telemetry frames |
+| IMU | `ioerr` 1/1 → 30/155; `hgrej` 1 → 155 (corrupt bursts, engine on); **High-G 0 → 64** (road shocks again, about 45/h); `i2cerr` 0 → 2; `i2cto` 0; `gaps` 1 → 3 |
+| MKR | No reset, no USB drop, no quarantine for the whole session |
+| Jetson | `tj` max 54.3 °C (mean 52.1 °C); disk 464 GB free after the drive |
+
+Still to analyse: the CSI night tuning frame by frame (decode via `csi_decode.read_bgr`), the fixed-focus footage,
+the High-G events against the footage, and CAN speed against GNSS speed.
+
+## 2026-10-03 21:10 (Jetson): rig prepared for the second drive, a night drive (code uncommitted)
+
+The K–Z work is committed and pushed (`2de0578`). Then, for the drive:
+
+**v0.4: every telemetry field into the `.ass`, every bridge frame into CSV (uncommitted, 11 files)**
+- **`.ass` detail block.**
+  - `OverlayData::detailText`, drawn middle-left in a new `DET` style at 0.6× the corner font.
+  - The application composes the text: `formatBridgeDetail()` / `applyBridgeDetail()` in `src/bridge_overlay.h`. The
+    lines are:
+    - powertrain + source;
+    - brake / turn / hazard / steer torque / yaw;
+    - the four wheels;
+    - GNSS;
+    - IMU raw;
+    - IMU fusion + peaks;
+    - High-G count/age, calibration, IMU flags;
+    - the OBD-II PIDs;
+    - CAN mode, map id and filter origin, switches, MKR uptime, flags.
+  - Same rule as the corners: a field whose source is not live is a dash. A bit is printed only when its validity bit
+    is set. A stale bridge gives `TLM -- no live bridge sample`.
+  - librecord dashes the whole block (`TLM --`) once `detailTimestampMs` is older than `StaleTimeoutMs`. It replaces
+    commas, braces and backslashes, which are ASS syntax.
+  - Switch: `<Overlay><VehicleDetail>`, default true.
+- **Telemetry CSV.** `src/telemetry_log.h` (`TelemetryCsvLog`) writes `telemetry_<start>.csv`, one row per bridge
+  telemetry frame (about 10 Hz), and `bridge_status_<start>.csv` (1 Hz) to the log directory.
+  - Columns: host epoch ms, every field, and the decoded bits (empty when not measured, never 0).
+  - Threading: the RX thread only queues (bounded at 6000 frames, oldest dropped and counted). A writer thread
+    flushes every 1 s and runs fdatasync every 5 s.
+  - Switch: `<Log><TelemetryCsv>`, default false. **The deployed `dashcam.xml` has it on**, plus log rotation
+    16 MB × 8; backup at `configs/dashcam.xml.bak-20261003-before-night-drive`.
+- **Tests:**
+  - `bridge_overlay_test` has 51 checks (detail lines; sentinels never leak; CSV row width, values and empty cells).
+  - `record_test` is PASS: DET rendering, sanitising, staleness, and the header style; style count 5 → 6, with
+    Part B on the UGREEN.
+  - `config_test` 173 and `dashcam_v0_4 --self-test` PASS.
+  - Plain `make` builds `bin/build_20261003_135326` (only the two old warnings). The service runs the newest build,
+    so this is what boots in the car.
+- Patch backup: `~/drive_logs/tools/drive_session/telemetry_ass_csv_working_tree_20261003.patch`.
+
+**Drive logging outside v0.4: `~/drive_logs/tools/drive_session/` (README there), armed with a crontab `@reboot`
+line (no sudo)**
+- Each boot writes `/media/jetson/backup/drive_sessions/session_NNN/`:
+  - the whole journal, followed live (the journal is volatile here);
+  - IMX296 footage: nvarguscamerasrc with no ISP properties, so the installed c8_sh15 is what you see; 1456x1088 at
+    30 fps, nvjpegenc, 60 s MKV segments, EOS on stop;
+  - the MKR USB console;
+  - UGREEN focus, exposure and gain every 1 s (with autofocus on, `focus_absolute` is the live lens position);
+  - tegrastats;
+  - a health snapshot every minute.
+- Every line carries `mono=`, because the clock is wrong at boot in the car until v0.4 sets it from GPS.
+- Disarm: `crontab -l | grep -v drive_session.sh | crontab -`.
+- **Dry run at 21:01 (indoors), every output checked:**
+  - the `.ass` block is live (IMU values, CAN sniff probing accept-all, GNSS present with no fix);
+  - the CSV gives 9.7 rows/s;
+  - CSI segments are finalised on stop;
+  - `ugreen.csv` follows v0.4's exposure loop step for step;
+  - stop takes 1 s;
+  - a run under a bare cron environment works.
+
+**Not done, by decision:** raw CAN frames. The MKR's single MCP2515 cannot stream all ~1100 fr/s and run production
+at once, and the Orin's `can0` (Waveshare SN65HVD230) is not wired yet. The decoded parameters are logged (telemetry
+CSV, `.ass`, MKR console).
+
+**Found:** the IMX296's V4L2 `exposure` control maxes at 1001 lines, about 15 ms. Indoors it already read 1000/1001,
+with gain 127/201. At night the CSI is gain-limited at about half the 33 ms a 30 fps stream allows. This is the
+driver's range and the DT `max_exp_time`, not the ISP file. Look at it in the imx296 driver rework after the drive.
+
+**In the car, 22:08–22:16 (parked, engine idling), before driving off:**
+- **Startup:** everything started by itself (session_001). NTP set the clock within a second of v0.4 starting
+  (+3208 s step). The detail block is live with car data: rpm 856, gear P, brake, steering torque, wheels, a 3D GNSS
+  fix with 8 sats, map 0x0B filtered. The telemetry CSV gives 9.5 rows/s.
+- **CAN loss:** the MKR console shows `ovf=` rising about 70/s against `rx=` about 420/s, roughly the 13% loss
+  of 2026-09-26.
+- **IMU:** corrupt bursts with the engine on are back (`hgrej=8`, `ioerr=1/8`).
+- **Footage rates:** CSI night segments are about 12 MB/s (3× indoors; noise inflates the JPEGs) and the UGREEN
+  about 7 MB/s, so about 68 GB/h. With 577 GB free that is about 8 h before v0.4's 20 GB floor.
+- **CSI at night:** bright and sharp, no halos. But the mount is rolled about 10° and the lower third of the frame is
+  dashboard.
+- **UGREEN autofocus fails at night.** After power-up it sat at the default `focus_absolute` 512 with
+  `focus_automatic_continuous=1`, never moved, and the footage was badly blurred (street lights as large discs).
+  After the sweep it also stayed at whatever value was written (1023, then 650) with autofocus back on.
+- **Parked manual sweep**, via the standard control while recording: frames were cut from the growing MKV's tail,
+  where frames are whole JPEGs, and scored by Laplacian variance.
+
+  | `focus_absolute` | 200 | 450 | 575 | 625 | 650 | 675 | 725 | 800 | 950 | 1023 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | Laplacian variance | 144 | 152 | 172 | 203 | 230–248 | **370** | 322 | 196 | 160 | 154 |
+
+  Road focus is about 690, close to the 665–694 that autofocus chose indoors in daylight.
+- **User chose fixed focus.** The deployed config now has `<FocusMode>fixed</FocusMode>` and
+  `<FocusAbsolute>690</FocusAbsolute>`; backup at `configs/dashcam.xml.bak-20261003-2215-before-fixed-focus`.
+- **v0.4 restarted without sudo:** `docker kill -s TERM dashcam_v04` makes v0.4 finalise and exit 0, and the
+  unit's `Restart=always` brings it back. The footage gap was about 6 s (22:14:44.7 → 22:14:50.9). The log reads
+  "focus: fixed at 690 … (autofocus off; range 0..1023)". The live frame scored Laplacian variance 486, the
+  sharpest of the night; `ugreen.csv` reads 0/690.
+- **The config change persists for later boots.** Revert to `camera` once a daylight check says autofocus is fine
+  by day, or keep fixed for windscreen use.
+
+**After the drive:**
+- Disarm the crontab line.
+- Pull `drive_sessions/session_NNN/`, `footage/` and `logs/` (`log_*`, `telemetry_*`, `bridge_status_*`).
+- Judge the CSI night tuning from `csi/` (decode with `csi_decode.read_bgr`: limited range).
+- Judge autofocus from `ugreen.csv` plus the footage.
+- Then decide whether to commit the telemetry work.
 
 ## Done 2026-10-03 (Jetson): items K–Z resolved
 
