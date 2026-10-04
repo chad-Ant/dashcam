@@ -63,6 +63,12 @@ info". Clarified by questions:
   `find_core.sh`).
 - Before relaunching, add to its prompts: use the real baseline log below as the decoder's real-data input
   (read-only, outside the repo, never copied in), and the 0.4 % loss as the target.
+- **Relaunched 2026-10-04 06:55 as run `wf_265592d8-b63`**, with those additions.
+  - The script must sit under the working directory, so it is at `.git/claude_workflows/mkr_raw_can_stream.js`
+    (inside `.git`, never committed).
+  - Resume an interrupted run with
+    `Workflow({scriptPath: ".git/claude_workflows/mkr_raw_can_stream.js", resumeFromRunId: "wf_265592d8-b63"})`:
+    completed agents come back cached.
 
 **Real all-IDs baseline, captured parked with the engine on (23:55):**
 - The MKR was flashed with CANRawLog from a clean `git archive HEAD` copy, then production was flashed back at 00:00
@@ -121,8 +127,30 @@ The first file pair spans the clock step, so its wall-clock span reads 60 min; r
 | MKR | No reset, no USB drop, no quarantine for the whole session |
 | Jetson | `tj` max 54.3 °C (mean 52.1 °C); disk 464 GB free after the drive |
 
-Still to analyse: the CSI night tuning frame by frame (decode via `csi_decode.read_bgr`), the fixed-focus footage,
-the High-G events against the footage, and CAN speed against GNSS speed.
+**Paired snapshots (2026-10-04), 4 moments, both cameras:** in `~/drive_logs/night_drive_20261003_snapshots/`,
+outside the repo (camera captures).
+- **Method:**
+  - dashcam: frames with the `.ass` burned in;
+  - CSI: raw JPEGs decoded with `csi_decode.read_bgr_u8`;
+  - moments located through the telemetry CSV; CSI segments mapped through `mono=` (the recorder started before
+    the +3208 s clock step).
+- **UGREEN at fixed 690:** sharp when steady. Heavy motion blur in turns and on passing objects, because night-mode
+  auto-exposure runs a slow shutter (about 20 fps). The overlay and detail block render as designed.
+- **CSI (c8_sh15):**
+  - **On lit roads:** clean, sharp, natural colour, and much less motion blur than the UGREEN in the same turns
+    (global shutter, exposure ≤ 15 ms).
+  - **On unlit roads** (the 106 km/h highway frame): very noisy, with strong horizontal row banding and clipped
+    headlight pools. This is the driver's exposure cap (1001 lines ≈ 15 ms) forcing gain to maximum; lifting the cap
+    to the 33 ms a 30 fps frame allows would roughly halve the gain.
+  - **Mount:** the dashboard fills the lower third to half of every CSI frame, and it is rolled about 5–10°. Re-aim it
+    before the next drive.
+- **Yaw sign checked over the whole drive:**
+  - it is opposite to the GNSS course rate in 92 % of turns over 5 °/s (correlation −0.56, as left-positive
+    requires);
+  - left indicator with |yaw| > 8 °/s: yaw positive in 213 of 219 samples; right indicator: negative in 192 of 197.
+  - So the sign convention is right. The rare mismatches are real driving (signalling during an opposite curve).
+
+Still to analyse: the High-G events against the footage, and CAN speed against GNSS speed.
 
 ## 2026-10-03 21:10 (Jetson): rig prepared for the second drive, a night drive (code uncommitted)
 
