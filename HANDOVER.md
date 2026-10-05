@@ -27,6 +27,82 @@
 | Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Items X, Y fixed 2026-10-03; X confirmed on the UGREEN. |
 | commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Item W fixed 2026-10-03. |
 
+## 2026-10-06 (Jetson): raw CAN over the MKR's USB — implemented, reviewed, bench-proven (uncommitted)
+
+**Firmware** (`peripherals/mkr_zero`; workflows `wf_265592d8-b63` implement + `wf_1db52a87-ea3` adversarial review):
+- **Capture:** the TC3 timer ISR drains the MCP2515 every 100 µs into a 1024 × 16 B SPSC ring (`lib/CANFrameRing.h`,
+  `lib/CANStreamHw.*`, `canDrainIsr()`), stamping each frame with `micros()`.
+- **Boot and modes:** boot into DISCOVER (listen-only, accept-all, no decode, never bus-active on its own). SNIFF only
+  by host command, decoding from the ring through `canDecodeFrame()`.
+- **USB stream:** `lib/CANRawStream.*` writes `F`/`FS` lines (contract in CANRawStream.h). It writes only when DTR is
+  high and the bulk-IN bank is free (BK1RDY), and keeps the bank full with bounded waits (300 µs per packet, 1 ms per
+  call).
+- **Status line:** goes out in about 4 whole packets via `canStreamConsoleWrite()`, to avoid the core's `send()`
+  TRCPT1 race, which the 10 kHz ISR made likely.
+- **Telemetry:** in DISCOVER the CAN fields read unavailable (NaN, sentinels, validity bits clear, `canMode=1`). The
+  `.ass` dashes them and shows `CAN discover`.
+- **Self-test build** `build_and_upload.sh auto selftest[=N]`: numbered synthetic frames on id 0x7F0 for bench
+  throughput. **Never flash it to the car.**
+- **Tests:** 11 host suites (incl. can_ring/drain/telemetry/stream/selftest and sketch_policy_tests.py);
+  `make mutations` catches **102/102**. Production build: 123,236 B flash, 23,924 B RAM (8,844 B free; stack + heap
+  estimated ≤ 3.3 KB).
+
+**Orin tools** (`peripherals/mkr_zero/tools/canstream`, 67 tests):
+- `mkr_stream_log.py` writes `can_raw.log` (candump), `can_stats.csv`, `can_sync.csv` and `mkr_console.txt`. It uses
+  a reader thread and HUPCL, maps the MKR clock with a windowed minimum, and does exact host-loss accounting.
+- `canrawlog2candump.py` converts old CANRawLog logs.
+- `can_decode` is the offline decoder, built from the unmodified firmware decode.
+- `can_contract_emit` and the contract tests cover firmware formatter → logger → decoder.
+- `drive_session.sh` now runs the new logger.
+- **Real-data check:** the decoded 2026-10-03 baseline matches the user's actions.
+- **Map findings:** hazards are not observable on this bus, and 0x294 is a steady stalk bit, not a blinking lamp.
+
+**Bench results (2026-10-06, MKR + C3 on USB, no CAN bus):**
+
+| Self-test rate | Result |
+|---|---|
+| 2400 fr/s (2× the Brio), 120 s | 288,103 frames, **0 sequence gaps**, ovf 0, ringdrop 0, host loss 0, ring peak 22/1024, timestamps monotonic; loop 5.4–7.4 k passes/s, max pass ≈ 17 ms; IMU/GNSS/C3 healthy |
+| 4400 fr/s (a full 500 kbps bus of 8-byte frames), 60 s | **0 gaps**, ring peak 184/1024, host loss 0 |
+| 10000 fr/s (physically impossible), 60 s | saturates at ≈ 5,850 fr/s; the excess is counted exactly as ringdrop; no reset; IMU/C3 fine; loop slows to ≈ 200 passes/s |
+
+- **DTR/HUPCL:** with the port closed, frames counted as `nohost` and none as ringdrop.
+- **Stalled host** (port open, nobody reading): only the ring's overflow is dropped, and counted.
+- **Found and fixed on the bench:** every spell without a reader cost one IMU data gap. The new console writer still
+  handed unread status-line text to the core, arming a packet nobody collects, so the next `send()` blocked for 70 ms.
+  `canStreamConsoleWrite()` now **drops** text no host takes (break owed); tests and 3 mutants were added. Re-run:
+  `gaps=` held at 1 through two closed-port spells and stalls of 4 s and 8 s. The old firmware had the same 70 ms
+  behaviour.
+- **The production build is on the MKR now**, checked on the bench: DISCOVER, FS once a second, no self-test traces.
+- Logs: `~/drive_logs/bench_can_stream/`.
+
+**Tools adversarial review (done):** 80 tests; 70 mutants (logger, converter, decoder), all caught.
+- **Fixed:** a full or failing disk killed the logger for the rest of a session; it now keeps reading and resumes
+  writing, losing whole lines only.
+- **Fixed:** the stale first packet after a logger restart was used as a timing sample and as the start of the loss
+  count.
+- **Fixed:** a reader paused for more than 20 s split the timeline.
+- **Fixed:** the wall-clock read was racy (clock-step false positives).
+- **Format interop:** checked against python-can 4.6.1 and can-utils `log2asc`.
+- **Open risk:** a disk that hangs without erroring grows the logger's queue by about 0.85 GB/h until it recovers.
+- **Also open:** `drive_watch.sh` watches only `mkr_console.txt`'s age, not `can_raw.log` growth.
+
+**Logger on real hardware (2026-10-06 01:28, self-test at 1200 fr/s):**
+- **Restart against a running MKR:** one timeline, 0 malformed lines, 0 gaps.
+- **DTR drop on logger exit:** the gap was counted as `nohost` (7,353), with 0 ringdrop.
+- **Real MKR reset under the running logger** (production flashed mid-run):
+  - port lost → reopened 4.9 s later → exactly one new timeline;
+  - boot banner captured ("reset cause 0x40", "CAN: mode -> discover");
+  - 53,730 frames before the reset with 0 gaps.
+
+**Map facts from the baseline decode** (not yet reflected in the firmware or map comments):
+- 0x294 is a steady stalk-position bit, not a ~1.5 Hz blinking lamp, so SNIFF's 900 ms hold only delays "off".
+- Hazards are not observable on this bus.
+
+**Still to do:**
+- The **in-car loss measurement** (parked, engine on, about 10 min) against the CANRawLog baseline (≥ 0.4 %).
+- Commit when the user asks.
+- The drive crontab stays disarmed until the user re-arms it.
+
 ## 2026-10-04 00:25 (Jetson): raw CAN over the MKR's USB — decided, baseline captured, firmware NOT started yet
 
 **What the user asked** (after the drive): "stream raw CAN frames to the orin nano without logging CAN related sidecar
