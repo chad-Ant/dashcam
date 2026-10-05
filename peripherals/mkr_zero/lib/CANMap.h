@@ -226,7 +226,7 @@ struct CanSignalMap {
     uint8_t    filterCount;             ///< Entries of @c filterId in use.
     uint8_t    checksum;                ///< Identifies the map on the wire.
     uint8_t    statusFlags;             ///< CAN_MAP_F_*.
-    bool       loaded;                  ///< False -> the caller must use OBD2.
+    bool       loaded;                  ///< False -> no map: SNIFF would decode with the compiled-in one.
 };
 
 // ─── extraction ───────────────────────────────────────────────────────────────
@@ -283,11 +283,12 @@ bool canMapVehicleFromName(const char *name, char *vehicleOut, size_t vehicleLen
  *
  * @param[out] pathOut     Filename to hand to @c canMapLoad().
  * @param[out] vehicleOut  The `<vehicle>` portion, for the log. May be nullptr.
- * @return How many files matched. 0 means none — the caller falls back to
- *         OBD-II. More than 1 is an operator error rather than a fault, so it
- *         still loads: @p pathOut holds the lexicographically FIRST match, which
- *         is reproducible, where "whichever the directory yields first" depends
- *         on the order the card happened to be written in.
+ * @return How many files matched. 0 means none — the boot still enters the raw
+ *         DISCOVER stream, which needs no map. More than 1 is an operator error
+ *         rather than a fault, so it still loads: @p pathOut holds the
+ *         lexicographically FIRST match, which is reproducible, where
+ *         "whichever the directory yields first" depends on the order the card
+ *         happened to be written in.
  */
 uint8_t canMapFindFile(char *pathOut, size_t pathLen,
                        char *vehicleOut, size_t vehicleLen);
@@ -298,8 +299,8 @@ uint8_t canMapFindFile(char *pathOut, size_t pathLen,
  * Requires a road-speed source — a @c speed row or a @c wheel_fl row. A map that
  * cannot produce a speed offers nothing OBD-II does not do better, and speed is
  * what the overlay and the acceleration estimator consume, so it returns
- * @c NOK_NO_SPEED and the caller falls back rather than sniffing a bus it can
- * only partially read.
+ * @c NOK_NO_SPEED rather than install a map that could only partially read the
+ * bus. (The boot no longer picks its mode from this; see mkr_zero.ino setup().)
  */
 CanMapStatus canMapLoad(CanSignalMap &m, const char *filename);
 

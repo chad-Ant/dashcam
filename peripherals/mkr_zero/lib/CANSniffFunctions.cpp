@@ -2,11 +2,14 @@
 #include <math.h>
 
 #include "CANSniffFunctions.h"
+#include "CANStreamHw.h"
 #include "DataDictionary.h"
 
 // ─── raw SPI, for the registers the library keeps private ─────────────────────
 // Safe alongside the library: every one of its accessors brackets its own
-// transaction and releases CS between calls, so interleaving is fine.
+// transaction and releases CS between calls, so interleaving is fine. Safe
+// alongside the drain ISR, which uses these same helpers, only because the
+// main-loop callers below hold a CanSpiLock — see there.
 
 /// Own settings object rather than OBD2Functions.h's SPICfg. Including that
 /// header here would make the passive sniffer depend on the transmit path, and
@@ -26,15 +29,57 @@ static const uint8_t MODE_LISTEN_ONLY = 0x60;
 static const uint8_t MODE_CONFIG      = 0x80;
 static const uint8_t FLAG_OSM         = 0x08;
 
-static const uint8_t INSTR_READ      = 0x03;
-static const uint8_t INSTR_WRITE     = 0x02;
-static const uint8_t INSTR_BITMOD    = 0x05;
-static const uint8_t INSTR_READ_RXB0 = 0x90; ///< auto-clears RX0IF on CS rise
-static const uint8_t INSTR_READ_RXB1 = 0x94;
+static const uint8_t INSTR_READ        = 0x03;
+static const uint8_t INSTR_WRITE       = 0x02;
+static const uint8_t INSTR_BITMOD      = 0x05;
+static const uint8_t INSTR_READ_RXB0   = 0x90; ///< auto-clears RX0IF on CS rise
+static const uint8_t INSTR_READ_RXB1   = 0x94;
+/// RX0IF, RX1IF and the transmit flags in one byte, for two bytes on the wire
+/// against four for a READ of CANINTF — and the drain asks 10 000 times a second.
+static const uint8_t INSTR_READ_STATUS = 0xA0;
 
 static CanMode  gMode          = CanMode::OFF;
 static uint32_t gLastModeMs    = 0;
+/// Read by the drain ISR; written only under a CanSpiLock, so never mid-tick.
 static int      gCsPin         = MCP2515_DEFAULT_CS_PIN;
+
+/**
+ * Keeps the drain ISR off the SPI bus for the lifetime of the object.
+ *
+ * Both contexts drive the same controller over the same bus, and an ISR landing
+ * between a main-loop CS-low and its CS-high would clock its own instruction
+ * into the middle of that transaction — corrupting both, and quite possibly
+ * writing a register nobody asked for. So every function here that touches the
+ * bus from the main loop takes one of these first, for its WHOLE duration: a
+ * mode transition is several transactions and a CANSTAT poll, and the ISR has
+ * no business reading receive buffers half-way through one.
+ *
+ * A scope object rather than a mask/unmask pair because canSetMode() alone has
+ * ten return paths; a forgotten unmask on one of them would stop the drain for
+ * good, silently. Nests, so a locked function may call another.
+ */
+namespace {
+struct CanSpiLock {
+    CanSpiLock()  { canDrainIrqMask(); }
+    ~CanSpiLock() { canDrainIrqUnmask(); }
+    CanSpiLock(const CanSpiLock &) = delete;
+    CanSpiLock &operator=(const CanSpiLock &) = delete;
+};
+}
+
+// ─── the drain's state ────────────────────────────────────────────────────────
+
+/// Every frame the drain reads. Zero-initialised storage is an empty ring.
+static CanFrameRing gRing;
+/// The ISR may touch the bus. Set only by a successful canSetMode() into a
+/// listen-only mode, cleared at the start of every transition and on every
+/// failure — always under a CanSpiLock.
+static volatile bool     gDrainArmed = false;
+/// Frames read out of the controller since boot. ISR-written; see canDrainedCount().
+static volatile uint32_t gDrained    = 0;
+/// SNIFF's decoder position: free-running index in [tail, head] of gRing.
+/// Main-loop only.
+static uint16_t          gDecodeIdx  = 0;
 
 static uint8_t rawRead(uint8_t reg)
 {
@@ -108,23 +153,26 @@ static const CanSignalMap *gMap = nullptr;
 static uint32_t gFrames  = 0;
 static uint32_t gMatches = 0;
 /// Receive-buffer overrun EVENTS for the whole boot; see canSniffOverrunCount().
-static uint32_t gOverruns = 0;
+/// ISR-written since the drain moved into the timer interrupt.
+static volatile uint32_t gOverruns = 0;
 
 /**
  * Last millis() at which each indicator lamp was seen LIT.
  *
- * The lamp blinks at ~1.5 Hz and telemetry leaves at ~4 Hz, so the
- * instantaneous bit cannot survive the trip: the host would see the indicator
- * dark for roughly half the samples of a manoeuvre it was lit throughout. The
- * flash is therefore held here, where the frame arrives at 24 Hz — the same
- * argument that puts the yaw derivation on this board rather than the Jetson.
+ * Written for a lamp blinking at ~1.5 Hz, which telemetry at ~4 Hz would alias
+ * into a signal dark half the time, so each lit frame is held here. On the Brio
+ * the mapped bits turned out to be the STALK position, steady while set (the
+ * 2026-10-03 all-ID baseline: no dark frame in 15 s at 24 Hz; see the map), so
+ * there the hold only delays "off" by CAN_TURN_HOLD_MS. It stays because a map
+ * for another vehicle may point at a real lamp.
  *
  * Zero means never seen. Unsigned subtraction makes the comparison correct
  * across the millis() wrap, so no reset is needed on mode changes.
  */
 static uint32_t gTurnLeftLitMs  = 0;
 static uint32_t gTurnRightLitMs = 0;
-/// Same treatment for hazards, which flash on the same cadence.
+/// Same treatment for hazards. No hazard signal has been found on the Brio's bus
+/// (see the map), so on that car this stays zero.
 static uint32_t gHazardLitMs    = 0;
 
 /**
@@ -261,6 +309,7 @@ static bool gHostFilters = false;
 
 bool canProbeArm(CanProbeState &p)
 {
+    const CanSpiLock lock;   // the filter write below goes through Configuration
     p.stage        = CanProbeStage::Probing;
     p.startMs      = 0;
     p.clockStarted = false;
@@ -275,7 +324,7 @@ bool canProbeArm(CanProbeState &p)
     // opened, and the fallback to OBD2 never came — a simulated probe was still
     // pending after an hour. "Is the bus alive?" has to be asked of every ID;
     // only "is this the right map?" is a question about the map's own IDs, and
-    // the directory scan in tickCANSniff() still answers that one in software.
+    // the directory scan in canDecodeFrame() still answers that one in software.
     //
     // Listen-only either way: applyFilterSet() lands back in Listen-Only, so
     // opening the filters never makes the node bus-active.
@@ -470,6 +519,9 @@ static bool applyFilterSet(const uint16_t *ids, uint8_t count)
 
 bool canSniffSetFilters(const uint16_t *ids, uint8_t count)
 {
+    // Held across the whole write, and the drain stays ARMED: SNIFF goes on
+    // afterwards, so the ISR only has to sit out the Configuration window.
+    const CanSpiLock lock;
     if (ids == nullptr && count != 0u) return false;
     // Only in sniff mode. The filter registers belong to the receive path, and
     // in OBD2 mode they are programmed for the 0x7E8 response and must not be
@@ -508,11 +560,12 @@ static bool programSniffFilters()
 
     // More IDs than slots: the surplus are DROPPED, and the mask stays exact.
     //
-    // Loosening it to admit them would fill both RX buffers with traffic that is
-    // then discarded, and the frames that costs come out of the IDs we DO want —
-    // the drain is already the bottleneck at ~267 frames/s of capacity against
-    // ~1100 arriving. Losing the last few signals deterministically beats losing
-    // all of them at random. WHICH ones go is by slot priority, not by ID order,
+    // Loosening it to admit them would admit traffic the decoder then discards.
+    // That once cost the wanted IDs frames, while the drain ran once per loop()
+    // pass at ~267 frames/s against ~1100 arriving; the timer drain keeps up with
+    // the whole bus now, so the cost today is decode time and a SNIFF stream
+    // that is no longer what the map describes. An exact, smaller filter remains
+    // the honest one. WHICH ones go is by slot priority, not by ID order,
     // and is logged by name at boot rather than left to be discovered months
     // later as a signal that never updates.
     if (m.idCount > CAN_MAP_FILTER_SLOTS) {
@@ -565,6 +618,10 @@ static CanModeStatus failToConfig(CanModeStatus why)
     // than a silent one.
     const bool parked = rawSetMode(MODE_CONFIG);
     gMode = CanMode::OFF;
+    // Every caller holds a CanSpiLock, so the ISR is not running; disarmed here
+    // it stays off the bus once the lock is released, because the controller it
+    // would be reading is parked and receives nothing.
+    gDrainArmed = false;
 
     // gLastModeMs is deliberately NOT stamped.
     //
@@ -581,6 +638,7 @@ static CanModeStatus failToConfig(CanModeStatus why)
 
 bool canSniffApplyMapFilters()
 {
+    const CanSpiLock lock;
     if (gMode != CanMode::SNIFF) return false;
     // The host outranks the map. A filter set it installed while the probe ran
     // is an explicit choice about this capture, and the verdict is only the
@@ -595,6 +653,9 @@ bool canSniffApplyMapFilters()
 
 CanModeStatus canSetMode(CanMode mode, int csPin)
 {
+    // Masked for the whole function, on every one of its return paths — gCsPin
+    // below is the ISR's chip select too.
+    const CanSpiLock lock;
     gCsPin = csPin;
 
     if (mode == gMode) return CanModeStatus::UNCHANGED;
@@ -605,6 +666,12 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
     if (gLastModeMs != 0 && (millis() - gLastModeMs) < CAN_MODE_MIN_INTERVAL_MS) {
         return CanModeStatus::NOK_RATE_LIMIT;
     }
+
+    // Disarmed, not merely masked, from here on: the controller is about to
+    // pass through Configuration and possibly into a mode the drain must never
+    // read in (OBD2, whose frames belong to the CAN library's poller). Only
+    // success into a listen-only mode, at the bottom, arms it again.
+    gDrainArmed = false;
 
     // Configuration first, always. It is the only mode in which RXBnCTRL and the
     // filter registers are writable, and going via Configuration rather than
@@ -618,11 +685,18 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
 
     switch (mode) {
     case CanMode::DISCOVER:
-        // RXM=11 accepts everything. A census must not filter — that is the
-        // point of it.
+        // RXM=11 accepts everything. The raw stream must not filter — the Orin
+        // decides offline what it wanted, and it can only decide about frames
+        // it was sent. BUKT doubles the depth the drain has to beat.
         rawWrite(REG_RXB0CTRL, 0x64);     // RXM=11 | BUKT
         rawWrite(REG_RXB0CTRL + 0x10, 0x60);
         if (!rawSetMode(MODE_LISTEN_ONLY)) return failToConfig(CanModeStatus::NOK_VERIFY);
+        // The bookkeeping says so too. It used to keep whatever SNIFF had
+        // programmed, so telemetry's canMapFlags went on claiming "filtered,
+        // by the map" for an accept-all capture.
+        for (uint8_t i = 0; i < CAN_MAP_FILTER_SLOTS; ++i) gFilterIds[i] = 0u;
+        gFilterCount    = 0u;
+        gFiltersFromMap = false;
         break;
 
     case CanMode::SNIFF:
@@ -668,6 +742,11 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
         if ((rawRead(REG_CANCTRL) & FLAG_OSM) == 0u) {
             return failToConfig(CanModeStatus::NOK_NO_OSM);
         }
+        // Recorded as what it is — one exact filter, not the map's — for the
+        // same reason as DISCOVER above.
+        for (uint8_t i = 0; i < CAN_MAP_FILTER_SLOTS; ++i) gFilterIds[i] = 0x7E8u;
+        gFilterCount    = 1u;
+        gFiltersFromMap = false;
         break;
     }
 
@@ -683,20 +762,40 @@ CanModeStatus canSetMode(CanMode mode, int csPin)
     // Every transition reprograms the filters, so a host's set does not survive
     // into the new mode and must not be protected there.
     gHostFilters = false;
+
+    if (mode == CanMode::DISCOVER || mode == CanMode::SNIFF) {
+        // SNIFF decodes from what arrives from now on: frames already queued
+        // were received under the previous mode's filters, and are streamed
+        // but not decoded. The ISR is masked, so head cannot move under us.
+        gDecodeIdx  = gRing.head;
+        gDrainArmed = true;
+    }
     return CanModeStatus::OK;
 }
 
 // ─── receive path ─────────────────────────────────────────────────────────────
 
 /**
- * Reads one RX buffer with a single READ RX BUFFER instruction.
+ * Reads one RX buffer with a single READ RX BUFFER instruction and queues it.
+ * Drain ISR only.
  *
  * One CS pair and 13 bytes, against the ~15 separate register reads
  * parsePacket() issues for the same frame. At 500 kbps an 8-byte frame occupies
  * the bus for only ~222 us, so the cheaper read is what makes keeping up
- * possible. The instruction also auto-clears RXnIF on the CS rising edge.
+ * possible. The instruction also auto-clears RXnIF on the CS rising edge, so
+ * the buffer is free for the next frame the moment this returns.
+ *
+ * NOTHING is rejected here any more. Remote and extended frames used to be
+ * dropped at this point because the decoder was the only consumer; now every
+ * frame is evidence for the Orin, and the rule that they are not DECODED moved
+ * to tickCANSniff(), which applies it exactly as before. Every answer is in the
+ * bytes just read, so this still costs no extra transaction: RXBnSIDL.IDE
+ * (bit 3) marks an extended identifier, RXBnSIDL.SRR (bit 4) a standard remote
+ * request, and an extended frame carries its remote bit in RXBnDLC bit 6. (An
+ * earlier version read RXBnCTRL.RXRTR separately on the belief that a standard
+ * remote frame was flagged nowhere else — SRR is exactly that flag.)
  */
-static bool readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
+static void drainBuffer(uint8_t instr)
 {
     uint8_t b[13];
     SPI.beginTransaction(kSniffSPI);
@@ -706,29 +805,180 @@ static bool readFrame(uint8_t instr, uint16_t &id, uint8_t &dlc, uint8_t *data)
     digitalWrite(gCsPin, HIGH);
     SPI.endTransaction();
 
-    // Rejected AFTER the buffer read, never before: the read is what clears
-    // RXnIF, so returning early would leave the flag set and the drain would
-    // spin on the same frame forever.
-    //
-    // A remote frame carries NO data bytes, and the MCP2515 leaves the data
-    // registers holding whatever the previous frame put there. Decoding one
-    // would publish a stale payload under a live ID — a reading that is not
-    // merely wrong but plausible. An extended frame is rejected for the mirror
-    // reason: only its low 11 bits are compared here, so a 29-bit ID could
-    // masquerade as a mapped standard one.
-    // Both answers are already in the bytes just read, so this costs nothing.
-    // An earlier version read RXBnCTRL.RXRTR in a separate SPI transaction on
-    // the belief that a STANDARD remote frame was flagged nowhere else. It is:
-    // RXBnSIDL.SRR (bit 4) carries exactly that, and the extra register read was
-    // pure overhead on the hottest path in the firmware.
-    if (b[1] & 0x10u) return false;             // SRR: standard remote request
-    if (b[1] & 0x08u) return false;             // IDE: extended identifier
+    // Stamped after the CS rise: the moment the frame left the controller, and
+    // the moment its buffer became free again. micros() is written to be
+    // callable here with SysTick held off (delay.c adds a pending tick).
+    const uint32_t us = micros();
+    // Counted before the ring can refuse it: "read out of the MCP2515" is the
+    // liveness signal and the FS line's drained, whatever happens next.
+    gDrained = gDrained + 1u;
 
-    id  = (uint16_t)(((uint16_t)b[0] << 3) | (b[1] >> 5));
-    dlc = b[4] & 0x0F;
-    if (dlc > 8) dlc = 8;                       // DLC > 8 still means 8 bytes
-    for (uint8_t i = 0; i < 8; ++i) data[i] = (i < dlc) ? b[5 + i] : 0x00;
-    return true;
+    const bool ext = (b[1] & 0x08u) != 0u;
+    uint32_t   id;
+    bool       rtr;
+    if (ext) {
+        // SIDH = ID28..21, SIDL[7:5] = ID20..18, SIDL[1:0] = ID17..16,
+        // EID8 = ID15..8, EID0 = ID7..0.
+        id  = ((uint32_t)b[0] << 21) | ((uint32_t)(b[1] >> 5) << 18) |
+              ((uint32_t)(b[1] & 0x03u) << 16) | ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+        rtr = (b[4] & 0x40u) != 0u;
+    } else {
+        id  = ((uint32_t)b[0] << 3) | (uint32_t)(b[1] >> 5);
+        rtr = (b[1] & 0x10u) != 0u;
+    }
+
+    // DLC 9-15 still means eight bytes (ISO 11898-1); canRawPack() clamps it.
+    CanRawFrame f;
+    canRawPack(f, us, id, ext, rtr, (uint8_t)(b[4] & 0x0Fu), &b[5]);
+    (void)canRingPush(gRing, f);   // a full ring counts the loss itself
+}
+
+#if defined(DASHCAM_CAN_STREAM_SELFTEST)
+// ─── bench self-test generator (see the header; never in a production build) ──
+
+#pragma message "DASHCAM_CAN_STREAM_SELFTEST: the drain ISR synthesizes test frames - a BENCH build, never for the car"
+
+/// Drain ticks per second: the generator's clock, so the rate costs no micros().
+#define CAN_DRAIN_TICKS_PER_S (1000000UL / CAN_DRAIN_PERIOD_US)
+static_assert(CAN_SELFTEST_MAX_FPS == CAN_DRAIN_TICKS_PER_S,
+              "the self-test cap is one synthetic frame per drain tick");
+static_assert(DASHCAM_CAN_STREAM_SELFTEST >= 1 && DASHCAM_CAN_STREAM_SELFTEST <= CAN_SELFTEST_MAX_FPS,
+              "DASHCAM_CAN_STREAM_SELFTEST is frames per second, 1 to CAN_SELFTEST_MAX_FPS");
+
+/// Rate accumulator, in frames x ticks-per-second: +rate every armed tick, one
+/// frame per CAN_DRAIN_TICKS_PER_S. Exact over any whole second of ticks, and
+/// below one frame's worth between ticks, so a long disarmed spell owes nothing.
+static uint32_t          gSelfAcc = 0;
+/// Frames made since boot: the next sequence number. ISR-written only.
+static volatile uint32_t gSelfSeq = 0;
+
+uint32_t canSelfTestCount() { return gSelfSeq; }
+
+/** One armed tick of the generator. Drain ISR only; no SPI. */
+static void selfTestTick()
+{
+    gSelfAcc += (uint32_t)DASHCAM_CAN_STREAM_SELFTEST;
+    if (gSelfAcc < CAN_DRAIN_TICKS_PER_S) return;
+    gSelfAcc -= CAN_DRAIN_TICKS_PER_S;   // the cap makes one per tick the most there can be
+
+    const uint32_t seq  = gSelfSeq;
+    const uint16_t fill = canRingCount(gRing);
+    const uint32_t chk  = ~seq;
+    const uint8_t  d[8] = { (uint8_t)(seq >> 24), (uint8_t)(seq >> 16), (uint8_t)(seq >> 8), (uint8_t)seq,
+                            (uint8_t)(fill >> 8), (uint8_t)fill, (uint8_t)(chk >> 8), (uint8_t)chk };
+    CanRawFrame f;
+    canRawPack(f, micros(), CAN_SELFTEST_ID, false, false, 8u, d);
+    gSelfSeq = seq + 1u;
+    // Counted as drained, exactly where a real frame is: before the ring can
+    // refuse it — see the header for why the bench wants it counted at all.
+    gDrained = gDrained + 1u;
+    (void)canRingPush(gRing, f);
+}
+#endif // DASHCAM_CAN_STREAM_SELFTEST
+
+void canDrainIsr()
+{
+    // Disarmed is the normal state outside DISCOVER and SNIFF: OFF and OBD2
+    // belong to the main loop's own CAN calls, and in OBD2 the receive buffers
+    // hold the ECU's replies that tickOBD2() is waiting for.
+    if (!gDrainArmed) return;
+
+#if defined(DASHCAM_CAN_STREAM_SELFTEST)
+    selfTestTick();   // bench build only; armed ticks only, like the real drain below
+#endif
+
+    // Bounded twice over: frames read, and status reads. Every round that
+    // finds a flag reads at least one buffer, so the second bound never bites
+    // on a healthy controller — it is there so that no misreading of the
+    // status byte, now or after a later edit, can turn the ISR into a loop.
+    uint8_t taken = 0;
+    for (uint8_t round = 0; round < CAN_DRAIN_MAX_PER_TICK && taken < CAN_DRAIN_MAX_PER_TICK; ++round) {
+        // Gated on the RXnIF flags over SPI, NOT on the INT pin. INT is not
+        // wired on this shield — measured 0 asserted against 181790 missed
+        // across a full census — and a gate that is never satisfied silently
+        // reports an empty bus rather than being merely slower.
+        SPI.beginTransaction(kSniffSPI);
+        digitalWrite(gCsPin, LOW);
+        SPI.transfer(INSTR_READ_STATUS);
+        const uint8_t st = SPI.transfer(0x00);
+        digitalWrite(gCsPin, HIGH);
+        SPI.endTransaction();
+
+        // TX0IF / TX1IF / TX2IF (bits 3, 5, 7) cannot be set here: nothing
+        // transmits in Listen-Only, and canSetMode() cleared CANINTF on entry.
+        // So this is not the controller answering — a missing shield floats
+        // MISO high and 0xFF would claim both buffers full on every tick. Give
+        // up on the tick rather than queue frames made of 0xFF. (The TXREQ
+        // bits are not tested: an OBD2 request left pending can keep one set
+        // through the transition, and that would silence the drain for good.)
+        if (st & 0xA8u) return;
+        if ((st & 0x03u) == 0u) break;
+
+        // RXB0 first. With BUKT and accept-all, RXB1 only ever fills while
+        // RXB0 is occupied, so when both are full RXB0 holds the older frame;
+        // and a frame cannot complete between the status read and these reads
+        // (>= 94 us on the wire against ~60 us for both), so the order read is
+        // the order received. Under SNIFF's filters an ID can go straight to
+        // RXB1, and two frames from the same tick may then swap — their
+        // timestamps are ~30 us apart either way.
+        if (st & 0x01u) { drainBuffer(INSTR_READ_RXB0); ++taken; }
+        if ((st & 0x02u) != 0u && taken < CAN_DRAIN_MAX_PER_TICK) {
+            drainBuffer(INSTR_READ_RXB1);
+            ++taken;
+        }
+    }
+    if (taken == 0u) return;
+
+    // Overruns: counted, then cleared — but only after a tick that found
+    // frames, which costs nothing in coverage: an overrun needs both buffers
+    // full, and only this ISR empties them, so the tick after one always finds
+    // frames. Reading EFLG on every idle tick as well would put a second
+    // transaction on each of 10 000 idle ticks a second, nearly doubling the
+    // drain's standing cost. Each set flag is one EVENT (the flags latch, they
+    // do not count), so the total is a lower bound on frames lost; with BUKT a
+    // full RXB0 rolls over into RXB1, so it is mostly RX1OVR.
+    const uint8_t eflg = rawRead(REG_EFLG);
+    if (eflg & 0xC0u) {
+        gOverruns = gOverruns + ((eflg & 0x40u) ? 1u : 0u) + ((eflg & 0x80u) ? 1u : 0u);
+        rawBitModify(REG_EFLG, 0xC0u, 0x00u);
+    }
+}
+
+bool     canDrainArmed()    { return gDrainArmed; }
+uint32_t canDrainedCount()  { return gDrained; }
+uint32_t canRingDropCount() { return gRing.drops; }
+
+// ─── the ring's consumer side ─────────────────────────────────────────────────
+
+/// Where the stream must stop: at the decoder in SNIFF, so a slot is never
+/// released before the decoder has read it; at the producer otherwise.
+static uint16_t streamLimit()
+{
+    return (gMode == CanMode::SNIFF) ? gDecodeIdx : gRing.head;
+}
+
+uint16_t canRawStreamable()
+{
+    return (uint16_t)(streamLimit() - gRing.tail);
+}
+
+bool canRawFront(CanRawFrame &f)
+{
+    if (canRawStreamable() == 0u) return false;
+    return canRingPeek(gRing, gRing.tail, f);
+}
+
+void canRawPop()
+{
+    if (canRawStreamable() != 0u) canRingRelease(gRing, 1u);
+}
+
+uint16_t canRawDiscard(uint16_t n)
+{
+    const uint16_t avail = canRawStreamable();
+    if (n > avail) n = avail;
+    if (n != 0u) canRingRelease(gRing, n);
+    return n;
 }
 
 /**
@@ -782,7 +1032,7 @@ static void applyRow(VehicleSignals &v, const CanSignalMap &m,
         break;
     // Only the LIT edge is recorded. The dark half of a blink is not evidence
     // that the indicator stopped, so it must not clear anything; the hold in
-    // tickCANSniff() decides when it is genuinely off. The freshness stamp is
+    // evaluateHolds() decides when it is genuinely off. The freshness stamp is
     // taken on every frame either way, because the MESSAGE is what went stale.
     case CAN_SIG_TURN_LEFT:
         if (raw != 0u) gTurnLeftLitMs = now;
@@ -812,124 +1062,145 @@ static void applyRow(VehicleSignals &v, const CanSignalMap &m,
     }
 }
 
-uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
+/**
+ * @brief Re-evaluates the indicator holds against @p nowMs.
+ *
+ * Every pass, not only on frames that carried the message — otherwise a lamp
+ * that stopped flashing would stay "active" until the next 0x294 arrived to
+ * disprove it, and on a quiet bus that is exactly when it would not. And after
+ * every frame canDecodeFrame() applies, so the Orin's offline decoder, which has
+ * no passes, sees the held state as of each frame.
+ */
+static void evaluateHolds(VehicleSignals &v, uint32_t nowMs)
 {
-    if (gMode != CanMode::SNIFF && gMode != CanMode::DISCOVER) return 0;
-
-    const CanSignalMap &m = *canSniffGetMap();
-
-    uint8_t decoded = 0;
-    for (uint8_t n = 0; n < CAN_SNIFF_MAX_PER_TICK; ++n) {
-        // Gated on CANINTF over SPI, NOT on the INT pin. INT is not wired on
-        // this shield — measured 0 asserted against 181790 missed across a full
-        // census — and a gate that is never satisfied silently reports an empty
-        // bus rather than being merely slower.
-        const uint8_t intf = rawRead(REG_CANINTF);
-        if ((intf & 0x03u) == 0u) break;
-
-        uint16_t id;
-        uint8_t  dlc;
-        uint8_t  d[8];
-        const bool usable = readFrame((intf & 0x01u) ? INSTR_READ_RXB0 : INSTR_READ_RXB1,
-                                      id, dlc, d);
-        ++decoded;
-        ++gFrames;
-        // Counted as a frame (it occupied a buffer and cost a drain slot) but
-        // not decoded, and deliberately not counted as a probe match either —
-        // a remote frame is not evidence that this map fits this vehicle.
-        if (!usable) continue;
-
-        const uint32_t now = millis();
-
-        // Directory scan. Ascending by ID, so it early-exits rather than always
-        // walking the whole table. A frame that matches nothing was let through
-        // by a loose hardware mask and costs exactly this scan — which IS the
-        // software compare, so there is no second one to write.
-        const CanIdEntry *e = nullptr;
-        for (uint8_t i = 0; i < m.idCount; ++i) {
-            if (m.id[i].canId == id) { e = &m.id[i]; gIdsSeenMask |= (uint16_t)(1u << i); break; }
-            if (m.id[i].canId >  id) break;
-        }
-        if (e == nullptr) continue;
-        ++gMatches;
-
-        bool sawWheel = false;
-        for (uint8_t k = 0; k < e->count; ++k) {
-            const CanSigRow &r = m.row[e->first + k];
-            // Per-row, not per-frame: a short frame still yields the fields that
-            // fit. The old guard rejected the whole frame if any field would not.
-            if (dlc < r.minDlc) continue;
-
-            const uint32_t raw =
-                (r.flags & CAN_ROW_SINGLEBIT) ? canExtractBit(d, r.startBit)          :
-                (r.flags & CAN_ROW_ALIGNED)   ? canExtractAligned(d, r.startBit, r.len)
-                                              : canExtractMotorola(d, r.startBit, r.len);
-            applyRow(v, m, r, raw, now);
-            // Bounded on both sides on purpose. An open-ended `>=` was correct
-            // only while the wheels were the last slots in the enum, and would
-            // have silently counted every slot added after them as a wheel.
-            if (r.slot >= CAN_SIG_WHEEL_FL && r.slot <= CAN_SIG_WHEEL_RR) sawWheel = true;
-        }
-
-        // Indicator exclusivity, decided on this frame alone. Both lamps present
-        // and only one lit means the other is off NOW, whatever its hold says —
-        // so drop it, or a stalk moved from left to right reads as hazards for
-        // most of a second. Both lit leaves both holds standing.
-        if (gFrameTurnL >= 0 && gFrameTurnR >= 0) {
-            if (gFrameTurnL == 1 && gFrameTurnR == 0) gTurnRightLitMs = 0;
-            if (gFrameTurnR == 1 && gFrameTurnL == 0) gTurnLeftLitMs  = 0;
-        }
-        gFrameTurnL = -1;
-        gFrameTurnR = -1;
-
-        // Yaw once per wheel frame, after every wheel row in it has landed.
-        if (sawWheel && (m.statusFlags & CAN_MAP_F_YAW_OK)) {
-            const int16_t yaw = yawRateFromWheels(y, v.wheelRaw[VEH_WHEEL_RL],
-                                                     v.wheelRaw[VEH_WHEEL_RR]);
-            v.yawRateCdps = yaw;
-            v.yawSrc      = (yaw == INT16_MIN) ? VehSource::NONE : VehSource::CAN_SNIFF;
-            if (yaw != INT16_MIN) v.yawMs = now;
-        }
-
-        // Speed from the front-left wheel ONLY when the map defines no dedicated
-        // speed source. Which of the two wins is now a property of the map, not
-        // of an if-statement ordering.
-        if (sawWheel && m.slotRow[CAN_SIG_SPEED] == 0xFFu &&
-            v.wheelRaw[VEH_WHEEL_FL] != VEH_WHEEL_INVALID) {
-            v.speedKmh = (float)v.wheelRaw[VEH_WHEEL_FL] * m.wheelKmhPerCount;
-            v.speedMs  = now;
-            v.speedSrc = VehSource::CAN_SNIFF;
-        }
-    }
-
-    // Indicator hold, evaluated every pass rather than only on frames that
-    // carried the message — otherwise a lamp that stopped flashing would stay
-    // "active" until the next 0x294 arrived to disprove it, and on a quiet bus
-    // that is exactly when it would not.
     if (v.turnSrc == VehSource::CAN_SNIFF) {
-        const uint32_t t = millis();
-        v.turnLeft  = (gTurnLeftLitMs  != 0u) && ((t - gTurnLeftLitMs)  <= CAN_TURN_HOLD_MS);
-        v.turnRight = (gTurnRightLitMs != 0u) && ((t - gTurnRightLitMs) <= CAN_TURN_HOLD_MS);
+        v.turnLeft  = (gTurnLeftLitMs  != 0u) && ((nowMs - gTurnLeftLitMs)  <= CAN_TURN_HOLD_MS);
+        v.turnRight = (gTurnRightLitMs != 0u) && ((nowMs - gTurnRightLitMs) <= CAN_TURN_HOLD_MS);
     }
     if (v.hazardSrc == VehSource::CAN_SNIFF) {
-        const uint32_t t = millis();
-        v.hazard = (gHazardLitMs != 0u) && ((t - gHazardLitMs) <= CAN_TURN_HOLD_MS);
+        v.hazard = (gHazardLitMs != 0u) && ((nowMs - gHazardLitMs) <= CAN_TURN_HOLD_MS);
+    }
+}
+
+uint8_t canDecodeFrame(VehicleSignals &v, YawEstimator &y, uint32_t id, uint8_t dlc,
+                       const uint8_t *data, uint32_t nowMs)
+{
+    const CanSignalMap &m = *canSniffGetMap();
+    if (dlc > 8u) dlc = 8u;                     // DLC > 8 still means 8 bytes
+
+    // The buffer SNIFF always decoded from: the payload, zero-padded to eight.
+    // A row never reads past its own minDlc, but the offline decoder hands over
+    // exactly dlc bytes, so nothing beyond them may even be touched.
+    uint8_t d[8];
+    for (uint8_t i = 0; i < 8u; ++i) d[i] = (i < dlc) ? data[i] : 0x00u;
+
+    // Directory scan. Ascending by ID, so it early-exits rather than always
+    // walking the whole table. A frame that matches nothing was let through
+    // by a loose hardware mask and costs exactly this scan — which IS the
+    // software compare, so there is no second one to write.
+    const CanIdEntry *e = nullptr;
+    for (uint8_t i = 0; i < m.idCount; ++i) {
+        if (m.id[i].canId == id) { e = &m.id[i]; gIdsSeenMask |= (uint16_t)(1u << i); break; }
+        if (m.id[i].canId >  id) break;
+    }
+    if (e == nullptr) {
+        evaluateHolds(v, nowMs);
+        return 0u;
     }
 
-    // Overruns: counted, then cleared. They used to be cleared uncounted, on the
-    // grounds that one lost frame of a 50-100 Hz signal repeats within 20 ms —
-    // true of one, but the drain is polled once per loop() pass and the
-    // controller holds two frames, so any long step in the pass loses a burst,
-    // and nobody could say how often. Each set flag is one EVENT (the flags
-    // latch, they do not count), so the total is a lower bound on frames lost.
-    // With BUKT a full RXB0 rolls over into RXB1, so here it is mostly RX1OVR;
-    // RX0OVR is counted too.
-    const uint8_t eflg = rawRead(REG_EFLG);
-    if (eflg & 0xC0u) {
-        const uint32_t events = ((eflg & 0x40u) ? 1u : 0u) + ((eflg & 0x80u) ? 1u : 0u);
-        gOverruns = (gOverruns > 0xFFFFFFFFu - events) ? 0xFFFFFFFFu : gOverruns + events;
-        rawBitModify(REG_EFLG, 0xC0u, 0x00u);
+    bool sawWheel = false;
+    for (uint8_t k = 0; k < e->count; ++k) {
+        const CanSigRow &r = m.row[e->first + k];
+        // Per-row, not per-frame: a short frame still yields the fields that
+        // fit. The old guard rejected the whole frame if any field would not.
+        if (dlc < r.minDlc) continue;
+
+        const uint32_t raw =
+            (r.flags & CAN_ROW_SINGLEBIT) ? canExtractBit(d, r.startBit)          :
+            (r.flags & CAN_ROW_ALIGNED)   ? canExtractAligned(d, r.startBit, r.len)
+                                          : canExtractMotorola(d, r.startBit, r.len);
+        applyRow(v, m, r, raw, nowMs);
+        // Bounded on both sides on purpose. An open-ended `>=` was correct
+        // only while the wheels were the last slots in the enum, and would
+        // have silently counted every slot added after them as a wheel.
+        if (r.slot >= CAN_SIG_WHEEL_FL && r.slot <= CAN_SIG_WHEEL_RR) sawWheel = true;
     }
 
-    return decoded;
+    // Indicator exclusivity, decided on this frame alone. Both lamps present
+    // and only one lit means the other is off NOW, whatever its hold says —
+    // so drop it, or a stalk moved from left to right reads as hazards for
+    // most of a second. Both lit leaves both holds standing.
+    if (gFrameTurnL >= 0 && gFrameTurnR >= 0) {
+        if (gFrameTurnL == 1 && gFrameTurnR == 0) gTurnRightLitMs = 0;
+        if (gFrameTurnR == 1 && gFrameTurnL == 0) gTurnLeftLitMs  = 0;
+    }
+    gFrameTurnL = -1;
+    gFrameTurnR = -1;
+
+    // Yaw once per wheel frame, after every wheel row in it has landed.
+    if (sawWheel && (m.statusFlags & CAN_MAP_F_YAW_OK)) {
+        const int16_t yaw = yawRateFromWheels(y, v.wheelRaw[VEH_WHEEL_RL],
+                                                 v.wheelRaw[VEH_WHEEL_RR]);
+        v.yawRateCdps = yaw;
+        v.yawSrc      = (yaw == INT16_MIN) ? VehSource::NONE : VehSource::CAN_SNIFF;
+        if (yaw != INT16_MIN) v.yawMs = nowMs;
+    }
+
+    // Speed from the front-left wheel ONLY when the map defines no dedicated
+    // speed source. Which of the two wins is now a property of the map, not
+    // of an if-statement ordering.
+    if (sawWheel && m.slotRow[CAN_SIG_SPEED] == 0xFFu &&
+        v.wheelRaw[VEH_WHEEL_FL] != VEH_WHEEL_INVALID) {
+        v.speedKmh = (float)v.wheelRaw[VEH_WHEEL_FL] * m.wheelKmhPerCount;
+        v.speedMs  = nowMs;
+        v.speedSrc = VehSource::CAN_SNIFF;
+    }
+
+    evaluateHolds(v, nowMs);
+    return 1u;
+}
+
+/// Arrival time of the last frame decoded; see the clamp in tickCANSniff().
+static uint32_t gLastDecodeMs = 0;
+
+uint8_t tickCANSniff(VehicleSignals &v, YawEstimator &y)
+{
+    // SNIFF only. DISCOVER used to decode here too — it shared this drain —
+    // and now decodes nothing at all: its frames go to the Orin raw, and the
+    // telemetry's CAN fields stay at their sentinels.
+    if (gMode != CanMode::SNIFF) return 0;
+
+    // One reading of each clock per call. A frame's arrival is "now" minus its
+    // age in the ring, which puts the controller's delivery time, not the time
+    // this pass got round to it, into the millis() domain the freshness windows
+    // run on. After a 750 ms pass the difference is the whole window.
+    const uint32_t ms0 = millis();
+    const uint32_t us0 = micros();
+
+    uint8_t     taken = 0;
+    CanRawFrame f;
+    while (taken < CAN_SNIFF_MAX_PER_TICK && canRingPeek(gRing, gDecodeIdx, f)) {
+        gDecodeIdx = (uint16_t)(gDecodeIdx + 1u);
+        ++taken;
+        ++gFrames;
+        // Counted as a frame (it was on the bus and in the ring) but not
+        // decoded, and deliberately not counted as a probe match either — a
+        // remote frame is not evidence that this map fits this vehicle. See
+        // canDecodeFrame() for why neither kind may reach the decoder.
+        if (canRawRtr(f) || canRawExt(f)) continue;
+
+        // Signed: a frame the ISR pushed after us0 was read is "younger than
+        // now", which is now. Never backwards either — millis() and micros()
+        // round independently by up to a millisecond, and a hold evaluated
+        // against a time before the lamp's own stamp would read as long expired.
+        const int32_t ageUs = (int32_t)(us0 - f.us);
+        uint32_t nowMs = (ageUs > 0) ? ms0 - (uint32_t)ageUs / 1000u : ms0;
+        if ((int32_t)(nowMs - gLastDecodeMs) < 0) nowMs = gLastDecodeMs;
+        gLastDecodeMs = nowMs;
+
+        if (canDecodeFrame(v, y, canRawId(f), canRawDlc(f), f.data, nowMs)) ++gMatches;
+    }
+
+    evaluateHolds(v, ms0);
+    return taken;
 }

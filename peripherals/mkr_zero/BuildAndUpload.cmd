@@ -6,6 +6,17 @@ rem
 rem   BuildAndUpload.cmd            compile only
 rem   BuildAndUpload.cmd COM5       compile and upload to COM5
 rem   BuildAndUpload.cmd COM5 amg   ...with the IMU in its raw (AMG) mode
+rem   BuildAndUpload.cmd COM5 selftest
+rem                                 BENCH build: the raw CAN stream's self-test
+rem
+rem "selftest" defines DASHCAM_CAN_STREAM_SELFTEST=2400: while the CAN drain is
+rem armed its timer interrupt also synthesizes 2400 frames a second (id 0x7F0,
+rem a sequence number in the data), with no bus, so the USB stream's throughput
+rem can be measured on the bench. See build_and_upload.sh for the details and
+rem for "selftest=N" (another rate) and "amg selftest" together; this script
+rem takes one option, "amg" OR "selftest" - cmd.exe splits "selftest=N" at the
+rem "=" and quoting a property with two defines is not worth the risk here.
+rem NEVER flash a selftest build to the car.
 rem
 rem The optional "amg" argument defines DASHCAM_IMU_MODE_AMG, which selects
 rem IMUSampleMode::Raw at bring-up instead of the production IMUPLUS. The mode is
@@ -50,6 +61,12 @@ rem ("OBD2Functions.h", not "lib/OBD2Functions.h"): a path-qualified include is
 rem treated as a plain relative file and never binds to the library, which
 rem reproduces the same link failure even with --library present.
 rem
+rem The MKR's USB port is a PRODUCTION data path, not just a development
+rem link: next to the console it streams every CAN frame to the Orin as
+rem "F ..." lines, with an "FS ..." stats line each second (see
+rem lib\CANRawStream.h). Stop whatever reads that port in the car before an
+rem upload, and expect the raw stream to be missing while it runs.
+rem
 rem NOTE: keep this file plain ASCII - cmd.exe parses it in the OEM codepage.
 
 where arduino-cli >nul 2>&1
@@ -84,17 +101,25 @@ if not "%CORE_FOUND%"=="%CORE_REQUIRED%" (
     exit /b 1
 )
 
-rem "amg" is accepted in EITHER position, so a compile-only AMG build does not
-rem need an empty first argument - a shell that collapses "" would otherwise pass
-rem "amg" as the PORT and try to upload to a device of that name.
+rem "amg" and "selftest" are accepted in EITHER position, so a compile-only
+rem build does not need an empty first argument - a shell that collapses ""
+rem would otherwise pass the option as the PORT and try to upload to a device of
+rem that name. One option per build; "selftest" wins if both are given.
 rem Each set is its own line: grouping them inside parentheses needs delayed
 rem expansion to read back, which is a well-known way to get an empty variable.
-set "EXTRA="
+set "MODE="
+if /i "%~1"=="amg" set "MODE=amg"
+if /i "%~2"=="amg" set "MODE=amg"
+if /i "%~1"=="selftest" set "MODE=selftest"
+if /i "%~2"=="selftest" set "MODE=selftest"
 set "PORT=%~1"
 if /i "%~1"=="amg" set "PORT="
-if /i "%~1"=="amg" set "EXTRA=--build-property compiler.cpp.extra_flags=-DDASHCAM_IMU_MODE_AMG"
-if /i "%~2"=="amg" set "EXTRA=--build-property compiler.cpp.extra_flags=-DDASHCAM_IMU_MODE_AMG"
-if not "%EXTRA%"=="" echo Building with the IMU in AMG ^(raw^) mode.
+if /i "%~1"=="selftest" set "PORT="
+set "EXTRA="
+if "%MODE%"=="amg" set "EXTRA=--build-property compiler.cpp.extra_flags=-DDASHCAM_IMU_MODE_AMG"
+if "%MODE%"=="amg" echo Building with the IMU in AMG ^(raw^) mode.
+if "%MODE%"=="selftest" set "EXTRA=--build-property compiler.cpp.extra_flags=-DDASHCAM_CAN_STREAM_SELFTEST=2400"
+if "%MODE%"=="selftest" echo Building the BENCH self-test: 2400 synthetic CAN frames/s. Never flash this to the car.
 
 if "%PORT%"=="" (
     arduino-cli compile %WARN% %EXTRA% --fqbn "%FQBN%" --library "%WIRE_DIR%" --library "%CAN_DIR%" --library "%SDFAT_DIR%" --library "%LIB_DIR%" "%SKETCH_DIR%"

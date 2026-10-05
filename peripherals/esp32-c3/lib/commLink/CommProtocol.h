@@ -281,6 +281,14 @@ enum CommMsgType : uint8_t {
     /**
      * C3 -> MKR: payload uint8 CanMode (1=discover 2=sniff 3=obd2).
      *
+     * The master boots into 1, DISCOVER: listen-only, accept-all, every frame
+     * forwarded raw to the Orin over the MKR's own USB port, and NOTHING decoded
+     * on the MKR. This command is the only way into 2 (SNIFF: map filters, and
+     * decoding on the MKR as well as the raw stream) or 3 (OBD2: bus-active
+     * queries); the master never chooses either itself. It returns to
+     * DISCOVER on its own only to recover: after giving up on an OBD2 session
+     * no ECU answered, or after a refused transition parked the controller.
+     *
      * The FIRST payload-bearing command on this hop. Everything before it was
      * zero-payload, and the receiver exploited that with a blanket
      * "len != 0 -> NACK" - so adding this without the helpers below would have
@@ -640,8 +648,15 @@ struct __attribute__((packed)) TelemetryPayload {
      * @c wheelRaw exist ONLY while sniffing, and are at their sentinels in OBD2
      * mode because that mode structurally cannot supply them - which is a
      * different statement from "the sensor went quiet".
+     *
+     * In DISCOVER - the master's boot mode - NEITHER runs: the MKR decodes no
+     * CAN at all and forwards the raw frames to the Orin over its own USB port
+     * instead. Every field here then reads as unavailable, never as a zero:
+     * NaN @c speed / @c rpm / @c accel, @c sigSource 0, @c gearPos 0, the
+     * @c vehFlags validity bits clear, 0xFFFF torque and wheels, INT16_MIN yaw.
+     * The CAN-derived values come from decoding that raw stream on the Orin.
      */
-    uint8_t canMode;       ///< CanMode: 0=off 1=discover 2=sniff 3=obd2.
+    uint8_t canMode;       ///< CanMode: 0=off 1=discover (boot: raw stream, no decode) 2=sniff 3=obd2.
     uint8_t sigSource;     ///< VehSource, 2 bits each: speed|rpm|gear|steer.
     uint8_t gearPos;       ///< VehGear selector position (0 = unknown).
     /**

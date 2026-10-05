@@ -5,6 +5,17 @@ rem Host tests for the MKR Zero firmware logic, built with MSVC:
 rem   switch_tests      lib\SwitchFunctions.cpp
 rem   imu_tests         lib\IMUFunctions.cpp lifecycle and fault accounting
 rem   can_probe_tests   lib\CANSniffFunctions.cpp map probe (MCP2515 model)
+rem   can_ring_tests    lib\CANFrameRing.h ISR -> loop() frame ring
+rem   can_drain_tests   lib\CANSniffFunctions.cpp drain ISR, SPI masking, SNIFF
+rem   can_stream_tests  lib\CANRawStream.cpp F/FS lines and USB gating
+rem   can_selftest_tests, can_selftest_max_tests
+rem                     the bench self-test generator, at 2400 and 10000 frames/s
+rem
+rem   NOT here: sketch_policy_tests.py (Python, mkr_zero.ino); run it with
+rem   "python sketch_policy_tests.py" or the Makefile.
+rem   NOT here: can_telemetry_tests. It links lib\CommProtocol.h, whose payload
+rem   struct is declared with a GCC packing attribute MSVC does not accept; run
+rem   it with the Makefile (g++ or clang++).
 rem
 rem   RunTests.cmd        build and run every suite
 rem
@@ -68,16 +79,41 @@ if errorlevel 1 goto :buildfail
 cl %CL_FLAGS% arduino_stub.cpp bno_init_tests.cpp "%LIBDIR%\BNO055Init.cpp" /Fe:bno_init_tests.exe
 if errorlevel 1 goto :buildfail
 
-cl %CL_FLAGS% arduino_stub.cpp mcp2515_model.cpp can_probe_tests.cpp ^
+cl %CL_FLAGS% arduino_stub.cpp mcp2515_model.cpp can_stream_hw_stub.cpp can_probe_tests.cpp ^
    "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
    /Fe:can_probe_tests.exe
+if errorlevel 1 goto :buildfail
+
+cl %CL_FLAGS% can_ring_tests.cpp /Fe:can_ring_tests.exe
+if errorlevel 1 goto :buildfail
+
+cl %CL_FLAGS% arduino_stub.cpp mcp2515_model.cpp can_stream_hw_stub.cpp can_drain_tests.cpp ^
+   "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
+   /Fe:can_drain_tests.exe
+if errorlevel 1 goto :buildfail
+
+cl %CL_FLAGS% arduino_stub.cpp mcp2515_model.cpp can_stream_hw_stub.cpp can_stream_tests.cpp ^
+   "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
+   "%LIBDIR%\CANRawStream.cpp" /Fe:can_stream_tests.exe
+if errorlevel 1 goto :buildfail
+
+rem The bench self-test generator: the same sources with ONE define, at the
+rem build script's default rate and at the one-frame-per-tick cap.
+cl %CL_FLAGS% /DDASHCAM_CAN_STREAM_SELFTEST=2400 arduino_stub.cpp mcp2515_model.cpp can_stream_hw_stub.cpp can_selftest_tests.cpp ^
+   "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
+   "%LIBDIR%\CANRawStream.cpp" /Fe:can_selftest_tests.exe
+if errorlevel 1 goto :buildfail
+
+cl %CL_FLAGS% /DDASHCAM_CAN_STREAM_SELFTEST=10000 arduino_stub.cpp mcp2515_model.cpp can_stream_hw_stub.cpp can_selftest_tests.cpp ^
+   "%LIBDIR%\CANSniffFunctions.cpp" "%LIBDIR%\CANMap.cpp" "%LIBDIR%\VehicleSignals.cpp" ^
+   "%LIBDIR%\CANRawStream.cpp" /Fe:can_selftest_max_tests.exe
 if errorlevel 1 goto :buildfail
 
 del /q *.obj 2>nul
 echo.
 
 rem Every suite runs even after one fails, so a single run reports everything.
-for %%T in (switch_tests imu_tests can_probe_tests bno_init_tests) do (
+for %%T in (switch_tests imu_tests can_probe_tests bno_init_tests can_ring_tests can_drain_tests can_stream_tests can_selftest_tests can_selftest_max_tests) do (
     .\%%T.exe
     set /a RC+=!ERRORLEVEL!
 )

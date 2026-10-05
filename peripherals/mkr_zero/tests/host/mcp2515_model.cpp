@@ -1,4 +1,5 @@
 #include "mcp2515_model.h"
+#include "can_stream_hw_stub.h"
 
 #include <SPI.h>
 #include <CAN.h>
@@ -18,6 +19,9 @@ static const uint8_t REG_RXB0CTRL = 0x60;
 static const uint8_t REG_RXB0SIDH = 0x61;
 static const uint8_t REG_RXB1CTRL = 0x70;
 static const uint8_t REG_RXB1SIDH = 0x71;
+static const uint8_t REG_TXB0CTRL = 0x30;
+static const uint8_t REG_TXB1CTRL = 0x40;
+static const uint8_t REG_TXB2CTRL = 0x50;
 
 static const uint8_t OPMOD_MASK   = 0xE0;
 static const uint8_t MODE_NORMAL  = 0x00;
@@ -36,6 +40,8 @@ static bool     g_refuse;
 static uint32_t g_rejected;
 static uint32_t g_overflowed;
 static bool     g_everNormal;
+static bool     g_misoStuck;
+static uint8_t  g_misoValue;
 
 static uint8_t opMode() { return static_cast<uint8_t>(g_reg[REG_CANSTAT] & OPMOD_MASK); }
 
@@ -62,6 +68,7 @@ void fakeCanReset()
     g_rejected   = 0;
     g_overflowed = 0;
     g_everNormal = false;
+    g_misoStuck  = false;
     g_reg[REG_CANCTRL] = 0x87;   // datasheet reset value: REQOP=100, CLKEN, CLKPRE
     setOpMode(MODE_CONFIG);
 }
@@ -71,7 +78,7 @@ void fakeCanReset()
 // State per transaction. The first byte is the instruction; what follows means
 // whatever that instruction says it means.
 
-enum class Op : uint8_t { None, Read, Write, BitMod, ReadRx };
+enum class Op : uint8_t { None, Read, Write, BitMod, ReadRx, Status };
 
 static bool    g_inTx;
 static Op      g_op;
@@ -82,6 +89,7 @@ static uint8_t g_rxClear;  ///< RXnIF a READ RX BUFFER clears when CS rises.
 
 void SPIClass::beginTransaction(const SPISettings &)
 {
+    hostDrainOnSpiBegin();   // who is using the bus, and is the drain kept out?
     g_inTx    = true;
     g_op      = Op::None;
     g_pos     = 0;
@@ -98,7 +106,10 @@ void SPIClass::endTransaction()
 
 uint8_t SPIClass::transfer(uint8_t b)
 {
+    hostDrainOnSpiByte();    // where an unmasked drain tick would land
     if (!g_inTx) return 0xFF;
+    // A shield that is not there: MISO floats, and every byte reads the same.
+    if (g_misoStuck) return g_misoValue;
 
     if (g_op == Op::None) {
         switch (b) {
@@ -110,6 +121,7 @@ uint8_t SPIClass::transfer(uint8_t b)
         case 0x92: g_op = Op::ReadRx; g_addr = REG_RXB0SIDH + 5; g_rxClear = RX0IF; break;
         case 0x94: g_op = Op::ReadRx; g_addr = REG_RXB1SIDH;     g_rxClear = RX1IF; break;
         case 0x96: g_op = Op::ReadRx; g_addr = REG_RXB1SIDH + 5; g_rxClear = RX1IF; break;
+        case 0xA0: g_op = Op::Status; break;
         default:   break;   // an instruction this model does not need
         }
         return 0xFF;
@@ -133,6 +145,15 @@ uint8_t SPIClass::transfer(uint8_t b)
         return 0xFF;
     case Op::ReadRx:
         return g_reg[g_addr++];
+    case Op::Status: {
+        // READ STATUS (DS20001801 Fig. 12-8): the same byte for as long as it
+        // is clocked. RXnIF and TXnIF from CANINTF, TXREQ from each TXBnCTRL.
+        const uint8_t intf = g_reg[REG_CANINTF];
+        return (uint8_t)(((intf & RX0IF) ? 0x01u : 0u) | ((intf & RX1IF) ? 0x02u : 0u) |
+                         ((g_reg[REG_TXB0CTRL] & 0x08u) ? 0x04u : 0u) | ((intf & 0x04u) ? 0x08u : 0u) |
+                         ((g_reg[REG_TXB1CTRL] & 0x08u) ? 0x10u : 0u) | ((intf & 0x08u) ? 0x20u : 0u) |
+                         ((g_reg[REG_TXB2CTRL] & 0x08u) ? 0x40u : 0u) | ((intf & 0x10u) ? 0x80u : 0u));
+    }
     default:
         return 0xFF;
     }
@@ -149,6 +170,12 @@ bool MCP2515Class::setFilterRegisters(uint16_t mask0, uint16_t filter0, uint16_t
     // for Configuration never completes, so OPMOD stays where it was — usually
     // Listen-Only. That is the case where the driver's own park matters, and
     // modelling it this way is what lets a test see whether the park happened.
+    //
+    // The real library does this over ~30 SPI transactions of its own, which
+    // are as exposed to the drain ISR as the driver's raw ones; report one, so
+    // the mask check covers them too.
+    hostDrainOnSpiBegin();
+    hostDrainOnSpiByte();
     if (g_refuse) return false;
     setOpMode(MODE_CONFIG);
 
@@ -170,17 +197,24 @@ static bool matches(uint16_t id, uint16_t mask, uint16_t filt)
     return ((id ^ filt) & mask) == 0u;
 }
 
-static bool rxb0Accepts(uint16_t id)
+static bool filtersOff(uint8_t ctrlReg) { return ((g_reg[ctrlReg] >> 5) & 0x03u) == 0x03u; }
+
+// The driver programs standard filters only (EXIDE = 0), and a standard filter
+// never matches an extended frame — so with the filters on, extended frames are
+// rejected outright, and only RXM = 11 admits them.
+static bool rxb0Accepts(uint32_t id, bool ext)
 {
-    if (((g_reg[REG_RXB0CTRL] >> 5) & 0x03u) == 0x03u) return true;
-    return matches(id, g_mask[0], g_filt[0]) || matches(id, g_mask[0], g_filt[1]);
+    if (filtersOff(REG_RXB0CTRL)) return true;
+    if (ext) return false;
+    return matches((uint16_t)id, g_mask[0], g_filt[0]) || matches((uint16_t)id, g_mask[0], g_filt[1]);
 }
 
-static bool rxb1Accepts(uint16_t id)
+static bool rxb1Accepts(uint32_t id, bool ext)
 {
-    if (((g_reg[REG_RXB1CTRL] >> 5) & 0x03u) == 0x03u) return true;
+    if (filtersOff(REG_RXB1CTRL)) return true;
+    if (ext) return false;
     for (int i = 2; i < 6; ++i) {
-        if (matches(id, g_mask[1], g_filt[i])) return true;
+        if (matches((uint16_t)id, g_mask[1], g_filt[i])) return true;
     }
     return false;
 }
@@ -188,25 +222,39 @@ static bool rxb1Accepts(uint16_t id)
 bool fakeCanAccepts(uint16_t id)
 {
     id = static_cast<uint16_t>(id & 0x7FFu);
-    return rxb0Accepts(id) || rxb1Accepts(id);
+    return rxb0Accepts(id, false) || rxb1Accepts(id, false);
 }
 
-static void store(uint8_t sidh, uint16_t id, uint8_t dlc, const uint8_t *data)
+/// Lays a frame into one buffer's registers exactly as the controller does
+/// (DS20001801 Register 4-4..4-9). A remote frame stores no data: the data
+/// registers keep whatever the previous frame left, which is the trap the
+/// driver must not fall into.
+static void store(uint8_t sidh, uint32_t id, bool ext, bool rtr, uint8_t rawDlc, const uint8_t *data)
 {
-    g_reg[sidh + 0] = static_cast<uint8_t>(id >> 3);
-    g_reg[sidh + 1] = static_cast<uint8_t>((id & 0x07u) << 5);   // SRR = 0, IDE = 0
-    g_reg[sidh + 2] = 0;
-    g_reg[sidh + 3] = 0;
-    g_reg[sidh + 4] = static_cast<uint8_t>(dlc & 0x0Fu);
+    if (ext) {
+        g_reg[sidh + 0] = static_cast<uint8_t>(id >> 21);
+        g_reg[sidh + 1] = static_cast<uint8_t>((((id >> 18) & 0x07u) << 5) | 0x08u | ((id >> 16) & 0x03u));
+        g_reg[sidh + 2] = static_cast<uint8_t>(id >> 8);
+        g_reg[sidh + 3] = static_cast<uint8_t>(id);
+        g_reg[sidh + 4] = static_cast<uint8_t>((rtr ? 0x40u : 0u) | (rawDlc & 0x0Fu));
+    } else {
+        g_reg[sidh + 0] = static_cast<uint8_t>(id >> 3);
+        g_reg[sidh + 1] = static_cast<uint8_t>(((id & 0x07u) << 5) | (rtr ? 0x10u : 0u));   // SRR, IDE = 0
+        g_reg[sidh + 2] = 0;
+        g_reg[sidh + 3] = 0;
+        g_reg[sidh + 4] = static_cast<uint8_t>(rawDlc & 0x0Fu);
+    }
+    if (rtr) return;
+    const uint8_t n = (rawDlc > 8u) ? 8u : rawDlc;
     for (uint8_t i = 0; i < 8; ++i) {
-        g_reg[sidh + 5 + i] = (data != nullptr && i < dlc) ? data[i] : 0x00;
+        g_reg[sidh + 5 + i] = (data != nullptr && i < n) ? data[i] : 0x00;
     }
 }
 
-bool fakeCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data)
+bool fakeCanFrameEx(uint32_t id, bool ext, bool rtr, uint8_t rawDlc, const uint8_t *data)
 {
-    id = static_cast<uint16_t>(id & 0x7FFu);
-    if (dlc > 8) dlc = 8;
+    id = ext ? (id & 0x1FFFFFFFu) : (id & 0x7FFu);
+    rawDlc = static_cast<uint8_t>(rawDlc & 0x0Fu);
 
     // Configuration and Sleep receive nothing. Listen-Only and Normal do.
     const uint8_t mode = opMode();
@@ -215,15 +263,15 @@ bool fakeCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data)
     uint8_t &intf = g_reg[REG_CANINTF];
     uint8_t &eflg = g_reg[REG_EFLG];
 
-    if (rxb0Accepts(id)) {
+    if (rxb0Accepts(id, ext)) {
         if (!(intf & RX0IF)) {
-            store(REG_RXB0SIDH, id, dlc, data);
+            store(REG_RXB0SIDH, id, ext, rtr, rawDlc, data);
             intf = static_cast<uint8_t>(intf | RX0IF);
             return true;
         }
         if (g_reg[REG_RXB0CTRL] & BUKT) {
             if (!(intf & RX1IF)) {
-                store(REG_RXB1SIDH, id, dlc, data);
+                store(REG_RXB1SIDH, id, ext, rtr, rawDlc, data);
                 intf = static_cast<uint8_t>(intf | RX1IF);
                 return true;
             }
@@ -234,9 +282,9 @@ bool fakeCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data)
         ++g_overflowed;
         return false;
     }
-    if (rxb1Accepts(id)) {
+    if (rxb1Accepts(id, ext)) {
         if (!(intf & RX1IF)) {
-            store(REG_RXB1SIDH, id, dlc, data);
+            store(REG_RXB1SIDH, id, ext, rtr, rawDlc, data);
             intf = static_cast<uint8_t>(intf | RX1IF);
             return true;
         }
@@ -247,6 +295,16 @@ bool fakeCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data)
     ++g_rejected;
     return false;
 }
+
+bool fakeCanFrame(uint16_t id, uint8_t dlc, const uint8_t *data)
+{
+    if (dlc > 8) dlc = 8;
+    return fakeCanFrameEx(id, false, false, dlc, data);
+}
+
+void fakeCanStickMiso(bool stuck, uint8_t value) { g_misoStuck = stuck; g_misoValue = value; }
+uint8_t fakeCanReg(uint8_t addr)                  { return g_reg[addr]; }
+void fakeCanSetReg(uint8_t addr, uint8_t value)   { g_reg[addr] = value; }
 
 uint8_t  fakeCanOpMode()                    { return opMode(); }
 void     fakeCanRefuseFilterWrites(bool r)  { g_refuse = r; }

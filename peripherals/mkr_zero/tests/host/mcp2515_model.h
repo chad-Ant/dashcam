@@ -16,9 +16,15 @@
  * mask 1 and filters 2-5, RXM = 11 accepting everything, BUKT rolling a full
  * RXB0 over into RXB1, and nothing received in Configuration mode.
  *
- * Standard 11-bit data frames only — that is all the sniffer decodes. Mode
- * changes complete instantly; the driver's bounded CANSTAT poll passes on its
- * first read, which is the uninteresting half of that loop.
+ * Standard and extended identifiers, data and remote frames, laid into the
+ * buffer registers as the controller lays them: a remote frame stores no data,
+ * so the data registers keep the previous frame's bytes. READ STATUS is
+ * modelled for the drain ISR. Mode changes complete instantly; the driver's
+ * bounded CANSTAT poll passes on its first read, which is the uninteresting
+ * half of that loop.
+ *
+ * Every transaction and byte is reported to can_stream_hw_stub.cpp, which is
+ * how a main-loop transaction made with the drain interrupt unmasked is caught.
  */
 
 #include <stdint.h>
@@ -33,6 +39,20 @@ void fakeCanReset();
  *         not receiving.
  */
 bool fakeCanFrame(uint16_t id, uint8_t dlc = 8, const uint8_t *data = nullptr);
+
+/**
+ * @brief Any frame on the bus: standard or extended, data or remote.
+ * @param rawDlc  The 4-bit DLC field as sent, 0-15; above 8 still means 8 bytes.
+ * @return as fakeCanFrame().
+ */
+bool fakeCanFrameEx(uint32_t id, bool ext, bool rtr, uint8_t rawDlc, const uint8_t *data);
+
+/// MISO stuck at @p value for every byte — a missing or unpowered shield.
+void fakeCanStickMiso(bool stuck, uint8_t value = 0xFF);
+
+/// Direct register access, for tests that set up a state no frame produces.
+uint8_t fakeCanReg(uint8_t addr);
+void    fakeCanSetReg(uint8_t addr, uint8_t value);
 
 /// Whether the filters now programmed would accept @p id (buffers aside).
 bool fakeCanAccepts(uint16_t id);

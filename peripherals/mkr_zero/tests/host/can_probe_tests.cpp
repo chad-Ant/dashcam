@@ -14,6 +14,14 @@
  * 0x158 0x17C 0x191 0x1AB 0x1D0 0x294, all of which fit the six hardware
  * filter slots.
  *
+ * Since the raw-stream change the controller is emptied by the drain timer's
+ * ISR into a RAM ring, and tickCANSniff() decodes from the ring. So one
+ * loop() pass here is pass(): a drain tick (can_stream_hw_stub), the decode,
+ * and the USB side's release of what it may take. Only that mechanism changed;
+ * every expectation below is the one the probe always had. (The production
+ * sketch no longer ARMS the probe at boot — that policy change is the sketch's
+ * and has no test here; the probe itself is unchanged.)
+ *
  * Exit status is the number of failures, so `make check` fails the build.
  */
 
@@ -21,6 +29,8 @@
 #include "DataDictionary.h"
 #include "SDFunctions.h"
 #include "mcp2515_model.h"
+#include "can_stream_hw_stub.h"
+#include "CANStreamHw.h"
 
 #include <stdio.h>
 
@@ -77,6 +87,8 @@ static void begin(const char *name)
     g_case = name;
     hostReset();
     fakeCanReset();
+    hostDrainReset();
+    canDrainTimerBegin();
     // The clock only ever moves FORWARD, across tests too. The driver keeps its
     // own static state between them — the mode and the rate limiter's last
     // transition among it — and a clock restarted per test would put "now"
@@ -105,6 +117,21 @@ static bool enterSniff()
 }
 
 /**
+ * @brief One loop() pass's worth of the receive path, in the sketch's order.
+ *
+ * The timer would tick ~100 times in a 10 ms pass; once is enough to empty two
+ * buffers. The release stands in for the USB stream, which in SNIFF never takes
+ * a frame the decoder has not reached — without it the ring would fill across
+ * these long runs and starve the decoder, which is a stream test's business.
+ */
+static void pass()
+{
+    hostDrainTick();
+    (void)tickCANSniff(g_v, g_y);
+    (void)canRawDiscard(canRawStreamable());
+}
+
+/**
  * @brief Runs loop() passes against a bus carrying @p ids round-robin.
  *
  * Two frames arrive per 10 ms pass — one per receive buffer — then the drain and
@@ -119,7 +146,7 @@ static CanProbeStage run(const uint16_t *ids, unsigned n, uint32_t forMs,
     for (uint32_t el = 0; el < forMs; el += stepMs) {
         advance(stepMs);
         for (unsigned k = 0; k < 2u && n > 0u; ++k) (void)fakeCanFrame(ids[g_next++ % n]);
-        (void)tickCANSniff(g_v, g_y);
+        pass();
         st = canProbeTick(g_p, g_t);
         if (st != CanProbeStage::Probing) {
             if (verdictAtMs != nullptr) *verdictAtMs = g_t;
@@ -360,17 +387,17 @@ static void test_overruns_are_counted()
     // three with nowhere to go — all on RX1OVR, which latches ONE event.
     for (unsigned k = 0; k < 5u; ++k) (void)fakeCanFrame(kMapIds[k % kMapN]);
     CHECK(fakeCanOverflowed() == 3u);
-    (void)tickCANSniff(g_v, g_y);
+    pass();
     CHECK(canSniffOverrunCount() == before + 1u);  // a lower bound: 3 frames, 1 event
 
     // Cleared by that drain: a pass that loses nothing adds nothing.
     for (unsigned k = 0; k < 2u; ++k) (void)fakeCanFrame(kMapIds[k]);
-    (void)tickCANSniff(g_v, g_y);
+    pass();
     CHECK(canSniffOverrunCount() == before + 1u);
 
     // Loss on a later pass is a second event.
     for (unsigned k = 0; k < 3u; ++k) (void)fakeCanFrame(kMapIds[k]);
-    (void)tickCANSniff(g_v, g_y);
+    pass();
     CHECK(canSniffOverrunCount() == before + 2u);
 
     // Boot-cumulative: re-arming restarts the probe's counters, not this one.

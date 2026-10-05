@@ -10,8 +10,17 @@
  * pushes MSG_TELEMETRY at COMM_STREAM_INTERVAL_MS (10 Hz) until told to stop.
  * All of that lives in tickCommMaster(), which must be called every loop().
  *
- * Serial1 (pins 13/14) belongs to the C3 link.  Serial is the USB CDC console
- * and is safe to print to — it is a different peripheral entirely.
+ * Serial1 (pins 13/14) belongs to the C3 link.  Serial is the native USB CDC
+ * port — a different peripheral entirely — and carries TWO things to the Orin:
+ * the raw CAN stream (every frame, as "F ..." lines, plus an "FS ..." line once
+ * a second; see CANRawStream.h) and this console's human text. It used to be a
+ * development link only; the raw stream makes it a production data path.
+ *
+ * Two rules keep the two apart, and every print in this firmware must keep
+ * them: no console line may begin with "F " or "FS ", and canStreamService() is
+ * called only BETWEEN console messages, never part-way through printing one —
+ * it writes whole lines, so a frame line can sit between two console lines but
+ * never inside one.
  *
  * Wiring:
  *   Serial1 TX (pin 14) -> C3 RX (GPIO20)
@@ -32,6 +41,8 @@
 #include "GPSFunctions.h"
 #include "CommunicationFunctions.h"
 #include "CANSniffFunctions.h"
+#include "CANRawStream.h"
+#include "CANStreamHw.h"
 #include "SDFunctions.h"
 #include "VehicleSignals.h"
 #include "SignalProcessingFunctions.h"
@@ -89,23 +100,27 @@ OBD2Config OBD2S1Commands;
 OBD2Data   obdData;
 
 /**
- * The common template both sources fill, and the CAN controller's current mode.
+ * The common template both decoding sources fill, and the CAN controller's mode.
  *
- * Boot default is SNIFF, not OBD2 — inverting what this sketch used to do.
- * Listen-only emits neither ACK bits nor error frames, so until the bit timing
- * has been proven on a given vehicle the node cannot disturb the bus at all;
- * and sniffing is the better source anyway (50-100 Hz and 0.01 km/h, against a
- * ~500 ms poll cycle quantised to whole km/h). OBD2 is entered only when the
- * Jetson asks, via CMD_SET_CAN_MODE.
+ * Boot default is DISCOVER: listen-only, accept-all, every frame streamed raw
+ * to the Orin over USB and NOTHING decoded here — whatever the SD card holds.
+ * It replaced booting into SNIFF behind a map probe with an automatic OBD2
+ * fallback. Listen-only still emits neither ACK bits nor error frames, so the
+ * node cannot disturb a bus whose bit timing nobody has proven; and decoding
+ * moved to the Orin, which can re-decode a recording when a map is found to be
+ * wrong — a live decode on this board could not be taken back.
+ *
+ * So in DISCOVER this template stays at its sentinels and the telemetry's CAN
+ * fields read as unavailable. SNIFF (decode on this board) and OBD2 (query, bus-
+ * active) are entered only when the Jetson asks, via CMD_SET_CAN_MODE.
  */
 VehicleSignals vehSignals;
 YawEstimator   yawEst;
 CanMode        canMode = CanMode::OFF;
 /// The vehicle signal map, read from the card at boot. Falls back to the
-/// compiled-in Honda map when the card holds none.
+/// compiled-in Honda map when the card holds none. Used only by a host-commanded
+/// SNIFF; its identity is reported in telemetry either way.
 CanSignalMap   canMap;
-/// Boot-time "is this map for this car?" decision. Runs to a verdict ONCE.
-CanProbeState  canProbe = { CanProbeStage::Idle, 0, false };
 GPSData    gpsData;
 CommMaster commMaster;
 
@@ -199,20 +214,73 @@ static bool          obdReady       = false;
 /// the retry loop; see OBD2_DEAD_SESSIONS.
 static uint8_t       obdDeadSessions = 0;
 static unsigned long lastOBD2Retry  = 0;
-/// True once an ECU has actually ANSWERED a request — not merely once the CAN
-/// controller came up.
+/// True once the vehicle itself has been heard — an ECU ANSWERED a request in
+/// OBD2, or, in a listen-only mode, the drain read any frame off the bus — not
+/// merely once the CAN controller came up.
 ///
 /// The distinction is the whole of the vehicle-power signal, and conflating the
 /// two is what previously made low-power mode unreachable.  initializeOBD2()
 /// configures a chip on the SPI bus; it succeeds with no vehicle attached at
-/// all.  Only a decoded reply proves an ECU is powered and talking, which is the
-/// thing "is the vehicle on?" is really asking.
+/// all.  Only traffic from the vehicle proves an ECU is powered and talking,
+/// which is the thing "is the vehicle on?" is really asking.
 static bool          vehBusEverLive = false;
-/// @c millis() of the last decoded ECU reply, for the shutdown timer.
+/// @c millis() of the last evidence above, for the shutdown timer.
 static unsigned long lastEcuReplyMs = 0;
+/// canDrainedCount() as of the last pass. A change is a frame read off the bus.
+static uint32_t      lastDrainedSeen = 0;
 static unsigned long lastLEDBlink   = 0;
 static unsigned long lastDebugPrint = 0;
 static int           LED_on         = 1;
+
+/**
+ * The once-a-second console status line, assembled into whole USB packets.
+ *
+ * Printed straight to Serial it is ~110 separate writes, one packet each, and
+ * every one that finds the previous packet still armed enters the core's
+ * send() wait — which watches only TRCPT1, a flag the USB interrupt clears on
+ * every 1 kHz start-of-frame. With the 10 kHz drain preempting the thread ~10 %
+ * of the time, a start-of-frame landing inside a preempted wait clears it
+ * unseen, and send() spins its full 70 ms and drops the text. Collected here and
+ * handed to canStreamConsoleWrite() 63 bytes at a time, each packet goes into a
+ * bank already seen free, so send() never waits at all — and the line costs the
+ * bank ~4 packets instead of ~110, which leaves it to the raw stream.
+ *
+ * Everything else still prints to Serial directly: edge logs and refusals are
+ * a few lines a minute, not a hundred a second.
+ */
+class UsbConsoleLine : public Print {
+public:
+    using Print::write;
+    size_t write(uint8_t c) override { return write(&c, 1u); }
+    size_t write(const uint8_t *buf, size_t n) override
+    {
+        for (size_t i = 0; i < n; ++i) {
+            mBuf[mLen++] = buf[i];
+            if (mLen == sizeof(mBuf)) flush();
+        }
+        return n;
+    }
+    /// Sends what is buffered. The line's last packet goes out here, at its end.
+    void flush() override
+    {
+        if (mLen == 0u) return;
+        (void)canStreamConsoleWrite(mBuf, mLen);
+        mLen = 0u;
+    }
+private:
+    uint8_t mBuf[CAN_STREAM_PACKET_MAX];
+    uint8_t mLen = 0u;
+};
+static UsbConsoleLine statusOut;
+
+#if defined(DASHCAM_CAN_STREAM_SELFTEST)
+/// Bench self-test build only: loop() passes since the last status line, the
+/// longest of them, and when the current one began. The two numbers the raw
+/// stream's throughput is made of (see CANRawStream.h), printed as loop=N/Mus.
+static uint32_t selfPasses      = 0;
+static uint32_t selfPassMaxUs   = 0;
+static uint32_t selfPassStartUs = 0;
+#endif
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -494,9 +562,16 @@ static bool startOBD2(bool stayInConfig = false)
         return false;
     }
 
+    // The drain ISR is already disarmed here — only OFF and OBD2 get this far,
+    // and canSetMode() arms it for the listen-only modes alone — but this is
+    // CAN.begin(): SPI.begin() reconfigures the bus and reset() takes the chip
+    // through a reset. Masked as well, so the ISR's exclusion from the bus does
+    // not rest on one flag.
+    canDrainIrqMask();
     const CANReturnStatus st =
         initializeOBD2(OBD2S1Commands, OBD2_TX_GLOBAL, OBD2_RX_ECM_1,
                        MCP2515_DEFAULT_CS_PIN, MCP2515_DEFAULT_INT_PIN, stayInConfig);
+    canDrainIrqUnmask();
     if (st != CANReturnStatus::OK) {
         // Which failure, not just that there was one. NOK_INIT_FAILED means the
         // MCP2515 never acknowledged a mode change across a 50 ms bounded poll —
@@ -541,7 +616,12 @@ static const char *canModeName(CanMode m)
  * SNIFF must clear the sniffed values, because they are about to stop being
  * updated and a consumer would otherwise keep reading a speed frozen at the
  * instant of the switch; leaving OBD2 must clear the poller, because its
- * failure counters describe a session that has ended.
+ * failure counters describe a session that has ended. Entering DISCOVER is
+ * what leaves the template at its sentinels for as long as it lasts: nothing
+ * decodes there, so nothing writes them again.
+ *
+ * The drain needs nothing here: canSetMode() arms it for DISCOVER and SNIFF and
+ * disarms it for everything else, on success and failure alike.
  */
 static bool applyCanMode(CanMode want)
 {
@@ -594,25 +674,6 @@ static bool applyCanMode(CanMode want)
     Serial.print("CAN: mode -> ");
     Serial.println(canModeName(want));
     return true;
-}
-
-/**
- * @brief Arms the map probe after a successful switch into SNIFF.
- *
- * The probe opens the filters to accept-all (see canProbeArm()), and that write
- * can be refused. The driver then parks the controller in Configuration and
- * reports OFF, so adopt that: the OFF retry in loop() brings the controller
- * back and arms again, which is the recovery every other refused transition
- * already relies on.
- */
-static void armCanProbe()
-{
-    if (canProbeArm(canProbe)) return;
-    canMode  = canGetMode();
-    obdReady = false;
-    Serial.print("CAN: probe could not open the filters; controller parked (");
-    Serial.print(canModeName(canMode));
-    Serial.println("), will retry");
 }
 
 // ─── Arduino entry points ─────────────────────────────────────────────────────
@@ -885,31 +946,19 @@ void setup()
     }
     watchdogFeed();
 
-    // Bring the controller up and go straight to listen-only sniffing.
-    //
-    // startOBD2() is still what configures the MCP2515 (bit timing, pins, OSM),
-    // so it runs first — but the node does NOT stay bus-active. applyCanMode()
-    // immediately moves it to Listen-Only, where it emits neither ACK bits nor
-    // error frames. That ordering matters on a vehicle whose bit timing has not
-    // been proven: a wrong CNF setting in Normal mode produces error frames and
-    // can set a VSA light, while in listen-only it costs nothing but frames.
-    //
-    // If the controller fails to come up at all, the retry path below handles
-    // it exactly as before.
-    // The vehicle signal map decides what happens next. Read before anything
-    // touches the CAN controller, because canSetMode(SNIFF) programs the
-    // hardware filter from the map's ID set.
-    // canmap.<vehicle>.txt, found by pattern — see CAN_MAP_PREFIX. The vehicle
-    // is named so the log can say WHICH map is live, which a fixed filename
-    // could never report and which is the first thing to check when the numbers
-    // look like another car's.
+    // The vehicle signal map: read and reported, but it no longer decides the
+    // boot mode. canmap.<vehicle>.txt, found by pattern — see CAN_MAP_PREFIX.
+    // The vehicle is named so the log can say WHICH map is installed, which a
+    // fixed filename could never report and which is the first thing to check
+    // when SNIFF's numbers look like another car's. Its identity also rides on
+    // every telemetry frame (canMapChecksum, COMM_FLAG_CANMAP_LOADED).
     char mapPath[CAN_MAP_NAME_MAX];
     char mapVehicle[CAN_MAP_VEHICLE_MAX];
     const uint8_t mapMatches = canMapFindFile(mapPath, sizeof(mapPath),
                                               mapVehicle, sizeof(mapVehicle));
     if (mapMatches > 1u) {
         // Loaded anyway rather than refused: a second map on the card is an
-        // operator slip, and refusing would cost the whole drive's telemetry to
+        // operator slip, and refusing would cost a SNIFF session its decode to
         // punish it. The choice is deterministic and named, so it is checkable.
         Serial.print("CANMAP: ");
         Serial.print(mapMatches);
@@ -931,13 +980,11 @@ void setup()
         Serial.print(" ids, id=0x");
         Serial.println(canMap.checksum, HEX);
     } else {
-        // NOT "falling back to the compiled-in map", which is what this said and
-        // which the very next line contradicted. The compiled-in map is installed
-        // below for null-safety only; it is deliberately NOT used to sniff, so
-        // the node goes to OBD-II. Say the actionable thing instead — the fix is
-        // one file copy, and an operator should not have to read the source to
-        // find that out.
-        Serial.print("CANMAP: no usable map -> OBD2 only. Copy ");
+        // The raw stream needs no map, so this costs the boot nothing. It
+        // matters only to a host that later asks for SNIFF, which would then
+        // decode with the compiled-in Honda map — another manufacturer's bits on
+        // any other car. Say the actionable thing: the fix is one file copy.
+        Serial.print("CANMAP: no usable map (the raw stream needs none). For SNIFF copy ");
         Serial.print("config/canmap.<vehicle>.txt to the card root, e.g. ");
         Serial.println("canmap.brio.txt");
     }
@@ -945,41 +992,37 @@ void setup()
     initYawEstimator(yawEst, canSniffGetMap());
     watchdogFeed();
 
-    // Configure-only: the controller comes up off the bus and the mode choice
-    // below is what first puts it on. applyCanMode(OBD2) programs its own filter
-    // and sets Normal+OSM atomically, so the OBD-II path loses nothing.
+    // The drain timer first, so it is running the moment DISCOVER arms it. Its
+    // interrupt is harmless until then: canDrainIsr() returns at once while
+    // disarmed, and only canSetMode() arms it.
+    canDrainTimerBegin();
+#if defined(DASHCAM_CAN_STREAM_SELFTEST)
+    // Said at every boot, so a bench build that reaches the car announces itself
+    // on the first line anyone reads: its frames are not the vehicle's.
+    Serial.print("CAN: SELFTEST BUILD - ");
+    Serial.print((unsigned long)DASHCAM_CAN_STREAM_SELFTEST);
+    Serial.println(" synthetic frames/s (id 0x7F0) while the drain is armed. Bench only, never the car.");
+#endif
+
+    // Bring the controller up and go straight to listen-only, accept-all
+    // DISCOVER — whatever the card holds. No probe, no automatic OBD2.
+    //
+    // startOBD2() is still what configures the MCP2515 (bit timing, pins), and
+    // it does so configure-only: the controller comes up in Configuration, off
+    // the bus, and applyCanMode() is what first puts it on — in Listen-Only,
+    // where it emits neither ACK bits nor error frames. That ordering matters on
+    // a vehicle whose bit timing has not been proven: a wrong CNF setting in
+    // Normal mode produces error frames and can set a VSA light, while in
+    // listen-only it costs nothing but frames.
+    //
+    // If the controller does not come up, or DISCOVER is refused, the mode is
+    // OFF and the OFF retry in loop() brings it back into DISCOVER every
+    // OBD2_RETRY_MS. Nothing on the boot path can end up bus-active.
     if (!startOBD2(/*stayInConfig=*/true)) {
         obdReady = false;
-        canProbeSkip(canProbe);
-    } else if (ms != CanMapStatus::OK) {
-        // No usable map: OBD-II, immediately, without a probe.
-        //
-        // The compiled-in map is deliberately NOT used to sniff here. It exists
-        // as the Phase 2 A/B artefact and as null-safety for canSniffGetMap();
-        // sniffing a hardcoded Honda map on an unknown car would decode another
-        // manufacturer's bits and publish the results as measurements. OBD-II is
-        // a standard every compliant vehicle answers, so an unconfigured install
-        // still produces telemetry - just slower and coarser.
-        //
-        // And there is nothing to probe FOR: with no map, a ten-second window
-        // could only reach the same answer ten seconds later.
-        canProbeSkip(canProbe);
-        applyCanMode(CanMode::OBD2);
-        Serial.println("CAN: no vehicle map; using OBD2 query");
-    } else {
-        if (applyCanMode(CanMode::SNIFF)) {
-            // ARMED, not run. setup() must not hold the boot for the probe
-            // window: the C3 link, the IMU drain and the GNSS machine all need
-            // loop() passes during it, and the 8 s watchdog would fire long
-            // before ten seconds elapsed.
-            armCanProbe();
-        } else {
-            // Sniffing refused: fall back to a mode we can verify rather than
-            // to a controller in an unknown state.
-            canProbeSkip(canProbe);
-            applyCanMode(CanMode::OBD2);
-            Serial.println("CAN: sniff unavailable; using OBD2");
-        }
+    } else if (!applyCanMode(CanMode::DISCOVER)) {
+        obdReady = false;
+        Serial.println("CAN: DISCOVER refused; controller parked, will retry");
     }
     lastOBD2Retry = millis();
     initVehicleSignals(vehSignals);
@@ -997,22 +1040,40 @@ void loop()
     // this pass for up to 750 ms (see gpsInitTick), which is bounded and far
     // under WATCHDOG_PERIOD_MS but long enough to age the IMU FIFO past its
     // freshness window and be reported as a data gap.  Every OTHER branch is
-    // non-blocking by construction.
+    // non-blocking by construction. The CAN drain does not pause for any of it:
+    // the timer interrupt keeps emptying the controller into the ring, which
+    // holds ~880 ms of the measured bus — more than that worst pass.
     watchdogFeed();
+
+#if defined(DASHCAM_CAN_STREAM_SELFTEST)
+    {
+        const uint32_t now = micros();
+        if (selfPasses != 0u && (uint32_t)(now - selfPassStartUs) > selfPassMaxUs) {
+            selfPassMaxUs = now - selfPassStartUs;
+        }
+        selfPassStartUs = now;
+        ++selfPasses;
+    }
+#endif
+
+    // ── Raw CAN to USB, at the seams of the pass ─────────────────────────────
+    //
+    // Called here and at three more points below, each BETWEEN console
+    // messages: a call writes at most one packet of whole lines and never waits
+    // on the host, and the endpoint holds one packet at a time, so how often it
+    // runs is what the stream's throughput is made of. See CANRawStream.h.
+    canStreamService();
+
     // ── 0) CAN mode requests from the Jetson, relayed by the C3 ──────────────
     //
     // Applied HERE, once per pass, rather than inside the frame decoder: a
     // transition passes through Configuration mode and drops frames, which has
     // no business happening in the middle of servicing a command budget.
     if (commMaster.canModeRequest != 0) {
-        // The host outranks the boot heuristic. A probe that later "decided" to
-        // switch modes out from under an explicit CMD_SET_CAN_MODE would be
-        // overriding a human with a guess.
-        canProbeSkip(canProbe);
-        // Skipping a running probe rewrites its open filters, and a refused
-        // write parks the controller. Adopt the driver's mode first, so the
-        // transition below starts from the truth — an UNCHANGED answer to
-        // the request would otherwise leave canMode claiming SNIFF.
+        // The ONLY way into SNIFF or OBD2. Adopt the driver's mode first, so the
+        // transition below starts from the truth — an UNCHANGED answer to the
+        // request would otherwise leave canMode claiming a mode the controller
+        // was parked out of by a refused filter write.
         canMode = canGetMode();
         // The give-up tally is cleared too. It bounds an AUTONOMOUS retry loop;
         // a host that explicitly asks for OBD2 again is entitled to a full fresh
@@ -1043,10 +1104,10 @@ void loop()
             // then a no-op.
             canMode = canGetMode();
         } else if (commMaster.canFilterCount == 0u) {
-            // Said out loud because it is the opposite of how it sounds, and on
-            // this bus it is a real capacity decision rather than a formality.
-            Serial.println("cleared - ACCEPT ALL. The drain holds ~267 frames/s "
-                           "against ~1100 arriving, so losses become random.");
+            // Said out loud because it is the opposite of how it sounds. It no
+            // longer costs frames — the timer drain keeps up with the whole bus
+            // — but it does change what SNIFF decodes and streams.
+            Serial.println("cleared - ACCEPT ALL (every id decoded and streamed)");
         } else {
             Serial.print(commMaster.canFilterCount);
             Serial.print(" ids:");
@@ -1055,16 +1116,6 @@ void loop()
                 Serial.print(commMaster.canFilterIds[i], HEX);
             }
             Serial.println();
-        }
-        // The host outranks the boot heuristic here too. A probe left running
-        // behind a host filter set would judge the map through the HOST'S
-        // filters — the same blindness the probe opens its filters to avoid —
-        // and a FellBack verdict would then replace the host's listen-only
-        // capture with bus-active OBD2. Its set is kept: canProbeSkip() leaves
-        // host filters alone.
-        if (ok && canProbe.stage == CanProbeStage::Probing) {
-            canProbeSkip(canProbe);
-            Serial.println("CAN: probe ended - the host's filters take precedence");
         }
         // Cleared whether or not it succeeded, for the same reason as the mode
         // request above: a refused command retried every pass forever produces a
@@ -1122,51 +1173,27 @@ void loop()
         commMaster.imuModeRequest = 0;
     }
 
-    // ── 0b) Passive decode, whenever a listen-only mode is active ────────────
+    // ── 0b) SNIFF decode from the ring; vehicle liveness from the drain ──────
     //
-    // The match counter is read either side so a decoded frame can stamp vehicle
-    // liveness. Sniffed traffic is BETTER evidence of a live vehicle than an
-    // OBD-II reply: it is passive, arrives at 50-100 Hz, and needs no request.
-    // Without this the liveness clock was only ever stamped inside the OBD2
-    // poll block, so booting into SNIFF left the vehicle state at Unknown for
-    // the whole drive - and the IMU, which picks its sampling mode from that
-    // state, never dropped to low power on a parked car.
-    const uint32_t matchesBefore = canSniffMatchCount();
+    // tickCANSniff() decodes only in SNIFF — DISCOVER leaves the template at its
+    // sentinels — and touches no hardware: the drain ISR has already read the
+    // frames out of the controller, so a late pass delays decoding without
+    // losing anything.
+    //
+    // Liveness is stamped from the DRAIN, not from decoding, in both listen-only
+    // modes: any frame read off the vehicle bus is evidence the vehicle is
+    // powered, and in DISCOVER nothing is decoded at all. Taken from the ISR's
+    // count, which moves at the moment of the read — before the ring or the USB
+    // host get a say — so a stalled host or a full ring cannot make a moving car
+    // look parked. (It was once stamped only inside the OBD2 poll block, which
+    // left a listen-only session at Unknown for the whole drive; the IMU picks
+    // its low-power mode from this state.)
     tickCANSniff(vehSignals, yawEst);
-    if (canSniffMatchCount() != matchesBefore) {
-        vehBusEverLive = true;
-        lastEcuReplyMs = millis();
-    }
-
-    // ── 0c) Boot-time source decision. Runs to a verdict ONCE, never again ───
-    if (canProbe.stage == CanProbeStage::Probing) {
-        const CanProbeStage st = canProbeTick(canProbe, millis());
-        if (st == CanProbeStage::Sniffing) {
-            Serial.print("CAN: probe passed (");
-            Serial.print(canSniffMatchCount());
-            Serial.println(" matching frames); sniffing this vehicle");
-            // The probe ran accept-all; now that the map is proven, narrow to
-            // its IDs so the drain spends its capacity on them.
-            if (!canSniffApplyMapFilters()) {
-                canMode  = canGetMode();
-                obdReady = false;
-                Serial.println("CAN: map filters REFUSED; controller parked, will retry");
-            }
-        } else if (st == CanProbeStage::FellBack) {
-            // Two different faults needing different repairs, told apart by the
-            // frame count: traffic but no matches means the map is for another
-            // vehicle; no traffic at all means wrong bit rate, wrong wiring, or
-            // a sleeping bus. Reporting both as "no CAN" sends someone looking
-            // for a broken cable on a car whose only problem is a config file.
-            Serial.print("CAN: probe saw ");
-            Serial.print(canSniffMatchCount());
-            Serial.print(" matching of ");
-            Serial.print(canSniffFrameCount());
-            Serial.println(canSniffFrameCount()
-                ? " accepted - map is for another vehicle; using OBD2"
-                : " accepted - nothing on the bus; using OBD2");
-            applyCanMode(CanMode::OBD2);
-        }
+    const uint32_t drainedNow = canDrainedCount();
+    if (drainedNow != lastDrainedSeen) {
+        lastDrainedSeen = drainedNow;
+        vehBusEverLive  = true;
+        lastEcuReplyMs  = millis();
     }
 
     // Age each signal on its own source's clock. Sniffed IDs repeat every
@@ -1181,7 +1208,12 @@ void loop()
         // decoded and stored, which only happens when an ECU answered.  It used
         // to be discarded and the clock stamped unconditionally, which made
         // every pass look like proof of life and kept the vehicle "on" forever.
-        if (tickOBD2(OBD2S1Commands, obdData)) {
+        // Masked although the drain is disarmed in OBD2 (see startOBD2()):
+        // the CAN library's SPI traffic must never meet the ISR's.
+        canDrainIrqMask();
+        const bool replied = tickOBD2(OBD2S1Commands, obdData);
+        canDrainIrqUnmask();
+        if (replied) {
             vehBusEverLive = true;
             lastEcuReplyMs = millis();
         }
@@ -1204,87 +1236,83 @@ void loop()
             }
 
             if (obdDeadSessions >= OBD2_DEAD_SESSIONS) {
-                // OFF, not another retry. Every one of those retries takes the
-                // controller bus-active on a live vehicle to transmit requests
-                // that have never once been answered - unattended, indefinitely,
-                // for no telemetry. Stopping is the honest outcome, and OFF
-                // parks it in Configuration where it emits nothing at all.
-                applyCanMode(CanMode::OFF);
+                // Back to DISCOVER, not another retry. Every one of those
+                // retries takes the controller bus-active on a live vehicle to
+                // transmit requests that have never once been answered -
+                // unattended, indefinitely, for no telemetry. Stopping
+                // transmitting is the honest outcome; and where this used to
+                // park the controller OFF, it now returns to the node's own
+                // mode — listen-only, emitting nothing — so the raw stream to
+                // the Orin resumes. A refusal leaves it OFF, and the OFF retry
+                // below brings it into DISCOVER.
+                applyCanMode(CanMode::DISCOVER);
                 Serial.print("OBD2: no ECU replied in ");
                 Serial.print((unsigned)obdDeadSessions);
-                Serial.println(" sessions - giving up, CAN now OFF (bus-idle)");
+                Serial.println(" sessions - giving up, CAN back to DISCOVER (listen-only)");
                 Serial.println("  This vehicle does not answer Mode 01 at this tap.");
-                Serial.println("  Fit a vehicle map (canmap.<vehicle>.txt) to sniff instead,");
+                Serial.println("  The raw stream needs no answer; decode it on the Orin,");
                 Serial.println("  or send CMD_SET_CAN_MODE from the host to retry.");
             }
         }
-    } else if ((canMode == CanMode::OBD2 || canMode == CanMode::OFF) &&
-               obdDeadSessions < OBD2_DEAD_SESSIONS &&
+    } else if ((canMode == CanMode::OFF ||
+                (canMode == CanMode::OBD2 && obdDeadSessions < OBD2_DEAD_SESSIONS)) &&
                isTimeout(OBD2_RETRY_MS, lastOBD2Retry)) {
-        // The tally gate is load-bearing. Giving up sets the mode to OFF, and
-        // OFF is one of the modes this branch retries from - so without it the
-        // very next pass would re-initialise and the give-up would last five
-        // seconds. A controller that never came up at all still retries, because
-        // that path never ran a session and never incremented the tally.
+        // Two recoveries share this branch, and only one is tally-gated.
+        //
+        //   OFF   the controller never came up, or a transition or filter write
+        //         was refused and parked it. Retried every OBD2_RETRY_MS for as
+        //         long as it takes, into DISCOVER: listen-only, so a retry emits
+        //         nothing, and a failed boot must not cost the whole drive's
+        //         raw stream. Gating this on the tally (as when the give-up
+        //         parked the controller OFF) is what used to make that permanent.
+        //   OBD2  a host-commanded session lost its link. Re-initialised, but
+        //         only until OBD2_DEAD_SESSIONS sessions in a row produced no
+        //         reply — each attempt goes bus-active — and then the give-up
+        //         above returns the node to DISCOVER instead.
+        //
         // Gated on the MODE, not on obdReady.
         //
         // This used to read `else if (isTimeout(...))`, which fires precisely
         // BECAUSE obdReady is false — and obdReady is false for the whole of
         // every listen-only session. So five seconds into every sniff the
         // controller was re-initialised into Normal mode with a 0x7E8-only
-        // filter, while canMode still reported SNIFF and tickCANSniff() polled
-        // a filter that admitted nothing. Sniffing silently stopped working
-        // after five seconds and the node went bus-active on a vehicle whose
-        // bit timing nothing had confirmed.
-        //
-        // A comment in applyCanMode() asserted that obdReady=false PREVENTED
-        // this. It was exactly backwards, which is why the guard is now a
-        // condition rather than a claim.
+        // filter, while canMode still reported SNIFF and the decoder polled a
+        // filter that admitted nothing. Sniffing silently stopped working after
+        // five seconds and the node went bus-active on a vehicle whose bit
+        // timing nothing had confirmed. A comment in applyCanMode() asserted
+        // that obdReady=false PREVENTED this. It was exactly backwards, which is
+        // why the guard is now a condition rather than a claim.
         //
         // Only the controller comes back here.  Nothing about this success says
         // an ECU is present, so the liveness clock is deliberately NOT stamped:
         // a parked vehicle re-initialises the MCP2515 every 5 s quite happily,
         // and refreshing liveness on each attempt would hold the system awake
         // for as long as it stayed parked.
-        // OFF is included deliberately. It means the controller never came up at
-        // all, which is exactly the fault this retry exists for — gating on OBD2
-        // alone would have made a failed boot permanent.
         const bool wasOff = (canMode == CanMode::OFF);
         // From OFF, bring the controller up in Configuration — off the bus —
-        // exactly as setup() does: whichever mode follows below programs its
-        // own filters and final mode. The default bring-up ends in Normal, and
-        // that window made the node ACK-capable on a vehicle where only SNIFF
-        // may have been chosen; this path is also where a refused filter write
-        // recovers. Re-initialising a live OBD2 session keeps the default.
-        obdReady      = startOBD2(/*stayInConfig=*/wasOff);
+        // exactly as setup() does, so DISCOVER below is what first puts it on.
+        // The default bring-up ends in Normal, which would make the node
+        // ACK-capable for that window. Re-initialising a live OBD2 session keeps
+        // the default.
+        const bool up = startOBD2(/*stayInConfig=*/wasOff);
         lastOBD2Retry = millis();
 
-        // Recovering from OFF means the controller is back but no mode has been
-        // chosen. Try sniffing again rather than silently settling for OBD2:
-        // one unlucky boot used to cost the whole drive, because nothing ever
-        // re-attempted SNIFF after setup().
-        if (wasOff && obdReady) {
-            // Gated on a loaded map, exactly as the boot path is.
+        if (!wasOff) {
+            obdReady = up;   // the host's OBD2 session, re-initialised or not
+        } else {
+            // Never the poller from here: only a host command enters OBD2. The
+            // controller is in Configuration whether or not DISCOVER follows,
+            // and polling it would transmit on the node's own initiative.
             //
-            // This used to re-attempt SNIFF unconditionally, which quietly
-            // bypassed the whole "no map -> OBD2" policy: a boot whose CAN init
-            // failed would recover here and start sniffing with the COMPILED-IN
-            // Honda map, on whatever vehicle it happened to be plugged into.
-            // Observed doing exactly that. It looked fine because the car was a
-            // Brio; on anything else it would have decoded another
-            // manufacturer's bits and published them as measurements, which is
-            // worse than publishing nothing.
-            if (!canMap.loaded) {
-                canProbeSkip(canProbe);
-                applyCanMode(CanMode::OBD2);
-                Serial.println("CAN: controller back, but no vehicle map; using OBD2 query");
-            } else if (applyCanMode(CanMode::SNIFF)) {
-                // Probe armed, for the same reason the boot arms it: this is the
-                // first time the map has met the bus, so it is still unproven.
-                armCanProbe();
-            } else {
-                obdReady = true;   // applyCanMode() left state untouched on failure
-                Serial.println("CAN: sniff still unavailable; OBD2 poller armed");
+            // DISCOVER whatever the card holds — the same boot policy, with no
+            // map check: the raw stream decodes nothing, so a map for another
+            // car cannot publish another car's bits from here. (This branch once
+            // re-attempted SNIFF with the COMPILED-IN Honda map on whatever
+            // vehicle it was plugged into; the map gate that fixed that is moot
+            // now that nothing on this path decodes.)
+            obdReady = false;
+            if (up && !applyCanMode(CanMode::DISCOVER)) {
+                Serial.println("CAN: controller back, but DISCOVER refused; will retry");
             }
         }
     }
@@ -1438,6 +1466,9 @@ void loop()
     gpsData.devicePresent = gpsReady;
 #endif
 
+    // Seam: after the GNSS block, the step most likely to have held the pass.
+    canStreamService();
+
     // ── 2c) IMU poll, with bounded recovery ──────────────────────────────────
     // Unconditional on the timer: getIMUData() returns immediately without
     // touching the bus when a device is down, so there is nothing to gate on.
@@ -1451,6 +1482,9 @@ void loop()
         lastIMUPoll = millis();
         (void)getIMUData(imuDev, imuData);   // status is carried by the data's own valid flags
     }
+
+    // Seam: after the 100 Hz IMU burst, ~1.3 ms of I2C.
+    canStreamService();
 
     // ── 2b-ii) Panel switches ────────────────────────────────────────────────
     //
@@ -1669,6 +1703,10 @@ void loop()
     // healthy one, and the master would otherwise stream into the void forever.
     logSubsystemEdge("C3 link", !isCommLinkSilent(commMaster, COMM_LINK_SILENT_MS), prevLinkUp);
 
+    // Seam: the last before the console status line, which is ~80 separate
+    // prints and must not have a frame line land inside it.
+    canStreamService();
+
     // ── 4) Heartbeat + console status ────────────────────────────────────────
     if (isTimeout(LED_BLINK_MS, lastLEDBlink)) {
         LED_on ^= 1;
@@ -1678,65 +1716,108 @@ void loop()
 
     if (isTimeout(DEBUG_PRINT_MS, lastDebugPrint)) {
         // Serial is the USB console, a different peripheral from Serial1 —
-        // printing here cannot corrupt the C3 link.
+        // printing here cannot corrupt the C3 link. It shares the port with the
+        // raw CAN stream, which is why this line starts with "spd=" and no
+        // console line may start with "F ". Printed through statusOut, which
+        // sends it in whole packets into a bank seen free (see UsbConsoleLine);
+        // nothing in this block may call canStreamService() before the flush.
         // Vehicle signals, from whichever source is live. These used to read
         // obdData only, which showed "--" for the whole of a healthy sniffing
         // session because sniffed values land in vehSignals instead.
-        Serial.print("spd=");
-        if      (!isnan(vehSignals.speedKmh)) Serial.print(vehSignals.speedKmh, 2);
-        else if (!isnan(obdData.speed))       Serial.print(obdData.speed, 1);
-        else                                  Serial.print("--");
-        Serial.print(" rpm=");
-        if      (!isnan(vehSignals.rpm)) Serial.print(vehSignals.rpm, 0);
-        else if (!isnan(obdData.rpm))    Serial.print(obdData.rpm, 0);
-        else                             Serial.print("--");
+        //
+        // "--" outright while nothing on this board decodes (DISCOVER, OFF).
+        // The values are unavailable there anyway — nothing writes them — but
+        // the console should say "not decoding" because of the MODE, not
+        // because a sentinel happened to survive.
+        const bool decoding = (canMode == CanMode::SNIFF || canMode == CanMode::OBD2);
+        statusOut.print("spd=");
+        if      (!decoding)                   statusOut.print("--");
+        else if (!isnan(vehSignals.speedKmh)) statusOut.print(vehSignals.speedKmh, 2);
+        else if (!isnan(obdData.speed))       statusOut.print(obdData.speed, 1);
+        else                                  statusOut.print("--");
+        statusOut.print(" rpm=");
+        if      (!decoding)              statusOut.print("--");
+        else if (!isnan(vehSignals.rpm)) statusOut.print(vehSignals.rpm, 0);
+        else if (!isnan(obdData.rpm))    statusOut.print(obdData.rpm, 0);
+        else                             statusOut.print("--");
 
         // Held indicator state, so this reads steadily while indicating rather
         // than flickering with the lamp. Both arrows at once is hazards.
         // "<>" is now driven by the hazard SIGNAL, not by both turn bits being
         // set. On this vehicle the hazards leave both turn bits clear, so the
         // old test could never fire — which is exactly how it was found.
-        Serial.print(" turn=");
-        if      (vehSignals.hazard)                           Serial.print("<>");
-        else if (vehSignals.turnLeft && vehSignals.turnRight) Serial.print("<>");
-        else if (vehSignals.turnLeft)                         Serial.print("<-");
-        else if (vehSignals.turnRight)                        Serial.print("->");
-        else if (vehSignals.turnSrc == VehSource::NONE)       Serial.print("--");
-        else                                                  Serial.print("..");
+        statusOut.print(" turn=");
+        if      (!decoding)                                   statusOut.print("--");
+        else if (vehSignals.hazard)                           statusOut.print("<>");
+        else if (vehSignals.turnLeft && vehSignals.turnRight) statusOut.print("<>");
+        else if (vehSignals.turnLeft)                         statusOut.print("<-");
+        else if (vehSignals.turnRight)                        statusOut.print("->");
+        else if (vehSignals.turnSrc == VehSource::NONE)       statusOut.print("--");
+        else                                                  statusOut.print("..");
 
         // The MODE, not obdReady. "obd=down" during a healthy listen-only
         // session reads as a fault and is not one — obdReady is false because
         // we are deliberately not transmitting. Printing the mode says which of
-        // the three the node is actually in, which is the thing worth knowing.
-        Serial.print("  can=");
-        Serial.print(canModeName(canMode));
-        // matched/total frames off the drain. Cheap, and it settles a question
-        // no amount of datasheet reading does: if the hardware filter is doing
-        // its job these two track each other, because only mapped IDs are
-        // admitted. A matched count that is a small fraction of the total means
-        // the filter is being bypassed and the drain is spending its budget on
-        // traffic it throws away — which is the difference between "sniffing
-        // works" and "sniffing works until the bus gets busy".
-        if (canMode == CanMode::SNIFF) {
-            Serial.print(" rx=");
-            Serial.print(canSniffMatchCount());
-            Serial.print("/");
-            Serial.print(canSniffFrameCount());
-            // Boot-cumulative receive overruns: each is at least one frame the
-            // two-deep buffer had to drop because this loop drained it too late.
-            // Climbing between lines means the drain is losing frames.
-            Serial.print(" ovf=");
-            Serial.print(canSniffOverrunCount());
+        // the four the node is actually in, which is the thing worth knowing.
+        statusOut.print("  can=");
+        statusOut.print(canModeName(canMode));
+        // The raw stream's health, in the FS line's terms: frames read out of
+        // the controller, overrun events (each at least one frame the two-deep
+        // buffer lost before the drain reached it — a lower bound), and frames
+        // the RAM ring had to refuse because the USB side fell behind. drop=
+        // climbing with ovf= flat says the Orin, not the bus, is the problem.
+        if (canMode == CanMode::DISCOVER) {
+            statusOut.print(" rx=");
+            statusOut.print(canDrainedCount());
+            statusOut.print(" ovf=");
+            statusOut.print(canSniffOverrunCount());
+            statusOut.print(" drop=");
+            statusOut.print(canRingDropCount());
         }
+        // matched/decoded frames. Cheap, and it settles a question no amount of
+        // datasheet reading does: if the hardware filter is doing its job these
+        // two track each other, because only mapped IDs are admitted. A matched
+        // count that is a small fraction of the total means the filter is being
+        // bypassed and the decoder is spending its time on traffic it throws
+        // away. drop= is here too: SNIFF shares the ring, and a ring the USB
+        // side cannot empty starves the decoder as well.
+        if (canMode == CanMode::SNIFF) {
+            statusOut.print(" rx=");
+            statusOut.print(canSniffMatchCount());
+            statusOut.print("/");
+            statusOut.print(canSniffFrameCount());
+            // Boot-cumulative receive overruns: each is at least one frame the
+            // two-deep buffer had to drop because the drain reached it too late.
+            // Climbing between lines means the drain is losing frames.
+            statusOut.print(" ovf=");
+            statusOut.print(canSniffOverrunCount());
+            statusOut.print(" drop=");
+            statusOut.print(canRingDropCount());
+        }
+#if defined(DASHCAM_CAN_STREAM_SELFTEST)
+        // Bench build: synthetic frames made so far, and loop()'s passes since
+        // the last line with the longest of them. Passes x 4 seams is how often
+        // the stream gets a look at the bank; the longest pass is how far the
+        // ring has to carry it.
+        statusOut.print(" st=");
+        statusOut.print(canSelfTestCount());
+        statusOut.print(" loop=");
+        statusOut.print(selfPasses);
+        statusOut.print("/");
+        statusOut.print(selfPassMaxUs);
+        statusOut.print("us");
+        selfPasses    = 0u;
+        selfPassMaxUs = 0u;
+#endif
         // Three states, not two. obdReady only says the CONTROLLER came up;
         // printing that as "/up" claims a working diagnostic link on a vehicle
         // that may never have answered, which reads as "OBD-II is fine, the
         // decode must be broken" when the truth is the opposite. "/noecu" is
         // the case where we are transmitting into silence.
         if (canMode == CanMode::OBD2) {
-            if      (!obdReady)         Serial.print("/down");
-            else if (obd2EverReplied()) Serial.print("/up");
-            else                        Serial.print("/noecu");
+            if      (!obdReady)         statusOut.print("/down");
+            else if (obd2EverReplied()) statusOut.print("/up");
+            else                        statusOut.print("/noecu");
         }
 #ifdef USE_GPS
         // Reported alongside OBD-II because the receiver is now a live
@@ -1744,165 +1825,166 @@ void loop()
         // evidence is a one-off line at boot, so a receiver that never came up
         // — or came up and later went quiet — is invisible for the rest of the
         // drive, which is precisely the state the retry exists to escape.
-        Serial.print("  gps=");
+        statusOut.print("  gps=");
         // While the receiver is down, show WHICH bring-up step the staged
         // machine is sitting on.  "down" alone cannot distinguish a receiver
         // that never answered from one that answered and then refused a
         // setting, and those are opposite repairs.
-        if (gpsReady) Serial.print("up");
-        else          Serial.print(gpsInitStageName(gpsInit.stage));
-        Serial.print(" sats=");
-        Serial.print(gpsData.satellites);
-        Serial.print(" fix=");
-        Serial.print(gpsData.fixValid ? "yes" : "no");
+        if (gpsReady) statusOut.print("up");
+        else          statusOut.print(gpsInitStageName(gpsInit.stage));
+        statusOut.print(" sats=");
+        statusOut.print(gpsData.satellites);
+        statusOut.print(" fix=");
+        statusOut.print(gpsData.fixValid ? "yes" : "no");
         // GNSS ground speed, which is a motion witness and therefore decides
         // whether the IMU may drop to low power.  Absent from this line before,
         // and its absence cost a bench session: the system sat in full capture
         // indefinitely and nothing displayed said why.
-        Serial.print(" gspd=");
-        if (isnan(gpsData.velocityKmh)) Serial.print("--");
-        else                            Serial.print(gpsData.velocityKmh, 1);
+        statusOut.print(" gspd=");
+        if (isnan(gpsData.velocityKmh)) statusOut.print("--");
+        else                            statusOut.print(gpsData.velocityKmh, 1);
 #endif
         // Four states. "configuring" is new and load-bearing: bring-up now takes
         // about 700 ms of wall clock, and without it the first console lines of
         // every boot would report a healthy IMU as "down".
-        Serial.print("  imu=");
-        if (isIMUQuarantined(imuDev))       Serial.print("QUARANTINED");
-        else if (imuIsReady(imuDev))        Serial.print("up");
+        statusOut.print("  imu=");
+        if (isIMUQuarantined(imuDev))       statusOut.print("QUARANTINED");
+        else if (imuIsReady(imuDev))        statusOut.print("up");
         else if (imuDev.init.stage != BNO055InitStage::Failed)
-                                            Serial.print("configuring");
-        else                                Serial.print("down");
-        Serial.print(" |a|=");
+                                            statusOut.print("configuring");
+        else                                statusOut.print("down");
+        statusOut.print(" |a|=");
         if (imuData.accelValid) {
-            Serial.print(sqrtf(imuData.accelX * imuData.accelX +
+            statusOut.print(sqrtf(imuData.accelX * imuData.accelX +
                                imuData.accelY * imuData.accelY +
                                imuData.accelZ * imuData.accelZ), 2);
         } else {
-            Serial.print("--");
+            statusOut.print("--");
         }
         // The peak is the number the FIFO exists to produce, so it is worth as
         // much bench visibility as the instantaneous magnitude beside it.  On a
         // still bench the two should track; under a tap on the desk only the
         // peak should jump, and that difference is the feature working.
-        Serial.print(" pk=");
-        if (isnan(imuData.accelPeakMs2)) Serial.print("--");
-        else                             Serial.print(imuData.accelPeakMs2, 2);
-        Serial.print("/");
-        if (isnan(imuData.gyroPeakDps)) Serial.print("--");
-        else                            Serial.print(imuData.gyroPeakDps, 1);
+        statusOut.print(" pk=");
+        if (isnan(imuData.accelPeakMs2)) statusOut.print("--");
+        else                             statusOut.print(imuData.accelPeakMs2, 2);
+        statusOut.print("/");
+        if (isnan(imuData.gyroPeakDps)) statusOut.print("--");
+        else                            statusOut.print(imuData.gyroPeakDps, 1);
         // The peak that actually drives incident detection, and the one the
         // previous hardware could not produce: gravity already removed, so a
         // stationary vehicle reads ~0 here while |a| beside it reads 9.81.
-        Serial.print(" lin=");
-        if (isnan(imuData.linAccelPeakMs2)) Serial.print("--");
-        else                                Serial.print(imuData.linAccelPeakMs2, 2);
+        statusOut.print(" lin=");
+        if (isnan(imuData.linAccelPeakMs2)) statusOut.print("--");
+        else                                statusOut.print(imuData.linAccelPeakMs2, 2);
         // SAT is not a detail. Fusion locks the accelerometer at ±4 g, so a
         // clipped peak understates a real collision fivefold, and a saturated
         // number printed plainly is indistinguishable from a measured one.
-        if (imuData.accelSaturated) Serial.print(" SAT");
+        if (imuData.accelSaturated) statusOut.print(" SAT");
         // The hardware latch. Distinct from a high peak, and the distinction is
         // the point: a peak is only ever as good as the polls that produced it,
         // while this survived whatever the loop was doing at the time.
-        if (imuData.highGEvent) Serial.print(" HIGH-G");
-        else if (!imuData.highGArmed && imuIsReady(imuDev)) Serial.print(" nohg");
+        if (imuData.highGEvent) statusOut.print(" HIGH-G");
+        else if (!imuData.highGArmed && imuIsReady(imuDev)) statusOut.print(" nohg");
         // The INT line stayed high through a successful RST_INT with nothing
         // latched: a wiring fault on that line, not an impact. Named so a stuck
         // line reads as what it is instead of as silence.
-        if (imuDev.intLineDistrusted) Serial.print(" INTSTUCK");
-        Serial.print(" mode=");
-        Serial.print(imuData.fusionMode ? "fus" : "amg");
-        Serial.print(" cal=");
-        Serial.print(imuData.calibGyro);
-        Serial.print(imuData.calibAccel);
-        if (imuData.dataGap) Serial.print(" GAP");
+        if (imuDev.intLineDistrusted) statusOut.print(" INTSTUCK");
+        statusOut.print(" mode=");
+        statusOut.print(imuData.fusionMode ? "fus" : "amg");
+        statusOut.print(" cal=");
+        statusOut.print(imuData.calibGyro);
+        statusOut.print(imuData.calibAccel);
+        if (imuData.dataGap) statusOut.print(" GAP");
         // The state that DECIDES the mode above, so the two can be compared.  A
         // mode that looks wrong is almost always a power state that is not what
         // was assumed — most often "unk", meaning no CAN interface has ever come
         // up and there is therefore no evidence about the vehicle at all.
-        Serial.print(" veh=");
+        statusOut.print(" veh=");
         switch (vehiclePowerState()) {
-            case VehiclePower::On:  Serial.print("on");  break;
-            case VehiclePower::Off: Serial.print("off"); break;
-            default:                Serial.print("unk"); break;
+            case VehiclePower::On:  statusOut.print("on");  break;
+            case VehiclePower::Off: statusOut.print("off"); break;
+            default:                statusOut.print("unk"); break;
         }
         // Cumulative failed IMU transactions, accel/mag.  A device can NACK
         // steadily and still never be declared lost — the consecutive-fault
         // counter resets on every success in between — so a bus that is quietly
         // degrading looks identical to a healthy one in every other field on
         // this line.  Slowly climbing numbers here are the only warning.
-        Serial.print(" ioerr=");
-        Serial.print(imuDev.ioErrors);
+        statusOut.print(" ioerr=");
+        statusOut.print(imuDev.ioErrors);
         // Bursts that arrived intact and failed a plausibility gate, counted
         // apart from bus errors because they mean the opposite thing: the part
         // answered perfectly and the CONTENTS were impossible. That is how the
         // previous IMU failed — 40 % of its samples corrupt, every transaction a
         // success — and no bus-level counter can see it.
-        Serial.print("/");
-        Serial.print(imuDev.implausible);
+        statusOut.print("/");
+        statusOut.print(imuDev.implausible);
         // CUMULATIVE gap counts, hardware overrun / freshness discard.  The
         // GAP flag above lasts only IMU_PEAK_WINDOW_MS, so a soak watching the
         // console can miss every one of them and still look clean — which is
         // exactly what a 150 s run showing no GAP proved, and did not prove.
         // These only ever climb, so one glance answers "were there any?".
-        Serial.print(" gaps=");
-        Serial.print(imuDev.missedPolls);
+        statusOut.print(" gaps=");
+        statusOut.print(imuDev.missedPolls);
         // Cumulative High-G latches. The published flag lasts IMU_HIGHG_HOLD_MS,
         // so a soak watching the console can miss every one of them and still
         // look clean. This only climbs, so one glance answers "were there any?".
-        Serial.print(" hg=");
-        Serial.print(imuDev.highGCount);
+        statusOut.print(" hg=");
+        statusOut.print(imuDev.highGCount);
         // Boot-cumulative rejected High-G evidence: corrupt register flags or
         // unconfirmed pin edges. These are not necessarily distinct impacts;
         // recovery preserves the count so intermittent faults stay visible.
-        Serial.print(" hgrej=");
-        Serial.print(imuDev.highGRejected);
+        statusOut.print(" hgrej=");
+        statusOut.print(imuDev.highGRejected);
         // Boot-cumulative I2C transfers abandoned at vendor/Wire's deadline: a
         // wedge (which used to end in a watchdog reset) or a stretch past it.
-        Serial.print(" i2cto=");
-        Serial.print(i2cWireTimeouts());
+        statusOut.print(" i2cto=");
+        statusOut.print(i2cWireTimeouts());
         // Boot-cumulative I2C transfers abandoned on a bus error: a START/STOP
         // glitch mid-transfer, i.e. a contact fault. The wiring's score on a
         // drive; each one used to be a garbage byte or a dead bus.
-        Serial.print(" i2cerr=");
-        Serial.print(i2cWireBusErrors());
+        statusOut.print(" i2cerr=");
+        statusOut.print(i2cWireBusErrors());
         // c3= is the LINK, stream= is the session on top of it.  They are
         // different failures: a bridge that is attached but not asking for
         // telemetry is healthy, one that has been unplugged is not, and
         // stream=off alone cannot tell them apart.  This also covers the case
         // the edge log cannot — a module absent from boot never transitions, so
         // without a continuous readout it would never appear anywhere.
-        Serial.print("  c3=");
-        Serial.print(isCommLinkSilent(commMaster, COMM_LINK_SILENT_MS) ? "down" : "up");
-        Serial.print(" stream=");
-        Serial.print(commMaster.streaming ? "on" : "off");
+        statusOut.print("  c3=");
+        statusOut.print(isCommLinkSilent(commMaster, COMM_LINK_SILENT_MS) ? "down" : "up");
+        statusOut.print(" stream=");
+        statusOut.print(commMaster.streaming ? "on" : "off");
 
         // Switch panel, on the same principle as c3= above: a chain absent from
         // boot never transitions, so the edge log alone would never mention it.
         // Positions are printed as a hex word rather than as named signals
         // because this firmware does not know what any of them mean, and a
         // console label would be the first place that knowledge crept in.
-        Serial.print("  sw=");
+        statusOut.print("  sw=");
         if (!switches.present) {
-            Serial.print("absent");
+            statusOut.print("absent");
         } else {
-            Serial.print("0x");
-            Serial.print(switches.state, HEX);
+            statusOut.print("0x");
+            statusOut.print(switches.state, HEX);
             // Only when non-zero. A chatter word of 0 on every line trains the
             // eye to skip the field, which is where the one that matters would
             // then also be skipped.
             if (switches.chatter != 0u) {
-                Serial.print(" CHATTER=0x");
-                Serial.print(switches.chatter, HEX);
+                statusOut.print(" CHATTER=0x");
+                statusOut.print(switches.chatter, HEX);
             }
             // Cumulative, so one glance answers "were there any?" over a soak —
             // the same reason gaps= and hg= are printed above rather than only
             // being flagged while they are current.
             if (switches.rejected != 0u) {
-                Serial.print(" rej=");
-                Serial.print(switches.rejected);
+                statusOut.print(" rej=");
+                statusOut.print(switches.rejected);
             }
         }
-        Serial.println();
+        statusOut.println();
+        statusOut.flush();   // the last packet, now: nothing may sit buffered past the line
         lastDebugPrint = millis();
     }
 }

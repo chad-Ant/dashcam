@@ -1,0 +1,8 @@
+# Binaries of the raw-stream suites; the repository's root .gitignore names the
+# older ones. The sources are the deliverable, and make rebuilds these.
+can_ring_tests
+can_drain_tests
+can_telemetry_tests
+can_stream_tests
+can_selftest_tests
+can_selftest_max_tests

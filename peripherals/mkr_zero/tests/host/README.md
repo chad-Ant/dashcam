@@ -4,6 +4,7 @@
 peripherals/mkr_zero/tests/host/RunTests.cmd    # Windows, MSVC
 make check                                      # Linux/Jetson, g++ or clang++
 make check-ports                                # Python 3 + bash, fake sysfs only
+make check-sketch                               # Python 3: mkr_zero.ino policy (also in make check)
 make mutations                                  # Python 3 + make + hosted C++11
 ```
 
@@ -15,11 +16,32 @@ board, no serial port.
 |---|---|---|
 | `switch_tests` | `lib/SwitchFunctions.cpp` | 61 |
 | `imu_tests` | `lib/IMUFunctions.cpp`: lifecycle, integrity, confirmed High-G (incl. INT-line candidate → release probe → stuck verdict, flicker, re-latch, retirement, mid-sample edge, High-G record surviving recovery and the mode-switch snapshot reset, episodes settled on every re-init), channel-level faults | 540 |
-| `can_probe_tests` | `lib/CANSniffFunctions.cpp`: the map probe, filter ownership, receive-overrun counting | 98 |
+| `can_probe_tests` | `lib/CANSniffFunctions.cpp`: the map probe, filter ownership, receive-overrun counting (frames now arrive through the drain ISR and the ring) | 98 |
 | `bno_init_tests` | **real** `lib/BNO055Init.cpp`: self-test checks, masked read-back, exact interrupt setup, High-G threshold per accelerometer range, calibration restored in fusion modes only | 602 |
+| `can_ring_tests` | `lib/CANFrameRing.h`: the ISR → `loop()` SPSC ring — 16-byte packing (DLC 0-15, extended, remote), FIFO order, full ring refusing and counting the newest, free-running indices wrapping past 65535, peeking ahead of the tail, the producer filling the ring between a peek and its release | 2673 |
+| `can_drain_tests` | `lib/CANSniffFunctions.cpp`: the drain ISR against the MCP2515 model (both buffers and rollover, order, `micros()` stamps, extended and remote frames, DLC clamp, overrun events, floating MISO, per-tick bound, a TXREQ left set, full ring), modes arming and disarming it (incl. refused writes, OBD2 left alone), **every main-loop SPI transaction masked** (preemption injected at every byte), a tick due while masked running at the unmask, the drained count as liveness, SNIFF decoding from the ring (golden values, arrival-time stamps, remote frames skipped, DISCOVER decoding nothing, the stream never passing the decoder) and **ring decode == `canDecodeFrame()`** over 3000 random passes | 178 |
+| `can_telemetry_tests` | the DISCOVER telemetry through the **real** `buildTelemetry()`: every CAN-derived field at its sentinel after a SNIFF session and with live map traffic, the acceleration input NaN, `canMapFlags` saying accept-all. g++/clang only (see below) | 146 |
+| `can_stream_tests` | `lib/CANRawStream.cpp`: F and FS lines byte for byte (DLC 0 with no trailing space, extended ids, remote frames, the 67-byte FS worst case), lines never partial, DTR low → `nohost`, writes only into a free bank and within `availableForWrite()`, whole lines only, a stalled host (no blocking, ring absorbs, `ringdrop`, FS first on resume), not enumerated, a refused write, FS once a second and only with a listener, **each FS column its own counter**, an FS line too long for the room written alone, frame conservation, SNIFF streaming behind the decoder and **discarding for want of a host only behind it**; the **bounded wait**: packet after packet to a reading host in one call, at most `CAN_STREAM_MAX_PACKETS_PER_CALL`, a stalled host costing one `CAN_STREAM_WAIT_US` wait and then none, the call budget, an idle stream (or one just emptied) never polling or waiting; **console text** in whole ≤ 63-byte packets into a free bank, kept whole when the host stalls; a **line break owed** before the first stream line after the port was closed or a console write was refused, so no F line continues a console fragment | 1252 |
+| `can_selftest_tests`, `can_selftest_max_tests` | the **bench self-test generator** (`-DDASHCAM_CAN_STREAM_SELFTEST`, below), built at 2400 frames/s and at the 10 000 cap: exactly RATE frames in every second of armed ticks and never more than one off in between, at most one per tick, sequence/fill/check-word payload and `micros()` stamps, nothing in OFF or OBD2 and an unbroken sequence across modes, SNIFF decoding none of it, every frame reaching a reading host as an F line, ring loss appearing as a sequence gap of exactly `ringdrop`, a real bus frame drained in the same tick | 264 / 258 |
+| `sketch_policy_tests.py` | **`mkr_zero.ino`**, read as text (no hosted compiler can build it): boot and both recoveries into DISCOVER only, SNIFF/OBD2 only from the host's command, no probe, the drain timer before the first bring-up, every `initializeOBD2()`/`tickOBD2()` masked, liveness from `canDrainedCount()`, ≥ 4 stream seams each after a whole console line, none in the status line, which prints only through `statusOut` and ends with a flush, no console literal that could open an F/FS line | 231 |
 | `port_tests.py` | shared MKR USB selector: product identity and ambiguity | 5 cases |
 
 All currently passing.
+
+## The bench self-test build
+
+`../../build_and_upload.sh [PORT|auto] selftest[=N]` defines
+`DASHCAM_CAN_STREAM_SELFTEST=N` (default 2400, 1-10000). While the drain is armed
+its ISR also synthesizes N frames a second into the ring, with no SPI and no
+bus: id `0x7F0`, DLC 8, data = big-endian sequence number (4 bytes), ring fill
+(2) and the low 16 bits of the complemented sequence (2). So the USB stream's
+throughput is measured on the bench: the Orin counts sequence gaps exactly and
+the FS lines say where any loss happened. Synthetic frames count as drained
+(and therefore as a live vehicle, keeping the IMU at production load). The
+status line gains `st=` and `loop=N/Mus` (passes since the last line / longest
+pass). Without the option none of it is compiled: a production build is
+byte-identical to the same tree with every `#if defined(DASHCAM_CAN_STREAM_SELFTEST)`
+block deleted (checked on 2026-10-05). Never flash a selftest build to the car.
 
 ## What is actually under test
 
@@ -60,6 +82,29 @@ wherever the defect lived in how the hardware behaves:
   nothing received in Configuration). A stub that handed the driver frames
   directly would have hidden the probe defect: the frames it never saw were the
   ones the controller's own filters threw away.
+- **CAN drain and raw stream** — the model also speaks READ STATUS, stores
+  extended and remote frames as the silicon lays them out (a remote frame keeps
+  the PREVIOUS payload in the data registers, the trap the drain must not fall
+  into; a standard filter never matches an extended frame), and can float MISO.
+  `lib/CANStreamHw.cpp` is registers only — TC3, the NVIC mask, the USB bulk IN
+  bank — so it is the one firmware file NOT compiled here: `can_stream_hw_stub.cpp`
+  implements its four functions over a model. The test is the timer
+  (`hostDrainTick()`); the mask nests and leaves a due tick pending until the
+  outermost unmask, as the NVIC does; and every SPI transaction is reported to
+  it, so a main-loop transaction made while the drain is armed and unmasked is
+  counted, and with preemption on a tick actually fires inside it and corrupts
+  it, as on the board. The stub `Serial` captures what the stream writes and
+  models the bank: armed after a write until the test collects it — a write
+  into an armed bank is where the core's `send()` would spin for 70 ms, and is
+  counted. Whether `CANStreamHw.cpp` itself programs TC3 correctly is a bench
+  question; these suites prove what is done with it.
+- **Equivalence with the previous decoder** — besides the in-suite check that
+  decoding from the ring equals calling `canDecodeFrame()` directly, the
+  2026-10-04 change was verified once against the code it replaced: the same
+  20 000 random passes run through the pre-change `tickCANSniff()` (built from
+  `git archive HEAD`) and through the new drain → ring → `tickCANSniff()` path
+  gave byte-identical decoded state after every pass. That harness lived in a
+  scratch directory and is not part of the suite.
 
 ## The tests have been shown to fail
 
@@ -153,10 +198,45 @@ finds Configuration knows the driver's own park ran. (An earlier version of the
 model entered Configuration itself before refusing, which made those checks
 pass whether or not the driver parked anything.)
 
+Raw CAN stream (2026-10-04, 24 more, 71 in all):
+
+| mutation | which suite caught it |
+|---|---|
+| ring full one slot early / a refused frame not counted / DLC 8 not flagged | `can_ring_tests` |
+| drain ignores RXB1 / believes a floating MISO / is silenced by a pending TXREQ / is unbounded | `can_drain_tests` |
+| refused frames not counted as drained (liveness) / extended bit lost in the drain | `can_drain_tests` |
+| drain armed in OBD2 / host filter write made with the drain unmasked | `can_drain_tests` |
+| DISCOVER decodes / frames stamped at decode time / remote frames decoded / stream passes the decoder | `can_drain_tests` |
+| DISCOVER keeps SNIFF's filter bookkeeping (`canMapFlags` lies) | `can_telemetry_tests` |
+| stream writes into an armed bank / ignores DTR / ignores `availableForWrite()` | `can_stream_tests` |
+| DLC 0 trailing space / extended id in 3 digits / lowercase hex / FS starved behind frames / failed write counted as streamed | `can_stream_tests` |
+
+Review 2026-10-05 (21 more library mutants and 8 sketch mutants, 100 in all).
+The first five were found surviving by an adversarial pass and are why the
+FS-column and oversized-FS tests exist:
+
+| mutation | which suite caught it |
+|---|---|
+| FS line's ringdrop / ovf / nohost column fed 0, drained column fed the streamed count | `can_stream_tests` |
+| an FS line longer than the room packed into the buffer with frames behind it | `can_stream_tests` |
+| stream never waits for its own packet / waits before its first / waits without a time bound / ignores the call budget / waits after the packet that emptied the ring | `can_stream_tests` |
+| console text written into an armed bank / in 64-byte packets | `can_stream_tests` |
+| no line break owed after the port was closed / after a refused console write; a break on every packet | `can_stream_tests` |
+| self-test rate off by a tick / sequence stuck / runs disarmed / not counted as drained / fill not the ring's / plain check word | `can_selftest_tests` |
+| sketch: boots into SNIFF / OBD2 give-up parks OFF / OFF retry arms the poller / `tickOBD2()` unmasked / liveness not stamped from the drain / stream seam inside the status line / status line not flushed / a console line opening with `F ` | `sketch_policy_tests.py` |
+
+Not mutated, because no single-threaded test can tell: the compiler barriers
+in `CANFrameRing.h`, and the lock in `canSetMode()` — that function disarms the
+drain before its first bus access, so on one core it is safe even unmasked; the
+lock is kept for the rule's sake, and its siblings that stay armed
+(`canSniffSetFilters()` above) are the ones the suite holds to it. Nor the clamp
+inside `canRawDiscard()`: its one caller already passes `canRawStreamable()`,
+so the mutant is equivalent; the SNIFF no-host test pins the behaviour instead.
+
 The earlier hardening tests incorrectly REQUIRED reserved bits to be zero and
 treated an unconfirmed pin edge as an impact. Those expectations were corrected:
 mutation testing measures a suite's sensitivity, not the truth of its contract.
-The current script covers 45 mutations; the older switch/CAN tables above record
+The current script covers 71 mutations; the older switch/CAN tables above record
 separate historical checks, not additional mutations run by this script.
 
 Cases carrying a `REGRESSION` comment are the ones anchored to a real defect
@@ -207,6 +287,18 @@ whole API.
 `HIGH`/`LOW` are enumerators, not macros, as in the real core (ArduinoCore-API
 `api/Common.h`, which arduino:samd 1.8.14 uses). A macro would rewrite every
 scoped enumerator of the same name, and `VehGear::LOW` is one.
+
+Added for the raw stream, and no more than it calls: `micros()` (set by the
+test, like `millis()`), `Serial.dtr()` / `availableForWrite()` / `write()` with
+the bank model above, `Stream` and a silent `Serial1` plus a one-line
+`SparkFun_u-blox_GNSS_Arduino_Library.h` so the telemetry builder links, and
+`can_stream_hw_stub.cpp` for `CANStreamHw.h`. The CAN stand-in's
+`setFilterRegisters()` reports itself to the mask check as one SPI
+transaction, since the real library's version is about thirty.
+
+`can_telemetry_tests` is in the Makefile only: `CommProtocol.h` declares the
+payload with `__attribute__((packed))`, which MSVC rejects, so RunTests.cmd
+leaves it out.
 
 The Wire, CAN and SdFat stand-ins define the markers that `I2CBus.h`,
 `CANSniffFunctions.h` and `SDFunctions.h` check for the vendored libraries.

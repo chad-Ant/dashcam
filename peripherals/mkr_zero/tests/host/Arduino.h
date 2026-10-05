@@ -55,27 +55,92 @@ uint32_t millis();
 // ─── ...and the little more IMUFunctions.cpp and CANSniffFunctions.cpp use ───
 //
 // There is one thread and no interrupt source on the host, so masking is a
-// no-op. Serial swallows everything: the modules under test only narrate to it,
-// and a test asserts on state, never on console text.
+// no-op. The drain timer's interrupt is modelled separately, and explicitly,
+// in can_stream_hw_stub.h: a test fires it, and the model defers it while the
+// firmware holds it masked, as the NVIC does.
 
 inline void noInterrupts() {}
 inline void interrupts()   {}
+
+/// micros() as the test sets it, independent of millis(). The drain ISR stamps
+/// frames with it, so tests that care about arrival times set both.
+uint32_t micros();
+
+typedef uint8_t byte;   // OBD2Functions.h, via the telemetry builder
 
 #define F(s) (s)
 #define DEC 10
 #define HEX 16
 
+/**
+ * @brief The USB CDC console, and the one bulk IN packet it can have in flight.
+ *
+ * print()/println() still swallow everything: the modules narrate to it, and a
+ * test asserts on state, never on console text. write() is different — it is
+ * how the raw CAN stream leaves (CANRawStream.cpp) — so it is captured, and it
+ * models the part of the core that decides whether a write BLOCKS: after a
+ * write the bank stays armed until the test "collects" it (hostUsbCollect()),
+ * and a write issued while it is armed is exactly where arduino:samd's
+ * USBDeviceClass::send() would spin for up to 70 ms. Such writes are counted,
+ * and the stream module must never make one.
+ *
+ * availableForWrite() returns what the test sets, 63 by default — the constant
+ * EPX_SIZE - 1 the real core returns whatever the endpoint is doing.
+ */
 struct HostSerial {
     template <typename T> void print(const T &, int = DEC) {}
     template <typename T> void println(const T &, int = DEC) {}
     void println() {}
+
+    bool   dtr();
+    int    availableForWrite();
+    size_t write(const uint8_t *buf, size_t n);
 };
 extern HostSerial Serial;
+
+/// Arduino's Stream, as far as CommProtocol.cpp's pollFrame() reads one.
+class Stream {
+public:
+    virtual ~Stream() {}
+    virtual int available() = 0;
+    virtual int read() = 0;
+};
+
+/// Serial1, the C3 link: never delivers a byte and accepts every write. Only the
+/// telemetry builder's file needs it to link; no test drives the link.
+struct HostUart : public Stream {
+    void   begin(unsigned long) {}
+    int    available() override { return 0; }
+    int    read() override { return -1; }
+    int    availableForWrite() { return 0; }
+    size_t write(const uint8_t *, size_t n) { return n; }
+};
+extern HostUart Serial1;
 
 // ─── test control ────────────────────────────────────────────────────────────
 
 /// Sets the value millis() returns. The clock never advances on its own.
 void hostSetMillis(uint32_t ms);
+
+/// Sets the value micros() returns. Never advances on its own either.
+void hostSetMicros(uint32_t us);
+
+// ─── the USB console's bank model (see HostSerial) ──────────────────────────
+//
+// Reset by hostReset(): no host (DTR low), enumerated, bank free, room 63.
+
+void        hostUsbSetDtr(bool high);         ///< A host opened (true) or closed the port.
+void        hostUsbSetConfigured(bool on);    ///< Enumerated by a host, or not.
+void        hostUsbSetRoom(int bytes);        ///< What availableForWrite() reports.
+void        hostUsbSetWriteFails(bool fail);  ///< write() returns (size_t)-1, as the core does on a bus reset.
+void        hostUsbCollect();                 ///< The host takes the armed packet; the bank is free.
+bool        hostUsbBankBusy();                ///< A packet is armed and not yet collected.
+bool        hostUsbConfigured();
+const char *hostUsbOutput();                  ///< Everything written so far, NUL-terminated.
+void        hostUsbClearOutput();             ///< Forgets the output AND the three counters below.
+uint32_t    hostUsbWrites();                  ///< write() calls that were accepted.
+uint32_t    hostUsbBlockingWrites();          ///< write() calls made while the bank was armed.
+uint32_t    hostUsbLargestWrite();            ///< Longest single write(), in bytes.
 
 /// Last mode passed to pinMode() for @p pin, or 0xFF if never configured.
 uint32_t hostPinMode(uint32_t pin);

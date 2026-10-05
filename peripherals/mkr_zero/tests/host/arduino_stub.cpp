@@ -5,6 +5,7 @@
 #include <string.h>
 
 HostSerial Serial;
+HostUart   Serial1;
 
 // ─── pin state ───────────────────────────────────────────────────────────────
 
@@ -13,6 +14,21 @@ static const uint32_t PIN_COUNT = 32u;
 static uint8_t  g_mode[PIN_COUNT];
 static uint8_t  g_level[PIN_COUNT];
 static uint32_t g_millis;
+static uint32_t g_micros;
+
+// ─── USB console bank model ──────────────────────────────────────────────────
+
+static const size_t USB_OUT_CAP = 1u << 20;   // plenty for any one test
+static char     g_usbOut[USB_OUT_CAP + 1];
+static size_t   g_usbOutLen;
+static bool     g_usbDtr;
+static bool     g_usbConfigured;
+static bool     g_usbBusy;
+static bool     g_usbWriteFails;
+static int      g_usbRoom;
+static uint32_t g_usbWrites;
+static uint32_t g_usbBlocking;
+static uint32_t g_usbLargest;
 
 // One-shot hook on the next digitalRead() of one pin, run just before or just
 // after the level is sampled: an interrupt landing inside the driver's window.
@@ -47,6 +63,17 @@ void hostReset()
     memset(g_mode,  0xFF, sizeof(g_mode));
     memset(g_level, 0,    sizeof(g_level));
     g_millis     = 0u;
+    g_micros     = 0u;
+    g_usbOutLen     = 0u;
+    g_usbOut[0]     = '\0';
+    g_usbDtr        = false;
+    g_usbConfigured = true;
+    g_usbBusy       = false;
+    g_usbWriteFails = false;
+    g_usbRoom       = 63;
+    g_usbWrites     = 0u;
+    g_usbBlocking   = 0u;
+    g_usbLargest    = 0u;
     g_panel      = 0xFFFFu;
     g_shift      = 0xFFFFu;
     g_present    = true;
@@ -66,6 +93,41 @@ uint32_t fakeChainClocks()             { return g_clocks; }
 
 void hostSetMillis(uint32_t ms) { g_millis = ms; }
 uint32_t millis()               { return g_millis; }
+void hostSetMicros(uint32_t us) { g_micros = us; }
+uint32_t micros()               { return g_micros; }
+
+// ─── USB console ─────────────────────────────────────────────────────────────
+
+bool HostSerial::dtr()               { return g_usbDtr; }
+int  HostSerial::availableForWrite() { return g_usbRoom; }
+
+size_t HostSerial::write(const uint8_t *buf, size_t n)
+{
+    // Not enumerated: the core's send() returns -1 at once, and Serial_::write()
+    // passes it on as (size_t)-1 — the "r > 0" test there is on a uint32_t.
+    if (!g_usbConfigured || g_usbWriteFails) return (size_t)-1;
+    // Armed and uncollected: the core would spin here for up to 70 ms.
+    if (g_usbBusy) ++g_usbBlocking;
+    if (n > g_usbLargest) g_usbLargest = (uint32_t)n;
+    for (size_t i = 0; i < n && g_usbOutLen < USB_OUT_CAP; ++i) g_usbOut[g_usbOutLen++] = (char)buf[i];
+    g_usbOut[g_usbOutLen] = '\0';
+    g_usbBusy = true;
+    ++g_usbWrites;
+    return n;
+}
+
+void        hostUsbSetDtr(bool high)        { g_usbDtr = high; }
+void        hostUsbSetConfigured(bool on)   { g_usbConfigured = on; }
+void        hostUsbSetRoom(int bytes)       { g_usbRoom = bytes; }
+void        hostUsbSetWriteFails(bool fail) { g_usbWriteFails = fail; }
+void        hostUsbCollect()                { g_usbBusy = false; }
+bool        hostUsbBankBusy()               { return g_usbBusy; }
+bool        hostUsbConfigured()             { return g_usbConfigured; }
+const char *hostUsbOutput()                 { return g_usbOut; }
+void        hostUsbClearOutput()            { g_usbOutLen = 0u; g_usbOut[0] = '\0'; g_usbWrites = 0u; g_usbBlocking = 0u; g_usbLargest = 0u; }
+uint32_t    hostUsbWrites()                 { return g_usbWrites; }
+uint32_t    hostUsbBlockingWrites()         { return g_usbBlocking; }
+uint32_t    hostUsbLargestWrite()           { return g_usbLargest; }
 void delay(uint32_t ms)          { g_millis += ms; }
 
 uint32_t hostPinMode(uint32_t pin)

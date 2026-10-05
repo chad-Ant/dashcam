@@ -145,21 +145,22 @@ enum MsgType : uint8_t {
     /**
      * Payload uint8: 1=discover 2=sniff 3=obd2. Relayed to the MKR.
      *
-     * The MKR never switches to OBD2 MID-DRIVE on its own. OBD2 transmits on a
-     * live vehicle bus, and a node that decides that unattended, on a car in
-     * motion, because a signal went quiet for a second, is not a decision
-     * firmware should make.
+     * The MKR boots into 1, DISCOVER, whatever its SD card holds: listen-only,
+     * accept-all, every CAN frame forwarded raw to the Orin over the MKR's OWN
+     * USB port ("F ..." lines, an "FS ..." stats line each second), and nothing
+     * decoded on the MKR - so the telemetry relayed here carries no CAN-derived
+     * values in that mode (see @c Telemetry::canMode). Decoding happens on the
+     * Orin, from that raw stream.
      *
-     * It DOES choose at boot, once, and then never revisits it: no vehicle map
-     * on the SD card, or a map whose IDs never appear during the probe window,
-     * selects OBD2 before the vehicle is moving. That is a human choosing - the
-     * card is written by hand - and the alternative is an unconfigured install
-     * that produces no telemetry at all. The boot decision is reported in
-     * @c Telemetry::canMode rather than left to be inferred.
+     * This command is the ONLY way into 2 (SNIFF: the map's filters, decoding
+     * on the MKR as well as the raw stream) or 3 (OBD2: queries, bus-active).
+     * The MKR never chooses either itself - in particular it never transmits on
+     * a live vehicle bus unattended. It returns to DISCOVER on its own only to
+     * recover: after giving up on an OBD2 session no ECU ever answered, or after
+     * a refused transition parked its controller.
      *
-     * This comment previously claimed there was no automatic fallback at all,
-     * which the boot path had already contradicted. A host command still
-     * outranks the boot decision and skips the probe entirely.
+     * This comment used to describe a boot-time choice - a map probe, with an
+     * automatic OBD2 fallback when the card held no usable map. Both are gone.
      */
     CMD_SET_CAN_MODE = 0x13,
     /**
@@ -703,8 +704,14 @@ struct __attribute__((packed)) Telemetry {
      * while sniffing and sit at their sentinels in OBD2 mode, because that mode
      * structurally cannot supply them - a different statement from "the sensor
      * went quiet".
+     *
+     * In DISCOVER (1) - the MKR's boot mode - neither runs: the MKR decodes no
+     * CAN and streams the raw frames over its own USB port instead, and every
+     * field here reads as unavailable, never as a zero: NaN speed / rpm /
+     * accel, @c sigSource 0, @c gearPos 0, the @c vehFlags validity bits clear,
+     * 0xFFFF torque and wheels, INT16_MIN yaw.
      */
-    uint8_t canMode;       ///< 0=off 1=discover 2=sniff 3=obd2.
+    uint8_t canMode;       ///< 0=off 1=discover (boot: raw stream, no decode) 2=sniff 3=obd2.
     uint8_t sigSource;     ///< 2 bits each: speed|rpm|gear|steer. 0=none 1=CAN 2=OBD2.
     uint8_t gearPos;       ///< 0=unknown 1=P 2=R 3=N 4=D 5=L 6=S.
     /**
