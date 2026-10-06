@@ -85,3 +85,12 @@ python3 canrawlog2candump.py canrawlog.log -o canrawlog.candump # old CANRawLog 
 - Exit status 3 if any input line was malformed (the output is still written).
 
 A decoder change reaches recordings already on disk by rebuilding `can_decode` and running it again.
+
+## Turning calibration demo
+
+[`turning/`](turning/README.md) follows this logger's candump file without opening
+another USB reader. It estimates yaw, rear-centre turning radius and equivalent
+front road-wheel angle, provides a localhost passenger display, and fits candidate
+calibrations against a [measured driving procedure](turning/DRIVE_PROCEDURE.md).
+No firmware changes or CAN transmission. Live data has the logger's 2–3 s delay;
+this is not steering guidance. Tests run as part of `make check`.

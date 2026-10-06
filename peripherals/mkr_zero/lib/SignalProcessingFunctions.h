@@ -1,7 +1,11 @@
 #ifndef SIGPROC_FUNCTIONS
 #define SIGPROC_FUNCTIONS 1
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#else
+#include <stdint.h>  // shared signal processing; algorithms are unchanged
+#endif
 #include <math.h>
 #include "MathFunctions.h"   // swapCustom() used by saturate(); divThreshold/fastReciprocal used by PIDControls
 

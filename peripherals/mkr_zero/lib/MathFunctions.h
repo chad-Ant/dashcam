@@ -4,7 +4,11 @@
 /// Minimum absolute value a divisor is allowed to have before it is clamped.
 #define DIVISOR_LIMIT 0.001F
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#else
+#include <stdint.h>  // pure maths also builds on the Orin, without an Arduino shim
+#endif
 #include <math.h>
 
 /**

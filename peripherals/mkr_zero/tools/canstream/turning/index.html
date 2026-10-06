@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Brio · turning lab</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101922;color:#edf1f5}
+body{max-width:1100px;margin:auto;padding:24px}h1{font-size:28px;margin-bottom:4px}p{color:#b7c6d2;line-height:1.5}
+.notice{border-left:4px solid #eeb24e;padding:10px 16px;background:#26303b}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:22px 0}
+.card{border:1px solid #385063;border-radius:12px;padding:20px;background:#172633}.value{font-size:42px;font-variant-numeric:tabular-nums;color:#76e7c4;margin:14px 0}
+.label{color:#b6c8d7}.small{font-size:13px}canvas{width:100%;height:230px;background:#14212c;border-radius:12px}.good{color:#76e7c4}#status{font-size:18px}
+@media(max-width:650px){.grid{grid-template-columns:1fr}.value{font-size:32px}}
+</style>
+<h1>Brio · turning lab</h1><p>Rear-wheel CAN odometry · equivalent front-wheel angle · passenger display</p>
+<div class="notice">Experimental estimate, not a steering sensor. Driver: do not watch or operate this display.
+Live data is delayed about 2–3 seconds. Not for vehicle control or navigation.</div>
+<p id="mode">Connecting…</p><div id="status">Waiting for wheel data</div>
+<div class="grid">
+<div class="card"><div class="label">Equivalent front-wheel angle</div><div class="value" id="angle">—</div><div class="small">+ left / − right · not steering-wheel rotation</div></div>
+<div class="card"><div class="label">Yaw rate</div><div class="value" id="yaw">—</div><div class="small">+ counter-clockwise · rear-wheel estimate</div></div>
+<div class="card"><div class="label">Turning radius</div><div class="value" id="radius">—</div><div class="small">Rear-axle centre path · not outer tyre radius</div></div>
+</div>
+<canvas id="plot" width="1000" height="230"></canvas>
+<p id="pose">Dead reckoning: optional C++ library not enabled</p>
+<canvas id="track" width="1000" height="230"></canvas>
+<p id="detail"></p><p class="small">Fixed profile for this run. Record → label measured manoeuvres → fit → review held-out errors → replay with candidate.
+No learning from the estimator's own “straight” prediction. Wheel cutoff, missing gear and stale data invalidate estimates.</p>
+<script>
+const el=id=>document.getElementById(id), number=(v,n=2)=>Number.isFinite(v)?v.toFixed(n):'—';
+function clearValues(){for(const id of ['angle','yaw','radius'])el(id).textContent='—'}
+function plot(history){const c=el('plot'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);
+ x.strokeStyle='#405363';x.beginPath();x.moveTo(40,125);x.lineTo(980,125);x.stroke();
+ x.fillStyle='#b7c6d2';x.font='14px system-ui';x.fillText('Yaw rate · recent source samples (±30 °/s display range)',20,24);
+ const ts=history.map(r=>r.time).filter(Number.isFinite);if(ts.length<2)return;
+ const t0=ts[0],duration=Math.max(.1,ts.at(-1)-t0);let active=false,last=null;
+ x.strokeStyle='#76e7c4';x.lineWidth=2;x.beginPath();for(const r of history){
+ if(r.status!=='ok'||!Number.isFinite(r.yaw_dps)){active=false;last=null;continue;}
+ if(last&&(r.segment!==last.segment||r.time-last.time>.25||r.time<=last.time))active=false;
+ const px=40+(r.time-t0)/duration*940,py=125-Math.max(-30,Math.min(30,r.yaw_dps))*2.6;
+ if(active)x.lineTo(px,py);else x.moveTo(px,py);active=true;last=r;}x.stroke();}
+function track(history){const c=el('track'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);
+ x.fillStyle='#b7c6d2';x.font='14px system-ui';x.fillText('Recent local trajectory · +x initial-forward (right), +y left (up) · equal metre scales',20,24);
+ const points=history.filter(r=>Number.isFinite(r.dr_x_m)&&Number.isFinite(r.dr_y_m));if(points.length<2)return;
+ const current=points.at(-1).segment,p=points.filter(r=>r.segment===current);
+ const xs=p.map(r=>r.dr_x_m),ys=p.map(r=>r.dr_y_m),loX=Math.min(...xs),hiX=Math.max(...xs),loY=Math.min(...ys),hiY=Math.max(...ys);
+ const scale=Math.min(900/Math.max(1,hiX-loX),160/Math.max(1,hiY-loY)),cx=(loX+hiX)/2,cy=(loY+hiY)/2;
+ x.strokeStyle=p.at(-1).dr_continuous?'#76e7c4':'#eeb24e';x.lineWidth=2;x.beginPath();let last=null;
+ for(const r of p){const px=500+(r.dr_x_m-cx)*scale,py=130-(r.dr_y_m-cy)*scale;
+ if(last&&r.dr_status==='tracking'&&r.time-last.time<=.25&&r.time>last.time)x.lineTo(px,py);else x.moveTo(px,py);last=r;}x.stroke();
+ x.fillStyle='#b7c6d2';x.fillText('Segment '+current+' · window span '+number(hiX-loX,1)+' × '+number(hiY-loY,1)+' m',20,220);}
+async function update(){try{const response=await fetch('/state',{signal:AbortSignal.timeout(1500)});if(!response.ok)throw Error('HTTP');
+ const s=await response.json(),r=s.latest;el('mode').textContent=(s.synthetic?'SYNTHETIC TEST · ':'')+(s.live?'LIVE / delayed':'REPLAY')+' · '+s.state+' · source lag '+number(s.lag_s,1)+' s';
+ el('status').textContent=r.status;el('status').className=r.status==='ok'?'good':'';
+ if(r.status==='ok'){el('angle').textContent=number(r.angle_deg)+'°';el('yaw').textContent=number(r.yaw_dps)+' °/s';el('radius').textContent=r.radius_m===null?'Near straight':number(r.radius_m,1)+' m';}else clearValues();
+ el('detail').textContent='Speed '+number(r.speed_kmh,1)+' km/h · '+(r.direction||'unavailable')+' · source epoch '+number(r.time,6)+' · segment '+(r.segment??'—')+' · samples '+s.samples+' · malformed '+s.errors;
+ el('pose').textContent=r.dr_status?'Local pose: x '+number(r.dr_x_m)+' m · y '+number(r.dr_y_m)+' m · heading '+number(r.dr_heading_deg,1)+'° · '+r.dr_status+' · '+(r.dr_continuous?'continuous estimate':'INCOMPLETE — unknown travel; re-anchor required')+(r.dr_limited?' · slew limited':''):'Local pose unavailable / C++ library not enabled';
+ plot(s.history);track(s.history);
+ }catch(e){clearValues();el('pose').textContent='Local pose unavailable';el('status').textContent='Disconnected — estimates hidden';}finally{setTimeout(update,200)}}update();
+</script></html>

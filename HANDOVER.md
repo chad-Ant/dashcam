@@ -1,4 +1,93 @@
-# Handover — branch `camera`, 2026-10-03 (night drive prepared; see the 21:10 section)
+# Handover — branch `camera`, 2026-10-06 (turning demo + dead reckoning implemented; measured-drive validation pending)
+
+## 2026-10-06 (Orin): turning calibration demo and dead-reckoning library
+
+**Implemented; not deployed to the production recorder.** No firmware flash, CAN
+transmission, camera/profile change or service stop/restart was performed by this
+work. The existing night-drive analysis edits below are preserved. This update
+and all pending source/documentation changes are being committed together at the
+user's request; raw captures and ignored build outputs stay local.
+
+### Delivered
+
+- `peripherals/mkr_zero/tools/canstream/turning/`: standard-library Python demo
+  following the existing logger's candump file (no second serial reader), with a
+  localhost-only passenger dashboard, replay, bounded history, CSV/provenance
+  output, synthetic test data and candidate calibration fitting.
+- Brio-specific wheel/gear decoding estimates left-positive yaw, rear-axle-centre
+  turning radius and equivalent front road-wheel angle using a planar bicycle
+  model. This is neither measured steering angle nor the individual inner/outer
+  tyre angle; EPS assist torque is not used. Default map scales and the 2.405 m
+  wheelbase remain provisional until independently verified.
+- `turning/DRIVE_PROCEDURE.md`: measured 30 m straights and 10 m rear-centre
+  circles, optional 15 m circles, left/right runs at 6–9 km/h, separate fit and
+  held-out validation runs, independent gate/lap timing and pose-closure checks.
+  The user confirmed a private measured area and a passenger are available.
+  Driver watches the course, never the delayed display.
+- Fit estimates tyre mismatch, wheel-speed scale and yaw scale from independent
+  distance/lap references. It rejects overlapping or invalid windows and writes
+  a **candidate only**, with baseline/validation errors; no automatic install.
+- `lib/libdeadreckoning/`: standalone C++17 CPU library for the Orin, static and
+  shared builds, narrow C API and Python binding used by the demo. Integrates
+  rear-wheel speed/yaw into local rear-centre x/y/heading with constant-curvature
+  arcs; supports forward/reverse, explicit reset and stale-state snapshots.
+- Reuses MKR `rateLimit`, `saturate` and `SimpleMovingAverage` unchanged. Only
+  Arduino/non-Arduino include guards changed in the two shared headers. A
+  time-aware IIR smooths integration inputs; the original moving average is
+  diagnostic only, avoiding its startup/lag effects on the pose.
+- Invalid/stale/out-of-order samples, gaps and direction changes cannot bridge
+  unknown travel. Continuity stays false until explicit re-anchoring. Default
+  unanchored budgets are 120 s / 1000 m, not accuracy guarantees. Updates allocate
+  no heap memory; the estimator is single-owner, with no IO or production wiring.
+- Root `make deadreckoning` / `make deadreckoning_test` delegate to the standalone
+  library without creating a timestamped app build or changing service selection.
+
+### Verification and evidence
+
+- C++: **55 checks pass** natively, in `l4t-ml-gpio:latest`, and under ASan/UBSan;
+  GCC analyzer reported no diagnostics. Strict compiler warnings enabled.
+- Python turning tests: **29 pass**, including the actual C++ binding. Full
+  canstream suite: **109 tests, no failures, one intentional abstract-fixture
+  skip**. Existing MKR host suites also passed; details in
+  `lib/libdeadreckoning/VERIFICATION.md`.
+- MKR compile-only in the existing Arduino container succeeded: **123236 B flash,
+  23924 B global RAM**, unchanged. Vendor core/library warnings remain; no upload.
+- October 3 baseline: all four wheel fields matched the existing C++ decoder on
+  **13103 wheel frames** (333679 raw frames). This proves decoder parity, not
+  steering or positioning accuracy.
+- Synthetic calibration/replay exercised the real shared library. A single
+  synthetic lap closed within **0.314 m / 1.81°**; this is software evidence only.
+  HTTP page/state endpoints were checked; browser visual rendering was not.
+- A **20 s hardware capture in the existing container**, with only MKR native USB
+  passed through, received 20 FS / 21 console lines, zero malformed lines and
+  **zero CAN frames**. Production DISCOVER firmware reported IMU/GNSS/C3 up and
+  no I2C errors. The demo followed the growing log correctly with no data.
+  **Live motion, angle/radius and position accuracy are still untested.**
+- Evidence stays local at `/home/jetson/drive_logs/turning_demo_check.thjJHt/`.
+  Do not publish raw vehicle logs or camera data.
+- During that earlier test session, `dashcam-v04` went from active to a clean
+  systemd stop at **11:39:52 local time**. This work issued no service-control
+  command and left it inactive; recheck current service state before a drive.
+
+### Remaining work / limits
+
+1. Run the measured private-area course with a passenger. Check logger loss and
+   clock-sync files, align independent gate timestamps, fit once, then evaluate
+   held-out straights/circles and independently measured endpoint/heading errors.
+2. Both rear wheel counts must clear the 300-count sensor cutoff; unavailable
+   readings are not standstill. The demo is forward-only; the C++ API supports
+   reverse and requires independently confirmed stationary input to accept zeros.
+3. Candump display inherits about **2–3 s logger delay** and epoch-clock limits.
+   Do not use it for steering guidance or physical gate timing. Production input
+   should carry mapped monotonic acquisition timestamps, fresh gear and quality
+   flags; small wall-clock steps cannot be repaired from candump alone.
+4. No GNSS/IMU fusion, absolute anchoring, covariance or calibrated error bounds
+   yet. Tyre mismatch, slip and unknown travel need independent validation and
+   re-anchoring, not optimistic extrapolation. Integrate into production only
+   after validation and explicit deployment approval.
+5. For host-only library checks, prefer `make -C lib/libdeadreckoning check`:
+   the root Makefile also probes unrelated app packages (`pugixml`, `spdlog`)
+   absent on the host, producing warnings even though the standalone test passes.
 
 ## Where things stand
 
@@ -26,6 +115,154 @@
 | usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Item Z fixed 2026-10-03, confirmed on the UGREEN. |
 | Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Items X, Y fixed 2026-10-03; X confirmed on the UGREEN. |
 | commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Item W fixed 2026-10-03. |
+
+## 2026-10-06 (Jetson): night drive 2026-10-03 analysed: camera findings (analysis only, nothing changed)
+
+No code, config, device tree or firmware was changed. Proposals are at the end and are not done.
+- **Outputs** (camera frames and vehicle data: local only, never publish), in
+  `~/drive_logs/night_drive_20261003_analysis/`:
+  - `REPORT.md`: the verified synthesis;
+  - `synth/verification_status.csv`: every analyst claim with its status;
+  - `synth/findings.json`;
+  - scripts and data under `synth/`, `ugreen/`, `csi/`, `system/`.
+- **Method:**
+  1. three analysts (UGREEN, CSI, system);
+  2. a synthesis pass that re-measured every high and medium finding by a different method;
+  3. a main-session check of the key claims against images, logs and source.
+- **Not finished:** a second check (CSI mount over the whole drive, MKR clock drift, coverage of earlier camera
+  issues) was cut off by a power loss. Its partial files in `verify2/` are unverified.
+
+**Correction first: the UGREEN autofocus did not fail.** In the car (22:08–22:16 section below) I reported it stuck
+at 512 and blurred. That was wrong.
+- **AF-on footage 22:08–22:14:50 is as sharp as fixed 690.** Laplacian variance, central band:
+  - AF on: 733–874;
+  - fixed 690: 754–849;
+  - wrong manual positions: 141–573.
+
+  Street-light halo was 12.9 px in both. From manual 1023, autofocus was sharp again within 0.7 s (3 times).
+- **What misled me:**
+  - `focus_absolute` does not follow the lens while autofocus is on. It keeps the last manual value (512, 1023, 650).
+    So the 21:10 section's note "with autofocus on, `focus_absolute` is the live lens position" is wrong too.
+  - The frame I judged came from `ffmpeg -sseof` on a growing MKV, which returns a stale frame.
+- **Fixed 690 stays.** It is verified as sharp as autofocus and cannot hunt on wipers or rain. Autofocus while driving
+  is untested.
+
+**Other corrections to the sections below:**
+
+| Earlier claim | Now |
+|---|---|
+| v0.4 run 2: 29 segments | **39** (304–342), 138,752 frames, 19.979 fps |
+| CSI about 12 MB/s | **18.3 MB/s** average (7.4–26.5 per segment, about 25 on unlit roads); 12 was the first, parked segment |
+| CSI rolled 5–10°, dashboard lower third to half | The mount **moved during the drive** (below) |
+| Drive 22:17–23:38 | Car stationary until 22:20:04. After "drive done" (23:38) it kept driving 23:38–23:51 and 00:00–00:05 (CAN baseline parked 23:54–23:59) |
+| Wall = mono + 1791040065.46 | **mono + 1791040066.389** (userspace journal, n=408, no drift). Kernel printk stamps drift up to +0.18 s, so use the journal's realtime column for kernel lines |
+| "Night mode one-way" (analysts) | **Wrong as a bug.** The exit works: 3 exits on the 2026-10-02 bench (`log_20261002_153605.txt`). At night it should stay on: v0.4's 30 fps setting (32.3 ms, gain 15) gave luma 4.6–9.3 against 67.6 under the camera's AE |
+
+**Camera findings, most important first** ([V] = re-measured or checked in source; [A] = analyst; [I] = inferred)
+
+1. **The CSI mount moved at 22:20:13, the first braking after pulling away** (about 30 km/h, −0.66 m/s²). [V]
+   - **Evidence:**
+     - Dashboard match against the parked reference: NCC 0.88–0.92 until 22:20:08, 0.69 at :12, 0.06 at :14,
+       never above 0.31 afterwards.
+     - The dash vent row went from 15.8° to a median 5.8° tilt.
+     - Roll against the level UGREEN went from about 13° (SIFT 10.3–11.5°) to about 4° (LSD median 3.9°, IQR
+       2.9–6.0).
+     - The view dropped about 230 px (about 13°). The car-fixed area went from about 25–30% to 44.5% of the frame.
+     - Checked by eye on `synth/img/csi_move_222008_16.png`: the dash pattern visibly rotates between :12 and :14.
+     - `csi_record.log` has one pipeline part, so this is not a mode or crop change.
+   - **Earlier change:** a possible shift at about 22:10:30 while parked, just after the rig was connected (22:09:32;
+     likely handled). [I]
+   - **Open: the mount may have moved again later.** The roll estimate swings from about −8° (22:30–22:50) to +7…+8°
+     (23:36–23:38). The 23:17 and 23:37 frames in `synth/img/csi_mount_montage.png` show yet another dash geometry.
+     The synthesis compared against one parked reference only, so it could not see later moves. Treat the mount as
+     loose until shown otherwise.
+2. **The CSI is gain-limited all night by the device tree.** [V]
+   - **Installed overlay** `tegra234-p3767-camera-p3768-imx296-cam1.dtbo`, mode0: `gain_factor` 16,
+     `max_gain_val` 200, `max_exp_time` 1000, `exposure_factor` 1e6, `default_framerate` 60 fps. This matches the
+     source overlay in `~/drive_logs/tools/imx296_driver/src/`.
+   - **What the driver does with them** (`build_src/imx296.c`, identical to the built one):
+     - Gain is written straight to the 0.1 dB register: 200 = 20 dB of the sensor's 48 dB (`IMX296_GAIN_MAX` 480).
+     - Exposure is lines (`SHS1 = vmax − val`, 14.81 µs per line), so 1000 = 14.8 ms. Argus believes it is 1000 µs.
+     - vmax at 30 fps is 2249 lines, so about 33 ms is physically possible.
+   - **What happened on the drive:**
+     - Sensor gain ≥ 199 for 99.91% of the drive (35,527 gain writes; one 2.1 s dip at 22:39:37).
+     - AE held output brightness level (median luma 89 lit vs 86 unlit) [A], so the rest came from ISP digital gain,
+       which shows up as noise.
+3. **CSI noise on unlit roads.** [V]
+   - Classed by UGREEN brightness, lit vs dark:
+     - pixel noise 5.6 vs 29.4 DN;
+     - temporal noise 11.0 vs 48.8;
+     - row banding 2.4 vs 9.5 DN;
+     - JPEG 383 vs 843 kB.
+   - Row banding is full-width and present on lit roads too: row variance 30–44× white noise, columns about 1×.
+   - Analyst [A]: clipped headlight pool 22.1% vs 2.7% of the frame, crushed blacks 20.8% vs 3.6%.
+4. **The CSI bitrate is set by noise**: Spearman 0.99 between JPEG size and noise (n=183). [V]
+   - 100.12 GB in 5,481 s.
+   - Both cameras together are about 23 MB/s, about 83 GB/h. Budget at least 25 MB/s for the CSI at night.
+5. **UGREEN turn blur is exposure, not focus.** [V]
+   - At 20 fps the camera's AE exposure is between 33 and 50 ms: it drops the frame rate only when it needs more than
+     1/30 s.
+   - Streak measurements:
+     - ≥ 32–38 ms (a lower bound);
+     - 44 ms from the cross-camera comparison [A];
+     - the analyst's 58.7 ms is longer than the frame, inflated by halos.
+   - Smear is about 15 px at 10°/s and 37 px at 17°/s [A]. In 10/10 turns the CSI kept more detail (≤ 3 px) [A].
+   - The UVC exposure/gain readback is stale under the camera's AE, so the real exposure is never logged.
+6. **The UGREEN is light-starved on unlit roads, even at maximum exposure.** [V]
+   - 44.9% of driving frames are below luma 35 (p5/50/95: 17.0/40.4/99.5).
+   - The fps stayed 19.9–20.0 all drive [A]; the camera's AE never returned to 30 fps under street lighting.
+7. **The CSI missed the last 13.3 min / 8.2 km of driving. The cause is operational.** [V]
+   - I stopped the drive session (the CSI recorder) by hand at 23:39:35, a minute after "drive done", but the car
+     drove on.
+   - v0.4 recorded until 00:10:35.
+8. **CSI glare discs** around street lights are 2.5–3× the UGREEN's angular size: 10.3/6.3° vs 3.6/2.6° for the same
+   lamps. [V]
+   - The cause (lens or windscreen veiling glare vs the brighter AE target) is not separated. [I]
+9. **Smaller items:**
+   - **UGREEN:** windscreen reflections of the in-car green and amber status LEDs (static, at 8 checked times). [A, V]
+   - **CSI colour:** warmer than the UGREEN (R/G ×1.12, B/G ×0.91). [A]
+   - **CSI hot pixels:** about 47 on the half-resolution grid at high gain. [V]
+   - **CSI coverage:** no in-car reflections.
+10. **imx296 debug flood:** 106,579 of the boot's 109,495 journal lines. [V]
+    - Cause: `#define DEBUG 1` at line 19 of `~/drive_logs/tools/imx296_driver/build_src/imx296.c`.
+
+**What worked** [A, V]
+- **UGREEN:** 146,591 frames, 0 duplicates, 0 decode errors, seamless joins. One 196 ms gap at each start, and the
+  planned 5.99 s restart gap.
+- **CSI:** one pipeline part, 164,498 frames at 30.013 fps, 3 single-frame drops, 91/91 seamless boundaries.
+- **System:**
+  - CPU mean 12.5%, junction ≤ 54.3 °C;
+  - 0 camera, USB, storage or thermal journal lines 22:17–23:38;
+  - 0 v0.4 warnings while driving (the first is 23:54:44, the planned CANRawLog flash).
+- **Timing:** video vs telemetry agree within about ±0.1 s. The `.ass` overlay values lag 0.10–0.20 s [A].
+- **Telemetry, low priority:**
+  - 5 C3→host stalls of 0.36–0.91 s lost 22 frames, matching the `host_tx_dropped` increments; root cause unknown.
+  - The analysts report MKR `master_ms` drifting up to −1283 ppm against the host. That is implausible for a
+    crystal-locked SAMD21 and **unverified**: the check was cut off. Use `host_ms` as the timebase.
+
+**Proposals (not done; for the user to decide)**
+1. **CSI mount:** re-mount it on a rigid bracket with no ball joint that can slip, level within 2°, car-fixed area
+   ≤ 30%. Take dashboard reference frames before and after the next drive (`synth/scripts/mount_track.py`,
+   `roll_track.py`).
+2. **CSI device tree:**
+   - raise `max_gain_val` (300–480) so AE uses analog gain before ISP digital gain;
+   - raise `max_exp_time` toward about 1500 lines (about 22 ms; ≤ 2249 at 30 fps; more exposure means more blur);
+   - review `default_framerate` 60 fps against the 30 fps recording.
+
+   Then A/B on a night drive with `synth/scripts/csi_verify.py`.
+3. **Driver:** drop `#define DEBUG 1` and rebuild with `build.sh`.
+4. **Coverage:** keep the CSI recording as long as v0.4 runs, or stop the session only when the engine is off.
+5. **UGREEN:** keep fixed 690. An exposure A/B (e.g. `exposure_dynamic_framerate=0`) would be darker; use the CSI
+   for motion detail instead.
+6. **In the car:** cover the status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch, consider a
+   lens hood.
+7. **Next drive's logging:**
+   - Argus per-frame exposure and gain;
+   - UGREEN frames stamped in CLOCK_MONOTONIC;
+   - tegrastats at 1 s.
+8. **Finish the cut-off check:** the mount over the whole drive, and the MKR clock (lower-envelope slope of
+   `host_ms − master_ms`, against GPS time and the 2026-10-06 bench `can_sync.csv`). The script is at
+   `~/.claude/projects/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/workflows/scripts/night-drive-verify2-wf_527be524-0ac.js`.
 
 ## 2026-10-06 (Jetson): raw CAN over the MKR's USB — implemented, reviewed, bench-proven (uncommitted)
 
@@ -191,7 +428,7 @@ The first file pair spans the clock step, so its wall-clock span reads 60 min; r
 
 | Area | Result |
 |---|---|
-| v0.4 | 29 segments, **0 warnings or errors during the drive** (the only WARN is the 22:14:44 port close at the planned restart); night mode the whole way |
+| v0.4 | 29 segments (**39**, corrected 2026-10-06), **0 warnings or errors during the drive** (the only WARN is the 22:14:44 port close at the planned restart); night mode the whole way |
 | UGREEN focus | Held at 690 with autofocus off for 5031 s (`ugreen.csv`); auto exposure (night mode) throughout |
 | CSI | **92 segments, one pipeline part (no restart)**, 100 GB, median 1.1 GB/min |
 | Telemetry CSV | 50,187 rows over 85.4 min = 9.79/s; max gap 912 ms (2 gaps over 500 ms) |
@@ -219,7 +456,8 @@ outside the repo (camera captures).
     headlight pools. This is the driver's exposure cap (1001 lines ≈ 15 ms) forcing gain to maximum; lifting the cap
     to the 33 ms a 30 fps frame allows would roughly halve the gain.
   - **Mount:** the dashboard fills the lower third to half of every CSI frame, and it is rolled about 5–10°. Re-aim it
-    before the next drive.
+    before the next drive. (2026-10-06: the mount moved at 22:20:13, about 13° → 4° roll, and possibly again later;
+    see the night-drive analysis section.)
 - **Yaw sign checked over the whole drive:**
   - it is opposite to the GNSS course rate in 92 % of turns over 5 °/s (correlation −0.56, as left-positive
     requires);
@@ -274,7 +512,8 @@ line (no sudo)**
   - IMX296 footage: nvarguscamerasrc with no ISP properties, so the installed c8_sh15 is what you see; 1456x1088 at
     30 fps, nvjpegenc, 60 s MKV segments, EOS on stop;
   - the MKR USB console;
-  - UGREEN focus, exposure and gain every 1 s (with autofocus on, `focus_absolute` is the live lens position);
+  - UGREEN focus, exposure and gain every 1 s (corrected 2026-10-06: with autofocus on, `focus_absolute` is NOT the
+    lens position, it keeps the last manual value; exposure and gain read stale under the camera's AE);
   - tegrastats;
   - a health snapshot every minute.
 - Every line carries `mono=`, because the clock is wrong at boot in the car until v0.4 sets it from GPS.
@@ -302,11 +541,14 @@ driver's range and the DT `max_exp_time`, not the ISP file. Look at it in the im
 - **CAN loss:** the MKR console shows `ovf=` rising about 70/s against `rx=` about 420/s, roughly the 13% loss
   of 2026-09-26.
 - **IMU:** corrupt bursts with the engine on are back (`hgrej=8`, `ioerr=1/8`).
-- **Footage rates:** CSI night segments are about 12 MB/s (3× indoors; noise inflates the JPEGs) and the UGREEN
+- **Footage rates:** CSI night segments are about 12 MB/s (parked; the drive averaged 18.3 MB/s, see the 2026-10-06
+  analysis) (3× indoors; noise inflates the JPEGs) and the UGREEN
   about 7 MB/s, so about 68 GB/h. With 577 GB free that is about 8 h before v0.4's 20 GB floor.
 - **CSI at night:** bright and sharp, no halos. But the mount is rolled about 10° and the lower third of the frame is
   dashboard.
-- **UGREEN autofocus fails at night.** After power-up it sat at the default `focus_absolute` 512 with
+- **WRONG, corrected 2026-10-06 (see the night-drive analysis section): autofocus worked; `focus_absolute` is
+  stale while it is on, and the judged frame was stale.** As first reported:
+  **UGREEN autofocus fails at night.** After power-up it sat at the default `focus_absolute` 512 with
   `focus_automatic_continuous=1`, never moved, and the footage was badly blurred (street lights as large discs).
   After the sweep it also stayed at whatever value was written (1023, then 650) with autofocus back on.
 - **Parked manual sweep**, via the standard control while recording: frames were cut from the growing MKV's tail,

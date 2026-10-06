@@ -1,0 +1,12 @@
+{
+  "clock_and_loss_checked": false,
+  "note": "TEMPLATE ONLY: replace every start/end with actual samples.csv timestamps and measured distance/radius. These are not real reference data.",
+  "runs": [
+    {"name":"S1","split":"fit","kind":"straight","segment":0,"start":0,"end":18,"distance_m":30},
+    {"name":"L1","split":"fit","kind":"left","segment":0,"start":30,"end":105.4,"radius_m":10,"laps":2},
+    {"name":"R1","split":"fit","kind":"right","segment":0,"start":120,"end":195.4,"radius_m":10,"laps":2},
+    {"name":"S3","split":"validation","kind":"straight","segment":0,"start":210,"end":222,"distance_m":30},
+    {"name":"L2","split":"validation","kind":"left","segment":0,"start":240,"end":290.26,"radius_m":10,"laps":2},
+    {"name":"R2","split":"validation","kind":"right","segment":0,"start":310,"end":360.26,"radius_m":10,"laps":2}
+  ]
+}

@@ -229,6 +229,13 @@ TARGETS := $(BUILD_DIR)/csi_test \
 # `all` stays the default goal even though convenience aliases precede it.
 .DEFAULT_GOAL := all
 
+# No timestamped app build: do not affect the service's newest-build selection.
+.PHONY: deadreckoning deadreckoning_test
+deadreckoning:
+	$(MAKE) -C lib/libdeadreckoning all
+deadreckoning_test:
+	$(MAKE) -C lib/libdeadreckoning check
+
 # Convenience alias so `make commlink_test` works without the build-dir prefix.
 commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
 	@echo "Built commlink_test in $(BUILD_DIR)/"
