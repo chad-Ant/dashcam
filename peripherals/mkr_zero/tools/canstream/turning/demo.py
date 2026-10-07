@@ -21,12 +21,14 @@ import time
 from calibrate import fit
 from model import Decoder, Profile, parse_line
 from dr_binding import DeadReckoning
+from fusion import FusionConfig, FIELDS as FUSION_FIELDS
+from fusion_input import FusionSession, TelemetryInput
 
 HERE = Path(__file__).resolve().parent
 FIELDS = ["time", "segment", "gear_raw", "wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr", "status",
           "speed_kmh", "corrected_diff", "yaw_raw_dps", "yaw_dps", "curvature_per_m", "angle_deg",
           "radius_m", "direction", "dr_x_m", "dr_y_m", "dr_heading_deg", "dr_distance_m",
-          "dr_status", "dr_continuous", "dr_limited"]
+          "dr_status", "dr_continuous", "dr_limited"] + FUSION_FIELDS
 
 
 def write_json(path, data):
@@ -153,6 +155,11 @@ def run(args):
     path = Path(args.input).resolve(strict=True)
     profile = load_profile(args.profile)
     dr = None
+    telemetry = fusion = None
+    fusion_config = None
+    if args.telemetry:
+        with Path(args.fusion_config).open() as stream:
+            fusion_config = FusionConfig(**json.load(stream))
     if not path.is_file():
         raise ValueError("input must be a regular candump log")
     out = Path(args.out)
@@ -162,6 +169,8 @@ def run(args):
                "created_epoch": time.time(), "profile": dataclasses.asdict(profile),
                "profile_status": "unvalidated defaults" if not args.profile else "user-selected candidate",
                "interface": args.interface, "dr_library": args.dr_library,
+               "telemetry": str(Path(args.telemetry).resolve()) if args.telemetry else None,
+               "fusion_config": dataclasses.asdict(fusion_config) if fusion_config else None,
                "start_time": args.start_time, "end_time": args.end_time,
                "geometry": "rear axle centre; equivalent bicycle front angle",
                "note": "no ECU angle/yaw sensor; logger delays live data; inspect can_sync/stats before fitting"})
@@ -180,6 +189,9 @@ def run(args):
     last_flush = last_print = 0.0
     success = False
     try:
+        if fusion_config:
+            telemetry = TelemetryInput(Path(args.telemetry).resolve(strict=True), fusion_config, args.follow)
+            fusion = FusionSession(profile, fusion_config, telemetry)
         if args.dr_library:
             dr = DeadReckoning(Path(args.dr_library).resolve(strict=True), profile)
         with (out / "samples.csv").open("x", newline="") as stream:
@@ -214,6 +226,8 @@ def run(args):
                     continue
                 display.frames += 1
                 if row:
+                    if fusion:
+                        row.update(fusion.update(row))
                     if dr:
                         row.update(dr.update(row))
                     writer.writerow(row)
@@ -235,6 +249,8 @@ def run(args):
         timer.cancel()
         if dr:
             dr.close()
+        if telemetry:
+            telemetry.close()
         if server:
             server.shutdown()
             server.server_close()
@@ -328,6 +344,8 @@ def main():
     run_p.add_argument("--out", required=True)
     run_p.add_argument("--profile")
     run_p.add_argument("--dr-library", help="optional absolute path to built libdeadreckoning.so")
+    run_p.add_argument("--telemetry", help="v0.4 telemetry CSV from same session; enables EKF")
+    run_p.add_argument("--fusion-config", help="required EKF mounting/geometry/noise JSON")
     run_p.add_argument("--start-time", type=float, help="replay window start (source epoch seconds)")
     run_p.add_argument("--end-time", type=float, help="replay window end (source epoch seconds)")
     run_p.add_argument("--follow", action="store_true", help="follow NEW lines only, from EOF")
@@ -342,9 +360,13 @@ def main():
     fit_p.add_argument("--out", required=True)
     synth_p = commands.add_parser("synthetic")
     synth_p.add_argument("--out", required=True)
+    fusion_synth_p = commands.add_parser("synthetic-fusion")
+    fusion_synth_p.add_argument("--out", required=True)
     args = parser.parse_args()
     try:
         if args.command == "run":
+            if bool(args.telemetry) != bool(args.fusion_config):
+                raise ValueError('--telemetry and --fusion-config must be supplied together')
             if not math.isfinite(args.speed) or not 0 <= args.speed <= 1000:
                 raise ValueError("replay speed must be 0..1000")
             if not math.isfinite(args.seconds) or not 0 < args.seconds <= 86400:
@@ -359,6 +381,9 @@ def main():
             return run(args)
         if args.command == "fit":
             return fit_command(args)
+        if args.command == 'synthetic-fusion':
+            from fusion_synthetic import generate
+            return generate(args)
         return synthetic_command(args)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.exit(2, "turning demo: %s\n" % exc)

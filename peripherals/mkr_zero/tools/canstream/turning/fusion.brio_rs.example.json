@@ -1,0 +1,14 @@
+{
+  "gyro_up": [0, 0, 1],
+  "front_track_m": 1.475,
+  "rear_track_m": 1.459,
+  "antenna_x_m": null,
+  "antenna_y_m": 0,
+  "wheel_sigma_mps": 0.12,
+  "gyro_sigma_dps": 1.0,
+  "course_sigma_deg": 8.0,
+  "gyro_time_offset_s": 0.0,
+  "gnss_time_offset_s": 0.0,
+  "gyro_time_sigma_s": 0.1,
+  "gnss_time_sigma_s": 0.5
+}

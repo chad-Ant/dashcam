@@ -1,4 +1,59 @@
-# Handover — branch `camera`, 2026-10-06 (turning demo + dead reckoning implemented; measured-drive validation pending)
+# Handover — branch `camera`, 2026-10-07 (turning EKF implemented; antenna measurement and measured-drive validation pending)
+
+## 2026-10-07 (Orin): GNSS + gyro + individual-wheel turning EKF
+
+**Implemented in the read-only demo, not deployed into v0.4.** No firmware flash,
+CAN transmission, camera change or service control. The earlier wheel-only demo
+and C++ dead-reckoning library remain available and unchanged in behaviour.
+
+- `peripherals/mkr_zero/tools/canstream/turning/fusion.py`: four-state EKF
+  (heading, forward speed, yaw rate, gyro bias), individual front/rear wheel
+  measurement models, GNSS antenna lever-arm correction, wrapped course residuals,
+  analytic Jacobians, innovation gates and Joseph covariance updates. Produces
+  equivalent bicycle front road-wheel angle, yaw and rear-centre turning radius;
+  it is not a steering-angle sensor or an individual Ackermann tyre-angle estimate.
+- `fusion_input.py`: bounded join of existing raw CAN and v0.4 telemetry CSV.
+  Rejects bad sensor quality, repeated GNSS fixes, stale/late observations and
+  inconsistent clocks. GNSS course is gated on movement; missing data is not zero.
+  `--telemetry` plus `--fusion-config` enables fusion, including `--follow` for
+  growing logs. No additional serial reader or CAN sender is started.
+- Dashboard and CSV retain the wheel-only comparison and add fused estimates,
+  model uncertainty, gyro bias, active sources and rejection/NIS diagnostics.
+  The optional C++ trajectory remains wheel-only, not GNSS-corrected position.
+- `synthetic-fusion` generates reproducible multi-sensor data with gyro bias,
+  noise, a GNSS outage, isolated wheel slip and a gyro spike. Usage, equations,
+  limitations and validation procedure: `turning/FUSION.md`.
+
+**Rig inputs and required next step:** the user confirmed IMU **+Z up** and a
+centred antenna at the bottom of the windscreen. Honda Vietnam's stock Brio RS
+specification lists **front/rear track 1.475/1.459 m**, wheelbase **2.405 m**
+(source linked in `FUSION.md`). The example config uses those track widths and
+zero lateral antenna offset. **Measure the horizontal rear-axle-centre-to-antenna
+distance forward in metres.** `fusion.brio_rs.example.json` deliberately leaves
+`antenna_x_m` null and refuses to run until supplied; the synthetic 2 m value is
+not a rig measurement. Verify gyro sign, tyres, geometry and sensor latency on
+the private measured course before trusting results.
+
+**Verification:** 27 fusion tests pass natively and in `l4t-ml-gpio:latest`,
+including Jacobians, covariance positive definiteness, faults, file following,
+CLI replay and HTTP endpoints. Original turning tests: 29 pass; unchanged C++
+DR: 55 checks pass. Full canstream run: 134 tests, no failures, one intentional
+skip; that run preceded two final tests, both covered by the 27-test reruns.
+
+**Do not claim an accuracy improvement yet:** in the synthetic 60 s run (scored
+after 10 s), yaw RMSE was 1.3721 deg/s raw wheels, **0.3777 smoothed wheels**, and
+**0.4651 EKF**. Bias converged to 1.7661 deg/s versus injected 1.8; 52 observations
+rejected, zero late. The existing smoother wins this clean-wheel, slow-changing
+case. Independent held-out drives and noise/latency tuning remain necessary.
+Evidence stays local at `/home/jetson/drive_logs/turning_ekf_check.NAQNaN/`.
+
+**Timing limitation:** CSV logs host arrival time, not per-sensor acquisition
+time, and lacks GNSS accuracy/fractional fix time. This join is approximate; its
+uncertainty is not a calibrated error bound. The October 3 log check found a
+boundary with 0.078 s host advance versus 5.211 s master advance, which fusion
+correctly refuses to cross. Split/re-align such logs; the cause was not determined.
+No live-drive accuracy validation was performed. Production integration should
+first add acquisition timestamps/accuracy fields and validate clock mapping.
 
 ## 2026-10-06 (Orin): turning calibration demo and dead-reckoning library
 

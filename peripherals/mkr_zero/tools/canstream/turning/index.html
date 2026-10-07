@@ -19,6 +19,13 @@ Live data is delayed about 2–3 seconds. Not for vehicle control or navigation.
 <div class="card"><div class="label">Turning radius</div><div class="value" id="radius">—</div><div class="small">Rear-axle centre path · not outer tyre radius</div></div>
 </div>
 <canvas id="plot" width="1000" height="230"></canvas>
+<h2>Sensor fusion · extended Kalman filter</h2>
+<p id="fusion">Not enabled: supply telemetry and a verified fusion config.</p>
+<div class="grid">
+<div class="card"><div class="label">Fused front-wheel angle</div><div class="value" id="ekf-angle">—</div><div class="small" id="ekf-angle-sigma">Model uncertainty, not measured accuracy</div></div>
+<div class="card"><div class="label">Fused yaw rate</div><div class="value" id="ekf-yaw">—</div><div class="small" id="ekf-yaw-sigma">+ left · gyro bias estimated</div></div>
+<div class="card"><div class="label">Fused turning radius</div><div class="value" id="ekf-radius">—</div><div class="small" id="ekf-radius-sigma">Hidden near straight / uncertain turn sign</div></div>
+</div>
 <p id="pose">Dead reckoning: optional C++ library not enabled</p>
 <canvas id="track" width="1000" height="230"></canvas>
 <p id="detail"></p><p class="small">Fixed profile for this run. Record → label measured manoeuvres → fit → review held-out errors → replay with candidate.
@@ -26,6 +33,15 @@ No learning from the estimator's own “straight” prediction. Wheel cutoff, mi
 <script>
 const el=id=>document.getElementById(id), number=(v,n=2)=>Number.isFinite(v)?v.toFixed(n):'—';
 function clearValues(){for(const id of ['angle','yaw','radius'])el(id).textContent='—'}
+function fused(r){
+ el('fusion').textContent=r.ekf_status? r.ekf_status.toUpperCase()+' · '+r.ekf_sources+' · wheels accepted '+r.ekf_wheels_used+'/4 · gyro bias '+number(r.ekf_bias_dps)+' °/s · rejected '+r.ekf_rejected+' · late '+r.ekf_late_events+' · body heading '+number(r.ekf_heading_deg,1)+'° true':'EKF unavailable / not enabled';
+ el('ekf-angle').textContent=Number.isFinite(r.ekf_angle_deg)?number(r.ekf_angle_deg)+'°':'—';
+ el('ekf-yaw').textContent=Number.isFinite(r.ekf_yaw_dps)?number(r.ekf_yaw_dps)+' °/s':'—';
+ el('ekf-radius').textContent=Number.isFinite(r.ekf_radius_m)?number(r.ekf_radius_m,1)+' m':'—';
+ el('ekf-angle-sigma').textContent='Model 1σ: '+number(r.ekf_angle_sigma_deg)+'°';
+ el('ekf-yaw-sigma').textContent='Model 1σ: '+number(r.ekf_yaw_sigma_dps)+' °/s';
+ el('ekf-radius-sigma').textContent='Model 1σ: '+number(r.ekf_radius_sigma_m,1)+' m · blank = unavailable/uncertain';
+}
 function plot(history){const c=el('plot'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);
  x.strokeStyle='#405363';x.beginPath();x.moveTo(40,125);x.lineTo(980,125);x.stroke();
  x.fillStyle='#b7c6d2';x.font='14px system-ui';x.fillText('Yaw rate · recent source samples (±30 °/s display range)',20,24);
@@ -52,6 +68,6 @@ async function update(){try{const response=await fetch('/state',{signal:AbortSig
  if(r.status==='ok'){el('angle').textContent=number(r.angle_deg)+'°';el('yaw').textContent=number(r.yaw_dps)+' °/s';el('radius').textContent=r.radius_m===null?'Near straight':number(r.radius_m,1)+' m';}else clearValues();
  el('detail').textContent='Speed '+number(r.speed_kmh,1)+' km/h · '+(r.direction||'unavailable')+' · source epoch '+number(r.time,6)+' · segment '+(r.segment??'—')+' · samples '+s.samples+' · malformed '+s.errors;
  el('pose').textContent=r.dr_status?'Local pose: x '+number(r.dr_x_m)+' m · y '+number(r.dr_y_m)+' m · heading '+number(r.dr_heading_deg,1)+'° · '+r.dr_status+' · '+(r.dr_continuous?'continuous estimate':'INCOMPLETE — unknown travel; re-anchor required')+(r.dr_limited?' · slew limited':''):'Local pose unavailable / C++ library not enabled';
- plot(s.history);track(s.history);
- }catch(e){clearValues();el('pose').textContent='Local pose unavailable';el('status').textContent='Disconnected — estimates hidden';}finally{setTimeout(update,200)}}update();
+ fused(r);plot(s.history);track(s.history);
+ }catch(e){clearValues();fused({});el('pose').textContent='Local pose unavailable';el('status').textContent='Disconnected — estimates hidden';}finally{setTimeout(update,200)}}update();
 </script></html>

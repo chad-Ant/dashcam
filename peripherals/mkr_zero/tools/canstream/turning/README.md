@@ -7,6 +7,11 @@ This is an experimental calibration tool, **not vehicle control or navigation**.
 
 ## What it estimates
 
+Optional [GNSS + gyro + four-wheel EKF](FUSION.md): add `--telemetry` and
+`--fusion-config` to `run` for a side-by-side fused estimate, gyro-bias tracking,
+uncertainty and outlier rejection. `synthetic-fusion` creates a reproducible
+multi-sensor test. The original wheel-only path below is unchanged.
+
 This decoder is explicitly for the current Brio map: `0x1D0` wheel fields at
 Motorola starts 7/8/25/42, length 15; `0x191` gear at 44|5. Do not use it with
 another vehicle/map without updating and verifying the decoder. EPS assist
