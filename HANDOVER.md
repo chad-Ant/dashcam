@@ -1,4 +1,76 @@
-# Handover — branch `camera`, 2026-10-07 (turning EKF implemented; antenna measurement and measured-drive validation pending)
+# Handover — branch `camera`, 2026-10-07 (v2 CSI chart/analyser added; live chart and measured-drive validation pending)
+
+## 2026-10-07 (Orin): IMX296 v2 chart and offline calibration analyser
+
+**Implemented and tested offline; no camera/ISP/service changes.** Original work
+is at `/home/jetson/drive_logs/tools/isp_tuning/chart/v2/`. Reusable sources,
+documentation, geometry and printable assets are now version-controlled under
+`tools/isp_tuning/chart/v2/`, with the existing range-aware `csi_decode.py` copied
+unchanged to `tools/isp_tuning/`. The repo wrapper additionally mounts the repo
+tool directory read-only so it works outside `drive_logs`. See
+`tools/isp_tuning/README.md` for local-vs-repo paths. Original v1 chart/tools are
+untouched. Captures, generated analysis results and caches are not committed.
+
+### Delivered
+
+- **Three A4 landscape vector sheets:** colour/neutral balance (24 colour
+  patches plus six repeated greys), noise/shadows (six large flat regions and
+  ten shadow steps), and detail (four 5-degree slanted edges plus four texture
+  periods). The PDF contains no embedded JPEGs; SVGs, lossless 300 dpi PNGs,
+  preview, geometry and generator are included. IDs 10-21 distinguish v2 from
+  legacy IDs 0-3. Print at 100% and verify the 100 mm ruler.
+- `calibrate.py`: saved-image colour comparison against USB, regularized
+  neutral-preserving matrix fitting with six held-out chromatic patches,
+  native-pixel temporal noise (32-256 frames; recommend 64), separate spatial
+  variation and lag-1/4/8 difference statistics, relative edge width/halo and
+  texture diagnostics. Writes JSON/Markdown reports and annotated ROI/swatch
+  previews to a new directory, refusing overwrite.
+- Gates wrong/missing markers, poor geometry/coverage, motion, lighting drift,
+  clipping, repeated-neutral inconsistency and duplicate frames. Retains the
+  rig's limited-range nvJPEG correction and records the selected decoder.
+- `run_calibration.sh`: offline Docker execution in `l4t-ml-gpio:latest`, no
+  network/GPU/devices/Argus access; inputs read-only, only new results writable.
+  Usage and method limitations: `chart/v2/CALIBRATION.md`.
+
+### Verification and limitations
+
+- **24 synthetic tests passed** in the existing container, including a rerun
+  from the packaged repo copy: geometry and failure
+  gates, known matrix recovery/holdout, independent/correlated noise, a full
+  32-frame noise command, Gaussian-blur response, decoding and overwrite guards.
+- Chart validation passed all 12 markers and 46 flat-patch RGB regions, native
+  1456x1088 framing/perspective simulations and independent PDF rendering. The
+  local colour/detail wrappers were exercised on the generated artwork; the
+  repo-path detail wrapper also passed after packaging.
+- Existing Oct 1 CSI/USB JPEGs selected the expected limited/full-range decoder
+  paths. This was read-only verification, **not fresh live calibration**.
+- The colour matrix acts on inverse-sRGB-linearized **processed RGB**, with USB
+  as a comparative reference, not ground truth. It is **not an Argus ISP CCM**;
+  do not paste it into or multiply it into `camera_overrides.isp`. No `.isp`
+  output or automatic installation is provided. Home-printed RGB is not measured
+  reflectance, and noise/detail figures include print/codec/ISP effects.
+- Analysis cannot prove capture timestamps, sensor synchronization or control
+  locks from still files. The old five-frame runtime sweep is insufficient for
+  noise analysis; never combine different variants just to reach 32 frames.
+
+### Next steps
+
+1. Print/mount v2 matte at actual size, filling about 70-80% of native CSI width;
+   verify all markers and ROI overlays in both cameras. Use controlled lighting
+   and fixed exposure/gain/WB; a characterized target is needed for absolute colour.
+2. Acquire new per-sheet captures and one continuous 64-frame noise burst per
+   profile. **A dedicated v2 acquisition helper is not implemented**; the new
+   script analyses saved files only. No live v2 print/camera validation yet.
+3. Validate colour on held-out captures under another light, and assess noise
+   jointly with detail retention and moving-scene ghosting. Any later ISP trial
+   must be a separately reviewed base/candidate/base experiment, not direct use
+   of the post-render matrix. Installed profile and recorder state were not changed
+   or freshly certified by this work.
+
+Local synthetic smoke-test reports remain in
+`/home/jetson/drive_logs/tools/isp_tuning/chart/v2/results/`; these use chart
+artwork, not real camera measurements. Turning EKF antenna measurement and
+independent measured-drive validation below also remain outstanding.
 
 ## 2026-10-07 (Orin): GNSS + gyro + individual-wheel turning EKF
 

@@ -1,0 +1,10 @@
+{
+  "schema": "imx296-chart-v2",
+  "pages": [
+    "01_colour",
+    "02_noise_tone",
+    "03_detail"
+  ],
+  "print_pdf": "imx296_chart_v2_a4.pdf",
+  "source_rgb": "nominal sRGB, PDF DeviceRGB; printed output must be characterized"
+}

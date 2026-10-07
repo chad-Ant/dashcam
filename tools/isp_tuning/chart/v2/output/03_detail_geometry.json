@@ -1,0 +1,209 @@
+{
+  "schema": "imx296-chart-v2",
+  "sheet": "03_detail",
+  "title": "DETAIL / DENOISING TRADE-OFF",
+  "paper_mm": [
+    297,
+    210
+  ],
+  "coordinate_system": "top-left; x right, y down; mm",
+  "colour_reference": "nominal sRGB artwork only, NOT measured print reflectance",
+  "dictionary": "DICT_4X4_50",
+  "marker_order": "TL, TR, BR, BL; upright",
+  "markers": [
+    {
+      "id": 18,
+      "rect_mm": [
+        10,
+        10,
+        26,
+        26
+      ]
+    },
+    {
+      "id": 19,
+      "rect_mm": [
+        261,
+        10,
+        26,
+        26
+      ]
+    },
+    {
+      "id": 20,
+      "rect_mm": [
+        261,
+        174,
+        26,
+        26
+      ]
+    },
+    {
+      "id": 21,
+      "rect_mm": [
+        10,
+        174,
+        26,
+        26
+      ]
+    }
+  ],
+  "scale_bar_mm": [
+    98.5,
+    193,
+    100
+  ],
+  "patches": [],
+  "edges": [
+    {
+      "id": "E1",
+      "orientation": "vertical",
+      "angle_from_axis_deg": 5,
+      "polarity": 1,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        48,
+        43,
+        88,
+        48
+      ],
+      "roi_mm": [
+        70,
+        53,
+        44,
+        28
+      ]
+    },
+    {
+      "id": "E2",
+      "orientation": "horizontal",
+      "angle_from_axis_deg": 5,
+      "polarity": 1,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        161,
+        43,
+        88,
+        48
+      ],
+      "roi_mm": [
+        183,
+        53,
+        44,
+        28
+      ]
+    },
+    {
+      "id": "E3",
+      "orientation": "vertical",
+      "angle_from_axis_deg": 5,
+      "polarity": -1,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        48,
+        105,
+        88,
+        48
+      ],
+      "roi_mm": [
+        70,
+        115,
+        44,
+        28
+      ]
+    },
+    {
+      "id": "E4",
+      "orientation": "horizontal",
+      "angle_from_axis_deg": 5,
+      "polarity": -1,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        161,
+        105,
+        88,
+        48
+      ],
+      "roi_mm": [
+        183,
+        115,
+        44,
+        28
+      ]
+    }
+  ],
+  "textures": [
+    {
+      "id": "T1",
+      "kind": "checker",
+      "period_mm": 4,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        48,
+        167,
+        45,
+        15
+      ]
+    },
+    {
+      "id": "T2",
+      "kind": "checker",
+      "period_mm": 2,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        99,
+        167,
+        45,
+        15
+      ]
+    },
+    {
+      "id": "T3",
+      "kind": "checker",
+      "period_mm": 1,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        150,
+        167,
+        45,
+        15
+      ]
+    },
+    {
+      "id": "T4",
+      "kind": "checker",
+      "period_mm": 0.5,
+      "nominal_srgb": [
+        96,
+        180
+      ],
+      "rect_mm": [
+        201,
+        167,
+        45,
+        15
+      ]
+    }
+  ]
+}
