@@ -1,4 +1,411 @@
-# Handover — branch `camera`, 2026-10-07 (v2 CSI chart/analyser added; live chart and measured-drive validation pending)
+# Handover — branch `camera`, 2026-10-10
+
+This file has three parts:
+- **Start here:** the rig as it is now, the state of every workstream, and the open work in priority order.
+- **Reference:** who does what, the environment, the tests, a rig procedure and the code backlog.
+- **Log:** dated sections, newest first, kept as written at the time. Later corrections are marked inline. Where a log
+  section disagrees with Start here, Start here is current.
+
+# Start here (2026-10-10)
+
+## The rig now
+
+| Item | State |
+|---|---|
+| **Attached now** (boot of 2026-10-09 16:00, checked 2026-10-10 07:53) | **No camera and no MCU is attached.** The IMX296 failed to probe (`imx296 9-001a: 8-bit write to 0x3000 failed: -121`, no I2C acknowledge: on 2026-10-03 the same error was a loose ribbon). There is no `/dev/video*` and no `/dev/serial/by-id`; `lsusb` shows only the Bluetooth radio, so the UGREEN, MKR and C3 are unplugged. Reseat or reconnect everything, power-cycle, and check `csi_test 0` before relying on anything below. |
+| Platform | L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra, UEFI 36.5.2 (upgraded 2026-10-01). The 65 NVIDIA packages are held. |
+| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). |
+| UGREEN | `/dev/video1` when attached, pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. |
+| v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). The newest build is `bin/build_20261003_135326`. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on and logs at 16 MB × 8. |
+| MKR Zero | Production raw-CAN build (`3a702a8`). It boots into DISCOVER: listen-only, accept-all, raw `F`/`FS` lines on native USB, no decode. |
+| ESP32-C3 | Bridge firmware 1.0; `HostProtocol` and `CommProtocol` are at 0x07. |
+| Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. |
+| Storage | `/media/jetson/backup` sits on the root NVMe: 428 GB free. |
+| Uncommitted | `lib/liblidartracking/`, `lib/libstereoprototype/`, `peripherals/mkr_zero/libraries/GRF250/` and `peripherals/mkr_zero/helper_scripts/GRF250Bridge/` (see the 2026-10-09 log section). |
+
+## Workstreams
+
+| Workstream | Commits | State | Next |
+|---|---|---|---|
+| v0.4 recorder (UGREEN) | `7293abe` and earlier | Segmented MJPEG passthrough, auto night mode, fixed focus, every telemetry field in the `.ass` and in CSV. The 2026-10-03 night drive recorded cleanly, with 0 warnings while driving. | Start the service before a drive. |
+| UGREEN image | — | Fixed 690 is verified, and autofocus also works (parked). Night blur is exposure (33–50 ms at 20 fps), not focus. 45% of night driving frames are below luma 35. | Autofocus while driving is untested; an exposure A/B is optional. |
+| CSI IMX296 | — (driver and ISP files live outside the repo) | c8_sh15 is clean indoors. At night it is gain-limited by the device tree: noisy and banded on unlit roads, 18.3 MB/s. The mount moved during the drive. | Re-mount; device-tree gain/exposure A/B; drop the driver's DEBUG define. |
+| MKR raw CAN over USB | `3a702a8`, `9b5c00e` | Bench-proven: 0 loss at 2400 and 4400 fr/s. The production build is on the MKR. Orin logger and offline decoder in `peripherals/mkr_zero/tools/canstream/`. | In-car loss test. |
+| Turning demo, dead reckoning, EKF | `cd89438`, `8838ead` | Read-only demo plus a C++ library. Synthetic and decoder-parity tests only. | Measure `antenna_x_m`; run the measured course. |
+| IMX296 v2 chart | `7e45172` | Offline analyser; synthetic tests only. | Print it, capture, validate live. |
+| GRF-250 ranging | uncommitted | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
+| Stereo prototype | uncommitted | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
+| IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running; High-G 64 on the night drive. | Wiring rework; the parked block test. |
+
+## Open work, in priority order
+
+1. **Before the next drive:**
+   - reconnect the UGREEN, MKR and C3, reseat the CSI ribbon, power-cycle; check `csi_test 0` 5/5 and the
+     `/dev/v4l/by-id` and `/dev/serial/by-id` entries;
+   - start `dashcam-v04` (or reboot);
+   - re-mount the CSI rigidly: it moved at 22:20:13 on 2026-10-03. Level it within 2°, keep the dashboard to at most
+     30% of the frame, and take reference frames before and after the drive;
+   - decide whether to re-arm the drive crontab. Keep the CSI recording as long as v0.4 runs: on 2026-10-03 it missed
+     the last 13 min because the session was stopped too early.
+2. **In-car raw-CAN loss test:** parked, engine on, about 10 min, against the CANRawLog baseline (≥ 0.4%).
+3. **CSI night quality** (needs the user's sudo):
+   - device-tree A/B: `max_gain_val` 300–480 and `max_exp_time` about 1500 lines;
+   - then drop `#define DEBUG 1` and rebuild with `~/drive_logs/tools/imx296_driver/build.sh`.
+4. **Finish the night-drive check a power cut stopped:**
+   - the CSI mount over the whole drive;
+   - the MKR `master_ms` drift. The −1283 ppm figure is implausible for a crystal-locked SAMD21. The EKF log
+     section's clock break (0.078 s host vs 5.211 s master) may be related.
+5. **Turning EKF:** measure the rear-axle-centre-to-antenna distance, then run the measured private course with a
+   passenger.
+6. **GRF-250:** verify the converter's IC and levels before wiring (the MKR is not 5 V tolerant), then bench the
+   sensor.
+7. **IMX296 v2 chart:** print it, write an acquisition helper, capture.
+8. **Smaller items:**
+   - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
+   - `drive_watch.sh` should watch `can_raw.log` growth;
+   - the logger's queue grows without bound under a disk that hangs;
+   - the High-G events against the footage, and CAN speed against GNSS speed;
+   - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
+   - item U with a replug, and the optional item O step (both need sudo).
+9. **Code backlog:** see "Backlog: deliberately not done" under Reference.
+
+# Reference
+
+## Who does what: read before handing work across
+
+Two coders work on this branch:
+- The **cloud session** runs in a virtual machine that holds this repository and nothing else. It started this file; Jetson sessions add to it.
+- The **Jetson coder** works on the Jetson, with the MKR rig, the camera and the car.
+
+**What the cloud session cannot do:**
+- **Touch hardware.** It has no MKR Zero, BNO055, GNSS, MCP2515 or CAN bus, ESP32-C3, UGREEN camera, Jetson GPU,
+  serial console or car. It cannot flash or run firmware, watch a console, measure a line, look at footage or
+  drive.
+- **See what happened on the car.** It sees the car's logs, the SD card, the deployed `/user/output` configs and
+  the Jetson's files only when someone commits them or pastes them into the conversation.
+- **Build or run anything that needs CUDA or a camera.**
+  - CUDA: `liblanedetector` and `libdriverstate`, and so `dashcam_v0_2` and `dashcam_v0_3`, do not build there.
+  - Camera: `record_test` Part B, `csi_test` and `usb_test` cannot run. `camera_gst_test` covers the GStreamer
+    camera class over videotestsrc, but not v4l2src or Argus themselves.
+- **Build the binary you flash.** It compiles the MKR firmware with GCC 13.2 against the core cloned from git
+  (recipe below), not with the Jetson's 7.2.1. That is a compile check, not the shipped image. It has not built
+  the ESP32-C3 firmware at all; only the C3 host tests run there.
+- **Know timing or electrical behaviour.** Anything at register level (bus states, clock stretching, what a glitch
+  does) is reasoned from the datasheet and stays a hypothesis until the rig runs it. `1e93aeb` is exactly that
+  case.
+- **Keep anything between sessions.** The machine is rebuilt every session: installed toolchains are gone, and
+  only pushed commits survive.
+- **Count on the network.** `downloads.arduino.cc` is blocked. GitHub and apt worked on 2026-09-27, but that
+  depends on the environment's settings, not on anything the session controls.
+
+**Cloud sessions, this one included, leave hardware tests to the Jetson coder.**
+- Deliver the code, the host tests, and the rig procedure: which test, which command, what a pass looks like, and
+  what each failure means.
+- Never report a hardware result that nobody measured.
+- Mark every change that still needs the rig as "not run on hardware" in the status table.
+
+**Jetson coder: be careful what you hand to a cloud session.**
+- Give it work it can finish and check by itself: code with host tests, reviews, refactors, docs and compile checks.
+  Do not ask it to flash, measure, run on the car or check footage.
+- Put the hardware facts it needs into the handover: console lines, test output, measured numbers, failure
+  records. It cannot go and look for them.
+- Treat its firmware changes as unproven until you have run them. It compiled them with a different compiler, and
+  none of that code has run on a real bus.
+
+## Environment (the Jetson rig, as of 2026-10-10)
+
+Collected from the machine, not from memory: `/etc/nv_tegra_release`, `dpkg-query`, `arduino-cli core/lib list`,
+and the tools' own `--version`. Re-collect after an upgrade.
+
+**Hardware**
+- **Jetson:** NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super. 6 cores, 7.4 GB RAM, 937 GB NVMe
+  root. No RTC coin cell, so the clock comes from NTP or GPS. It runs on **its own battery** in the car.
+- **CSI camera:** IMX296LQ (colour, global shutter, 1456×1088 @ 60) in **CAM1** (`i2c-9`, `serial_c`), `/dev/video0`,
+  Argus sensor-id 0. Driver rebuilt from the vendor source for 5.15.199 (`~/drive_logs/tools/imx296_driver/`);
+  overlay `imx296-cam1.dtbo`. No IMX219 is connected.
+- **Camera:** UGREEN Camera 4K, USB UVC, `eba4:6579`, `/dev/video1` since the CSI camera came back. It records
+  1080p30 MJPEG (`FormatIndex 4`), pinned by `/dev/v4l/by-id`. Controls are standard UVC only (focus, exposure,
+  gain, backlight compensation). Frames from the evening of 2026-09-26 are upright.
+- **Telemetry master:** Arduino MKR Zero (SAMD21G18A), **powered from the car's OBD2 port**. Its native USB to the
+  Jetson carries the raw CAN stream and the console.
+  - **CAN:** MKR CAN Shield, an MCP2515 with a 16 MHz crystal, 500 kbit/s, sniffing the Honda Brio (map `brio`,
+    id 0x0B, on the SD card).
+  - **I2C:** at 400 kHz. BNO055 IMU at 0x29 on a **breadboard**, INT pin not wired. SparkFun u-blox GNSS at 0x42
+    over ESLOV.
+  - **SD card:** on SPI1, holding the CAN map and the IMU calibration profile.
+- **Bridge:** Seeed XIAO ESP32-C3. It talks to the MKR over UART1 at 115200 and to the Jetson over native USB CDC.
+
+**Jetson host**
+- JetPack 6.2.3 (`nvidia-jetpack 6.2.3+b81`), L4T R36.5.2 (`/etc/nv_tegra_release` R36 REVISION 5.2), kernel
+  5.15.199-tegra, Ubuntu 22.04.5 LTS. UEFI `36.5.2-gcid-46426093`. Upgraded 2026-10-01; the 65 NVIDIA packages are on
+  `apt-mark hold`. Rollback and upgrade tools: `~/drive_logs/tools/` (2026-10-01 log section).
+- CUDA 12.6.11, TensorRT 10.3.0.30 (`libnvinfer10`, built for CUDA 12.5), cuDNN 9.3.0.75, VPI 3.2.4, GCC 11.4.0,
+  Python 3.10.12.
+- GStreamer 1.20.3, v4l-utils 1.22.1, Docker 29.9.0.
+- `nvargus-daemon` is active. `csi-driver.service` (installed 2026-10-03) reloads `imx296` after Argus starts;
+  the vendor's `imx296-reload.service` is disabled. The boot entry is `DEFAULT JetsonIO` with `imx296-cam1.dtbo`.
+  A kernel package change resets `DEFAULT` to `primary` (nv-update-extlinux); set it back afterwards. The v0.4
+  container does not mount `/tmp/argus_socket`, so its start log still shows two harmless
+  `(Argus) Error FileOperationFailed` lines (`Connecting to nvargus-daemon failed`, then
+  `Cannot create camera provider`).
+- ISP override `/var/nvidia/nvcam/settings/camera_overrides.isp` = `c8_sh15.isp` (sha256 `43ec0c81…`).
+- Host Python's `cv2` is broken (NumPy mismatch). Use the container; do not change system Python packages.
+
+**Dev container** `l4t-ml-gpio:latest`
+- Built 2026-09-25 from `docker_dev/Dockerfile`, base `dustynv/l4t-ml:r36.4.0`. The repo is mounted at
+  `/user/dashcam`. It builds everything: plain `make` gives a timestamped `bin/build_<ts>/`.
+- GCC 11.4.0, Python 3.10.12, CUDA 12.6 (nvcc), OpenCV 4.10.0-dev, NumPy 1.26.4, PyTorch 2.6.0, GStreamer 1.20.3.
+- spdlog 1.9.2, fmt 8.1.1, pugixml 1.12.1, pyserial 3.5.
+
+**Firmware toolchains (inside the container)**
+- **arduino-cli:** 1.5.1.
+- **MKR Zero:**
+  - Core `arduino:samd` **1.8.14**, pinned; `check_core.sh` refuses anything else. On aarch64 it is installed by
+    `docker_dev/install_samd_aarch64.py`, because arduino-cli cannot install it there.
+  - arm-none-eabi-gcc **7.2.1** (package `7-2017q4`), CMSIS 4.5.0, CMSIS-Atmel 1.2.0, bossac 1.7.0-arduino3.
+  - Build and flash with `peripherals/mkr_zero/build_and_upload.sh [auto] [amg]`.
+- **ESP32-C3:**
+  - Core `esp32:esp32` **3.2.0**, esptool 5.4.0.
+  - FQBN `esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app,CPUFreq=160,FlashMode=qio,FlashFreq=80,FlashSize=4M,DebugLevel=none,UploadSpeed=921600`.
+- **Arduino libraries**, pinned in the Dockerfile and installed `--no-deps`:
+  - Time 1.6.1
+  - SparkFun u-blox GNSS Arduino Library 2.2.29
+  - Servo 1.3.0
+  - RTCZero 1.6.0
+  - Adafruit BusIO 1.17.4
+  - Adafruit GFX Library 1.12.6
+  - Adafruit SSD1306 2.5.17
+  - Adafruit LED Backpack Library 1.5.1
+- **Vendored** in `peripherals/mkr_zero/vendor`:
+  - Wire: the arduino:samd 1.8.14 copy, patched with the `busOwner` fix, bounded transfers and bus errors. See its
+    README.
+  - CAN 0.3.1, patched.
+  - SdFat 2.3.1.
+  - BNO055 1.2.1.
+
+**Protocol and firmware versions**
+- MKR↔C3 `CommProtocol` and C3↔Jetson `HostProtocol` are both at version **0x07** (180-byte telemetry payload).
+- The C3 bridge firmware reports **1.0**.
+- The MKR production image is the raw-CAN build (`3a702a8`): DISCOVER at boot, 123,236 B flash, 23,924 B RAM.
+- `dashcam-v04.service` runs the newest `bin/build_*/dashcam_v0_4` it finds at start.
+
+**Where the cloud sandbox differs** (see "Cloud sessions" above): arm-none-eabi-gcc 13.2 and host g++ 13 instead of
+7.2.1 and 11.4.0, no CUDA, and no hardware.
+
+## Tests
+
+```bash
+make -C peripherals/mkr_zero/tests/host check        # 11 suites: switch, imu, can_probe, bno_init, can_ring, can_drain,
+                                                     #   can_telemetry, can_stream, can_selftest, port, sketch policy
+make -C peripherals/mkr_zero/tests/host mutations    # 102 mutants, all must be caught
+make -C peripherals/esp32-c3/tests/host check        # bridge 79
+make                                                 # every target, inside the l4t-ml-gpio container
+B=$(ls -td bin/build_* | head -1)                    # the build just made; run from the repo root
+$B/dashcam_v0_4 --self-test && $B/config_test && $B/bridge_overlay_test
+$B/camera_gst_test [name]                            # Camera_GST over videotestsrc: no camera needed
+$B/focus_test                                        # the fixed-focus hold against a simulated camera
+$B/usb_test --self-test                              # usb_test's stop-and-restore path on a simulated camera
+docker_dev/test_csi_driver.sh                        # csi_driver.sh against stubs (123 checks)
+docker_dev/csi_driver.sh check                       # on the Jetson, read-only: the IMX296 module vs the running kernel
+$B/commlink_sim_test                                 # CommLink + libuart against a simulated C3 on a pty: no hardware
+$B/commlink_test --by-id 30                          # the real C3 bridge, by-id only as v0.4 (stop dashcam-v04 first)
+$B/commlink_test "" 30                               # auto-discover with the ttyACM fallback
+$B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
+$B/usb_test                                          # a USB camera (stop dashcam-v04 first); puts its controls back
+$B/scan_cameras                                      # lists the cameras, their controls and formats
+make -C peripherals/mkr_zero/tools/canstream check   # raw-CAN logger, converter, decoder, contract, turning + fusion (~2 min; container)
+make -C lib/libdeadreckoning check                   # dead-reckoning library (55 checks); `sanitize` for ASan/UBSan
+make -C lib/liblidartracking test                    # GRF-250 parser/FSM + Orin association library (container for camera tests)
+make -C lib/libstereoprototype test                  # stereo feasibility prototype (container)
+tools/isp_tuning/chart/v2/run_calibration.sh ...     # v2 chart analyser; tests: test_calibrate.py in the container (CALIBRATION.md)
+bash ~/drive_logs/tools/verify_platform.sh           # on the Jetson, not in the container: after a platform change
+bash ~/drive_logs/tools/test_l4t_checks.sh           # on the Jetson: the pre-reboot checks of the upgrade/rollback
+```
+
+`usb_test` puts brightness, gain and backlight_compensation back as found (`782bdfd`). It passed on the Jetson on
+2026-09-28 and again on 2026-09-30, with an empty before/after `--list-ctrls` diff. To check by hand, diff
+`v4l2-ctl -d /dev/v4l/by-id/usb-Image+_UGREEN_Camera_4K_LL-0000000001-video-index0 --list-ctrls` before and after the
+run: `/dev/video0` is the IMX296 now.
+
+The Wire changes have no host test: they are register-level SAMD21 code, proven only on the rig
+(BusFaultInjection). Running that is the Jetson coder's job.
+
+Where each test can run:
+- **Anywhere, cloud included:** the host suites, `mutations`, `--self-test`, `config_test`,
+  `bridge_overlay_test`, `camera_gst_test`, `focus_test`, `usb_test --self-test`, `commlink_sim_test`,
+  `test_csi_driver.sh` and `record_test` Part A.
+- **Jetson only:** CUDA targets, `record_test` Part B, `usb_test`, `csi_test`, `scan_cameras` (with a camera),
+  `commlink_test` (with the C3), `csi_driver.sh`, and everything on the rig or the car.
+
+## Rig procedure: the bus-error proof
+
+**Why.** The fault on this harness is contact that flickers, not a wedge. The 2026-09-26 corrupt reads came from
+breadboard contacts. On the SAMD21, a flicker that lands as a START or STOP mid-transfer is a **bus error**:
+
+- The controller sets BUSERR, ARBLOST and MB, never SB (SB means a byte received cleanly).
+- It then gives up the bus.
+
+`8ebb9be` copied the core's read, which accepts MB as a byte. It also kept the core's early "another master holds
+the bus" refusal. Two consequences follow from the datasheet's bus-state rules:
+
+- A glitch on a read's last byte returned a garbage byte at the full count.
+- A START with no STOP left the controller BUSY. Every later transfer was refused, both lines read idle, and
+  nothing was counted, so `i2cBusBegin()` never recovered. The IMU and GNSS would stay down until a power cycle.
+
+`1e93aeb` treats all of these as bus errors (see `vendor/Wire/README.md`, "Bus errors"). It compiles for both
+variants with no warnings in project code, but no glitch has been injected yet.
+
+**Run it.** Build the helper instrumented and flash it, from the host:
+
+```bash
+docker run --rm --privileged -v /dev:/dev -v ~/dashcam:/user/dashcam l4t-ml-gpio:latest \
+  /user/dashcam/peripherals/mkr_zero/helper_scripts/BusFaultInjection/build_and_upload.sh auto
+```
+
+Then send `a` on the console.
+
+- **Expected: 15 of 15.** T0–T6b as on 2026-09-27, plus C7, T7, T8, T9 and T9b.
+- **T1b** should now report `endTransmission=4 ... bus errors +1`, not `2`. A slave holding SDA low makes the address
+  phase lose arbitration, which is now a bus error. It still passes (the check is only `rc != 0`).
+- **C7** (stock path) must show the bus Ready 3/3 and CHIP_ID failing 3/3. That is the dead bus. If it fails, the
+  stock driver recovered by itself, and that premise was wrong on this silicon. The fix still holds; it just
+  mattered less.
+- **T7/T8:** one bus error, fast, then CHIP_ID `0xA0` and the GNSS answer, with no manual recovery.
+- **T9/T9b:** SDA is pulled low under a high SCL mid-read. Expect 0 bytes and one bus error, then recovery. If it
+  fails with `got 64 bytes, bus errors +0`, the controller did not flag that glitch, which is a hardware limit and
+  not something Wire can see.
+- **`SKIP` lines:** a test whose premise did not reproduce. For example, T7 did not reach BUSY, or T9 caught no high
+  SCL with SDA released. Say which, and rerun once.
+
+After the run, re-flash production (`peripherals/mkr_zero/build_and_upload.sh auto`, plus `amg` if used). At rest
+the console should read `i2cto=0 i2cerr=0`.
+
+**Also.** Fix the harness wiring (solder or crimp the I2C lines). The firmware now contains both a wedge and a
+glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the rework measures that directly.
+
+## Cloud sessions: compile-checking the MKR firmware
+
+This is a compile check only (see "Who does what"). The sandbox blocks `downloads.arduino.cc`, so the toolchain is
+put together from GitHub and apt, and has to be rebuilt every session (a few minutes). `1e93aeb` was
+compile-checked from these parts:
+
+- **Toolchain:** apt `gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib`, i.e. GCC 13.2.
+  The Jetson builds with 7.2.1, so image sizes differ (130,676 B here); this is a compile check, not the flashed
+  binary.
+- **Core:** `arduino/ArduinoCore-samd` at tag `1.8.14`, with `api` symlinked from `arduino/ArduinoCore-API`.
+- **CMSIS:** `ARM-software/CMSIS_5` (sparse checkout of `CMSIS/Core/Include`, served as `CMSIS/Include`), plus
+  `arduino/ArduinoModule-CMSIS-Atmel`. An empty `libarm_cortexM0l_math.a` satisfies the link.
+- **ctags:** `arduino/ctags` built from source, after renaming its `__unused__` / `__printf__` macros, which clash
+  with glibc.
+- **arduino-cli:** from its GitHub release.
+- **Libraries:** the eight from `docker_dev/Dockerfile`, each at its tag.
+- **Build:** `arduino-cli compile` with `ARDUINO_DIRECTORIES_USER` pointing at a sketchbook whose
+  `hardware/arduino/samd` is the core, and `--build-property runtime.tools.{arm-none-eabi-gcc-7-2017q4,CMSIS-4.5.0,CMSIS-Atmel-1.2.0,ctags}.path=...`.
+  A wrapper that adds those flags to `compile` lets `build_and_upload.sh` itself run unmodified.
+
+## Backlog: deliberately not done
+
+- **v0.3 overlay:** it keeps its own copy of the bridge→overlay rules. On a fix without altitude it shows the last
+  altitude, or the 52.3 m placeholder. v0.4 uses `src/bridge_overlay.h`. Skipped on request.
+- **Unused libraries:** `libstereocam` and `libsigndetector` are in the tree, but no target builds them.
+- **Seen during the libcamera pass, left for the next libraries:**
+  - `libcan.cpp:319` and `libgpio.cpp:311` ignore `read()`'s return (the only two warnings in the build).
+  - `Camera_GST::getCameraStatus()` drains the bus through a `const_cast` (it works, but it is a smell).
+  - `cameraAttribute` stores control ranges as `float`, which is lossy past 2^24 (no such control on the UGREEN).
+- **Proposed after the libcommlink pass, not done** (each changes behaviour on the car, so it is the user's call):
+  - **Back off after a failed handshake.**
+    - Today a bridge on the wrong firmware, or a silent device, is reopened every reconnectMs + handshakeMs
+      (about 3 s) forever.
+    - Each round logs about four lines. v0.4's `quietRepeats` demotes the repeats to DEBUG, but DEBUG is the default
+      level, so the log file still grows.
+    - Proposal: double the interval per consecutive handshake failure, capped at about 30 s, and reset it on a
+      compatible HELLO. It would slow reconnecting to a bridge that was just reflashed by up to the cap.
+  - **Twelve more libraries** keep their own truncating `doLog()`: libcan, libconfig, libdriverstate, libgpio (x2),
+    libi2c, liblanedetector, libmidi, librecord (x2), libspi and libstereocam. Switch each to `logPrintf()` in its
+    own pass.
+  - **`Uart::readLine()`** costs a poll and a read per character. That is fine for `gpio_test`'s NMEA; buffer it if
+    a real consumer appears.
+- **Proposed after the review fixes, not done:**
+  - **Item F, properly:** check a USB V4L2 control against the device (`VIDIOC_QUERYCTRL` / `QUERYMENU` on the node,
+    by its normalised name) and report `INVALID_ATTRIBUTE` for a missing control or an out-of-range value. Today
+    the driver clamps silently.
+  - **A branch that stalls the tee stops every branch.** Recording branches use blocking queues so no frame is
+    dropped; one stuck sink (an SD card stalling) starves the others, and at shutdown none is finalised. A leaky
+    recording queue, or a per-branch watchdog, trades that for dropped frames. It is a design decision; no app on
+    the car uses a blocking branch today.
+
+# Log (newest first)
+
+## 2026-10-09 (Orin): separate GRF-250 / IMX296 ranging prototype
+
+User ordered GRF-250, requested an RS-422 link through MKR and a separate
+single-pan-servo interface; subsequently supplied a photo of the **3.3 V variant**
+of the converter board and plans an **encoder-equipped servo**. Stereo work is
+preserved, including the pre-existing untracked `lib/libstereoprototype/`.
+
+Implemented (uncommitted):
+
+- `lib/liblidartracking/`: Orin Python association library, optional OpenCV
+  rectification + COCO YOLOv8 ONNX detector adapter, bounded IoU tracks, explicit
+  target selection, conservative beam/ROI and timing gates, range/closing-speed
+  filter, CRC USB decoder, round-trip clock mapping, synthetic demo/JSONL replay.
+- `peripherals/mkr_zero/libraries/GRF250/`: portable heap-free C++ UART parser
+  and startup FSM, checked against the user's Rev3 guide and manufacturer Rev5.2.
+  Identifies device, reads firmware, writes/reads back raw first/last + strength,
+  lost count1, 20 Hz and stream5. Preserves lost-return sentinel. No flash-save,
+  sensor-reset/upgrade or laser-enable command. ID45 five-return layout remains
+  deliberately unsupported because the guides disagree on its byte count.
+- `peripherals/mkr_zero/helper_scripts/GRF250Bridge/`: **bench-only replacement
+  sketch**, SERCOM0 A3/D18 TX and A6/D21 RX (ALT, pad0/pad3). Serial1/C3 and
+  A4/A5 servo reservations untouched. Bounded USB writes, sample sequence and
+  micros stamps, nonce clock replies and 1 Hz firmware/health counters. No
+  production scheduler/USB mux changes.
+- `ServoPort` interface only: pan requests expire; measured encoder angle,
+  angular-error bound and observed settled interval must cover the acquisition
+  interval. No PWM/motor control or simulated feedback in hardware paths.
+- Wiring, protocol contracts, limitations and staged bench/calibration procedure
+  in `lib/liblidartracking/README.md`; placeholder calibration is fail-closed.
+
+Verification:
+
+- Existing `l4t-ml-gpio:latest` container: 36 Python tests passed, including
+  real OpenCV preprocessing/rectification with injected model predictions and
+  a real POSIX tty path against a pseudo-terminal. C++ protocol/FSM tests pass
+  with `-Wall -Wextra -Wpedantic -Werror`, including 100000 noise bytes,
+  single-bit frame mutations and configuration mismatch rejection. GCC static
+  `-fanalyzer` also passed.
+- Host and container C++ AddressSanitizer + UBSan passed. Host non-camera tests pass; camera
+  tests skip because the existing host cv2 / NumPy2 ABI mismatch persists.
+  Do not change system Python packages to address this task; use the container.
+- Arduino SAMD 1.8.14 compile-only, warnings all: 14892 bytes flash / 3096 bytes
+  globals. No new warnings. Existing stereo suite: 30/30 passed in container.
+- No physical LiDAR, encoder, actual ONNX model inference or moving-vehicle
+  ranging tested. No ±1 m at 100 m validation. No hardware flash, service stop,
+  camera ownership change, commit or push performed.
+
+Important next steps / electrical blockers:
+
+1. **Verify converter IC and levels before wiring.** Photo labels A/R+, B/R-,
+   Y/T+, Z/T- show full duplex, but do not prove chip, level shifting or isolation.
+   Bare MAX490 is 5 V; a vendor's 3.3 V variant must use an appropriate transceiver
+   or level conversion. MKR inputs are NOT 5 V tolerant. Verify DI/RO rather than
+   trusting ambiguous TXD/RXD silk/arrows. GRF is TTL UART: use a transceiver at
+   **both** ends of the external RS-422 cable. Separate sensor/servo power.
+2. **Do not flash this helper over production telemetry casually.** It replaces
+   CAN/IMU/GPS. Native MKR USB is already the raw-CAN production path. A future
+   integration must add LiDAR records to the existing single reader/mux, health
+   and boot-epoch reporting, and scheduler/watchdog budget tests; no second tty
+   reader. The C3/host protocol is unchanged.
+3. Bench-verify delivered sensor firmware, cm units, raw bytes, sentinel, latency,
+   power and serial recovery. Measure camera intrinsics/mount/pan geometry and
+   encoder backlash. Sensor reception time is NOT acquisition time: unknown
+   latency bounds invalidate association. Encoder must report an observed stable
+   interval, not commanded position or a future promise.
+4. Calibrate and validate against measured static and then controlled moving
+   targets. Bounding boxes are not object masks; IoU is not guaranteed identity.
+   A horizontal servo cannot fix pitch/vertical mismatch. Defaults reject bad
+   alignment, target ambiguity, distinct first/last returns and stale data.
+   Results expire; consumers must clear them on expiry or transport loss.
 
 ## 2026-10-07 (Orin): IMX296 v2 chart and offline calibration analyser
 
@@ -216,33 +623,6 @@ user's request; raw captures and ignored build outputs stay local.
    the root Makefile also probes unrelated app packages (`pugixml`, `spdlog`)
    absent on the host, producing warnings even though the standalone test passes.
 
-## Where things stand
-
-| Item | Commit | Status | Still needs |
-|---|---|---|---|
-| Platform | — | **Upgraded to L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra on 2026-10-01; UEFI also 36.5.2.** Existing 16:18 verification log: 24 PASS, 0 FAIL, 1 SKIP; all 65 target packages at target versions and held. See the evening update below. | `usb_test` was skipped while the recorder owned the USB camera; evening paired USB captures succeeded, but do not substitute for that full test. |
-| IMX296 driver for any kernel | — | Rebuilt from the vendor's source plus FRC 971's mode table; 41/41 CRCs match 36.5.2. **Now loaded and hardware-tested on 5.15.199:** platform log has `csi_test` 5/5, CSI RTP and Camera_GST PASS; evening tuning captured from the IMX296 through Argus. Build/upgrade/rollback tools remain outside the repo in `/home/jetson/drive_logs/tools/`. | The 2026-10-03 probe failure (`-121`, no I2C ACK) was a loose ribbon, fixed by a reseat. Road-use validation is still open. |
-| CSI image tuning | — | **c8_sh15 is installed (2026-10-02 06:53, verified live)**: c5_rpi100T's colour (black level 50 + the IMX296 colour matrix the vendor file had transposed) plus the sharpness table set to its weakest index, so the ISP's default output matches ee-mode=0. The c7 A/B brings it closer to the USB camera (ΔE 11.7 → 6.7 once the CSI JPEGs are decoded correctly; first reported as 8.56 → 4.79). A review found that gain is mostly in-sample and about zero against the chart's own values, so **do not install c7 as it is**. The app sets no CSI properties, and with c8_sh15 that default is now clean (no halos). Details in "Review of the c7 work" and the c8 sections below. | A daylight A/B (`--auto`) before calling it production; the CSI saturation in the app's config. |
-| High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
-| CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
-| Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
-| I2C hang | `8ebb9be` | `vendor/Wire` bounds every bus wait at 25 ms. On expiry it resets the SERCOM, and `i2cBusBegin()` recovers the bus. Proven on the rig: BusFaultInjection 10/10, twice. The control run hung until the watchdog. | — |
-| AMG mode | `7882f4e` | AMG came up broken: it restored the IMUPLUS calibration profile at ±16 g, which raises SYS_ERR 0x09. The profile is now restored, and saved, in fusion modes only. Verified on the rig. | — |
-| I2C bus errors | `1e93aeb` | A glitch that the controller sees as a START or STOP mid-transfer now fails that transfer, resets the controller, counts it (`i2cerr=`) and recovers the bus. Before, it returned a garbage byte as data, or left every later transfer refused while the lines read idle. **Proven on the rig 2026-09-27:** BusFaultInjection 15/15, twice (results below). Production flashed; `i2cto=0 i2cerr=0` at rest. | a drive: `i2cerr=` before and after the wiring rework |
-| Build scripts | `c232b6d` | `check_core.sh` holds the arduino:samd 1.8.14 check. `install_map.sh` and the BusFaultInjection script now apply it too. | — |
-| liblog | `07a61d4` | `liblog.h` includes `<cstdint>`, so the tree builds with GCC 13 without `-include cstdint`. | — |
-| libcamera: dependencies | `05f3075` | `AttributeDictionary` now lives in libcamera (`libcamera_attributes.cpp`); libconfig no longer includes libcamera. There is no behaviour change. | — |
-| libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The EINTR retry is defensive only: the apps install handlers with `std::signal`, which sets SA_RESTART, so it never fires on the Jetson. **Run on the Jetson 2026-09-28:** `scan_cameras` output is byte-identical to the previous build's, and v0.4 starts, records and stops as before (results below). | — |
-| libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. **Run on the Jetson 2026-09-28:** `camera_gst_test` passes on GStreamer 1.20.3. The fix for branches that start disabled works only when the sink sees GAP events directly, so not for this project's real branches (review item C, fixed in `f03a13f`). | — |
-| libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). A write is checked against the **element's** property type and range, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. That does not check the **device's** range: the driver clamps out-of-range USB values, and those still report NONE (review item F). **Run on the Jetson 2026-09-28:** `usb_test` Test 4b reads back every control it sets, and the CSI dictionary check passes. `usb_test` changes the camera's settings and leaves them changed (review item A, fixed in `782bdfd`). | — |
-| libcommlink: fixes | `68fcceb` | CommLink logged its port open/close lines with the port mutex held, so a log callback that asked the link anything deadlocked (latent; v0.4's does not). The bridge tty and the wake pipe are now close-on-exec (children such as `nmcli` inherited them). `typeName()` now names `CMD_SET_IMU_MODE` in both `HostProtocol.h` copies, which stay byte-identical; the wire is unchanged. Discovery keeps partial results when a node vanishes mid-scan. `Uart::read(0)` no longer makes two `fcntl()` calls per read. New `logPrintf()` in liblog replaces three private log helpers. | **Run on the Jetson 2026-09-28:** `commlink_test` recovers from a cable pull on the C3's by-id path (what v0.4 uses), and v0.4's bridge line is as before. Auto-discover mode fails on this rig, which predates the pass (item U). Items U, V fixed 2026-10-03; C3 runs pass, the replug check needs sudo. |
-| libbus | `5be7a5b` | `ibus.h` (the base of libuart, libspi and libi2c) moved from `lib/libgpio` to `lib/libbus`. There is no code change. | — |
-| CSI driver loader | `aa9deb1` | The Jetson's own IMX296 unit (`imx296-reload.service`) stopped nvargus-daemon, then failed at `modprobe -r imx296`, because 5.15.199-tegra has no imx296 module at all (only 5.15.185-tegra has one), and left Argus stopped (found by the 2026-09-28 review; corrected by the Jetson run). `docker_dev/csi_driver.sh` checks the module against the running kernel before touching Argus, and restarts Argus on every exit path; `csi-driver.service` (in the repo, not installed) would load it before Argus at boot. The script does not fix a kernel/module mismatch by itself: on 5.15.199 the module would have had to be rebuilt, and the 2026-09-30 rollback to 5.15.185 removed the mismatch instead. Host test: `test_csi_driver.sh`, 31 checks. | Not needed on R36.5.0: there, the vendor's `imx296-reload.service` works as intended (active since the rollback). **Items K–P fixed 2026-10-03.** `csi-driver.service` (the `reload` mode) is installed and enabled in place of the vendor unit; start/restart and `csi_test` 5/5 are checked. The first boot with it passed (2026-10-03 20:25: ordered after Argus, `Result=success`, `csi_test` 5/5). |
-| libcamera: review fixes | `f03a13f` | Shutdown is bounded when a branch stops consuming (it hung, reproduced on the Jetson) or the source's thread is stuck. A stream that ends reports ERROR (it stayed RUNNING). Branches that start disabled start (item C). frameCount restarts at `start()`. Items B, D, E, F (docs), G, H, J and both older races fixed. `camera_gst_test` 72 → 120 checks. | **Run on the Jetson 2026-09-28:** `camera_gst_test` PASS 14/14; the reviewer's shapes redone on the UGREEN. **2026-09-30 on CSI:** `csi_test` 5/5, `csi_rtp_test` PASS, and Camera_CSI stops no slower than before, with no WARN (below). Items Q–T fixed 2026-10-03; R confirmed on Argus (`csi_test` 5/5, `csi_rtp_test`, no WARN). |
-| usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Item Z fixed 2026-10-03, confirmed on the UGREEN. |
-| Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Items X, Y fixed 2026-10-03; X confirmed on the UGREEN. |
-| commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Item W fixed 2026-10-03. |
-
 ## 2026-10-06 (Jetson): night drive 2026-10-03 analysed: camera findings (analysis only, nothing changed)
 
 No code, config, device tree or firmware was changed. Proposals are at the end and are not done.
@@ -391,7 +771,7 @@ at 512 and blurred. That was wrong.
    `host_ms − master_ms`, against GPS time and the 2026-10-06 bench `can_sync.csv`). The script is at
    `~/.claude/projects/-home-jetson-Documents-github-repos-dashcam/9e99e416-de12-476d-85c1-eba06ce68c4d/workflows/scripts/night-drive-verify2-wf_527be524-0ac.js`.
 
-## 2026-10-06 (Jetson): raw CAN over the MKR's USB — implemented, reviewed, bench-proven (uncommitted)
+## 2026-10-06 (Jetson): raw CAN over the MKR's USB — implemented, reviewed, bench-proven (committed `3a702a8`)
 
 **Firmware** (`peripherals/mkr_zero`; workflows `wf_265592d8-b63` implement + `wf_1db52a87-ea3` adversarial review):
 - **Capture:** the TC3 timer ISR drains the MCP2515 every 100 µs into a 1024 × 16 B SPSC ring (`lib/CANFrameRing.h`,
@@ -458,13 +838,13 @@ at 512 and blurred. That was wrong.
   - boot banner captured ("reset cause 0x40", "CAN: mode -> discover");
   - 53,730 frames before the reset with 0 gaps.
 
-**Map facts from the baseline decode** (not yet reflected in the firmware or map comments):
+**Map facts from the baseline decode** (now in the `canmap.brio.txt` comments, `3a702a8`):
 - 0x294 is a steady stalk-position bit, not a ~1.5 Hz blinking lamp, so SNIFF's 900 ms hold only delays "off".
 - Hazards are not observable on this bus.
 
 **Still to do:**
 - The **in-car loss measurement** (parked, engine on, about 10 min) against the CANRawLog baseline (≥ 0.4 %).
-- Commit when the user asks.
+- ~~Commit when the user asks.~~ Committed and pushed (`3a702a8`, `9b5c00e`).
 - The drive crontab stays disarmed until the user re-arms it.
 
 ## 2026-10-04 00:25 (Jetson): raw CAN over the MKR's USB — decided, baseline captured, firmware NOT started yet
@@ -591,9 +971,10 @@ outside the repo (camera captures).
   - left indicator with |yaw| > 8 °/s: yaw positive in 213 of 219 samples; right indicator: negative in 192 of 197.
   - So the sign convention is right. The rare mismatches are real driving (signalling during an opposite curve).
 
-Still to analyse: the High-G events against the footage, and CAN speed against GNSS speed.
+Still to analyse: the High-G events against the footage, and CAN speed against GNSS speed. The cameras were
+analysed on 2026-10-06 (see that section; it corrects several numbers here).
 
-## 2026-10-03 21:10 (Jetson): rig prepared for the second drive, a night drive (code uncommitted)
+## 2026-10-03 21:10 (Jetson): rig prepared for the second drive, a night drive (code committed later in `7293abe`)
 
 The K–Z work is committed and pushed (`2de0578`). Then, for the drive:
 
@@ -700,7 +1081,7 @@ driver's range and the DT `max_exp_time`, not the ISP file. Look at it in the im
 - Pull `drive_sessions/session_NNN/`, `footage/` and `logs/` (`log_*`, `telemetry_*`, `bridge_status_*`).
 - Judge the CSI night tuning from `csi/` (decode with `csi_decode.read_bgr`: limited range).
 - Judge autofocus from `ugreen.csv` plus the footage.
-- Then decide whether to commit the telemetry work.
+- ~~Then decide whether to commit the telemetry work.~~ Committed (`7293abe`).
 
 ## Done 2026-10-03 (Jetson): items K–Z resolved
 
@@ -851,7 +1232,99 @@ The full agent reports are in `~/drive_logs/tools/kz_agent_reports_20261003.json
 - **The deployed v0.4 already runs this build.** The launcher starts the newest `bin/build_*/dashcam_v0_4`, and the
   20:25 boot started `bin/build_20261003_124421` (journal: "starting bin/build_20261003_124421/dashcam_v0_4").
 
-## 2026-10-01 evening (Jetson): CSI/USB chart tuning and current rig state
+## 2026-09-28 → 10-03: items K–Z from the Jetson run and a second review (all fixed 2026-10-03, see the section above)
+
+These come from the Jetson run plus a second 8-agent review of `68fcceb..1888a94`, where each finding went to a
+skeptic told to refute it. **Deployed v0.4 cannot reach any of them.** The letters continue from the first
+review's A–J.
+
+**CSI loader (`aa9deb1`): fix these before installing `csi-driver.service`.**
+- **K. The default module name is wrong.**
+  - `csi_driver.sh:39` and `csi-driver.service:31` default to `nv_imx296`; on this Jetson the module is `imx296`.
+    Shipped as is, the unit fails at every boot.
+  - Also correct the root-cause text in the script header (`csi_driver.sh:6-8`) and the unit
+    (`csi-driver.service:3-4`): on 5.15.199 the old unit failed at `modprobe -r`, and never loaded a 5.15.185
+    module. On 5.15.185 it works. (The status row is corrected.)
+- **L. Starting it by hand deadlocks.**
+  - The unit is `Type=oneshot`, which has no start timeout on this systemd (249), and `Before=nvargus-daemon`.
+  - With Argus active, `systemctl start` (or `restart`, or `enable --now`) makes the script stop Argus.
+  - Its EXIT trap then runs a blocking `systemctl start nvargus-daemon`, and that job waits for csi-driver's own
+    start job. Both hang, and Argus stays down. Boot is not affected, because Argus is not active yet.
+  - Fix: use `systemctl --no-block start` when running under systemd (`$INVOCATION_ID`).
+- **M. It is not a like-for-like replacement.**
+  - The vendor unit is a post-boot reload: `After=nvargus-daemon`, a 5 s sleep, `modprobe -r` plus `modprobe`, then
+    Argus restarted. It exists for a black screen when Argus starts before the sensor is ready.
+  - `imx296.conf` already loads the module at boot, so `csi-driver.service` would always find it loaded and do
+    nothing.
+  - Suggestion: a `reload` mode that checks first, then does what the vendor unit does, installed
+    `After=nvargus-daemon`. That also avoids L.
+- **N. The vermagic check can judge the wrong file.**
+  - It reads the first file by name order, so `kernel/` comes before `updates/`. That is not the file modprobe
+    loads. It also cannot tell when depmod has not run.
+  - Fix: use `modinfo -k "$KREL" -F filename "$MODULE"`.
+- **O. A failed Argus restart still exits 0.** If Argus cannot be started again, the script still exits 0.
+- **P. `test_csi_driver.sh` is not executable.** It is committed without the executable bit (mode 100644), but
+  the procedure and its own usage line run it directly.
+
+**Camera_GST (`f03a13f`).** These affect v0.2/v0.3 only; v0.4 does not use Camera_GST.
+- **Q. The shutdown bound does not cover a sink stuck in a syscall.**
+  - The branch flush runs on the calling thread, before the abandon timer starts.
+  - FLUSH_START needs the sink's preroll and stream locks. A filesink stuck in `write()` holds them: the SD-card
+    stall that the open list names.
+  - Fix: flush on a helper thread under the timer, or say in the header that the bound excludes this case. No app
+    has a blocking branch today.
+- **R. A false WARN after an early ERROR.**
+  - When an ERROR ends the EOS wait early (the Argus CANCELLED case), teardown flushes at once and logs
+    `EOS not delivered within <eosTimeoutMs> ms`. The time in that line is not the elapsed time, and nothing has
+    stalled.
+  - The CSI check expects normal stops to log no such WARN, so this matters when CSI is verified.
+  - Fix: after an ERROR, wait for the send until the deadline, and log the elapsed time.
+- **S. `stop()` overlaps with `close()` and `start()`.** This predates the pass, but the window is now longer.
+  - `stop()` reports OPEN before its longer teardown starts.
+  - A concurrent `close()` or `start()` then runs a second `teardownPipeline()`, which is not a no-op: it touches
+    the tee pads and the handles, and `teePads_` without the lock. The comment saying the second call "exits
+    immediately" is false.
+  - Fix: a `tearingDown_` flag that `close()` and `start()` wait on, or document that the three must not overlap.
+- **T. "Auto controls first" holds only for `start()`'s batch.**
+  - `camera_attributes.xml:21-22` states it without that qualification.
+  - A write while running carries only its own control, so `auto_exposure=1` must be set before
+    `exposure_time_absolute`.
+
+**libcommlink (`68fcceb`, `0f548d7`).**
+- **U. Discovery in fallback mode picks the wrong device after a replug** (measured above; it predates the pass).
+  - Fix the close: `tcflush(TCOFLUSH)` before `close()` in `Uart::close()`, or `closing_wait` NONE through
+    `TIOCSSERIAL` for ACM ports.
+  - Fix the order: try the by-id matches before rotating through fallback nodes, or reset the cursor when the list
+    changes.
+  - Give `commlink_test` a by-id-only option, or document that auto-discover fails on a rig with the MKR console
+    attached.
+  - The review judged v0.4 not exposed to the 30 s close: the C3's HWCDC ISR always drains the USB FIFO, so its
+    writes complete even if `loop()` hangs.
+- **V. A log call under `m_statsMtx`.** The malformed MSG_TELEMETRY path (`libcommlink.cpp:446-451`) calls the log
+  callback with that mutex held, so a callback that calls `stats()` deadlocks. It is the same class of bug 68fcceb
+  fixed for the port lock. v0.4's callback does not call `stats()`.
+- **W. `commlink_sim_test` discovery depends on pty numbers.**
+  - It expects name order, but `enumerate()` sorts the resolved `/dev/pts` paths as strings.
+  - So it fails when the two pty numbers straddle a power of ten, e.g. 9 and 10.
+  - Fix: sort the by-id entries by name, then resolve them.
+
+**Focus (`3e3dc4f`) and usb_test (`782bdfd`).**
+- **X. The stored manual position is not handed back.** For a camera found with autofocus on, restore the lens
+  position too, when it could be read: write it while autofocus is still off, then turn autofocus back on.
+- **Y. A failed rollback is not reported.**
+  - `libcamera_focus.cpp:75` ignores the rollback's result. If the lens write fails and autofocus cannot be turned
+    back on, autofocus stays off, while v0.4 logs "left to the camera".
+  - It needs two control writes in a row to fail with the camera still attached.
+- **Z. An aborted usb_test leaves the camera changed.** It restores the controls only when `main()` finishes, so
+  Ctrl-C or a crash leaves them changed. Fix: print the restore command at start, or set a signal flag checked
+  between tests.
+
+**Refuted by the skeptics, so not items:**
+- Attributes are not re-applied across `stop()`/`start()`. No contract promises that, and 5aa56fd behaved the same.
+- An abandoned pipeline holds the device. That is documented, and the source is wedged anyway.
+- The 30 s close in v0.4. See U.
+
+## 2026-10-01 evening → 10-02 (Jetson): CSI/USB chart tuning, c8_sh15 installed
 
 **Current state, not a deployment:** the user ran the privileged c7 A/B trial successfully. It restored
 `/var/nvidia/nvcam/settings/camera_overrides.isp` to **c5_rpi100T.isp** afterwards. The restore was verified by
@@ -1191,47 +1664,6 @@ Back to c5: the same command with `c5_rpi100T.isp`.
 | no properties | 1.09 | 19.5 % | 8.5 % | 1.07 | 263 KB |
 | ee-mode=0 | 1.07 | 21.2 % | 5.6 % | 1.10 | 266 KB |
 | c5, no properties (2026-10-01) | 0.38 | 83 % | 61 % | 3.29 | 469 KB |
-
-## Who does what: read before handing work across
-
-Two coders work on this branch:
-- The **cloud session** runs in a virtual machine that holds this repository and nothing else. It wrote this file.
-- The **Jetson coder** works on the Jetson, with the MKR rig, the camera and the car.
-
-**What the cloud session cannot do:**
-- **Touch hardware.** It has no MKR Zero, BNO055, GNSS, MCP2515 or CAN bus, ESP32-C3, UGREEN camera, Jetson GPU,
-  serial console or car. It cannot flash or run firmware, watch a console, measure a line, look at footage or
-  drive.
-- **See what happened on the car.** It sees the car's logs, the SD card, the deployed `/user/output` configs and
-  the Jetson's files only when someone commits them or pastes them into the conversation.
-- **Build or run anything that needs CUDA or a camera.**
-  - CUDA: `liblanedetector` and `libdriverstate`, and so `dashcam_v0_2` and `dashcam_v0_3`, do not build there.
-  - Camera: `record_test` Part B, `csi_test` and `usb_test` cannot run. `camera_gst_test` covers the GStreamer
-    camera class over videotestsrc, but not v4l2src or Argus themselves.
-- **Build the binary you flash.** It compiles the MKR firmware with GCC 13.2 against the core cloned from git
-  (recipe below), not with the Jetson's 7.2.1. That is a compile check, not the shipped image. It has not built
-  the ESP32-C3 firmware at all; only the C3 host tests run there.
-- **Know timing or electrical behaviour.** Anything at register level (bus states, clock stretching, what a glitch
-  does) is reasoned from the datasheet and stays a hypothesis until the rig runs it. `1e93aeb` is exactly that
-  case.
-- **Keep anything between sessions.** The machine is rebuilt every session: installed toolchains are gone, and
-  only pushed commits survive.
-- **Count on the network.** `downloads.arduino.cc` is blocked. GitHub and apt worked on 2026-09-27, but that
-  depends on the environment's settings, not on anything the session controls.
-
-**Cloud sessions, this one included, leave hardware tests to the Jetson coder.**
-- Deliver the code, the host tests, and the rig procedure: which test, which command, what a pass looks like, and
-  what each failure means.
-- Never report a hardware result that nobody measured.
-- Mark every change that still needs the rig as "not run on hardware" in the status table.
-
-**Jetson coder: be careful what you hand to a cloud session.**
-- Give it work it can finish and check by itself: code with host tests, reviews, refactors, docs and compile checks.
-  Do not ask it to flash, measure, run on the car or check footage.
-- Put the hardware facts it needs into the handover: console lines, test output, measured numbers, failure
-  records. It cannot go and look for them.
-- Treat its firmware changes as unproven until you have run them. It compiled them with a different compiler, and
-  none of that code has run on a real bus.
 
 ## Done 2026-10-01 (Jetson coder): the IMX296 driver rebuilt from source, and tools to move between R36.5.0 and R36.5.2
 
@@ -1581,6 +2013,33 @@ before the fixes (`ef45a22`) and the current one:
 **Not run:** `commlink_test`. The MKR and the C3 were unplugged: no `/dev/serial/by-id` at all, and v0.4 logged
 "telemetry bridge (ESP32-C3) not present — retrying in the background". Plug them back in for the car.
 
+## 2026-09-27 → 10-03: status by commit (historical; the current state is under Start here)
+
+| Item | Commit | Status | Still needs |
+|---|---|---|---|
+| Platform | — | **Upgraded to L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra on 2026-10-01; UEFI also 36.5.2.** Existing 16:18 verification log: 24 PASS, 0 FAIL, 1 SKIP; all 65 target packages at target versions and held. See the 2026-10-01 evening section. | `usb_test` was skipped while the recorder owned the USB camera; evening paired USB captures succeeded, but do not substitute for that full test. |
+| IMX296 driver for any kernel | — | Rebuilt from the vendor's source plus FRC 971's mode table; 41/41 CRCs match 36.5.2. **Now loaded and hardware-tested on 5.15.199:** platform log has `csi_test` 5/5, CSI RTP and Camera_GST PASS; evening tuning captured from the IMX296 through Argus. Build/upgrade/rollback tools remain outside the repo in `/home/jetson/drive_logs/tools/`. | The 2026-10-03 probe failure (`-121`, no I2C ACK) was a loose ribbon, fixed by a reseat. Road-use validation is still open. |
+| CSI image tuning | — | **c8_sh15 is installed (2026-10-02 06:53, verified live)**: c5_rpi100T's colour (black level 50 + the IMX296 colour matrix the vendor file had transposed) plus the sharpness table set to its weakest index, so the ISP's default output matches ee-mode=0. The c7 A/B brings it closer to the USB camera (ΔE 11.7 → 6.7 once the CSI JPEGs are decoded correctly; first reported as 8.56 → 4.79). A review found that gain is mostly in-sample and about zero against the chart's own values, so **do not install c7 as it is**. The app sets no CSI properties, and with c8_sh15 that default is now clean (no halos). Details in "Review of the c7 work" and the c8 sections below. | A daylight A/B (`--auto`) before calling it production; the CSI saturation in the app's config. |
+| High-G settings | `ee952e1` | The threshold is 2 g in every IMU mode (`IMU_HIGHG_THRESHOLD_MG`, converted per accelerometer range). AMG used to write fusion's byte, which is 8 g at ±16 g. Host tests pass, and IMUPLUS is flashed on the Jetson. | a drive: `hg=` / `hgrej=` |
+| CAN frame loss | `ee952e1` | Overruns are counted (`ovf=` after `rx=` in SNIFF) so the loss can be sized. Nothing else has changed yet. | a drive: `ovf=` vs `rx=` |
+| Autofocus | `0d733b5` | v0.4 `<Recording><FocusMode>fixed</FocusMode>` + `<FocusAbsolute>` holds the lens. The default, `camera`, leaves it untouched. The UGREEN has `focus_automatic_continuous` and `focus_absolute` (0–1023). | the value for the road (below) |
+| I2C hang | `8ebb9be` | `vendor/Wire` bounds every bus wait at 25 ms. On expiry it resets the SERCOM, and `i2cBusBegin()` recovers the bus. Proven on the rig: BusFaultInjection 10/10, twice. The control run hung until the watchdog. | — |
+| AMG mode | `7882f4e` | AMG came up broken: it restored the IMUPLUS calibration profile at ±16 g, which raises SYS_ERR 0x09. The profile is now restored, and saved, in fusion modes only. Verified on the rig. | — |
+| I2C bus errors | `1e93aeb` | A glitch that the controller sees as a START or STOP mid-transfer now fails that transfer, resets the controller, counts it (`i2cerr=`) and recovers the bus. Before, it returned a garbage byte as data, or left every later transfer refused while the lines read idle. **Proven on the rig 2026-09-27:** BusFaultInjection 15/15, twice (results below). Production flashed; `i2cto=0 i2cerr=0` at rest. | a drive: `i2cerr=` before and after the wiring rework |
+| Build scripts | `c232b6d` | `check_core.sh` holds the arduino:samd 1.8.14 check. `install_map.sh` and the BusFaultInjection script now apply it too. | — |
+| liblog | `07a61d4` | `liblog.h` includes `<cstdint>`, so the tree builds with GCC 13 without `-include cstdint`. | — |
+| libcamera: dependencies | `05f3075` | `AttributeDictionary` now lives in libcamera (`libcamera_attributes.cpp`); libconfig no longer includes libcamera. There is no behaviour change. | — |
+| libcamera: V4L2 helpers | `bbc0caa` | Discovery, exposure and focus now share `libcamera_v4l2.h`: an EINTR-safe ioctl, an owning fd with `O_CLOEXEC`, and control query/get/set. Checked against the old code on a fake UVC device: identical ioctl sequences in 14 scenarios. The EINTR retry is defensive only: the apps install handlers with `std::signal`, which sets SA_RESTART, so it never fires on the Jetson. **Run on the Jetson 2026-09-28:** `scan_cameras` output is byte-identical to the previous build's, and v0.4 starts, records and stops as before (results below). | — |
+| libcamera: Camera_GST | `72e4dc7` | Fixed a **teardown deadlock**: a `start()` that timed out hung forever instead of reporting ERROR. Fixed a leak of refused branch bins, and logging under the state lock. Start and runtime failures now name the element and GStreamer's reason. New `camera_gst_test` (videotestsrc, no camera). v0.4 does not use Camera_GST. **Run on the Jetson 2026-09-28:** `camera_gst_test` passes on GStreamer 1.20.3. The fix for branches that start disabled works only when the sink sees GAP events directly, so not for this project's real branches (review item C, fixed in `f03a13f`). | — |
+| libcamera: attributes | `7697f40` | 6 of the 10 USB entries in `camera_attributes.xml` named v4l2src properties that do not exist, so they were ignored with only a GLib warning. They are now V4L2 controls written through `extra-controls` (valueType `v4l2_control`). A write is checked against the **element's** property type and range, and a rejected one reports `INVALID_ATTRIBUTE` plus a WARN. That does not check the **device's** range: the driver clamps out-of-range USB values, and those still report NONE (review item F). **Run on the Jetson 2026-09-28:** `usb_test` Test 4b reads back every control it sets, and the CSI dictionary check passes. `usb_test` changes the camera's settings and leaves them changed (review item A, fixed in `782bdfd`). | — |
+| libcommlink: fixes | `68fcceb` | CommLink logged its port open/close lines with the port mutex held, so a log callback that asked the link anything deadlocked (latent; v0.4's does not). The bridge tty and the wake pipe are now close-on-exec (children such as `nmcli` inherited them). `typeName()` now names `CMD_SET_IMU_MODE` in both `HostProtocol.h` copies, which stay byte-identical; the wire is unchanged. Discovery keeps partial results when a node vanishes mid-scan. `Uart::read(0)` no longer makes two `fcntl()` calls per read. New `logPrintf()` in liblog replaces three private log helpers. | **Run on the Jetson 2026-09-28:** `commlink_test` recovers from a cable pull on the C3's by-id path (what v0.4 uses), and v0.4's bridge line is as before. Auto-discover mode fails on this rig, which predates the pass (item U). Items U, V fixed 2026-10-03; C3 runs pass, the replug check needs sudo. |
+| libbus | `5be7a5b` | `ibus.h` (the base of libuart, libspi and libi2c) moved from `lib/libgpio` to `lib/libbus`. There is no code change. | — |
+| CSI driver loader | `aa9deb1` | The Jetson's own IMX296 unit (`imx296-reload.service`) stopped nvargus-daemon, then failed at `modprobe -r imx296`, because 5.15.199-tegra has no imx296 module at all (only 5.15.185-tegra has one), and left Argus stopped (found by the 2026-09-28 review; corrected by the Jetson run). `docker_dev/csi_driver.sh` checks the module against the running kernel before touching Argus, and restarts Argus on every exit path; `csi-driver.service` (in the repo, not installed) would load it before Argus at boot. The script does not fix a kernel/module mismatch by itself: on 5.15.199 the module would have had to be rebuilt, and the 2026-09-30 rollback to 5.15.185 removed the mismatch instead. Host test: `test_csi_driver.sh`, 31 checks. | Not needed on R36.5.0: there, the vendor's `imx296-reload.service` works as intended (active since the rollback). **Items K–P fixed 2026-10-03.** `csi-driver.service` (the `reload` mode) is installed and enabled in place of the vendor unit; start/restart and `csi_test` 5/5 are checked. The first boot with it passed (2026-10-03 20:25: ordered after Argus, `Result=success`, `csi_test` 5/5). |
+| libcamera: review fixes | `f03a13f` | Shutdown is bounded when a branch stops consuming (it hung, reproduced on the Jetson) or the source's thread is stuck. A stream that ends reports ERROR (it stayed RUNNING). Branches that start disabled start (item C). frameCount restarts at `start()`. Items B, D, E, F (docs), G, H, J and both older races fixed. `camera_gst_test` 72 → 120 checks. | **Run on the Jetson 2026-09-28:** `camera_gst_test` PASS 14/14; the reviewer's shapes redone on the UGREEN. **2026-09-30 on CSI:** `csi_test` 5/5, `csi_rtp_test` PASS, and Camera_CSI stops no slower than before, with no WARN (below). Items Q–T fixed 2026-10-03; R confirmed on Argus (`csi_test` 5/5, `csi_rtp_test`, no WARN). |
+| usb_test | `782bdfd` | Puts the controls it writes back as found, checks that, and reads back what Tests 3 and 4 set (items A, B). | **Run on the Jetson 2026-09-28:** PASS, the before/after control diff is empty; again on 2026-09-30 (R36.5.0). Item Z fixed 2026-10-03, confirmed on the UGREEN. |
+| Focus hold | `3e3dc4f` | `UvcFocusControl` refused nothing when it could not read what to hand back: autofocus came back on for a camera found in manual, or the manual lens position was not restored (the review's mocked read failures). It now refuses before writing anything. New `focus_test`: 22 checks against a simulated camera. | **Run on the Jetson 2026-09-28:** v0.4 with `FocusMode=fixed` holds the lens and hands autofocus back. Items X, Y fixed 2026-10-03; X confirmed on the UGREEN. |
+| commlink_sim_test | `0f548d7` | CommLink against a simulated C3 on a pseudo-terminal, with no hardware: 73 checks in about 6 s (handshake, every frame type, commands, watchdog, hot-plug, discovery, libuart). Passed 36 of 36 runs, 16 of them overloaded; ASan, UBSan and TSan are clean. | **Run on the Jetson 2026-09-28:** PASS 16/16, 5 of them with every core busy. Item W fixed 2026-10-03. |
+
 ## Done 2026-09-28 (Jetson coder): the libcamera pass run on the Jetson
 
 Everything was built from `ef45a22` in the l4t-ml-gpio container with plain `make` into `bin/build_20260928_074644`.
@@ -1767,98 +2226,6 @@ This build's v0.4 ran for 25 s with a temporary copy of the deployed `dashcam.xm
 **Also run, all PASS:** `--self-test`, `config_test`, `bridge_overlay_test`, `exposure_test`, `liblog_test`,
 `record_test` Parts A and B, and `scan_cameras` (output identical to the 2026-09-27 build's).
 
-## Items from the Jetson run and a second review (K–Z): all fixed 2026-10-03, see "Done 2026-10-03"
-
-These come from the Jetson run plus a second 8-agent review of `68fcceb..1888a94`, where each finding went to a
-skeptic told to refute it. **Deployed v0.4 cannot reach any of them.** The letters continue from the first
-review's A–J.
-
-**CSI loader (`aa9deb1`): fix these before installing `csi-driver.service`.**
-- **K. The default module name is wrong.**
-  - `csi_driver.sh:39` and `csi-driver.service:31` default to `nv_imx296`; on this Jetson the module is `imx296`.
-    Shipped as is, the unit fails at every boot.
-  - Also correct the root-cause text in the script header (`csi_driver.sh:6-8`) and the unit
-    (`csi-driver.service:3-4`): on 5.15.199 the old unit failed at `modprobe -r`, and never loaded a 5.15.185
-    module. On 5.15.185 it works. (The status row is corrected.)
-- **L. Starting it by hand deadlocks.**
-  - The unit is `Type=oneshot`, which has no start timeout on this systemd (249), and `Before=nvargus-daemon`.
-  - With Argus active, `systemctl start` (or `restart`, or `enable --now`) makes the script stop Argus.
-  - Its EXIT trap then runs a blocking `systemctl start nvargus-daemon`, and that job waits for csi-driver's own
-    start job. Both hang, and Argus stays down. Boot is not affected, because Argus is not active yet.
-  - Fix: use `systemctl --no-block start` when running under systemd (`$INVOCATION_ID`).
-- **M. It is not a like-for-like replacement.**
-  - The vendor unit is a post-boot reload: `After=nvargus-daemon`, a 5 s sleep, `modprobe -r` plus `modprobe`, then
-    Argus restarted. It exists for a black screen when Argus starts before the sensor is ready.
-  - `imx296.conf` already loads the module at boot, so `csi-driver.service` would always find it loaded and do
-    nothing.
-  - Suggestion: a `reload` mode that checks first, then does what the vendor unit does, installed
-    `After=nvargus-daemon`. That also avoids L.
-- **N. The vermagic check can judge the wrong file.**
-  - It reads the first file by name order, so `kernel/` comes before `updates/`. That is not the file modprobe
-    loads. It also cannot tell when depmod has not run.
-  - Fix: use `modinfo -k "$KREL" -F filename "$MODULE"`.
-- **O. A failed Argus restart still exits 0.** If Argus cannot be started again, the script still exits 0.
-- **P. `test_csi_driver.sh` is not executable.** It is committed without the executable bit (mode 100644), but
-  the procedure and its own usage line run it directly.
-
-**Camera_GST (`f03a13f`).** These affect v0.2/v0.3 only; v0.4 does not use Camera_GST.
-- **Q. The shutdown bound does not cover a sink stuck in a syscall.**
-  - The branch flush runs on the calling thread, before the abandon timer starts.
-  - FLUSH_START needs the sink's preroll and stream locks. A filesink stuck in `write()` holds them: the SD-card
-    stall that the open list names.
-  - Fix: flush on a helper thread under the timer, or say in the header that the bound excludes this case. No app
-    has a blocking branch today.
-- **R. A false WARN after an early ERROR.**
-  - When an ERROR ends the EOS wait early (the Argus CANCELLED case), teardown flushes at once and logs
-    `EOS not delivered within <eosTimeoutMs> ms`. The time in that line is not the elapsed time, and nothing has
-    stalled.
-  - The CSI check expects normal stops to log no such WARN, so this matters when CSI is verified.
-  - Fix: after an ERROR, wait for the send until the deadline, and log the elapsed time.
-- **S. `stop()` overlaps with `close()` and `start()`.** This predates the pass, but the window is now longer.
-  - `stop()` reports OPEN before its longer teardown starts.
-  - A concurrent `close()` or `start()` then runs a second `teardownPipeline()`, which is not a no-op: it touches
-    the tee pads and the handles, and `teePads_` without the lock. The comment saying the second call "exits
-    immediately" is false.
-  - Fix: a `tearingDown_` flag that `close()` and `start()` wait on, or document that the three must not overlap.
-- **T. "Auto controls first" holds only for `start()`'s batch.**
-  - `camera_attributes.xml:21-22` states it without that qualification.
-  - A write while running carries only its own control, so `auto_exposure=1` must be set before
-    `exposure_time_absolute`.
-
-**libcommlink (`68fcceb`, `0f548d7`).**
-- **U. Discovery in fallback mode picks the wrong device after a replug** (measured above; it predates the pass).
-  - Fix the close: `tcflush(TCOFLUSH)` before `close()` in `Uart::close()`, or `closing_wait` NONE through
-    `TIOCSSERIAL` for ACM ports.
-  - Fix the order: try the by-id matches before rotating through fallback nodes, or reset the cursor when the list
-    changes.
-  - Give `commlink_test` a by-id-only option, or document that auto-discover fails on a rig with the MKR console
-    attached.
-  - The review judged v0.4 not exposed to the 30 s close: the C3's HWCDC ISR always drains the USB FIFO, so its
-    writes complete even if `loop()` hangs.
-- **V. A log call under `m_statsMtx`.** The malformed MSG_TELEMETRY path (`libcommlink.cpp:446-451`) calls the log
-  callback with that mutex held, so a callback that calls `stats()` deadlocks. It is the same class of bug 68fcceb
-  fixed for the port lock. v0.4's callback does not call `stats()`.
-- **W. `commlink_sim_test` discovery depends on pty numbers.**
-  - It expects name order, but `enumerate()` sorts the resolved `/dev/pts` paths as strings.
-  - So it fails when the two pty numbers straddle a power of ten, e.g. 9 and 10.
-  - Fix: sort the by-id entries by name, then resolve them.
-
-**Focus (`3e3dc4f`) and usb_test (`782bdfd`).**
-- **X. The stored manual position is not handed back.** For a camera found with autofocus on, restore the lens
-  position too, when it could be read: write it while autofocus is still off, then turn autofocus back on.
-- **Y. A failed rollback is not reported.**
-  - `libcamera_focus.cpp:75` ignores the rollback's result. If the lens write fails and autofocus cannot be turned
-    back on, autofocus stays off, while v0.4 logs "left to the camera".
-  - It needs two control writes in a row to fail with the camera still attached.
-- **Z. An aborted usb_test leaves the camera changed.** It restores the controls only when `main()` finishes, so
-  Ctrl-C or a crash leaves them changed. Fix: print the restore command at start, or set a signal flag checked
-  between tests.
-
-**Refuted by the skeptics, so not items:**
-- Attributes are not re-applied across `stop()`/`start()`. No contract promises that, and 5aa56fd behaved the same.
-- An abandoned pipeline holds the device. That is documented, and the source is wedged anyway.
-- The 30 s close in v0.4. See U.
-
 ## Done 2026-09-28 (cloud): the libcamera review, and the Jetson coder's hardware findings
 
 Each fix has a `camera_gst_test`, `focus_test` or `test_csi_driver.sh` check that fails with the old code. In
@@ -1929,55 +2296,9 @@ rerun (`a`):
 Production (IMUPLUS, 121,684 B) was re-flashed afterwards. At rest it shows `imu=up`, `cal=33`, `gps=up`,
 `i2cto=0 i2cerr=0`, `ovf=0`.
 
-The procedure below is kept for reruns after a Wire change.
+The procedure (Reference: "Rig procedure: the bus-error proof") is kept for reruns after a Wire change.
 
-## Rig procedure: the bus-error proof
-
-**Why.** The fault on this harness is contact that flickers, not a wedge. The 2026-09-26 corrupt reads came from
-breadboard contacts. On the SAMD21, a flicker that lands as a START or STOP mid-transfer is a **bus error**:
-
-- The controller sets BUSERR, ARBLOST and MB, never SB (SB means a byte received cleanly).
-- It then gives up the bus.
-
-`8ebb9be` copied the core's read, which accepts MB as a byte. It also kept the core's early "another master holds
-the bus" refusal. Two consequences follow from the datasheet's bus-state rules:
-
-- A glitch on a read's last byte returned a garbage byte at the full count.
-- A START with no STOP left the controller BUSY. Every later transfer was refused, both lines read idle, and
-  nothing was counted, so `i2cBusBegin()` never recovered. The IMU and GNSS would stay down until a power cycle.
-
-`1e93aeb` treats all of these as bus errors (see `vendor/Wire/README.md`, "Bus errors"). It compiles for both
-variants with no warnings in project code, but no glitch has been injected yet.
-
-**Run it.** Build the helper instrumented and flash it, from the host:
-
-```bash
-docker run --rm --privileged -v /dev:/dev -v ~/dashcam:/user/dashcam l4t-ml-gpio:latest \
-  /user/dashcam/peripherals/mkr_zero/helper_scripts/BusFaultInjection/build_and_upload.sh auto
-```
-
-Then send `a` on the console.
-
-- **Expected: 15 of 15.** T0–T6b as on 2026-09-27, plus C7, T7, T8, T9 and T9b.
-- **T1b** should now report `endTransmission=4 ... bus errors +1`, not `2`. A slave holding SDA low makes the address
-  phase lose arbitration, which is now a bus error. It still passes (the check is only `rc != 0`).
-- **C7** (stock path) must show the bus Ready 3/3 and CHIP_ID failing 3/3. That is the dead bus. If it fails, the
-  stock driver recovered by itself, and that premise was wrong on this silicon. The fix still holds; it just
-  mattered less.
-- **T7/T8:** one bus error, fast, then CHIP_ID `0xA0` and the GNSS answer, with no manual recovery.
-- **T9/T9b:** SDA is pulled low under a high SCL mid-read. Expect 0 bytes and one bus error, then recovery. If it
-  fails with `got 64 bytes, bus errors +0`, the controller did not flag that glitch, which is a hardware limit and
-  not something Wire can see.
-- **`SKIP` lines:** a test whose premise did not reproduce. For example, T7 did not reach BUSY, or T9 caught no high
-  SCL with SDA released. Say which, and rerun once.
-
-After the run, re-flash production (`peripherals/mkr_zero/build_and_upload.sh auto`, plus `amg` if used). At rest
-the console should read `i2cto=0 i2cerr=0`.
-
-**Also.** Fix the harness wiring (solder or crimp the I2C lines). The firmware now contains both a wedge and a
-glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the rework measures that directly.
-
-## After flashing (Jetson coder): one drive answers the rest
+## 2026-09-27: after flashing, one drive answers the rest (the 2026-10-03 drive answered most of it)
 
 - **High-G:** `hg=` counts confirmed events, `hgrej=` rejected evidence. Tune `IMU_HIGHG_THRESHOLD_MG` /
   `IMU_HIGHG_DURATION_LSB` from that data, not before.
@@ -2001,172 +2322,3 @@ glitch; the wiring removes the cause. `i2cerr=` on a drive before and after the 
     "obsolete settings ignored" warning at start until those lines are deleted.
 
 **Also open, on the car:** the parked block test for the engine-on IMU faults, and the night plate-exposure test.
-
-## Open, deliberately not done
-
-- **v0.3 overlay:** it keeps its own copy of the bridge→overlay rules. On a fix without altitude it shows the last
-  altitude, or the 52.3 m placeholder. v0.4 uses `src/bridge_overlay.h`. Skipped on request.
-- **Unused libraries:** `libstereocam` and `libsigndetector` are in the tree, but no target builds them.
-- **Seen during the libcamera pass, left for the next libraries:**
-  - `libcan.cpp:319` and `libgpio.cpp:311` ignore `read()`'s return (the only two warnings in the build).
-  - `Camera_GST::getCameraStatus()` drains the bus through a `const_cast` (it works, but it is a smell).
-  - `cameraAttribute` stores control ranges as `float`, which is lossy past 2^24 (no such control on the UGREEN).
-- **Proposed after the libcommlink pass, not done** (each changes behaviour on the car, so it is the user's call):
-  - **Back off after a failed handshake.**
-    - Today a bridge on the wrong firmware, or a silent device, is reopened every reconnectMs + handshakeMs
-      (about 3 s) forever.
-    - Each round logs about four lines. v0.4's `quietRepeats` demotes the repeats to DEBUG, but DEBUG is the default
-      level, so the log file still grows.
-    - Proposal: double the interval per consecutive handshake failure, capped at about 30 s, and reset it on a
-      compatible HELLO. It would slow reconnecting to a bridge that was just reflashed by up to the cap.
-  - **Twelve more libraries** keep their own truncating `doLog()`: libcan, libconfig, libdriverstate, libgpio (x2),
-    libi2c, liblanedetector, libmidi, librecord (x2), libspi and libstereocam. Switch each to `logPrintf()` in its
-    own pass.
-  - **`Uart::readLine()`** costs a poll and a read per character. That is fine for `gpio_test`'s NMEA; buffer it if
-    a real consumer appears.
-- **Proposed after the review fixes, not done:**
-  - **Item F, properly:** check a USB V4L2 control against the device (`VIDIOC_QUERYCTRL` / `QUERYMENU` on the node,
-    by its normalised name) and report `INVALID_ATTRIBUTE` for a missing control or an out-of-range value. Today
-    the driver clamps silently.
-  - **A branch that stalls the tee stops every branch.** Recording branches use blocking queues so no frame is
-    dropped; one stuck sink (an SD card stalling) starves the others, and at shutdown none is finalised. A leaky
-    recording queue, or a per-branch watchdog, trades that for dropped frames. It is a design decision; no app on
-    the car uses a blocking branch today.
-
-## Cloud sessions: compile-checking the MKR firmware
-
-This is a compile check only (see "Who does what"). The sandbox blocks `downloads.arduino.cc`, so the toolchain is
-put together from GitHub and apt, and has to be rebuilt every session (a few minutes). `1e93aeb` was
-compile-checked from these parts:
-
-- **Toolchain:** apt `gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib`, i.e. GCC 13.2.
-  The Jetson builds with 7.2.1, so image sizes differ (130,676 B here); this is a compile check, not the flashed
-  binary.
-- **Core:** `arduino/ArduinoCore-samd` at tag `1.8.14`, with `api` symlinked from `arduino/ArduinoCore-API`.
-- **CMSIS:** `ARM-software/CMSIS_5` (sparse checkout of `CMSIS/Core/Include`, served as `CMSIS/Include`), plus
-  `arduino/ArduinoModule-CMSIS-Atmel`. An empty `libarm_cortexM0l_math.a` satisfies the link.
-- **ctags:** `arduino/ctags` built from source, after renaming its `__unused__` / `__printf__` macros, which clash
-  with glibc.
-- **arduino-cli:** from its GitHub release.
-- **Libraries:** the eight from `docker_dev/Dockerfile`, each at its tag.
-- **Build:** `arduino-cli compile` with `ARDUINO_DIRECTORIES_USER` pointing at a sketchbook whose
-  `hardware/arduino/samd` is the core, and `--build-property runtime.tools.{arm-none-eabi-gcc-7-2017q4,CMSIS-4.5.0,CMSIS-Atmel-1.2.0,ctags}.path=...`.
-  A wrapper that adds those flags to `compile` lets `build_and_upload.sh` itself run unmodified.
-
-## Environment (the Jetson rig, as of 2026-09-30)
-
-Collected from the machine, not from memory: `/etc/nv_tegra_release`, `dpkg-query`, `arduino-cli core/lib list`,
-and the tools' own `--version`. Re-collect after an upgrade.
-
-**Hardware**
-- **Jetson:** NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super. 6 cores, 7.4 GB RAM, 937 GB NVMe
-  root. No RTC coin cell, so the clock comes from NTP or GPS. It runs on **its own battery** in the car.
-- **CSI camera:** IMX296LQ (colour, global shutter, 1456×1088 @ 60) in **CAM1** (`i2c-9`, `serial_c`), `/dev/video0`,
-  Argus sensor-id 0. The vendor prebuilt driver is for 5.15.185; overlay `imx296-cam1.dtbo`. No IMX219 is connected.
-- **Camera:** UGREEN Camera 4K, USB UVC, `eba4:6579`, `/dev/video1` since the CSI camera came back. It records
-  1080p30 MJPEG (`FormatIndex 4`), pinned by `/dev/v4l/by-id`. Controls are standard UVC only (focus, exposure,
-  gain, backlight compensation). Frames from the evening of 2026-09-26 are upright.
-- **Telemetry master:** Arduino MKR Zero (SAMD21G18A), **powered from the car's OBD2 port**, with USB to the Jetson
-  as the dev console.
-  - **CAN:** MKR CAN Shield, an MCP2515 with a 16 MHz crystal, 500 kbit/s, sniffing the Honda Brio (map `brio`,
-    id 0x0B, on the SD card).
-  - **I2C:** at 400 kHz. BNO055 IMU at 0x29 on a **breadboard**, INT pin not wired. SparkFun u-blox GNSS at 0x42
-    over ESLOV.
-  - **SD card:** on SPI1, holding the CAN map and the IMU calibration profile.
-- **Bridge:** Seeed XIAO ESP32-C3. It talks to the MKR over UART1 at 115200 and to the Jetson over native USB CDC.
-
-**Jetson host**
-- JetPack 6.2.2 (`nvidia-jetpack 6.2.2+b24`), L4T R36.5.0 rootfs (`/etc/nv_tegra_release` R36 REVISION 5.0), kernel
-  5.15.185-tegra, Ubuntu 22.04.5 LTS.
-- The QSPI bootloader/UEFI still reports 36.5.2 (`/sys/class/dmi/id/bios_version` = `36.5.2-gcid-46426093`, running
-  from slot B).
-- The rig was rolled back from R36.5.2 on 2026-09-30, and the 65 NVIDIA packages are on `apt-mark hold`.
-- CUDA 12.6.11, TensorRT 10.3.0.30 (`libnvinfer10`, built for CUDA 12.5), cuDNN 9.3.0.75, VPI 3.2.4, GCC 11.4.0,
-  Python 3.10.12. The rollback did not change these; only their JetPack meta packages moved.
-- GStreamer 1.20.3, v4l-utils 1.22.1, Docker 29.8.1.
-- `nvargus-daemon` and the vendor's `imx296-reload.service` are active. The boot entry is `DEFAULT JetsonIO` with
-  `imx296-cam1.dtbo`. A kernel package change resets `DEFAULT` to `primary` (nv-update-extlinux); set it back
-  afterwards. The v0.4 container does not mount `/tmp/argus_socket`, so its start log still shows two harmless
-  `(Argus) Error FileOperationFailed` lines (`Connecting to nvargus-daemon failed`, then
-  `Cannot create camera provider`).
-- Host Python's `cv2` is broken (numpy mismatch). Use the container.
-
-**Dev container** `l4t-ml-gpio:latest`
-- Built 2026-09-25 from `docker_dev/Dockerfile`, base `dustynv/l4t-ml:r36.4.0`. The repo is mounted at
-  `/user/dashcam`. It builds everything: plain `make` gives a timestamped `bin/build_<ts>/`.
-- GCC 11.4.0, Python 3.10.12, CUDA 12.6 (nvcc), OpenCV 4.10.0-dev, NumPy 1.26.4, PyTorch 2.6.0, GStreamer 1.20.3.
-- spdlog 1.9.2, fmt 8.1.1, pugixml 1.12.1, pyserial 3.5.
-
-**Firmware toolchains (inside the container)**
-- **arduino-cli:** 1.5.1.
-- **MKR Zero:**
-  - Core `arduino:samd` **1.8.14**, pinned; `check_core.sh` refuses anything else. On aarch64 it is installed by
-    `docker_dev/install_samd_aarch64.py`, because arduino-cli cannot install it there.
-  - arm-none-eabi-gcc **7.2.1** (package `7-2017q4`), CMSIS 4.5.0, CMSIS-Atmel 1.2.0, bossac 1.7.0-arduino3.
-  - Build and flash with `peripherals/mkr_zero/build_and_upload.sh [auto] [amg]`.
-- **ESP32-C3:**
-  - Core `esp32:esp32` **3.2.0**, esptool 5.4.0.
-  - FQBN `esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app,CPUFreq=160,FlashMode=qio,FlashFreq=80,FlashSize=4M,DebugLevel=none,UploadSpeed=921600`.
-- **Arduino libraries**, pinned in the Dockerfile and installed `--no-deps`:
-  - Time 1.6.1
-  - SparkFun u-blox GNSS Arduino Library 2.2.29
-  - Servo 1.3.0
-  - RTCZero 1.6.0
-  - Adafruit BusIO 1.17.4
-  - Adafruit GFX Library 1.12.6
-  - Adafruit SSD1306 2.5.17
-  - Adafruit LED Backpack Library 1.5.1
-- **Vendored** in `peripherals/mkr_zero/vendor`:
-  - Wire: the arduino:samd 1.8.14 copy, patched with the `busOwner` fix, bounded transfers and bus errors. See its
-    README.
-  - CAN 0.3.1, patched.
-  - SdFat 2.3.1.
-  - BNO055 1.2.1.
-
-**Protocol and firmware versions**
-- MKR↔C3 `CommProtocol` and C3↔Jetson `HostProtocol` are both at version **0x07** (180-byte telemetry payload).
-- The C3 bridge firmware reports **1.0**.
-- The MKR production image is this branch's HEAD, IMUPLUS, 121,684 bytes.
-- `dashcam-v04.service` runs the newest `bin/build_*/dashcam_v0_4` it finds at start.
-
-**Where the cloud sandbox differs** (see "Cloud sessions" above): arm-none-eabi-gcc 13.2 and host g++ 13 instead of
-7.2.1 and 11.4.0, no CUDA, and no hardware.
-
-## Tests
-
-```bash
-make -C peripherals/mkr_zero/tests/host check        # switch 61, imu 540, can_probe 98, bno_init 602
-make -C peripherals/mkr_zero/tests/host mutations    # 47 mutants, all must be caught
-make -C peripherals/esp32-c3/tests/host check        # bridge 79
-make                                                 # every target, inside the l4t-ml-gpio container
-B=$(ls -td bin/build_* | head -1)                    # the build just made; run from the repo root
-$B/dashcam_v0_4 --self-test && $B/config_test && $B/bridge_overlay_test
-$B/camera_gst_test [name]                            # Camera_GST over videotestsrc: no camera needed
-$B/focus_test                                        # the fixed-focus hold against a simulated camera
-$B/usb_test --self-test                              # usb_test's stop-and-restore path on a simulated camera
-docker_dev/test_csi_driver.sh                        # csi_driver.sh against stubs (123 checks)
-docker_dev/csi_driver.sh check                       # on the Jetson, read-only: the IMX296 module vs the running kernel
-$B/commlink_sim_test                                 # CommLink + libuart against a simulated C3 on a pty: no hardware
-$B/commlink_test --by-id 30                          # the real C3 bridge, by-id only as v0.4 (stop dashcam-v04 first)
-$B/commlink_test "" 30                               # auto-discover with the ttyACM fallback
-$B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
-$B/usb_test                                          # a USB camera (stop dashcam-v04 first); puts its controls back
-$B/scan_cameras                                      # lists the cameras, their controls and formats
-bash ~/drive_logs/tools/verify_platform.sh           # on the Jetson, not in the container: after a platform change
-bash ~/drive_logs/tools/test_l4t_checks.sh           # on the Jetson: the pre-reboot checks of the upgrade/rollback
-```
-
-`usb_test` puts brightness, gain and backlight_compensation back as found (`782bdfd`). It passed on the Jetson on
-2026-09-28 and again on 2026-09-30, with an empty before/after `--list-ctrls` diff. To check by hand, diff
-`v4l2-ctl -d /dev/v4l/by-id/usb-Image+_UGREEN_Camera_4K_LL-0000000001-video-index0 --list-ctrls` before and after the
-run: `/dev/video0` is the IMX296 now.
-
-The Wire changes have no host test: they are register-level SAMD21 code, proven only on the rig
-(BusFaultInjection). Running that is the Jetson coder's job.
-
-Where each test can run:
-- **Anywhere, cloud included:** the host suites, `mutations`, `--self-test`, `config_test`,
-  `bridge_overlay_test`, `camera_gst_test`, `focus_test`, `usb_test --self-test`, `commlink_sim_test`,
-  `test_csi_driver.sh` and `record_test` Part A.
-- **Jetson only:** CUDA targets, `record_test` Part B, `usb_test`, `csi_test`, `scan_cameras` (with a camera),
-  `commlink_test` (with the C3), `csi_driver.sh`, and everything on the rig or the car.
