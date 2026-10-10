@@ -1,0 +1,23 @@
+{
+  "schema": "stereo-prototype-pair-v1",
+  "left": "left.png",
+  "right": "right.png",
+  "left_id": "REPLACE_WITH_LEFT_SERIAL",
+  "right_id": "REPLACE_WITH_RIGHT_SERIAL",
+  "static_scene": false,
+  "exposure": {
+    "trigger_left": 0,
+    "trigger_right": 0,
+    "clock_domain": "unverified",
+    "left_mid_us": null,
+    "right_mid_us": null,
+    "uncertainty_each_us": null,
+    "exposure_us": null,
+    "global_shutter": true,
+    "hardware_sync_verified": false
+  },
+  "lateral_speed_bound_mps": null,
+  "yaw_rate_bound_rad_s": null,
+  "forward_speed_bound_mps": null,
+  "note": "Deliberately refuses moving-scene processing until actual timing and motion bounds are supplied. Never substitute host arrival times."
+}

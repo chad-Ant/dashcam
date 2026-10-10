@@ -21,7 +21,7 @@ This file has three parts:
 | ESP32-C3 | Bridge firmware 1.0; `HostProtocol` and `CommProtocol` are at 0x07. |
 | Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. |
 | Storage | `/media/jetson/backup` sits on the root NVMe: 428 GB free. |
-| Uncommitted | `lib/liblidartracking/`, `lib/libstereoprototype/`, `peripherals/mkr_zero/libraries/GRF250/` and `peripherals/mkr_zero/helper_scripts/GRF250Bridge/` (see the 2026-10-09 log section). |
+| Uncommitted | Nothing. The GRF-250 and stereo prototypes were committed on 2026-10-10. |
 
 ## Workstreams
 
@@ -33,8 +33,8 @@ This file has three parts:
 | MKR raw CAN over USB | `3a702a8`, `9b5c00e` | Bench-proven: 0 loss at 2400 and 4400 fr/s. The production build is on the MKR. Orin logger and offline decoder in `peripherals/mkr_zero/tools/canstream/`. | In-car loss test. |
 | Turning demo, dead reckoning, EKF | `cd89438`, `8838ead` | Read-only demo plus a C++ library. Synthetic and decoder-parity tests only. | Measure `antenna_x_m`; run the measured course. |
 | IMX296 v2 chart | `7e45172` | Offline analyser; synthetic tests only. | Print it, capture, validate live. |
-| GRF-250 ranging | uncommitted | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
-| Stereo prototype | uncommitted | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
+| GRF-250 ranging | committed 2026-10-10 | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
+| Stereo prototype | committed 2026-10-10 | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running; High-G 64 on the night drive. | Wiring rework; the parked block test. |
 
 ## Open work, in priority order
@@ -343,7 +343,7 @@ single-pan-servo interface; subsequently supplied a photo of the **3.3 V variant
 of the converter board and plans an **encoder-equipped servo**. Stereo work is
 preserved, including the pre-existing untracked `lib/libstereoprototype/`.
 
-Implemented (uncommitted):
+Implemented (committed 2026-10-10 at the user's request, with `lib/libstereoprototype/`):
 
 - `lib/liblidartracking/`: Orin Python association library, optional OpenCV
   rectification + COCO YOLOv8 ONNX detector adapter, bounded IoU tracks, explicit
