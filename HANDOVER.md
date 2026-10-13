@@ -35,7 +35,7 @@ This file has three parts:
 | IMX296 v2 chart | `7e45172`; helper uncommitted | Offline analyser; synthetic tests only. Printed by the user (banding, crushed shadow steps 0–32: fine for relative A/B, not absolute). Capture helper `capture_chart.py` (2026-10-12): UGREEN path run live, **CSI path not run**. | Capture the three sheets once the CSI camera is back. |
 | GRF-250 ranging | `e46bf71` | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
 | Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
-| CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed and compiled, **not flashed** (the user's OK is needed). Flash it, then calibrate touch and check SD, LDR and audio on the board. |
+| CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
@@ -68,8 +68,8 @@ This file has three parts:
    sensor.
 8. **IMX296 v2 chart:** capture the three sheets with `capture_chart.py` (CALIBRATION.md, "Capture") once the CSI
    camera is back. Its first CSI run is also the helper's first CSI test.
-9. **CYD** (2026-10-12 log section): driver installed, flash backed up, dashboard app fixed and compiled. With the
-   user's OK: `build_and_upload.sh auto` in the container, then calibrate touch and check SD, LDR and audio on the board.
+9. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
+   boot alert, tap-test touch, cover/uncover the LDR (it read ~980 in the room and held the backlight at 32/255).
 10. **Smaller items:**
    - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
    - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
@@ -521,8 +521,11 @@ XPT2046, 12-point touch calibration with a check screen, LDR GPIO34 to backlight
 - Assets: `splash.bmp` is an illustration (dashcam over a road), not a capture; `splash.rgb565` is exactly its
   conversion; `alert.wav` is a 0.35 s 8 kHz tone. The artwork's origin and licence are unknown; settle that before the
   public repo gets it.
-- **Not flashed:** the auto-mode permission check stopped the upload (no explicit user OK). Writing app0 is reversible
-  from the backup.
+- **Flashed 2026-10-13** (user's OK) with `build_and_upload.sh auto`. Boot log: `SD mounted at 20 MHz`, `calibration
+  loaded`, `RGB565 splash rendered ... 130 ms`, `audio ready: GPIO26 DAC`, `audio playing: /alert.wav`, LDR ~980 and
+  backlight 32/255; no crash. The first flash printed ~20 `dac_continuous ... Get available descriptor timeout` lines
+  per alert: the driver logs every full queue on a zero-timeout write. `begin()` now sets that tag to ESP_LOG_NONE
+  (update() still reports real failures); reflashed, log clean. Audibility and touch not yet checked by a person.
 
 ## 2026-10-11 (MKR pan library): encoder-aware servo prototype, no deployment
 

@@ -3,6 +3,7 @@
 #include "cydAudio.h"
 
 #include <cstring>
+#include <esp_log.h>
 
 namespace {
 constexpr int kSpeakerDacPin = 26;  // DAC channel 1
@@ -40,6 +41,9 @@ bool CydAudio::begin()
         return false;
     }
     closeDac();
+    // update() writes with a zero timeout, and the driver logs every full
+    // queue as an error. Real write failures are reported by update().
+    esp_log_level_set("dac_continuous", ESP_LOG_NONE);
     _ready = true;
     Serial.printf("[cyd] audio ready: GPIO%d DAC\n", kSpeakerDacPin);
     return true;
