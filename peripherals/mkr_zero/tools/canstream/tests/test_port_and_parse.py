@@ -2,16 +2,21 @@
 
 Fast, in-process, on a pty slave standing in for /dev/ttyACM0.
 """
+import bisect
 import importlib.util
 import os
+import queue
+import random
+import re
 import shutil
 import tempfile
 import termios
+import threading
 import time as time_mod
 import tty
 import unittest
 
-from streamsim import LOGGER, WRAP
+from streamsim import LOGGER, WRAP, Pty, console_body, read_candump, read_csv
 
 spec = importlib.util.spec_from_file_location("msl_under_test", LOGGER)
 msl = importlib.util.module_from_spec(spec)
@@ -252,6 +257,323 @@ class TestWallMinusMono(unittest.TestCase):
         finally:
             msl.time = real
         self.assertAlmostEqual(msl.wall_minus_mono(), real.time() - real.monotonic(), delta=0.005)
+
+
+# ─── the reader's bounded hand-over queue (HUNG DISK in the logger's docstring) ──
+
+
+def queue_stream(n_frames, us0=0x20000000, period_us=800, fs_every=40, con_every=25):
+    """[(us, kind, line)] in stream order: frame lines carrying their sequence number as data, an FS line
+    every @fs_every frames (`streamed` = frame lines before it, as the firmware counts them), and a CRLF
+    console line every @con_every frames."""
+    out = []
+    for i in range(n_frames):
+        us = (us0 + i * period_us) % WRAP
+        if i and i % fs_every == 0:
+            out.append((us, "fs", b"FS %08X %d %d 0 0 0\n" % (us, i + 5, i)))
+        if i % con_every == 7:
+            out.append((us, "con", b"MKR status n=%d\r\n" % i))
+        out.append((us, "f", b"F %08X 17C 8 %016X\n" % (us, i)))
+    return out
+
+
+def queue_reads(lines, seed, base=100.0):
+    """The stream cut into reads of 1-150 bytes at random — lines split across reads included — each
+    stamped with a host time just after the newest MKR time it carries."""
+    blob = b"".join(line for _us, _k, line in lines)
+    starts, pos = [], 0
+    for _us, _k, line in lines:
+        starts.append(pos)
+        pos += len(line)
+    rng = random.Random(seed)
+    out, pos = [], 0
+    while pos < len(blob):
+        end = min(len(blob), pos + rng.randint(1, 150))
+        k = bisect.bisect_right(starts, end - 1) - 1         # the line holding the read's last byte
+        out.append((base + lines[k][0] / 1e6 + 0.001, blob[pos:end]))
+        pos = end
+    return out
+
+
+def runs_of(indices):
+    """[(first, last)] of the contiguous runs in a sorted index list."""
+    out = []
+    for i in indices:
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return [tuple(r) for r in out]
+
+
+NOTE_RE = re.compile(r"queue full for [0-9.]+ s: .*?can_raw\.log (\d+) frame lines \((\d+) bytes\), can_stats\.csv "
+                     r"(\d+) FS lines \((\d+) bytes\), mkr_console\.txt (\d+) lines \((\d+) bytes\)")
+
+
+class TestHandoverQueue(unittest.TestCase):
+    """The reader -> writer queue under a writer that stops dead, in-process and deterministic: a PortReader
+    that is never started is fed reads (received()), and the test plays the main thread — dispatching what
+    was queued into a real Logger after every read — or a hung disk, by not dispatching at all. The reader
+    must stay within the bound, drop whole lines only, count exactly what it dropped (per file, lines and
+    bytes as received), keep the USB check exact, and resume by itself once the writer catches up."""
+
+    LIMIT = 40 * (msl.EVENT_COST + 60)       # ~9 KB: full after a few dozen reads
+
+    def setUp(self):
+        self.out = tempfile.mkdtemp(prefix="canstream_queue_")
+        self.lg = msl.Logger(self.out, "can0")
+        self.q = msl.Handover(self.LIMIT)
+        self.lg.handover = self.q
+        self.said = []
+        self.rd = msl.PortReader(None, self.q, threading.Event(), self.said.append)
+        self.q.force(("open", 0.0, "/dev/ttyACM0", None))
+
+    def tearDown(self):
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def write(self):
+        while True:
+            try:
+                msl.dispatch(self.lg, self.q.get_nowait())
+            except queue.Empty:
+                return
+
+    def play(self, lines, hung, seed=11, slow=lambda k: False):
+        """Feeds every read; while hung(read index), nothing is dispatched, while slow(read index) one event
+        after every other read, and in both the bound is checked after each read. Returns the highest level
+        seen then."""
+        worst = 0
+        self.slow_took = {"data": 0, "drop": 0}
+        for k, (mono, data) in enumerate(queue_reads(lines, seed)):
+            self.rd.received(mono, data)
+            if hung(k) or slow(k):
+                self.assertLessEqual(self.q.level, self.q.limit, "read %d: the queue grew past its bound" % k)
+                worst = max(worst, self.q.level)
+                if slow(k) and k % 2:
+                    ev = self.q.get_nowait()
+                    self.slow_took[ev[0]] += 1
+                    msl.dispatch(self.lg, ev)
+            else:
+                self.write()
+        self.write()
+        self.lg.close()
+        return worst
+
+    def check(self, lines, episodes, gap_per_episode=True):
+        """Everything the logger wrote against the stream; returns the frame gaps."""
+        f_lines = [line for _us, k, line in lines if k == "f"]
+        fs_lines = [line for _us, k, line in lines if k == "fs"]
+        con_lines = [line for _us, k, line in lines if k == "con"]
+        got = read_candump(os.path.join(self.out, "can_raw.log"))       # raises on a torn or merged line
+        seqs = [int(g[6], 16) for g in got]
+        self.assertEqual(seqs, sorted(set(seqs)), "frames out of order or duplicated")
+        self.assertEqual(seqs[-1], len(f_lines) - 1, "writing did not resume to the end")
+        kept = set(seqs)
+        miss_f = [i for i in range(len(f_lines)) if i not in kept]
+        rows = read_csv(os.path.join(self.out, "can_stats.csv"))
+        kept_fs = {int(r["streamed"]) for r in rows}
+        miss_s = [j for j, line in enumerate(fs_lines) if int(line.split()[3]) not in kept_fs]
+        with open(os.path.join(self.out, "mkr_console.txt")) as f:
+            console = f.read()
+        body = console_body(console)
+        for b in body:
+            self.assertRegex(b, r"^MKR status n=\d+$", "a torn or merged console line")
+        kept_c = set(body)
+        miss_c = [j for j, line in enumerate(con_lines) if line.decode().rstrip("\r\n") not in kept_c]
+        gaps = runs_of(miss_f)
+        if gap_per_episode:
+            self.assertEqual(len(gaps), episodes, "one contiguous gap per hang: %r" % gaps)
+        # Exact, per file, lines and bytes as received (CRLF included).
+        self.assertEqual(self.lg.drops, [len(miss_f), sum(len(f_lines[i]) for i in miss_f),
+                                         len(miss_s), sum(len(fs_lines[j]) for j in miss_s),
+                                         len(miss_c), sum(len(con_lines[j]) for j in miss_c)])
+        self.assertGreater(len(miss_f), 500, "the hang dropped too little to test anything")
+        self.assertGreater(len(miss_s), 3)
+        self.assertGreater(len(miss_c), 3)
+        # Every missing FS and console line lies inside a frame gap: dropped with its neighbours, not apart.
+        for j in miss_s:
+            s = int(fs_lines[j].split()[3])
+            self.assertTrue(any(a <= s <= b + 1 for a, b in gaps), "FS line %d dropped outside the gap" % j)
+        # can_stats.csv: rx_frames still counts every frame line received, dropped or not, so it equals the
+        # change in `streamed` row to row; rx_dropped / fs_dropped say what of it is missing.
+        prev = 0
+        for r in rows:
+            self.assertEqual(int(r["rx_frames"]), int(r["streamed"]) - prev, r)
+            prev = int(r["streamed"])
+        self.assertEqual(sum(int(r["rx_dropped"]) for r in rows), len(miss_f))
+        self.assertEqual(sum(int(r["fs_dropped"]) for r in rows), len(miss_s))
+        self.assertEqual(self.lg.usb_lost, 0)
+        self.assertGreater(self.lg.usb_checked, 0)
+        self.assertEqual(self.lg.malformed, 0)
+        # Reported once per episode: stderr at the start, mkr_console.txt / can_sync.csv at the end.
+        self.assertEqual(len(self.said), episodes, self.said)
+        self.assertEqual(self.lg.drop_episodes, episodes)
+        notes = [tuple(int(x) for x in m.groups()) for m in NOTE_RE.finditer(console)]
+        self.assertEqual(len(notes), episodes, console[-3000:])
+        if gap_per_episode:
+            self.assertEqual([n[0] for n in notes], [b - a + 1 for a, b in gaps])
+        self.assertEqual([sum(n[i] for n in notes) for i in range(6)], self.lg.drops)
+        self.assertNotIn("still under way", console)
+        sync = [r["event"] for r in read_csv(os.path.join(self.out, "can_sync.csv"))]
+        self.assertEqual(len([e for e in sync if e.startswith("queue full ")]), episodes, sync)
+        self.assertIn("queue full %d time(s): dropped %d frame lines (%d bytes)" % (episodes, self.lg.drops[0],
+                                                                                    self.lg.drops[1]), console)
+        self.assertLessEqual(self.q.peak, self.q.limit)
+        return gaps
+
+    def test_one_hang(self):
+        lines = queue_stream(6000)
+        worst = self.play(lines, hung=lambda k: 800 <= k < 1800)
+        self.check(lines, episodes=1)
+        self.assertGreater(worst, self.LIMIT - (msl.EVENT_COST + 200), "the queue never filled")
+
+    def test_two_hangs_two_episodes(self):
+        lines = queue_stream(8000)
+        self.play(lines, hung=lambda k: 600 <= k < 1300 or 2500 <= k < 3300, seed=12)
+        self.check(lines, episodes=2)
+
+    def test_slow_writer_gets_data_not_drop_records(self):
+        """A writer that takes one event per two reads for 2000 reads (a slow disk, not a hung one): the
+        queue stays full and the reader drops and queues by turns. It queues again only once the writer has
+        freed 1/8 of the bound, so what the writer finds is mostly data in long runs. Resuming as soon as
+        anything fits would fill the queue with drop records instead — one per read that fit between two
+        that did not (889 of the writer's 1000 events, measured) — and lose twice the frames. One episode,
+        counted exactly all the same."""
+        lines = queue_stream(8000)
+        self.play(lines, hung=lambda k: False, seed=13, slow=lambda k: 600 <= k < 2600)
+        gaps = self.check(lines, episodes=1, gap_per_episode=False)
+        took = self.slow_took
+        print("\n    slow writer: took %d data events and %d drop records; %d gaps, %d frame lines dropped"
+              % (took["data"], took["drop"], len(gaps), self.lg.drops[0]))
+        self.assertGreater(len(gaps), 10, "the writer never freed anything: not a slow writer")
+        self.assertLess(took["drop"] * 5, took["data"] + took["drop"], "the writer got mostly drop records")
+
+
+class TestDropCounting(unittest.TestCase):
+    """What a dropped read is counted as: each line by the file Logger.handle would have put it in."""
+
+    def test_count_lines_by_destination(self):
+        parts = [(0, b"F 00000010 17C 8 0011223344556677\n"), (2, b"FS 00000020 1 1 0 0 0\r\n"),
+                 (4, b"MKR status\r\n"), (4, b"\n"), (4, b"F 0000ABCD 17C 9 00\n"),    # malformed: a console note
+                 (4, b"FS 0000ABCD 1 2 3\n"), (0, b"F 00000030 123 R 4\n"), (0, b"F 00000040 18DAF110 0\r\n")]
+        want = [0] * 6
+        for k, line in parts:
+            want[k] += 1
+            want[k + 1] += len(line)
+        acc = [0] * 6
+        msl.count_lines(b"".join(line for _k, line in parts), acc)
+        self.assertEqual(acc, want)
+        self.assertEqual(acc[1] + acc[3] + acc[5], sum(len(line) for _k, line in parts))
+
+    def test_overlong_fragment_dropped_counts_as_its_console_note(self):
+        q = msl.Handover(1)                                  # nothing fits
+        rd = msl.PortReader(None, q, threading.Event())
+        rd.received(1.0, b"x" * (msl.MAX_PARTIAL + 10))    # no newline, past MAX_PARTIAL
+        rd.received(1.1, b"F 00000010 17C 0\n")
+        self.assertEqual(rd.dropping, [1, 17, 0, 0, 1, msl.MAX_PARTIAL + 10])
+        self.assertEqual(rd.drop_span, [1.0, 1.1])
+        self.assertEqual(rd.drop_record(), ("drop", 1.0, 1.1, 1, 17, 0, 0, 1, msl.MAX_PARTIAL + 10))
+        self.assertEqual(len(q.items), 0)
+
+
+class TestStatsColumns(unittest.TestCase):
+    """rx_dropped and fs_dropped are ADDED at the end of can_stats.csv. A file an older logger started keeps
+    its header and its row width when appended to, so a reader of it never sees a ragged file."""
+
+    FS = b"FS 05F5E100 1000 1000 0 0 0\n"
+
+    def run_logger(self, out):
+        lg = msl.Logger(out, "can0")
+        lg.port_open("/dev/null", None)
+        lg.data(50.0, self.FS)
+        lg.close()
+        with open(os.path.join(out, "can_stats.csv")) as f:
+            return [line.rstrip("\n").split(",") for line in f]
+
+    def test_new_file_has_the_new_columns(self):
+        out = tempfile.mkdtemp(prefix="canstream_cols_")
+        try:
+            rows = self.run_logger(out)
+            self.assertEqual(",".join(rows[0]) + "\n", msl.STATS_HEADER)
+            self.assertEqual(rows[0][:11], ["host_epoch", "host_mono", "timeline", "mkr_us", "mkr_s", "drained",
+                                            "streamed", "ovf", "ringdrop", "nohost", "rx_frames"])
+            self.assertEqual(rows[0][11:], ["rx_dropped", "fs_dropped"])
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1][11:], ["0", "0"])
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+    def test_older_file_keeps_its_width(self):
+        out = tempfile.mkdtemp(prefix="canstream_cols_")
+        try:
+            old = "host_epoch,host_mono,timeline,mkr_us,mkr_s,drained,streamed,ovf,ringdrop,nohost,rx_frames\n"
+            with open(os.path.join(out, "can_stats.csv"), "w") as f:
+                f.write(old + "1.0,2.0,0,3,4.0,5,6,7,8,9,10\n")
+            rows = self.run_logger(out)
+            self.assertEqual(",".join(rows[0]) + "\n", old)
+            self.assertEqual([len(r) for r in rows], [11, 11, 11])
+            with open(os.path.join(out, "mkr_console.txt")) as f:
+                self.assertIn("older header", f.read())
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+
+class TestReaderDropsAcrossPortLoss(unittest.TestCase):
+    """The real read loop on a pty, nobody consuming its queue (the main thread hung): the reader keeps
+    reading and dropping, and when the port is then lost the drop record goes into the queue AHEAD of the
+    loss — the gap stays where it happened, on the timeline it happened on. Every line read is accounted
+    for exactly once: queued, or counted in the record."""
+
+    def test_record_before_loss_and_every_line_accounted(self):
+        tmp = tempfile.mkdtemp(prefix="canstream_qport_")
+        link = os.path.join(tmp, "ttyMKR")
+        pty = Pty(link)
+        q = msl.Handover(20 * (msl.EVENT_COST + 40))
+        stop = threading.Event()
+        said = []
+        rd = msl.PortReader(link, q, stop, said.append)
+        lines = [b"F %08X 17C 8 %016X\n" % (0x100000 + i * 800, i) for i in range(3000)]
+
+        def items():
+            with q.cond:
+                return list(q.items)
+
+        def wait_for(cond, what):
+            end = time_mod.monotonic() + 10.0
+            while not cond():
+                self.assertLess(time_mod.monotonic(), end, what)
+                time_mod.sleep(0.01)
+
+        rd.start()
+        try:
+            wait_for(lambda: any(ev[0] == "open" for ev in items()), "the reader never opened the pty")
+            for i, line in enumerate(lines):
+                pty.write(line)
+                if i % 8 == 7:
+                    time_mod.sleep(0.0005)                  # many small reads, as from the MKR
+            queued = lambda: sum(ev[2].count(b"\n") for ev in items() if ev[0] == "data")
+            dropped = lambda: rd.dropping[0] if rd.dropping is not None else 0
+            wait_for(lambda: queued() + dropped() == len(lines), "lines read != lines written")
+            self.assertLess(pty.worst_block, 0.5, "the reader stopped reading while its queue was full")
+            pty.hangup()
+            wait_for(lambda: [ev[0] for ev in items()].count("open") == 2, "the reader never reopened")
+        finally:
+            stop.set()
+            rd.join(2.0)
+            pty.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+        evs = items()
+        kinds = [ev[0] for ev in evs]
+        self.assertEqual(kinds[0], "open")
+        self.assertEqual(kinds[-3:], ["drop", "lost", "open"], kinds[-6:])
+        self.assertEqual(set(kinds[1:-3]), {"data"})
+        data = b"".join(ev[2] for ev in evs if ev[0] == "data")
+        rec = evs[-3]
+        self.assertEqual(data + b"".join(lines[data.count(b"\n"):]), b"".join(lines), "queued data is not a prefix")
+        self.assertEqual(rec[3:], (len(lines) - data.count(b"\n"), len(b"".join(lines)) - len(data), 0, 0, 0, 0))
+        self.assertEqual(evs[-2][3], b"", "no partial line at the loss")
+        self.assertEqual(len(said), 1, said)
+        self.assertLessEqual(q.peak, q.limit + 3 * msl.EVENT_COST)   # + the forced record, loss and open
 
 
 if __name__ == "__main__":

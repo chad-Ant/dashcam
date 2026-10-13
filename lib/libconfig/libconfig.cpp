@@ -173,9 +173,9 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam,
             ai.name     = attr.attribute("name").as_string();
             ai.writable = attr.attribute("writable").as_bool();
             ai.readable = attr.attribute("readable").as_bool();
-            ai.minValue = attr.attribute("min").as_float();
-            ai.maxValue = attr.attribute("max").as_float();
-            ai.step     = attr.attribute("step").as_float();
+            ai.minValue = attr.attribute("min").as_double();
+            ai.maxValue = attr.attribute("max").as_double();
+            ai.step     = attr.attribute("step").as_double();
             ai.menuOptions = attr.attribute("menu").as_string();
             if (!ai.name.empty())
                 cam.attributeInfo.push_back(std::move(ai));
@@ -365,9 +365,9 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
             a.append_attribute("name").set_value(ai.name.c_str());
             a.append_attribute("writable").set_value(ai.writable);
             a.append_attribute("readable").set_value(ai.readable);
-            a.append_attribute("min").set_value(static_cast<double>(ai.minValue));
-            a.append_attribute("max").set_value(static_cast<double>(ai.maxValue));
-            a.append_attribute("step").set_value(static_cast<double>(ai.step));
+            a.append_attribute("min").set_value(ai.minValue);
+            a.append_attribute("max").set_value(ai.maxValue);
+            a.append_attribute("step").set_value(ai.step);
             if (!ai.menuOptions.empty())
                 a.append_attribute("menu").set_value(ai.menuOptions.c_str());
         }

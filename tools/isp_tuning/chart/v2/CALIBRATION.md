@@ -13,6 +13,61 @@ your actual session directory under `/home/jetson/drive_logs`. Never combine
 different sheets, lighting conditions, runtime variants or profiles in a glob.
 The wrapper chooses a new timestamped directory below `v2/results` each time.
 
+### 0. Capture (`capture_chart.py`)
+
+`capture_chart.py` takes the captures for the three commands below, named the
+way they expect. It runs on the **host** with `/usr/bin/python3` (Argus is
+local; no container) and refuses while `dashcam-v04` runs:
+
+```bash
+sudo systemctl stop dashcam-v04
+cd ~/dashcam/tools/isp_tuning/chart/v2
+/usr/bin/python3 capture_chart.py colour   # sheet 1: 5 CSI + 5 UGREEN frames, 0.2 s apart
+/usr/bin/python3 capture_chart.py noise    # sheet 2: 64 consecutive CSI frames
+/usr/bin/python3 capture_chart.py detail   # sheet 3: one CSI frame, detail.csi.jpg
+```
+
+Each run makes a new directory under `/home/jetson/drive_logs/chart_captures/`
+(`--label` adds a suffix; `--out` names another new directory, but
+`run_calibration.sh` only sees `/home/jetson/drive_logs`) and prints the
+`run_calibration.sh` command for it. `session.json` beside the images keeps
+the pipelines and settings, the UGREEN's controls before/during/after, and
+every frame's PTS, buffer offset, arrival time, size and hash. It also records
+which IMX296 setup ran: the **running** device-tree limits (`max_gain_val`,
+`max_exp_time`, frame rates, read from `/proc/device-tree`), plus the ISP
+override, overlay and module hashes **on disk**, each flagged when the file
+changed after boot (an installed candidate is not live until the reboot).
+
+- **CSI:** `nvarguscamerasrc` → `nvjpegenc` quality 95 at 30 fps (the
+  recorder's rate; with a staged IMX296 candidate installed, stay at 30 fps).
+  It streams for `--settle` seconds (default 7), then locks AE and AWB;
+  `--auto` leaves them free. No other Argus property is set unless
+  `--csi-prop KEY=VALUE` asks (for example `ee-mode=0`); the recorder sets none.
+- **UGREEN:** the camera's own MJPEG, not re-encoded, 1920x1080 at 30 fps (the
+  recording mode); `--ug-size 3840x2160` gives the colour ROIs more pixels.
+  Its controls are not written unless `--ug-set CONTROL=VALUE` asks (standard
+  UVC controls only). Whatever is written is put back and read back afterwards;
+  if one does not come back, the exit code is 3 and the fix command is printed.
+  Under the camera's auto-exposure the exposure readback is stale, so fix it
+  explicitly for a noise burst, for example `--ug-set auto_exposure=1
+  --ug-set exposure_time_absolute=150 --ug-set gain=4
+  --ug-set white_balance_automatic=0 --ug-set white_balance_temperature=4500`.
+- **Bursts** are one continuous stream per camera. A noise burst must be
+  consecutive: no PTS step over 1.5 frame times and, where the source numbers
+  its buffers (`v4l2src`: the V4L2 sequence), no offset gap. Otherwise the run
+  exits 2 and keeps the files for diagnosis; capture again. The PTS test alone
+  is a heuristic: a source that stamps on arrival can hide a single drop.
+- `--cameras csi|ug|csi,ug` overrides the per-sheet default. `--frames` stays
+  within what the analyser accepts (detail: one image per run).
+- **Stopping:** Ctrl-C, SIGTERM and a dropped SSH session (SIGHUP) put any
+  written UGREEN control back first; a second signal does not cut that short.
+  `kill -9` cannot: use `tmux` for `--ug-set` runs over SSH.
+
+Tests, no camera: `/usr/bin/python3 test_capture_chart.py` (simulated cameras
+and a stub `v4l2-ctl`). Run live on the UGREEN on 2026-10-12. **The CSI path
+has not run yet** (no CSI was attached); it uses `tune_session.py`'s pipeline
+and AE/AWB lock, which did run on this rig.
+
 ### 1. Colour / USB reference
 
 Photograph **sheet 1** with both cameras under unchanged lighting. Prefer five

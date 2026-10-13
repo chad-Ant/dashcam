@@ -198,6 +198,15 @@ static bool test_roundtrip() {
     usb.type        = "USB";
     usb.device      = "/dev/video2";
     usb.formatIndex = 0;
+    // A control range past float's 2^24 integer limit (V4L2 ranges are int32): it must come back exact.
+    CameraAttributeInfo wide;
+    wide.name     = "wide_range";
+    wide.writable = true;
+    wide.readable = true;
+    wide.minValue = -2147483648.0;
+    wide.maxValue = 2147483647.0;
+    wide.step     = 16777217.0;
+    usb.attributeInfo.push_back(wide);
     src.cameras.push_back(usb);
 
     bool saved = ConfigReader::save(tmpFile, src);
@@ -342,6 +351,13 @@ static bool test_roundtrip() {
         check(c1.device      == "/dev/video2",  "cam[1].device == \"/dev/video2\"");
         check(c1.formatIndex == 0,              "cam[1].formatIndex == 0");
         check(c1.capabilities.empty(),          "cam[1] has no capabilities");
+        check(c1.attributeInfo.size() == 1 && c1.attributeInfo[0].name == "wide_range",
+              "cam[1] attributeInfo round-trip");
+        if (c1.attributeInfo.size() == 1) {
+            const auto& w = c1.attributeInfo[0];
+            check(w.minValue == -2147483648.0 && w.maxValue == 2147483647.0 && w.step == 16777217.0,
+                  "cam[1] attribute range exact past 2^24 (int32 min/max, step 2^24+1)");
+        }
     }
 
     fs::remove(tmpFile);

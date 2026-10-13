@@ -219,9 +219,9 @@ struct CameraAttributeInfo {
     std::string name;
     bool        writable    = false;
     bool        readable    = false;
-    float       minValue    = 0.0f;
-    float       maxValue    = 0.0f;
-    float       step        = 0.0f;
+    double      minValue    = 0.0;   ///< double: V4L2 ranges are int32, which float holds exactly only to 2^24
+    double      maxValue    = 0.0;
+    double      step        = 0.0;
     std::string menuOptions; ///< Semicolon-separated option strings for MENU controls.
 };
 

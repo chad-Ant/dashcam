@@ -22,6 +22,9 @@ eliminate colour offset or noise. Printed ink is not a calibrated reference.
 - `calibrate.py`: v2 saved-capture colour/noise/detail analyser; see
   [CALIBRATION.md](CALIBRATION.md) for commands and measurement limits.
 - `run_calibration.sh`: offline Docker wrapper with read-only captures and a fresh result folder.
+- `capture_chart.py`: takes those captures on the Jetson host (CSI and UGREEN, one continuous session per
+  camera, a `session.json` with controls, hashes and PTS); `test_capture_chart.py` tests it without cameras.
+  See CALIBRATION.md, "Capture".
 
 ## What changed and why
 

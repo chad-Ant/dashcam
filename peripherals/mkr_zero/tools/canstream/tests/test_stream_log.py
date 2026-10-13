@@ -583,6 +583,135 @@ class TestDiskFull(unittest.TestCase):
             ls.cleanup()
 
 
+class TestHungDisk(unittest.TestCase):
+    """The disk hangs WITHOUT erroring for HANG_S: patched_logger's hang_gate makes every write that reaches
+    the kernel and every fsync wait, as on a USB disk mid-reset or a dying card, then complete normally.
+    The hand-over queue is bounded at BOUND bytes (QUEUE_BYTES, set small so that it fills in ~1.5 s at this
+    rate). Before the bound the queue grew by the stream's rate for as long as the hang lasted. Required:
+      - the reader keeps draining the port: the synthetic MKR's writes never block;
+      - the queue stays within its bound (the logger's own peak, in its end note);
+      - only whole lines are dropped, in ONE contiguous run, and the counts reported in mkr_console.txt
+        (per file, lines and bytes as received) are exactly what is missing from the three files;
+      - can_stats.csv: rx_frames still equals the change in `streamed` row to row (dropped frames were
+        received), rx_dropped / fs_dropped add up to what is missing, and the USB check stays at 0 lost;
+      - stderr gets the episode's start and its end, once each; can_sync.csv one 'queue full' row;
+      - writing resumes by itself when the disk does, reported while running, every frame on time;
+      - SIGTERM still finalises and exits 0.
+    The stream also carries a CRLF console line every 50 packets and splits every 7th packet across two
+    writes, so drops land between reads that end mid-line."""
+
+    BOUND = 150_000
+    HANG_S = 6.0
+    NOTE_RE = re.compile(r"queue full for [0-9.]+ s: .*?can_raw\.log (\d+) frame lines \((\d+) bytes\), "
+                         r"can_stats\.csv (\d+) FS lines \((\d+) bytes\), mkr_console\.txt (\d+) lines \((\d+) bytes\)")
+
+    def test_bounded_counted_exactly_and_resumes(self):
+        gdir = tempfile.mkdtemp(prefix="canstream_gate_")
+        gate = os.path.join(gdir, "hang")
+        ls = LiveStream(self, us0=0x2468ACE0, patch={"hang_gate": gate, "set": {"QUEUE_BYTES": self.BOUND}})
+        sent = []                # every line written to the port, in order
+        n = [0]
+
+        def write(b):
+            n[0] += 1
+            if n[0] % 50 == 0:
+                b = b"MKR status n=%d\r\n" % n[0] + b
+            sent.extend(b.splitlines(keepends=True))
+            if n[0] % 7 == 3:
+                cut = len(b) // 2
+                ls.pty.write(b[:cut])
+                time.sleep(0.0003)
+                ls.pty.write(b[cut:])
+            else:
+                ls.pty.write(b)
+            return True
+
+        try:
+            ls.run(3.0, write)
+            with open(gate, "w"):
+                pass
+            while not os.path.exists(gate + ".hit"):         # until the logger's writer really is held
+                self.assertLess(ls.t, 8.0, "the logger never wrote while the gate was up")
+                ls.run(ls.t + 0.05, write)
+            ls.run(ls.t + self.HANG_S, write)
+            self.assertIsNone(ls.lg.p.poll(), "the logger died while its disk hung:\n" + ls.console())
+            os.unlink(gate)
+            ls.run(ls.t + 4.0, write)
+            console_running = ls.console()
+            time.sleep(HOLD_WAIT)
+            rc = ls.lg.stop()
+            ls.pty.close()
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(os.path.join(ls.out, "mkr_stream_log.err")))
+            self.assertLess(ls.pty.worst_block, 0.5, "the MKR side blocked %.2f s: the reader stopped reading"
+                            % ls.pty.worst_block)
+            self.assertIn("queue full for", console_running, "recovery reported while running, not at exit")
+
+            f_sent = [line for line in sent if line.startswith(b"F ")]       # index = sequence number
+            fs_sent = [line for line in sent if line.startswith(b"FS ")]
+            con_sent = [line for line in sent if line.startswith(b"MKR ")]
+            self.assertEqual(len(f_sent), len(ls.truth))
+            got = read_candump(os.path.join(ls.out, "can_raw.log"))      # raises on any torn or merged line
+            seqs = [int(g[6], 16) for g in got]
+            self.assertEqual(seqs, sorted(set(seqs)), "frames out of order or duplicated")
+            self.assertEqual((seqs[0], seqs[-1]), (0, len(f_sent) - 1), "frames missing at the start or the end")
+            kept = set(seqs)
+            miss_f = [i for i in range(len(f_sent)) if i not in kept]
+            gaps = [(a, b) for a, b in zip(seqs, seqs[1:]) if b != a + 1]
+            self.assertEqual(len(gaps), 1, "one contiguous gap expected, got %r" % gaps)
+            self.assertGreater(len(miss_f), 1000, "the hang dropped too little to test anything")
+            rows = read_csv(os.path.join(ls.out, "can_stats.csv"))
+            kept_fs = {int(r["streamed"]) for r in rows}
+            miss_s = [line for line in fs_sent if int(line.split()[3]) not in kept_fs]
+            for line in miss_s:
+                self.assertTrue(gaps[0][0] <= int(line.split()[3]) <= gaps[0][1] + 1, "FS dropped outside the gap")
+            console = ls.console()
+            body = console_body(console)
+            for b in body:
+                self.assertRegex(b, r"^MKR status n=\d+$", "a torn or merged console line")
+            miss_c = [line for line in con_sent if line.decode().rstrip("\r\n") not in set(body)]
+            want = [len(miss_f), sum(len(f_sent[i]) for i in miss_f), len(miss_s), sum(len(x) for x in miss_s),
+                    len(miss_c), sum(len(x) for x in miss_c)]
+            notes = [[int(x) for x in m.groups()] for m in self.NOTE_RE.finditer(console)]
+            self.assertEqual(notes, [want], "reported vs missing (frame lines, bytes, FS, bytes, console, bytes)")
+            self.assertGreater(want[2], 0)
+            self.assertGreater(want[4], 0)
+            self.assertIn("queue full 1 time(s): dropped %d frame lines (%d bytes), %d FS lines (%d bytes), "
+                          "%d console lines (%d bytes)" % tuple(want), console)
+            prev = 0
+            for r in rows:
+                self.assertEqual(int(r["rx_frames"]), int(r["streamed"]) - prev, r)
+                prev = int(r["streamed"])
+            self.assertEqual(sum(int(r["rx_dropped"]) for r in rows), want[0])
+            self.assertEqual(sum(int(r["fs_dropped"]) for r in rows), want[2])
+            self.assertIn(" 0 not received here", console)
+            m = re.search(r"queue peak (\d+) of (\d+) bytes", console)
+            self.assertIsNotNone(m)
+            peak, bound = int(m.group(1)), int(m.group(2))
+            self.assertEqual(bound, self.BOUND)
+            self.assertLessEqual(peak, bound, "the queue grew past its bound")
+            self.assertGreater(peak, bound - 1000, "the queue never filled")
+            self.assertEqual(len([e for e in ls.sync_events() if e.startswith("queue full ")]), 1)
+            with open(ls.out + ".stderr") as f:
+                err = f.read()
+            self.assertEqual(err.count("queue full ("), 1, err)
+            self.assertEqual(err.count("queue full for"), 1, err)
+            errs = [(g[0] / 1e6 - ls.lg.K) - ls.truth[q][0] for g, q in zip(got, seqs)]
+            worst = max(errs, key=abs)
+            print("\n    hung disk %.0f s: %d frame lines dropped of %d, queue peak %d of %d, worst MKR-side block "
+                  "%.3f s, worst timestamp error %.3f ms" % (self.HANG_S, want[0], len(f_sent), peak, bound,
+                                                             ls.pty.worst_block, worst * 1e3))
+            self.assertLess(abs(worst), TOL_MAX, "a frame timed %.3f s off" % worst)
+        finally:
+            if os.path.exists(gate):
+                os.unlink(gate)                             # never leave the logger hung
+            if ls.lg.p.poll() is None:
+                ls.lg.stop()
+            ls.pty.close()
+            shutil.rmtree(gdir, ignore_errors=True)
+            ls.cleanup()
+
+
 HOLD_WAIT = 2.5     # past the logger's 2 s hold, so every frame read has been handed to can_raw.log
 
 

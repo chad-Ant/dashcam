@@ -308,7 +308,11 @@ void GpioWatcher::watchLoop() {
         }
 
         if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            uint8_t buf[16]; (void)::read(m_pipe[0], buf, sizeof(buf));
+            // Drain the wake byte; the loop ends whatever read() returns, and the pipe is
+            // closed after the join. (A (void) cast does not silence glibc's warn_unused_result.)
+            uint8_t buf[16];
+            ssize_t drained = ::read(m_pipe[0], buf, sizeof(buf));
+            (void)drained;
             break;
         }
 

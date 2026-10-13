@@ -1,4 +1,4 @@
-# Handover — branch `camera`, 2026-10-10
+# Handover — branch `camera`, 2026-10-12
 
 This file has three parts:
 - **Start here:** the rig as it is now, the state of every workstream, and the open work in priority order.
@@ -6,36 +6,38 @@ This file has three parts:
 - **Log:** dated sections, newest first, kept as written at the time. Later corrections are marked inline. Where a log
   section disagrees with Start here, Start here is current.
 
-# Start here (2026-10-10)
+# Start here (2026-10-12)
 
 ## The rig now
 
 | Item | State |
 |---|---|
-| **Attached now** (boot of 2026-10-09 16:00, checked 2026-10-10 07:53) | **No camera and no MCU is attached.** The IMX296 failed to probe (`imx296 9-001a: 8-bit write to 0x3000 failed: -121`, no I2C acknowledge: on 2026-10-03 the same error was a loose ribbon). There is no `/dev/video*` and no `/dev/serial/by-id`; `lsusb` shows only the Bluetooth radio, so the UGREEN, MKR and C3 are unplugged. Reseat or reconnect everything, power-cycle, and check `csi_test 0` before relying on anything below. |
+| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | **The UGREEN and the CYD only.** The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CYD is `/dev/ttyUSB0` since the out-of-tree `ch341.ko` was installed and brltty-udev masked (2026-10-12 log section). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. |
 | Platform | L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra, UEFI 36.5.2 (upgraded 2026-10-01). The 65 NVIDIA packages are held. |
-| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). |
-| UGREEN | `/dev/video1` when attached, pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. |
-| v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). The newest build is `bin/build_20261003_135326`. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on and logs at 16 MB × 8. |
-| MKR Zero | Production raw-CAN build (`3a702a8`). It boots into DISCOVER: listen-only, accept-all, raw `F`/`FS` lines on native USB, no decode. |
+| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
+| UGREEN | `/dev/video1` next to the CSI camera (`/dev/video0` without it), pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. `usb_test`, `record_test` Part B and `scan_cameras` pass on it with the 2026-10-11 build (2026-10-12). It has **no** `exposure_dynamic_framerate` control. |
+| v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). **The newest build is now `bin/build_20261011_003045`**, which holds the uncommitted 2026-10-11 library changes (behaviour-neutral, all tests pass); the service runs it at its next start. `bin/build_20261011_002908` is a test build of the old float code; delete it through the container if wanted. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on, logs at 16 MB × 8, and since 2026-10-10 no obsolete settings (backup `dashcam.xml.bak-20261010-before-obsolete-cleanup`). Its wrong "autofocus stuck at 512" comment was corrected on 2026-10-12 (comment only; backup `dashcam.xml.bak-20261012-before-focus-comment`). |
+| MKR Zero | Production raw-CAN build (`3a702a8`). It boots into DISCOVER: listen-only, accept-all, raw `F`/`FS` lines on native USB, no decode. Its millis() clock is **not** held to the crystal (+1300 → −140 ppm within a drive; 2026-10-11 log section). |
 | ESP32-C3 | Bridge firmware 1.0; `HostProtocol` and `CommProtocol` are at 0x07. |
-| Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. |
+| Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. Since 2026-10-10: `drive_watch.sh` watches the raw-CAN files, tegrastats runs every 1 s, and `drive_session.sh stop` refuses while the car is moving (`--force` overrides). |
 | Storage | `/media/jetson/backup` sits on the root NVMe: 428 GB free. |
-| Uncommitted | Nothing. The GRF-250 and stereo prototypes were committed on 2026-10-10. |
+| Uncommitted | `peripherals/mkr_zero/tools/canstream/` (logger hung-disk bound, tests, README); `peripherals/mkr_zero/libraries/EncoderPan/` (standalone servo/encoder prototype); `lib/libcan/libcan.cpp`, `lib/libgpio/libgpio.cpp`, `lib/libcamera/libcamera.{h,cpp}`, `lib/libconfig/libconfig.{h,cpp}`, `src/tests/test_libconfig.cpp`; since 2026-10-12: `tools/isp_tuning/chart/v2/` (capture helper, tests, docs), `peripherals/cyd/` (the dashboard app the user copied in from a colleague's uncommitted work, with my fixes; bring-up sketch fixes; CH340 driver script; README), `docker_dev/Dockerfile`, `build.sh` and `install_samd_aarch64.py`; this file. |
 
 ## Workstreams
 
 | Workstream | Commits | State | Next |
 |---|---|---|---|
-| v0.4 recorder (UGREEN) | `7293abe` and earlier | Segmented MJPEG passthrough, auto night mode, fixed focus, every telemetry field in the `.ass` and in CSV. The 2026-10-03 night drive recorded cleanly, with 0 warnings while driving. | Start the service before a drive. |
-| UGREEN image | — | Fixed 690 is verified, and autofocus also works (parked). Night blur is exposure (33–50 ms at 20 fps), not focus. 45% of night driving frames are below luma 35. | Autofocus while driving is untested; an exposure A/B is optional. |
-| CSI IMX296 | — (driver and ISP files live outside the repo) | c8_sh15 is clean indoors. At night it is gain-limited by the device tree: noisy and banded on unlit roads, 18.3 MB/s. The mount moved during the drive. | Re-mount; device-tree gain/exposure A/B; drop the driver's DEBUG define. |
-| MKR raw CAN over USB | `3a702a8`, `9b5c00e` | Bench-proven: 0 loss at 2400 and 4400 fr/s. The production build is on the MKR. Orin logger and offline decoder in `peripherals/mkr_zero/tools/canstream/`. | In-car loss test. |
-| Turning demo, dead reckoning, EKF | `cd89438`, `8838ead` | Read-only demo plus a C++ library. Synthetic and decoder-parity tests only. | Measure `antenna_x_m`; run the measured course. |
-| IMX296 v2 chart | `7e45172` | Offline analyser; synthetic tests only. | Print it, capture, validate live. |
-| GRF-250 ranging | committed 2026-10-10 | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
-| Stereo prototype | committed 2026-10-10 | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
-| IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running; High-G 64 on the night drive. | Wiring rework; the parked block test. |
+| v0.4 recorder (UGREEN) | `7293abe` and earlier | Segmented MJPEG passthrough, auto night mode, fixed focus, every telemetry field in the `.ass` and in CSV. The 2026-10-03 night drive recorded cleanly; the overlay matches the telemetry and every segment has its `.ass`. | Start the service before a drive. |
+| UGREEN image | — | Fixed 690 is verified, and autofocus also works (parked). Night blur is exposure (33–50 ms at 20 fps), not focus. 45% of night driving frames are below luma 35. The camera has no `exposure_dynamic_framerate` control, so the proposed A/B with it is impossible; v0.4's frame-rate-priority loop is the existing way to cap exposure (`libcamera_exposure.h`). | Autofocus while driving is untested. |
+| CSI IMX296 | — (driver and ISP files live outside the repo) | c8_sh15 is clean indoors. At night it is gain-limited by the device tree: noisy and banded on unlit roads, 18.3 MB/s. **The mount is loose: 23 pose changes in 91 min**, mostly on road shocks. Candidates for the gain/exposure caps and the debug flood are staged. | Re-mount rigidly; install cand1 and A/B (sudo); then the debug-off module. |
+| MKR raw CAN over USB | `3a702a8`, `9b5c00e` | Bench-proven: 0 loss at 2400 and 4400 fr/s. The production build is on the MKR. Orin logger and offline decoder in `peripherals/mkr_zero/tools/canstream/`; the logger is now bounded under a hung disk (uncommitted). | In-car loss test. |
+| Turning demo, dead reckoning, EKF | `cd89438`, `8838ead` | Read-only demo plus a C++ library. Synthetic and decoder-parity tests only. The 2026-10-03 "clock break" it refuses is one stale frame, not a clock fault. | Measure `antenna_x_m`; run the measured course; let `fusion_input` drop stale rows (proposal). |
+| IMX296 v2 chart | `7e45172`; helper uncommitted | Offline analyser; synthetic tests only. Printed by the user (banding, crushed shadow steps 0–32: fine for relative A/B, not absolute). Capture helper `capture_chart.py` (2026-10-12): UGREEN path run live, **CSI path not run**. | Capture the three sheets once the CSI camera is back. |
+| GRF-250 ranging | `e46bf71` | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
+| Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
+| CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed and compiled, **not flashed** (the user's OK is needed). Flash it, then calibrate touch and check SD, LDR and audio on the board. |
+| Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
+| IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
 ## Open work, in priority order
 
@@ -43,31 +45,39 @@ This file has three parts:
    - reconnect the UGREEN, MKR and C3, reseat the CSI ribbon, power-cycle; check `csi_test 0` 5/5 and the
      `/dev/v4l/by-id` and `/dev/serial/by-id` entries;
    - start `dashcam-v04` (or reboot);
-   - re-mount the CSI rigidly: it moved at 22:20:13 on 2026-10-03. Level it within 2°, keep the dashboard to at most
-     30% of the frame, and take reference frames before and after the drive;
-   - decide whether to re-arm the drive crontab. Keep the CSI recording as long as v0.4 runs: on 2026-10-03 it missed
-     the last 13 min because the session was stopped too early.
+   - **re-mount the CSI on a rigid bracket.** It moved 23 times on 2026-10-03, mostly at bumps: its roll against the car
+     spanned about 20°, and single jumps reached 250 px. Level it within 2°, keep the dashboard to at most 30% of the frame, and take reference frames
+     before and after the drive;
+   - decide whether to re-arm the drive crontab. The session's stop guard now refuses a stop while the car moves.
 2. **In-car raw-CAN loss test:** parked, engine on, about 10 min, against the CANRawLog baseline (≥ 0.4%).
-3. **CSI night quality** (needs the user's sudo):
-   - device-tree A/B: `max_gain_val` 300–480 and `max_exp_time` about 1500 lines;
-   - then drop `#define DEBUG 1` and rebuild with `~/drive_logs/tools/imx296_driver/build.sh`.
-4. **Finish the night-drive check a power cut stopped:**
-   - the CSI mount over the whole drive;
-   - the MKR `master_ms` drift. The −1283 ppm figure is implausible for a crystal-locked SAMD21. The EKF log
-     section's clock break (0.078 s host vs 5.211 s master) may be related.
-5. **Turning EKF:** measure the rear-axle-centre-to-antenna distance, then run the measured private course with a
+3. **CSI night quality** (needs the user's sudo; procedure in
+   `~/drive_logs/tools/imx296_driver/staging_20261010/README.md`):
+   - `sudo ./install_candidate.sh --apply --module keep --dtbo cand1`, then reboot and run a night A/B;
+   - after that, the debug-off module.
+4. **Bench checks that need the MKR and C3:**
+   - the MKR's DFLL/XOSC32K lock: log `SYSCTRL->PCLKSR`, `DFLLCTRL`, `DFLLVAL` each second, and measure GCLK1;
+   - the C3's USB TX path (the five telemetry stalls).
+5. **Decisions for the user (data in the 2026-10-11 log section):**
+   - the High-G incident threshold: keep 2 g as a roughness counter and add a 3 g or horizontal-axis incident
+     trigger;
+   - the canmap speed scale: CAN reads 1.0–1.1% low against GNSS, so 0.01 → 0.0101;
+   - `fusion_input.py`: drop or re-time late rows rather than abort.
+6. **Turning EKF:** measure the rear-axle-centre-to-antenna distance, then run the measured private course with a
    passenger.
-6. **GRF-250:** verify the converter's IC and levels before wiring (the MKR is not 5 V tolerant), then bench the
+7. **GRF-250:** verify the converter's IC and levels before wiring (the MKR is not 5 V tolerant), then bench the
    sensor.
-7. **IMX296 v2 chart:** print it, write an acquisition helper, capture.
-8. **Smaller items:**
+8. **IMX296 v2 chart:** capture the three sheets with `capture_chart.py` (CALIBRATION.md, "Capture") once the CSI
+   camera is back. Its first CSI run is also the helper's first CSI test.
+9. **CYD** (2026-10-12 log section): driver installed, flash backed up, dashboard app fixed and compiled. With the
+   user's OK: `build_and_upload.sh auto` in the container, then calibrate touch and check SD, LDR and audio on the board.
+10. **Smaller items:**
    - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
-   - `drive_watch.sh` should watch `can_raw.log` growth;
-   - the logger's queue grows without bound under a disk that hangs;
-   - the High-G events against the footage, and CAN speed against GNSS speed;
    - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
+   - a night plate test on an unlit road, and autofocus while driving;
+   - whether a link loss minutes after a recovered link-up should stay DEBUG-only (the 00:06 MKR reboot was);
    - item U with a replug, and the optional item O step (both need sudo).
-9. **Code backlog:** see "Backlog: deliberately not done" under Reference.
+11. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
+    warnings and the float control ranges. Left: the `const_cast` in `getCameraStatus()`.
 
 # Reference
 
@@ -134,6 +144,8 @@ and the tools' own `--version`. Re-collect after an upgrade.
     over ESLOV.
   - **SD card:** on SPI1, holding the CAN map and the IMU calibration profile.
 - **Bridge:** Seeed XIAO ESP32-C3. It talks to the MKR over UART1 at 115200 and to the Jetson over native USB CDC.
+- **Dashboard (bench only, 2026-10-12):** CYD, ESP32-2432S028R (classic ESP32, ILI9341 2.8", XPT2046 touch, microSD).
+  USB through a CH340 (`1a86:7523`), which needs the out-of-tree `ch341.ko` (`peripherals/cyd/README.md`).
 
 **Jetson host**
 - JetPack 6.2.3 (`nvidia-jetpack 6.2.3+b81`), L4T R36.5.2 (`/etc/nv_tegra_release` R36 REVISION 5.2), kernel
@@ -152,8 +164,14 @@ and the tools' own `--version`. Re-collect after an upgrade.
 - Host Python's `cv2` is broken (NumPy mismatch). Use the container; do not change system Python packages.
 
 **Dev container** `l4t-ml-gpio:latest`
-- Built 2026-09-25 from `docker_dev/Dockerfile`, base `dustynv/l4t-ml:r36.4.0`. The repo is mounted at
-  `/user/dashcam`. It builds everything: plain `make` gives a timestamped `bin/build_<ts>/`.
+- Built 2026-09-25 from `docker_dev/Dockerfile`, base `dustynv/l4t-ml:r36.4.0`; **rebuilt 2026-10-12**
+  (`e8686f613fba`, from the final Dockerfile; the 2026-09-25 image is kept as `:build_20261012_115503`). The first 70 of 74 layers are
+  byte-identical: only the MKR layer (re-run because `install_samd_aarch64.py` changed in `a04f749`; same
+  123,236 B MKR image) and the new CYD layer differ. The repo is mounted at `/user/dashcam`. It builds everything:
+  plain `make` gives a timestamped `bin/build_<ts>/`.
+- `docker_dev/build.sh` no longer untags `:latest` before building. `docker build --tag` moves it only on success,
+  so a failed or interrupted build leaves it in place (2026-10-12: a dropped download from downloads.arduino.cc left
+  no `:latest`, which the service needs; restored by hand).
 - GCC 11.4.0, Python 3.10.12, CUDA 12.6 (nvcc), OpenCV 4.10.0-dev, NumPy 1.26.4, PyTorch 2.6.0, GStreamer 1.20.3.
 - spdlog 1.9.2, fmt 8.1.1, pugixml 1.12.1, pyserial 3.5.
 
@@ -167,7 +185,11 @@ and the tools' own `--version`. Re-collect after an upgrade.
 - **ESP32-C3:**
   - Core `esp32:esp32` **3.2.0**, esptool 5.4.0.
   - FQBN `esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app,CPUFreq=160,FlashMode=qio,FlashFreq=80,FlashSize=4M,DebugLevel=none,UploadSpeed=921600`.
-- **Arduino libraries**, pinned in the Dockerfile and installed `--no-deps`:
+- **CYD (classic ESP32):** the same `esp32:esp32` 3.2.0 core (Xtensa toolchain), FQBN `esp32:esp32:esp32` (ESP32 Dev
+  Module defaults). `peripherals/cyd/build_and_upload.sh [PORT|auto]` builds the dashboard app (442,402 B; the
+  colleague built it on Windows with core 3.3.11). The bring-up sketch builds with plain `arduino-cli compile`
+  (384,186 B).
+- **Arduino libraries**, pinned in the Dockerfile and installed `--no-deps`, with retries and a name@version check:
   - Time 1.6.1
   - SparkFun u-blox GNSS Arduino Library 2.2.29
   - Servo 1.3.0
@@ -176,6 +198,7 @@ and the tools' own `--version`. Re-collect after an upgrade.
   - Adafruit GFX Library 1.12.6
   - Adafruit SSD1306 2.5.17
   - Adafruit LED Backpack Library 1.5.1
+  - Adafruit ILI9341 1.6.4 (CYD, since 2026-10-12)
 - **Vendored** in `peripherals/mkr_zero/vendor`:
   - Wire: the arduino:samd 1.8.14 copy, patched with the `busOwner` fix, bounded transfers and bus errors. See its
     README.
@@ -218,6 +241,8 @@ make -C lib/libdeadreckoning check                   # dead-reckoning library (5
 make -C lib/liblidartracking test                    # GRF-250 parser/FSM + Orin association library (container for camera tests)
 make -C lib/libstereoprototype test                  # stereo feasibility prototype (container)
 tools/isp_tuning/chart/v2/run_calibration.sh ...     # v2 chart analyser; tests: test_calibrate.py in the container (CALIBRATION.md)
+/usr/bin/python3 tools/isp_tuning/chart/v2/test_capture_chart.py   # chart capture helper, host, no camera (18 tests)
+peripherals/cyd/host/ch341_module.sh check           # on the Jetson host, read-only: CH340 driver, tty, brltty
 bash ~/drive_logs/tools/verify_platform.sh           # on the Jetson, not in the container: after a platform change
 bash ~/drive_logs/tools/test_l4t_checks.sh           # on the Jetson: the pre-reboot checks of the upgrade/rollback
 ```
@@ -335,6 +360,394 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-10-12 (Jetson, bench): UGREEN work and the CYD toolchain
+
+Only the UGREEN and the CYD were attached; the rig was not in the car. Nothing was committed, flashed or installed
+with sudo, and dashcam-v04 stayed stopped. The captures taken (the room, no chart) stay in the session scratchpad.
+
+**1. UGREEN: the 2026-10-11 library change on the real camera** (`bin/build_20261011_003045`, control ranges as
+`double`)
+- `usb_test`: 9/9 PASS (open/close, capture, attributes queued/live/reaching the device, invalid name, stop/restart,
+  format cycling, controls put back). `--list-ctrls` is identical before and after.
+- `record_test`: PASS, 0 failures (Part A and Part B on the UGREEN). `scan_cameras`: every range matches
+  `v4l2-ctl` exactly, including pan/tilt −576000..576000 step 3600.
+- **The UGREEN has no `exposure_dynamic_framerate` control** (UVC "auto exposure priority" is not exposed). The night
+  analysis's "exposure A/B with `exposure_dynamic_framerate=0`" cannot be run as written. Capping exposure is what
+  v0.4's frame-rate-priority loop already does (`libcamera_exposure.h`); at night it hands exposure to the camera on
+  purpose, because the UVC gain range is far too dark.
+- The deployed `dashcam.xml`'s wrong "autofocus stuck at 512" comment now states the 2026-10-06 finding. It is a
+  comment-only change, checked well-formed; backup `dashcam.xml.bak-20261012-before-focus-comment`.
+
+**2. v2 chart capture helper** (`tools/isp_tuning/chart/v2/capture_chart.py`; CALIBRATION.md, "Capture")
+- Host `/usr/bin/python3`, refuses while dashcam-v04 runs. One continuous session per camera:
+  - CSI: `tune_session.py`'s pipeline (`nvjpegenc` q95) at 30 fps, AE/AWB locked after a 7 s settle;
+  - UGREEN: its own MJPEG, 1080p30 by default.
+  - Output: a new directory under `~/drive_logs/chart_captures/`, named as `run_calibration.sh` expects, with
+    `session.json` (controls before/during/after, ISP/overlay/module hashes, per-frame PTS, arrival time and hash,
+    and a gap check for noise bursts). It prints the analysis command.
+- UGREEN controls are written only on `--ug-set` (standard UVC only): mode switches first, values after. They are
+  put back in reverse order, with signals ignored during the restore, and read back; a failure gives exit 3 and the
+  fix command.
+- **Tests:** `test_capture_chart.py`, 18 tests (simulated cameras, stub `v4l2-ctl`): captures, naming, spacing,
+  burst gap detection (PTS and buffer offsets), 19 refusals, write order and restore, failed write, failed restore
+  with an unwritable `session.json`, SIGTERM, SIGHUP, a second signal mid-restore, `--csi-prop` read-back, and the
+  running-DT record. Ten mutants are each caught.
+- **Live on the UGREEN:** a colour capture with no control writes (controls identical afterwards), and a 32-frame
+  noise burst with fixed exposure/gain/WB: PTS steps 31.9–36.1 ms, 0 gaps, controls restored identically. The first
+  live run found `v4l2-ctl --get-ctrl` printing menus as `3 (Aperture Priority Mode)`; it failed safely (exit 2,
+  nothing written) and is fixed.
+- **The CSI path has not streamed** (no CSI attached). Checked without the camera: the exact pipeline parses and
+  links, all 11 `--csi-prop` keys take values of the right type on a real `nvarguscamerasrc` element, and
+  `aelock`/`awblock` set. Its first chart capture is its streaming test.
+- The prints: the user's photos show inkjet banding, paper texture, sheen specks and shadow steps 0–32 merged.
+  These are fine for relative CSI-vs-UGREEN and base/candidate work (temporal noise cancels static print texture).
+  They are not usable for absolute edge width or shadow steps below about 40. Use diffuse light at 30–45° to remove
+  the specks.
+
+- **Review** (three read-only agents, one per area; every finding came with a reproduction, and the main session
+  re-checked the key ones). Capture helper: 3 medium, 8 low, all fixed except where noted:
+  - a failed restore followed by a failing `session.json` write or controls read lost the exit-3 fix message. The
+    restore now runs first in `finally` and prints at once;
+  - SIGHUP killed it without a restore;
+  - `--simulate --ug-set` wrote the real camera;
+  - detail allowed more frames than `calibrate.py` takes;
+  - noise allowed `--spacing`, and a gap still exited 0;
+  - out-of-range `--csi-prop` values were silently kept at their defaults (now read back);
+  - on-disk hashes could name a candidate that was not live yet (now the running device tree too);
+  - `--out` outside drive_logs (note printed);
+  - arrival-stamped PTS can hide a drop (offsets checked);
+  - the UGREEN restore no longer waits behind the Argus teardown.
+
+  Re-run live on the UGREEN afterwards: offsets 62, 63, …, 0 gaps, controls identical.
+
+**3. CYD toolchain** (`peripherals/cyd/`)
+- **No serial port:** the CYD enumerates as a CH340 (`1a86:7523`), but 5.15.199-tegra has
+  `CONFIG_USB_SERIAL_CH341` unset (`usbserial`, `cp210x` and `ftdi_sio` are built). Ubuntu's `brltty` udev rule also
+  claims `1a86/7523` (`SYSTEMD_WANTS=brltty-udev.service`; that service was running).
+- **`host/ch341_module.sh`:**
+  - `build` fetches `ch341.c` for stable v5.15.199 and refuses an unpinned sha256. That file is byte-identical to
+    NVIDIA's R36.4.3/R36.4.4/R36.5 public_sources copy.
+  - It builds against `/lib/modules/5.15.199-tegra/build`, then checks vermagic and 28/28 imported symbol CRCs.
+  - Output: `~/drive_logs/tools/ch341_driver/out-5.15.199-tegra/` (`ch341.ko`, source, SHA256SUMS). It prints the
+    sudo install and undo commands.
+  - `check` is read-only (driver, tty per CH34x, brltty). Tested: unpinned source refused (exit 3), the NVIDIA copy
+    builds, usage, temp dirs cleaned.
+  - **Not installed: that needs the user's sudo.**
+- **`build_and_upload.sh`:** the Linux twin of the README's Windows command (FQBN `esp32:esp32:esp32`); `auto`
+  takes the single CH340 under `/dev/serial/by-id`. The bring-up sketch compiles to 384,162 B with no warnings.
+  The upload is not run (no tty yet).
+- **Image:** a new last layer adds Adafruit ILI9341 1.6.4 (`--no-deps`; GFX and BusIO come from the MKR layer). The
+  Xtensa toolchain was already in the esp32 core.
+  - The first rebuild died on a downloads.arduino.cc `EOF` in the MKR layer. That layer re-ran because
+    `install_samd_aarch64.py` changed after the image was built (`a04f749`).
+  - `build.sh` had already untagged `:latest`, so there was **no `:latest`**, which the service needs. I re-tagged
+    the old image by hand.
+  - Fixes: `build.sh` re-tags on failure (tested with a stub `docker`). The library installs retry 3 times, then
+    check every name@version, POSIX-only since the base image's `/bin/sh` is dash (tested under dash, including a
+    wrong version).
+  - Rebuilt: `f2304ca58b60`, and after the review fixes `e8686f613fba` (the current `:latest`; no retry was
+    needed, the intermediate image is deleted). 70 of 74 layers are byte-identical to the old image. The MKR firmware still builds to
+    123,236 B / 23,924 B (the production numbers), and the C3 bridge builds.
+- **Review fixes:**
+  - The printed undo ran `modprobe -r` after `depmod`, which fails (kmod 29 cannot find a module it has
+    forgotten); it now unloads first.
+  - `check` prints the brltty fix command, honours an `/etc` rules override and commented lines, and accepts
+    `masked-runtime`.
+  - `build_and_upload.sh` no longer takes a mistyped sketch path as the port.
+  - Image: `build.sh` keeps `:latest` during the build; the index downloads retry too; the Dockerfile comment
+    now says RUN uses the base image's bash. Not changed: the version check greps the `lib list` table. The
+    reviewer showed it cannot false-pass for libraries installed from the index.
+  - The rebuild after these fixes hung for 20+ min on `CMSIS@4.5.0` (about 1.5 KB/s, no retry) and was
+    cancelled when the session ended. `:latest` stayed on the working image, as the new `build.sh` intends.
+    Cause: `install_samd_aarch64.py`'s `urlretrieve` has no timeout. It now sets a 60 s socket timeout, so a
+    stall raises into its existing retry/backoff (shown against a local server that never answers).
+- **Bring-up sketch review** (user asked to check the existing CYD code first; the only CYD code anywhere is
+  `cyd_bringup_test`, from `2f6b3f6`, never run on a board). Checked against witnessmenow's
+  ESP32-Cheap-Yellow-Display pin list and `User_Setup.h`, and the core 3.2.0 / Adafruit sources in the image:
+  - The SD card was probed over the display's pins. `SPI.begin(14, 12, 13, 15)` remaps the global (VSPI) bus to
+    the display, and `SD.begin(5, SPI)` calls `spi.begin()`, which returns early on a started bus. The card is on
+    18/19/23 (CS 5), so it would always read `NOT FOUND`. The display now has its own `SPIClass(HSPI)`; the
+    global bus is started on the card's pins.
+  - The backlight (GPIO 21, HIGH = on) was never driven, so the panel would most likely stay dark. It is now driven HIGH.
+  - `TFT_RST = 4` is the red LED (active low). The panel's reset is tied to EN, so the sketch now passes -1 and
+    Adafruit sends a software reset instead.
+  - Not changed: the serial `display OK` is printed unconditionally (README now says to look at the screen).
+    Some CYD batches use an ST7789 panel rather than an ILI9341; if the screen shows wrong colours or garbage,
+    that is the first suspect.
+  - Compiles to 384,186 B, no warnings.
+- **Driver installed (user's sudo, 16:18):** brltty-udev masked; `ch341.ko` in
+  `/lib/modules/5.15.199-tegra/updates/`, loaded; `check` OK, CYD = `/dev/ttyUSB0`
+  (`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`). A mangled paste left an empty `/lib/modules/updates`
+  (empty `$K`); the user removed it. Give sudo steps with literal paths, one per line.
+- **Chip:** ESP32-D0WD-V3 rev 3.1, 4 MB flash (0x68/0x4016); esptool auto-reset works.
+- **Flash backed up before any write:** `~/drive_logs/cyd_backup/factory_flash_20261012.bin` (full 4 MB, sha256
+  `0c80861d…`, `verify-flash` digest matched), plus the boot log and flash-id output. Not for the repo. Restore:
+  `esptool --port /dev/ttyUSB0 write-flash 0 factory_flash_20261012.bin` (in the container).
+- **What was on the board is not a factory demo.** `app0` is a custom dashboard app built 2026-07-20 on a Windows PC
+  with arduino-esp32 **3.3.11** (IDF v5.5.5): the strings include `DASHCAM LIVE`, `[cyd]` logs for SD splash
+  (BMP/RGB565), LDR auto-backlight, touch calibration saved to SD (`CYD_TOUCH_CAL_V3`), and DAC audio on a GPIO.
+  Partitions are the default layout (app0 0x10000, app1 empty, spiffs, coredump). **It crash-loops at boot:**
+  `E (163) ADC: CONFLICT! driver_ng is not allowed to be used with the legacy driver`, abort, reboot, every
+  ~0.2 s, before `setup()`. IDF 5 aborts when the legacy ADC driver and the new oneshot driver (Arduino's
+  `analogRead`, e.g. the LDR) are linked together. The legacy one is most likely pulled in by audio through the
+  legacy I2S/DAC API; that is inferred from the strings, not seen in source. **Its source is not on the Jetson
+  or on any branch**; asked the user where it is.
+
+**4. Dashboard app source** (the user copied a colleague's uncommitted work into `peripherals/cyd/` at 16:34). It is
+the app that was on the board. Layout: `cyd.ino` marker, `src/main.cpp` (five placeholder pages), `lib/cydStorage`
+(SD on VSPI 18/19/23/5, 20 MHz with 10 MHz fallback, `/cyd_touch.cal`), `lib/cydGraphics` (ILI9341 on HSPI, bit-banged
+XPT2046, 12-point touch calibration with a check screen, LDR GPIO34 to backlight PWM on GPIO21, SD splash
+`/splash.rgb565` or `.bmp`), `lib/cydAudio` (8-bit mono 8–16 kHz WAV from SD), `assets/`, `tools/bmp24_to_rgb565.py`,
+`BuildAndUpload.cmd`, `platformio.ini`.
+- **The copy overwrote my uncommitted `build_and_upload.sh` and `README.md`.** Its own `build_and_upload.sh` (builds
+  the app with the three `--library` dirs) is kept, plus my `auto` port (tested with a stub `arduino-cli`: no arg,
+  `auto`, explicit port, and none found, which exits 1). The README is the colleague's, with my "From the Jetson",
+  CH340 driver and bring-up sections merged back in.
+- **Boot crash, root cause confirmed:** `cydAudio` used the legacy `driver/i2s.h` built-in-DAC mode, which links the
+  legacy ADC driver; `analogRead()` for the LDR links the new one. The original build on core 3.2.0 contains both
+  `adc_oneshot_new_unit` and the legacy `check_adc_oneshot_driver_conflict` constructor, the one that aborts.
+  **Fix:** `CydAudio` now uses `driver/dac_continuous.h`, with the same public API. GPIO26 = `DAC_CHANNEL_MASK_CH1`;
+  APLL clock, because PLL_D2 cannot go below 19.6 kHz; 8×256 B DMA; non-blocking writes (timeout 0, keeping the
+  remainder), up to 4 blocks per `update()`; a natural end lets the queued tail play; `stop()` deletes the channel
+  (enable/disable could replay stale descriptors). The rebuilt ELF has no legacy ADC or I2S symbols. Also fixed two
+  bugs in the old version: `stop()` at end-of-data zeroed the DMA and cut up to ~96 ms of the tail, and one block per
+  loop could not keep up with 16 kHz.
+- `kTftRst` 4 → -1 (red LED, same as the bring-up sketch).
+- Builds on 3.2.0 with `--warnings all`: no warnings, 442,402 B.
+- Not changed, noted: `platformio.ini` targets PlatformIO's stock `espressif32` (Arduino 2.x, no `ledcAttach`) and
+  declares no `lib_deps`, so it probably does not build. README's `darkRaw`/`brightRaw` "window" only sets polarity in
+  the code. A missing splash triggers an SD remount (100s of ms) on every LIVE redraw.
+- Assets: `splash.bmp` is an illustration (dashcam over a road), not a capture; `splash.rgb565` is exactly its
+  conversion; `alert.wav` is a 0.35 s 8 kHz tone. The artwork's origin and licence are unknown; settle that before the
+  public repo gets it.
+- **Not flashed:** the auto-mode permission check stopped the upload (no explicit user OK). Writing app0 is reversible
+  from the backup.
+
+## 2026-10-11 (MKR pan library): encoder-aware servo prototype, no deployment
+
+User requested continued MKR Zero single-axis servo work and delegated hardware
+selection, with a US$100 budget **per** servo/encoder and reasonable weather
+resistance. Existing `ServoFunctions` was open-loop and unused by production;
+left it unchanged. New code is isolated under
+`peripherals/mkr_zero/libraries/EncoderPan/`; its README has sources, prices,
+wiring, build commands, interface contract and staged bench procedure.
+
+- Choice: Hitec D646WP positional PWM servo (manufacturer lists $64.99, IP67)
+  plus AS5048B absolute I2C encoder (adapter listed $19.40, remaining distributor
+  stock). Encoder PCB is **not weatherproof**: sealed housing, protected magnet,
+  connectors and an output-shaft mounting arrangement remain to be designed.
+  Optional differential I2C extenders for the outside cable; never long bare
+  I2C or reuse the GRF RS-422 pairs. Separate regulated servo power/cutoff.
+- Controller uses integer millidegrees, rate limits and optional bounded P trim
+  (default off). Safety uses raw encoder data; integer IIR only feeds trim.
+  Explicit calibration/arm, expiring sequenced commands, no homing sweep,
+  encoder age/order/jump/travel checks, following-error timer and latched faults.
+  A renewed command cannot conceal expiry or restart the stall timer.
+- AS5048B read-only driver checks defined diagnostic bits, acquires high-low-high
+  with bounded carry retry, accounts for read duration in angle uncertainty and
+  requires this repo's bounded Wire with its one-byte-read fix. No OTP writes.
+- Gated PWM backend keeps startup pulses hidden and detaches on fault/stop;
+  sample uses A5 PWM and proposes A4 for a default-off enable circuit. Those
+  pins were the two servo reservations; GRF/C3/CAN pins are untouched. Servo
+  uses TC4, distinct from CAN's TC3. **PWM suppression is not guaranteed torque
+  removal**; independent cutoff/watchdog still required. Third-party Servo timer
+  synchronization waits remain unbounded; do not claim unattended hardening.
+- Feedback is measured angle plus uncertainty and a past observed stable
+  interval, compatible in meaning with Orin `ServoPort`. Clock mapping, boot
+  identity, protocol framing/acknowledgements and shared production scheduling
+  are **not integrated**. No second native-USB reader; raw-CAN capture owns it.
+- `PanBench` is a standalone encoder monitor by default. Both calibration and
+  installation interlocks are false. Optional manual targets have 250 ms TTL;
+  this is not a host command protocol. Stock sensor resolution/backlash does
+  not establish adequate 100 m pointing: measure repeatability and beam-to-camera
+  alignment under vibration and temperature first.
+
+Validation: host tests pass **633 checks**, both GCC static analyzer/strict
+warnings and ASan+UBSan. MKR compile with the existing container, SAMD 1.8.14,
+Servo 1.3.0 and vendor Wire passes; two unused-parameter warnings are in the
+upstream Servo source, not this library. Default-disabled sketch: 20,628 bytes
+flash, 3,328 bytes static RAM. Existing GRF protocol/FSM tests and all 36 Orin
+LiDAR tests also pass in the container. No servo/encoder live test, firmware
+flash, service restart, commit or push. Stereo and production telemetry are
+unchanged; unrelated dirty work has been preserved.
+
+## 2026-10-11 (Jetson, rig stripped): the hardware-free open items
+
+The rig had only the Jetson attached. A workflow took every open item that needs no hardware. Usage limits cut it off
+twice; the main session finished the rest inline and re-checked what the agents had left. The three analyses below
+did not get their independent reviewer; their headline numbers were spot-checked instead. Nothing was installed,
+flashed, committed or restarted. Outputs that hold camera frames or vehicle data stay in `~/drive_logs/`.
+
+**1. The CSI mount is loose, not "slipped once"** (`~/drive_logs/night_drive_20261003_analysis/verify2/mount/`)
+- **Method:** a car-fixed dashboard mask, ECC and coarse alignment between 15 s windows every 10 s, refined to 1 s,
+  plus the dashboard edge's row and tilt (`changes_raw.csv`, `change_brackets.csv`, `periods_pose.csv`).
+- **Result:** **23 pose changes** (C01–C22) and 24 stable periods over 22:08–23:39. The dashboard edge tilt went:
+  - 19.4° parked;
+  - 14.9° after the 22:10 handling;
+  - 7.5° after 22:20:13;
+  - drifting through 10–12° to 15.7° by 23:01;
+  - 11.8°, then 1.4° at 23:19, −1.4° at 23:21;
+  - 6.3–7.1° to the end.
+
+  Single jumps reached 250 px. Some changes are excursions that return, e.g. 23:05:46–:52 (+257 px, then −274).
+- **Shocks:** 12 of the 31 steps fall in the top 10% of IMU linear-accel peaks (about 3 expected by chance), and 18
+  in the top 20%. The camera moves when the car hits something.
+- **Checked by eye** on frames at 22:40, 23:10, 23:20:10 and 23:25: the dash edge is clearly tilted, then nearly
+  level and lower, then at a third angle.
+- **Recommendation:** a rigid bracket. The earlier "about 4° for the rest of the drive" (REPORT F1) is wrong.
+
+**2. MKR clock, telemetry stalls and the "clock break"** (`verify2/clock/v3/`, scripts in `verify2/clock/scripts/`)
+- **The drift is real.** Three references agree within 48 ppm per 10-min block: GPS seconds, the C3's millis
+  (neither uses host time) and the host. The MKR runs **+1278…+1300 ppm fast at 22:15, falling to −58…−211 ppm by
+  23:45–23:54**; cumulative +2.9 s. REPORT's −2.64 s was too low.
+- **What the firmware does:**
+  - `master_ms` is plain `millis()` at frame build; the C3 copies it verbatim, and it is never re-based.
+  - Core 1.8.14 locks the DFLL to the 32 kHz crystal (MUL 1465), which would give a constant +106.7 ppm.
+- **What the logs show instead:**
+  - +230…+1034 ppm in the first minute after each of 8 boots;
+  - about 800 ppm apart between boots at similar temperatures;
+  - within a boot it tracks temperature and time (block r 0.99 / −0.98).
+- **So the DFLL is not regulated to the crystal.** A bench check needs the MKR (open work).
+- **The "0.078 s host / 5.211 s master" break** in the EKF section is row 1 of `telemetry_20261003_221449.csv`:
+  - a frame built 22:14:44.8 that sat in the C3's USB buffer across the manual v0.4 restart and arrived at
+    22:14:49.933 (its GPS time reads 15:14:44Z; the next row 15:14:49Z);
+  - host−master offsets on both sides agree within 6 ms;
+  - with that row dropped, `fusion_input` accepts all 58,686 rows of the boot.
+- **The five stalls (REPORT F13) are confirmed:** 403, 819, 912, 357 and 581 ms, 22 frames, exactly the C3's
+  `host_tx_dropped` rise (48 → 70).
+  - Each time, one frame is held 253–815 ms in the C3's USB CDC TX buffer (room for about one 186-byte frame), then
+    2–7 are dropped.
+  - The MKR, the Jetson's USB and the UGREEN were all fine; the cause is on the C3 USB link.
+  - Code reading: arduino-esp32 3.2.0's HWCDC only restarts sending from its IN-empty interrupt or a `write()`, and
+    hostLink skips `write()` when a frame does not fit. A larger TX buffer, or re-arming on a refused frame, is the
+    candidate fix; bench it.
+- **`host_ms` is not an absolute clock either:** ±30 ms wander on 10-03; +466 ppm for 90 min on 10-08. Time events
+  through a lower envelope of host−master, or GPS UTC when the fix is valid.
+- **Proposal for `fusion_input.py`** (not edited):
+  - drop or re-time rows more than about 150 ms above the running envelope, including the first row after a reopen;
+  - split rather than abort on a master reset or a persistent step over 1 s.
+
+**3. Earlier camera issues against this drive** (`verify2/coverage/coverage_status.csv`, about 30 items)
+- **Most earlier claims hold.** Corrections:
+  - the UGREEN did return to 30 fps once, for 1.9 s under a lit toll-plaza canopy at 22:39:37 (the same second as
+    the CSI's only gain dip); night mode correctly stayed;
+  - "0 v0.4 warnings" holds for the log files only. The journal had the obsolete-settings WARN at both starts (fixed
+    since; see 6) and two Argus connect errors from camera discovery;
+  - the analyst's UGREEN flicker test could not see 100 Hz at 20 fps. A proper banding test at five lamp-lit stops
+    finds none;
+  - the CSI stopped in 0.88 s at the session end, not ~5 s (one sample).
+- **Newly measured:**
+  - the overlay matches the telemetry (speed 0.03 km/h, heading 0.2°, position 0.05 m median error);
+  - dashes appear exactly when the bridge data is missing;
+  - all 42 segments have their `.ass`, at about 5 Hz with gaps ≤ 0.23 s;
+  - CSI warmer than the UGREEN, R/G ×1.11–1.17 (pixel-matched);
+  - a faint 100 Hz line in the CSI at one stop (0.2–0.5% of brightness, invisible);
+  - the 60 fps device-tree default does not affect the 30 fps recording;
+  - no first-frame timeout or stall in either run;
+  - a plate was legible at 8–10 m in the UGREEN in one lit scene, not in the CSI.
+- **Not checkable:** v0.4's exit status at 00:10:35 (the journal after 23:39 is gone), autofocus in motion, absolute
+  colour.
+
+**4. High-G events and CAN speed** (`verify2/highg_speed/`)
+- **66 latches, not 64:** 64 in the MKR console window, 2 after it ended. Spot-checked: the telemetry `highg_count`
+  rises by 66.
+- **All 66 were road shocks:** 64 confirmed, 2 unconfirmed; 0 harsh braking (peak deceleration 0.25 g); 0 spurious.
+  - The vertical axis dominated in 56.
+  - 0 latches while stopped with the engine on, although corrupt bursts kept coming.
+  - CSI frame motion separates events from speed-matched controls (AUC 0.96, lit scenes).
+  - What was hit: rumble strips, humps, raised crossings, expansion and bridge joints.
+  - e02/e03 are one bump counted on both axles (the 500 ms hold is shorter than the axle gap below ~17 km/h).
+- **The threshold:** 2 g per axis includes gravity, so the vertical axis trips at +1 g of shock. It fires 44 times
+  per moving hour: a roughness counter. Polled peaks say at least 10 / 3 / 1 of the 66 would still fire at 2.5 / 3 /
+  3.5 g.
+- **Recommendation:** keep 2 g as a counter, and add an incident trigger at 3 g or on the horizontal axes with
+  gravity removed. Leave the duration alone until a burst log exists.
+- **Speed:**
+  - CAN/GNSS = **0.98896** (95% interval 0.98860–0.98940), spot-checked 0.9898; 0.9937 at 30–50 km/h down to 0.9875
+    above 90.
+  - GNSS arrives 0.46 s after CAN for the same instant.
+  - CAN distance is 1.05% short. The 2026-09-26 drive gives 0.9912.
+  - For true road speed the map scale would be 0.0101 (×1.010 ± 0.003): needs the user, an SD-card reinstall, and a
+    daylight check.
+
+**5. Raw-CAN logger bounded under a hung disk** (`peripherals/mkr_zero/tools/canstream/`, uncommitted)
+- **The bound:** the reader → writer hand-over is now `Handover`, capped at 64 MiB charged as bytes plus 160 B per
+  event. That is at least 4.7 min of the Brio's bus in the worst case (one frame line per read).
+- **When full:**
+  - the reader drops whole lines, never blocks, and keeps draining the port;
+  - the counts are exact per destination file;
+  - it queues again only after the writer has freed 1/8 of the bound, so one hang costs one contiguous gap.
+- **Reporting:**
+  - `can_stats.csv` gains `rx_dropped`/`fs_dropped` at the end (an older file keeps its header and width);
+  - an episode is reported at its start on stderr (from its own thread) and at its end in `mkr_console.txt`,
+    `can_sync.csv` and stderr;
+  - the end note gives totals and the queue's peak.
+- **Tests:** `make check` in the container: **145 tests OK** (134 before), 1 intentional skip. Four mutants (bound
+  removed, drop counter, byte count, rx_frames accounting) are each caught. The README documents it.
+- **Consumers:** no other tool reads `can_stats.csv` by position; `drive_watch.sh` reads it by header name.
+
+**6. Drive tooling and the deployed config** (outside the repo)
+- **`drive_watch.sh`:**
+  - new checks: `can_stats.csv` growth, MKR ringdrop, host loss (Δ`streamed` − `rx_frames`, plus `rx_dropped`),
+    and `can_raw.log` not growing while the MKR drains frames;
+  - columns by header name; grace for files that do not exist yet; path variables for tests.
+  - Tested on a fake growing session with stub `docker`/`systemctl`: quiet when healthy; each new alarm fires after
+    two strikes.
+- **`drive_session.sh`:**
+  - tegrastats every 1 s;
+  - `stop` refuses (rc 3, loud warning) while v0.4's telemetry shows the car moving in the last 120 s; `--force`
+    overrides; shutdown and signals still stop at once.
+  - Tested: moving → refused; `--force`; parked; stale data; empty cells.
+- **Deployed `dashcam.xml`:** `<Encoder>`, `WarmupFrames`, `RecordWidth` and `RecordHeight` removed (exactly those;
+  well-formed; backup `dashcam.xml.bak-20261010-before-obsolete-cleanup`). This ends the obsolete-settings WARN at
+  every start.
+
+**7. IMX296 candidates staged** (`~/drive_logs/tools/imx296_driver/staging_20261010/`, README there; nothing
+installed)
+- **`imx296_debugoff_5.15.199.ko`:**
+  - only `#define DEBUG 1` removed;
+  - 40/40 symbol CRCs match 5.15.199;
+  - the preprocessed sources differ only where `dev_dbg` became `if (0)`; `set_exposure`, streaming and `write` are
+    instruction-identical.
+- **Overlays:**
+  - `cand1` (gain cap 300 = 30 dB, exposure cap 1500 lines ≈ 22 ms) and `cand2` (gain 480);
+  - the stock overlay round-trips through `dtc` byte-identically, and each candidate differs in exactly those two
+    properties.
+- **The unit mismatch, which decides the choice:**
+  - Argus models gain as linear (value/16) while the driver writes 0.1 dB: 300 is 18.75× to Argus, 31.6× real; 480 is
+    30× vs 251×.
+  - Exposure is in lines while Argus thinks microseconds. At 60 fps the 1500 cap meets the vmax clamp (SHS1 = 0):
+    stay at 30 fps until that is seen to behave.
+  - Recommendation: cand1 first.
+- **`install_candidate.sh` / `rollback.sh`:**
+  - dry run by default; sha256-checked; refuse unknown files or a busy camera;
+  - every backup goes to its own directory; `rollback.sh --stock` always returns to stock.
+  - Tested on a fake root, which caught and fixed a backup collision for two installs in the same second.
+- **For the A/B night, keep the DEBUG-on module:** the gain time series comes from its debug lines.
+
+**8. Code backlog**
+- **`read()` warnings:** `libcan.cpp` and `libgpio.cpp` ignored `read()` on the wake pipe; GCC does not honour a
+  `(void)` cast for glibc's warn_unused_result. The result is now bound and documented. **The build has 0
+  warnings.**
+- **Control ranges:** `cameraAttribute` and `CameraAttributeInfo` hold them as `double`, so every int32 is exact
+  (`as_double()` in libconfig).
+  - A new `config_test` check round-trips int32 min/max and a 2^24+1 step: it **fails on the old float code**
+    (shown) and passes now.
+  - Plain `make` (`bin/build_20261011_003045`): `config_test`, `bridge_overlay_test`, `dashcam_v0_4 --self-test`,
+    `focus_test`, `usb_test --self-test`, `commlink_sim_test`, `camera_gst_test` and `record_test` (Part B skipped,
+    no camera) all PASS.
+- **Left as is:** the `const_cast` in `Camera_GST::getCameraStatus()`. Removing it needs a non-const `iCamera`
+  interface or `mutable` state, and the comment already explains it.
+
+**Not done:**
+- the v2 chart acquisition helper;
+- a units-correct imx296 driver;
+- the `fusion_input.py` stale-row change;
+- the canmap speed scale;
+- any firmware change (High-G trigger, C3 TX buffer, DFLL logging).
+
+All of these need the user's decision or hardware to validate.
 
 ## 2026-10-09 (Orin): separate GRF-250 / IMX296 ranging prototype
 

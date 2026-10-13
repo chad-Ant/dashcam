@@ -7,7 +7,7 @@ decoder. The line contract is in `lib/CANRawStream.h`.
 
 | file | what it is |
 |---|---|
-| `mkr_stream_log.py` | Records the USB stream: `can_raw.log` (candump `-l`), `can_stats.csv` (the once-a-second `FS` counters, plus `rx_frames`: frame lines received since the previous FS line, which must equal Δ`streamed` — the exact USB/host-side loss count), `can_sync.csv` (timelines, offset changes, clock steps), `mkr_console.txt` (everything else). Its docstring explains the timing. |
+| `mkr_stream_log.py` | Records the USB stream: `can_raw.log` (candump `-l`), `can_stats.csv` (the once-a-second `FS` counters, plus `rx_frames`: frame lines received since the previous FS line, which must equal Δ`streamed` — the exact USB/host-side loss count — then `rx_dropped`/`fs_dropped`: lines received but dropped by a full hand-over queue), `can_sync.csv` (timelines, offset changes, clock steps), `mkr_console.txt` (everything else). Its docstring explains the timing. |
 | `can_decode` (`can_decode.cpp`) | Offline decoder: candump log + map file → CSV of every field the MKR publishes from CAN, plus a per-ID census. Compiled from the **unmodified** `lib/CANSniffFunctions.cpp`, `lib/CANMap.cpp`, `lib/VehicleSignals.cpp` against the host stand-ins in `../../tests/host`. |
 | `canrawlog2candump.py` | Converts a CANRawLog recording (`helper_scripts/CANRawLog`) to candump, timed by its `S ... @epoch` lines. |
 | `can_contract_emit` (`can_contract_emit.cpp`) | Test fixture: real F/FS lines from the firmware's formatter (`format`) or from the whole drain → ring → `canStreamService()` path (`stream`). |
@@ -37,8 +37,11 @@ Needs tty permission (on the Jetson: a `--privileged -v /dev:/dev` container). I
 exclusively and with HUPCL, so DTR drops when it exits and the MKR counts frames as `nohost` rather than
 filling its ring; it survives MKR resets (new timeline per boot) and a full or failing disk (it keeps
 reading, writes again when it can, loses whole lines only and notes how many bytes of `can_raw.log`
-never reached the disk: `output writes failed` in `mkr_console.txt` and `can_sync.csv`); SIGINT/SIGTERM
-flush and exit 0. The
+never reached the disk: `output writes failed` in `mkr_console.txt` and `can_sync.csv`) and a disk that
+hangs without erroring (the reader keeps draining the port into a hand-over queue bounded at 64 MiB, about
+4.7 min of the Brio's bus at worst; beyond that it drops whole lines, counts them exactly per file, and adds
+`rx_dropped`/`fs_dropped` to `can_stats.csv` and a `queue full` note to `mkr_console.txt`/`can_sync.csv`;
+see HUNG DISK in the docstring); SIGINT/SIGTERM flush and exit 0. The
 drive-session launcher outside the repo runs it for 12 h per session. Holding the port also means a
 flash cannot reset the MKR while it runs (the 1200-baud touch is refused, or as root never reaches the
 board, since DTR only drops at the last close): stop it first.

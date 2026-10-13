@@ -17,17 +17,25 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 
-// Standard ESP32-2432S028R / 2.8-inch CYD SPI wiring. Verify against the board
-// silk-screen or seller schematic before changing hardware connections.
+// Standard ESP32-2432S028R / 2.8-inch CYD wiring (witnessmenow's
+// ESP32-Cheap-Yellow-Display PINS.md). Verify against the board silk-screen or
+// seller schematic before changing hardware connections.
+// The display and the SD card are on separate SPI buses: the display on HSPI's
+// pins, the card on VSPI's.
 static constexpr int TFT_MISO = 12;
 static constexpr int TFT_MOSI = 13;
 static constexpr int TFT_SCLK = 14;
 static constexpr int TFT_CS   = 15;
 static constexpr int TFT_DC   = 2;
-static constexpr int TFT_RST  = 4;
+static constexpr int TFT_RST  = -1;  // panel reset is tied to the ESP32's EN; GPIO4 is the red LED
+static constexpr int TFT_BL   = 21;  // backlight, HIGH = on
+static constexpr int SD_SCLK  = 18;
+static constexpr int SD_MISO  = 19;
+static constexpr int SD_MOSI  = 23;
 static constexpr int SD_CS    = 5;
 
-static Adafruit_ILI9341 gTft(TFT_CS, TFT_DC, TFT_RST);
+static SPIClass gTftSpi(HSPI);  // the global SPI object (VSPI) serves the SD card
+static Adafruit_ILI9341 gTft(&gTftSpi, TFT_DC, TFT_CS, TFT_RST);
 
 static void drawHeader(const char *title)
 {
@@ -52,6 +60,7 @@ static void drawColourCheck()
 
 static bool probeSd(uint64_t &sizeBytes)
 {
+  SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, SPI, 10000000)) return false;
   const uint8_t cardType = SD.cardType();
   if (cardType == CARD_NONE) return false;
@@ -85,9 +94,11 @@ void setup()
   Serial.begin(115200);
   delay(200);
 
-  SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
+  gTftSpi.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
   gTft.begin();
   gTft.setRotation(1);  // landscape: 320 x 240
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
 
   drawHeader("CYD BRING-UP");
   drawColourCheck();

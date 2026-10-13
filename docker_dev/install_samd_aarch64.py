@@ -3,7 +3,10 @@
 whole platform because one tool (avrdude, unused by the MKR boards, which upload
 with bossac) has no aarch64 build.  Everything else comes from Arduino's own
 package index, checksum-verified.  Usage: install_samd_aarch64.py <arduino data dir> [version]"""
-import hashlib, json, os, shutil, sys, tarfile, tempfile, time, urllib.request
+import hashlib, json, os, shutil, socket, sys, tarfile, tempfile, time, urllib.request
+# urlretrieve has no timeout of its own: a stalled connection hung a build for 20+ min on 2026-10-12 with no
+# retry.  60 s without a byte now raises, and the retry below takes it from there.
+socket.setdefaulttimeout(60)
 data = sys.argv[1]; ver = sys.argv[2] if len(sys.argv) > 2 else "1.8.14"
 idx = json.load(open(os.path.join(data, "package_index.json")))
 pk = next(p for p in idx["packages"] if p["name"] == "arduino")

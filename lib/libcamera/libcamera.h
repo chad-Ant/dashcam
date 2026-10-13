@@ -105,9 +105,9 @@ struct cameraAttribute {
     CAMERA_ATTRIBUTE_TYPE type;        ///< Data type of the control value.
     bool                  isWritable;  ///< True if the control can be set (not read-only).
     bool                  isReadable;  ///< True if the control can be read (not write-only).
-    float                 minValue;    ///< Minimum value (cast from int32; not meaningful for STRING/BUTTON).
-    float                 maxValue;    ///< Maximum value (cast from int32; not meaningful for STRING/BUTTON).
-    float                 step;        ///< Step size between valid values; 0 if not applicable.
+    double                minValue;    ///< Minimum value (int32, held exactly; not meaningful for STRING/BUTTON).
+    double                maxValue;    ///< Maximum value (int32, held exactly; not meaningful for STRING/BUTTON).
+    double                step;        ///< Step size between valid values; 0 if not applicable.
     std::vector<std::string> menuOptions; ///< Valid option strings for MENU controls; integer menus store the value as a decimal string.
 };
 

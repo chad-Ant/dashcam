@@ -114,13 +114,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #     core and its other tools from Arduino's own index, checksum-verified.
 #   - The sketch's external libraries, pinned to the versions it was verified
 #     with on the Jetson (2026-09-25), without their example-only dependencies.
+#     downloads.arduino.cc drops connections now and then (2026-10-12: EOF on
+#     the last library), so every download from it retries; the gates are the
+#     checks that follow (core list, every library name@version).  RUN uses the
+#     base image's SHELL (/bin/bash -c); the snippets stay POSIX anyway.
 ARG ARDUINO_SAMD_CORE=1.8.14
 COPY install_samd_aarch64.py /tmp/install_samd_aarch64.py
-RUN arduino-cli core update-index \
+RUN for i in 1 2 3; do arduino-cli core update-index && break; sleep 10; done \
     && python3 /tmp/install_samd_aarch64.py "$(arduino-cli config get directories.data)" "${ARDUINO_SAMD_CORE}" \
     && arduino-cli core list | grep -q "^arduino:samd *${ARDUINO_SAMD_CORE}" \
-    && arduino-cli lib update-index \
-    && arduino-cli lib install --no-deps \
+    && for i in 1 2 3; do arduino-cli lib update-index && break; sleep 10; done \
+    && set -- \
         "Time@1.6.1" \
         "SparkFun u-blox GNSS Arduino Library@2.2.29" \
         "Servo@1.3.0" \
@@ -129,7 +133,30 @@ RUN arduino-cli core update-index \
         "Adafruit GFX Library@1.12.6" \
         "Adafruit SSD1306@2.5.17" \
         "Adafruit LED Backpack Library@1.5.1" \
+    && for i in 1 2 3; do \
+           arduino-cli lib install --no-deps "$@" && break; \
+           echo "library install attempt $i failed; retrying"; sleep 10; \
+       done \
+    && for lib in "$@"; do \
+           arduino-cli lib list | grep -q "^${lib%@*} *${lib#*@} " \
+               || { echo "library $lib is not installed"; exit 1; }; \
+       done \
     && rm /tmp/install_samd_aarch64.py
+
+# CYD (ESP32-2432S028R "Cheap Yellow Display") dashboard tooling: build and
+# flash peripherals/cyd from the Jetson (peripherals/cyd/build_and_upload.sh).
+# The CYD is a classic ESP32: the esp32 core above already carries its Xtensa
+# toolchain.  It uploads over a CH340 USB-serial chip, whose host driver the
+# Tegra kernel does not ship (peripherals/cyd/README.md: build it with
+# host/ch341_module.sh).  Adafruit ILI9341 is pinned to the version the
+# bring-up sketch was verified with (2026-10-12); --no-deps skips the
+# touch-controller libraries only its examples use.  GFX/BusIO come from the
+# MKR layer.
+RUN for i in 1 2 3; do \
+           arduino-cli lib update-index && arduino-cli lib install --no-deps "Adafruit ILI9341@1.6.4" && break; \
+           echo "library install attempt $i failed; retrying"; sleep 10; \
+       done \
+    && arduino-cli lib list | grep -q "^Adafruit ILI9341 *1.6.4 "
 
 WORKDIR /home/app
 

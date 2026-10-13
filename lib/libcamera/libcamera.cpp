@@ -250,9 +250,9 @@ static void populateCameraAttributes(int fd, cameraInfo& info) {
         }
         attr.isWritable = !(queryctrl.flags & V4L2_CTRL_FLAG_READ_ONLY);
         attr.isReadable = !(queryctrl.flags & V4L2_CTRL_FLAG_WRITE_ONLY);
-        attr.minValue = static_cast<float>(queryctrl.minimum);
-        attr.maxValue = static_cast<float>(queryctrl.maximum);
-        attr.step = static_cast<float>(queryctrl.step);
+        attr.minValue = static_cast<double>(queryctrl.minimum);   // double: every int32 exact (float: 2^24)
+        attr.maxValue = static_cast<double>(queryctrl.maximum);
+        attr.step = static_cast<double>(queryctrl.step);
         attr.menuOptions.clear();
 
         if (attr.type == CAMERA_ATTRIBUTE_TYPE::MENU) {

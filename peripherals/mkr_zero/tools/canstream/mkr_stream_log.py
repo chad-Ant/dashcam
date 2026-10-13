@@ -17,15 +17,23 @@ the line contract). This splits them:
                           five counters (drained, streamed, ovf, ringdrop, nohost;
                           uint32, wrapping, cumulative since MKR boot), and
                           rx_frames: frame lines received here since the previous
-                          FS line of the same timeline. Lines leave in order and
+                          row of the same timeline. Lines leave in order and
                           an FS line is formatted after every earlier packet was
                           written, so rx_frames must equal the change in
                           `streamed`; any shortfall was lost between the MKR's USB
                           write and this logger (totalled in the end note).
+                          Then rx_dropped: how many of those rx_frames were
+                          received but DROPPED here, never written to can_raw.log
+                          (HUNG DISK below; 0 otherwise), and fs_dropped: FS lines
+                          dropped since the previous row, whose rows are missing
+                          (this row's deltas then span them). Columns are only
+                          ever added at the end; a can_stats.csv started by an
+                          older logger keeps its old header and row width.
   OUTDIR/can_sync.csv     every event that changes how MKR time becomes host
                           time: logger start, new timeline, offset change, wall
                           clock step (and 'output writes failed N s', see
-                          DISK below). Each row carries host epoch, host
+                          DISK below, and 'queue full N s ...', see HUNG DISK).
+                          Each row carries host epoch, host
                           monotonic and their difference, so any timestamp in
                           can_raw.log can be recomputed on either clock.
   OUTDIR/mkr_console.txt  every other line, prefixed with local wall time, plus
@@ -113,6 +121,9 @@ fsync happen in the main thread and can stall for seconds on an SD card or a
 busy USB disk; had they shared the reading thread, the n_tty buffer (4 KB) would
 fill, cdc-acm would throttle the bulk-IN endpoint, and the MKR's ring (1024
 frames, ~0.85 s of this bus) would overflow — frame loss caused by the logger.
+The reader also cuts each read at its last newline and hands over only complete
+lines (the rest waits for the next read), so whatever happens to a hand-over
+happens to whole lines.
 
 ── DISK ────────────────────────────────────────────────────────────────────────
 A failing write, flush or fsync (the backup disk full, or gone) is counted, not
@@ -121,6 +132,44 @@ takes it, losing whole lines only, and then notes in mkr_console.txt for how
 long writes failed and exactly how many bytes of can_raw.log (about how many
 frames) never reached the disk. The first failure also goes to stderr (docker
 logs), since the files may be what cannot be written. See class Out.
+
+── HUNG DISK ───────────────────────────────────────────────────────────────────
+A disk that hangs WITHOUT erroring (a USB disk mid-reset, a dying card: write or
+fsync just does not return) stops the main thread, while the reader keeps
+reading. What it reads waits in the hand-over queue (class Handover), which is
+bounded: QUEUE_BYTES = 64 MiB, charged as each read's bytes plus EVENT_COST for
+the Python objects around them (129 B measured with tracemalloc, CPython 3.10; a
+queue filled to the bound with one-line reads measured 62.9 MB of RSS, under the
+charge). The worst case is one 34-byte frame line per read (the MKR writes
+packets of at most 63 bytes, so one 8-byte frame line each): 194 B charged per
+frame, 0.24 MB/s at the Brio's ~1230 frames/s, so the bound holds 281 s (4.7
+min) of a hung disk before anything is lost; reads carrying more lines last
+longer. That outlasts a USB disk reset or a stalled card; a disk that never
+comes back costs this much memory and no more (unbounded, it grew ~0.85 GB/h),
+and one the kernel gives up on errors out, where DISK above takes over.
+
+When a read does not fit, the reader drops it WHOLE and counts its lines by the
+file each would have gone to: can_raw.log, can_stats.csv, mkr_console.txt;
+lines and bytes as received, CR/LF included. Once dropping, it queues again only
+after the writer has freed 1/8 of the bound, so a disk that hangs and recovers
+costs ONE contiguous gap. It never blocks and never stops reading: the MKR never
+sees a stalled host, and its ring stays as empty as ever. The count rides in the
+queue as a record at the exact place of the gap, so:
+  - can_stats.csv: dropped frame lines still count in rx_frames (they were
+    received: the USB check against `streamed` stays exact) and also in
+    rx_dropped; fs_dropped counts the FS rows missing just before a row.
+  - an episode runs from the first drop until the queue is back under half the
+    bound. It goes to stderr at its start (written by a thread of its own:
+    stderr may be on the hung disk too), and at its end to mkr_console.txt
+    ('queue full for N s ... dropped whole lines, as received: can_raw.log N
+    frame lines (N bytes), ...', exact per file), can_sync.csv ('queue full N s
+    ...') and stderr. The end note totals every episode and gives the queue's
+    peak, so a run without drops still shows how close it came.
+A dropped run hides whatever it held: an unreported MKR reset inside it is seen
+(if at all) by the first line after the gap that does not fit the timeline, and
+a dropped FS line is not checked. SIGTERM is handled only when the hung write
+returns (docker stop then kills after its timeout); what was already written is
+complete lines.
 
 ── THE PORT ────────────────────────────────────────────────────────────────────
 Opened exclusively (flock + TIOCEXCL, as CANRawLog's can_log.py does): a second
@@ -165,6 +214,11 @@ DRIFT_MAX = 0.001        # 1000 ppm: a crystal's +-100 plus the +-500 an NTP sle
 OFFSET_NOTE_S = 0.0005   # can_sync.csv gets a row when the offset moves more than this
 MAX_PARTIAL = 4096       # bytes without a newline before the partial line is dropped
 READ_SIZE = 65536
+QUEUE_BYTES = 64 << 20   # bound on the reader -> writer hand-over (HUNG DISK): >= 4.7 min of this bus
+EVENT_COST = 160         # charged per queued event on top of its bytes: 129 B measured, plus allocator slack
+
+STATS_HEADER = ("host_epoch,host_mono,timeline,mkr_us,mkr_s,drained,streamed,ovf,ringdrop,nohost,rx_frames,"
+                "rx_dropped,fs_dropped\n")
 
 # The contract (CANRawStream.h), matched on bytes so a frame line is never decoded to str:
 #   F tttttttt iii d hh..    F tttttttt iiiiiiii d hh..    F tttttttt iii R d
@@ -256,6 +310,25 @@ def wall_minus_mono():
         if m1 - m0 < 0.0001:
             break
     return best[1]
+
+
+def count_lines(blob, acc):
+    """Adds the complete lines of @blob (which ends in a newline) to @acc by the file Logger.handle would put
+    each in: acc = [can_raw.log lines, bytes, can_stats.csv lines, bytes, mkr_console.txt lines, bytes].
+    Bytes as received, newline (and CR) included, so the three byte counts add up to len(blob). A malformed
+    F or FS line would have been a note in mkr_console.txt, so it counts there."""
+    for line in blob.split(b"\n")[:-1]:
+        n = len(line) + 1
+        if line[-1:] == b"\r":
+            line = line[:-1]
+        if line[:2] == b"F " and parse_frame(line) is not None:
+            k = 0
+        elif line[:3] == b"FS " and parse_stats(line) is not None:
+            k = 2
+        else:
+            k = 4
+        acc[k] += 1
+        acc[k + 1] += n
 
 
 def candump_line(epoch, ident, ext, rtr, dlc, data_hex, iface):
@@ -408,11 +481,27 @@ class Logger:
         self.stats = Out(self, os.path.join(outdir, "can_stats.csv"), 1 << 14)
         self.sync = Out(self, os.path.join(outdir, "can_sync.csv"), 1)
         self.con = Out(self, os.path.join(outdir, "mkr_console.txt"), 1)
+        self.stats_wide = True       # rows carry rx_dropped,fs_dropped (not if appending to an older header)
         if self.stats.start == 0:
-            self.stats.write("host_epoch,host_mono,timeline,mkr_us,mkr_s,drained,streamed,ovf,ringdrop,nohost,"
-                             "rx_frames\n")
+            self.stats.write(STATS_HEADER)
+        else:
+            try:
+                with open(os.path.join(outdir, "can_stats.csv"), "rb") as f:
+                    self.stats_wide = f.readline(4096).decode("ascii", "replace") == STATS_HEADER
+            except OSError:
+                self.stats_wide = False
+        # The hand-over queue's drops (HUNG DISK): [can_raw.log lines, bytes, can_stats.csv lines, bytes,
+        # mkr_console.txt lines, bytes] in all, and [first monotonic] + the same six for the episode under way.
+        self.handover = None         # main() sets it: the Handover, for its bound and peak in the notes
+        self.drops = [0] * 6
+        self.drop_ep = None
+        self.drop_episodes = 0
+        self.rx_dropped = 0          # frame lines dropped since the last FS line (counted in rx_since_fs too)
+        self.fs_dropped = 0          # FS lines dropped since the last FS line written
         if self.sync.start == 0:
             self.sync.write("host_epoch,host_mono,wall_minus_mono,timeline,event,offset_s,mkr_s\n")
+        if not self.stats_wide:
+            self.note("can_stats.csv has an older header: rows keep its columns (no rx_dropped, fs_dropped)")
         self.timeline_no = 0
         self.tl = Timeline()
         self.pending = collections.deque()   # (host_mono_arrival, timeline obj, mkr_s, frame tuple)
@@ -445,11 +534,7 @@ class Logger:
         self.out_errors += 1
         if self.out_err is None:
             self.out_err = (time.monotonic(), "%s: %s" % (out.name, e))
-            try:
-                sys.stderr.write("mkr_stream_log: %s %s - frames are dropped until it can write again\n"
-                                 % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), self.out_err[1]))
-            except (OSError, ValueError):
-                pass
+            self.stderr("%s - frames are dropped until it can write again" % self.out_err[1])
 
     def out_recovered(self):
         """Every file flushed: the episode is over. How much of can_raw.log it cost is exact here."""
@@ -463,6 +548,45 @@ class Logger:
         self.raw_lost = lost
         self.out_err = None
 
+    def stderr(self, text):
+        try:
+            sys.stderr.write("mkr_stream_log: %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), text))
+        except (OSError, ValueError):
+            pass
+
+    def dropped(self, ev):
+        """A drop record from the reader: whole lines it could not queue (HUNG DISK), at their place in the
+        stream. Dropped frame lines were received, so they count in rx_frames as well as in rx_dropped."""
+        _, t0, _t1, *c = ev
+        if self.drop_ep is None:
+            self.drop_ep = [t0, 0, 0, 0, 0, 0, 0]
+            self.drop_episodes += 1
+        for i, v in enumerate(c):
+            self.drop_ep[1 + i] += v
+            self.drops[i] += v
+        self.rx_since_fs += c[0]
+        self.rx_dropped += c[0]
+        self.fs_dropped += c[2]
+        # A record after an open means the first read since it that completed a line was dropped: the
+        # next one queued is fresh, not the MKR's bank leftover (module docstring).
+        self.after_open = False
+
+    def drained(self, mono, tail=""):
+        """The episode is over (the queue is back under half its bound): report what it cost, exactly."""
+        if self.drop_ep is None:
+            return
+        t0, rl, rb, sl, sb, cl, cb = self.drop_ep
+        limit = self.handover.limit if self.handover is not None else QUEUE_BYTES
+        text = ("queue full for %.1f s%s: the output did not keep up (a hung or slow disk); dropped whole lines, "
+                "as received: can_raw.log %d frame lines (%d bytes), can_stats.csv %d FS lines (%d bytes), "
+                "mkr_console.txt %d lines (%d bytes); queue bound %d bytes"
+                % (mono - t0, tail, rl, rb, sl, sb, cl, cb, limit))
+        self.note(text)
+        self.sync_row("queue full %.1f s%s dropped %d frame lines (%d B) %d FS lines (%d B) %d console lines (%d B)"
+                      % (mono - t0, tail, rl, rb, sl, sb, cl, cb), mono=mono)
+        self.stderr(text)
+        self.drop_ep = None
+
     def sync_row(self, event, offset="", mkr_s="", mono=None):
         mono = time.monotonic() if mono is None else mono
         self.sync.write("%.6f,%.6f,%.6f,%d,%s,%s,%s\n" % (mono + self.wall_minus_mono, mono, self.wall_minus_mono,
@@ -475,7 +599,7 @@ class Logger:
         # later with the offset they were measured against — nothing needs flushing early here.
         self.timeline_no += 1
         self.tl = Timeline()
-        self.rx_since_fs = 0
+        self.rx_since_fs = self.rx_dropped = self.fs_dropped = 0
         self.prev_streamed = None
         self.sync_row("new timeline (%s)" % why)
         self.note("new timeline %d: %s" % (self.timeline_no, why))
@@ -526,9 +650,12 @@ class Logger:
                 return None
             mkr_s = self.place(st[0], False, host_mono, first)
             self.stat_lines += 1
-            self.stats.write("%.6f,%.6f,%d,%d,%.6f,%s,%d\n" % (host_mono + self.wall_minus_mono, host_mono,
-                                                                self.timeline_no, st[0], mkr_s,
-                                                                ",".join(str(c) for c in st[1]), self.rx_since_fs))
+            row = "%.6f,%.6f,%d,%d,%.6f,%s,%d" % (host_mono + self.wall_minus_mono, host_mono, self.timeline_no,
+                                                  st[0], mkr_s, ",".join(str(c) for c in st[1]), self.rx_since_fs)
+            if self.stats_wide:
+                row += ",%d,%d" % (self.rx_dropped, self.fs_dropped)
+            self.stats.write(row + "\n")
+            self.rx_dropped = self.fs_dropped = 0
             streamed = st[1][1]
             if self.prev_streamed is not None:
                 d = (streamed - self.prev_streamed) % WRAP
@@ -549,13 +676,19 @@ class Logger:
         self.console(text)
         return None
 
+    def overlong(self, n, head):
+        self.malformed += 1
+        self.note("overlong line dropped (%d bytes): %s" % (n, head[:120].decode("ascii", "replace")))
+
     def data(self, host_mono, chunk):
-        """One read's bytes. Complete lines are handled; the read is one delivery sample."""
+        """One read's bytes. Complete lines are handled; the read is one delivery sample.
+
+        The reader hands over complete lines only (PortReader.received), so self.buf stays empty there;
+        it holds a partial line only for a caller that feeds raw chunks."""
         self.buf += chunk
         if b"\n" not in chunk:
             if len(self.buf) > MAX_PARTIAL:
-                self.malformed += 1
-                self.note("overlong line dropped (%d bytes): %s" % (len(self.buf), self.buf[:120].decode("ascii", "replace")))
+                self.overlong(len(self.buf), self.buf)
                 self.buf = b""
             return
         *lines, self.buf = self.buf.split(b"\n")
@@ -576,11 +709,13 @@ class Logger:
         if newest is not None and not first and tl is self.tl and tl.observe(host_mono, newest):
             self.sync_row("offset", "%.6f" % tl.offset, "%.6f" % newest, mono=host_mono)
 
-    def port_lost(self, why):
+    def port_lost(self, why, partial=b""):
+        """@partial: the line in progress the reader held (or self.buf, for a caller feeding raw chunks)."""
         self.note("port lost (%s)" % why)
-        if self.buf:
-            self.note("partial line at port loss: " + self.buf[:120].decode("ascii", "replace"))
-            self.buf = b""
+        partial = partial or self.buf
+        if partial:
+            self.note("partial line at port loss: " + partial[:120].decode("ascii", "replace"))
+        self.buf = b""
 
     def port_open(self, dev, lost_for):
         self.note("port open %s" % dev + (" (was lost %.1f s)" % lost_for if lost_for is not None else ""))
@@ -644,33 +779,190 @@ class Logger:
         self.flush_pending(force=True)
         if self.raw.flush() and self.out_err is not None:
             self.out_recovered()
+        peak = self.handover.peak if self.handover is not None else 0
+        limit = self.handover.limit if self.handover is not None else QUEUE_BYTES
+        if self.drop_ep is not None:
+            self.drained(time.monotonic(), " (still under way at exit)")
         self.note("logger end: %d frames, %d FS lines, %d console lines, %d malformed, %d timeline(s); "
                   "between FS lines %d frames streamed by the MKR, %d not received here"
                   % (self.frames, self.stat_lines, self.console_lines, self.malformed, self.timeline_no + 1,
                      self.usb_checked, self.usb_lost)
                   + ("; %d output write failures%s" % (self.out_errors, ", STILL FAILING" if self.out_err else "")
-                     if self.out_errors else ""))
+                     if self.out_errors else "")
+                  + ("; queue full %d time(s): dropped %d frame lines (%d bytes), %d FS lines (%d bytes), "
+                     "%d console lines (%d bytes)" % ((self.drop_episodes,) + tuple(self.drops))
+                     if self.drop_episodes else "")
+                  + "; queue peak %d of %d bytes" % (peak, limit))
         for f in (self.raw, self.stats, self.sync, self.con):
             f.flush()
             f.fsync()
             f.close()
 
 
+class Handover:
+    """The reader thread's queue to the main thread, bounded in bytes (HUNG DISK in the module docstring).
+
+    Each event is charged EVENT_COST, plus its bytes for a "data" event. offer() queues all of its events or
+    none, and never waits. force() ignores the bound, for events that must not be lost and that only the
+    port's own changes produce: open, lost (with the drop record that has to precede it), a 'cannot open'
+    note (once per distinct error), and the one "drained" per episode — a handful per reconnect, never the
+    stream itself. get()/get_nowait() as queue.SimpleQueue's. @peak: the highest level so far."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.resume = limit - limit // 8     # once dropping, queue again only at or below this level
+        self.items = collections.deque()
+        self.cond = threading.Condition(threading.Lock())
+        self.level = 0                       # charged bytes queued
+        self.peak = 0
+
+    @staticmethod
+    def cost(ev):
+        return EVENT_COST + len(ev[2]) if ev[0] == "data" else EVENT_COST
+
+    def offer(self, *evs):
+        c = sum(self.cost(e) for e in evs)
+        with self.cond:
+            if self.level + c > self.limit:
+                return False
+            self._push(evs, c)
+        return True
+
+    def force(self, *evs):
+        with self.cond:
+            self._push(evs, sum(self.cost(e) for e in evs))
+
+    def _push(self, evs, c):
+        self.items.extend(evs)
+        self.level += c
+        if self.level > self.peak:
+            self.peak = self.level
+        self.cond.notify()
+
+    def get(self, timeout=None):
+        with self.cond:
+            if not self.items:
+                self.cond.wait(timeout)
+                if not self.items:
+                    raise queue.Empty
+            ev = self.items.popleft()
+            self.level -= self.cost(ev)
+        return ev
+
+    def get_nowait(self):
+        with self.cond:
+            if not self.items:
+                raise queue.Empty
+            ev = self.items.popleft()
+            self.level -= self.cost(ev)
+        return ev
+
+
+class StderrWriter(threading.Thread):
+    """Writes the reader's stderr lines from a thread of its own: stderr can be a pipe nobody drains, or a
+    file on the very disk that hung, and the reader must never wait on either."""
+
+    def __init__(self):
+        super().__init__(name="mkr-stderr", daemon=True)
+        self.lines = queue.SimpleQueue()
+
+    def say(self, text):
+        self.lines.put("mkr_stream_log: %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), text))
+
+    def run(self):
+        while True:
+            text = self.lines.get()
+            try:
+                sys.stderr.write(text)
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+
+
 class PortReader(threading.Thread):
     """Owns the tty: finds, opens, reads, notices loss. Hands (kind, host_mono, ...) to the main thread.
 
     Its own thread so that nothing the main thread does — a write, an fsync — can pause the reads;
-    see READING in the module docstring. host_mono is taken the moment os.read() returns."""
+    see READING in the module docstring. host_mono is taken the moment os.read() returns. Hands over
+    complete lines only, through a bounded queue: what does not fit is dropped whole and counted (HUNG
+    DISK), and nothing here waits on the main thread or on any file."""
 
-    def __init__(self, port, events, stop):
+    def __init__(self, port, events, stop, say=None):
         super().__init__(name="mkr-port", daemon=True)
         self.port, self.events, self.stop = port, events, stop
+        self.say = say or (lambda text: None)
+        self.partial = b""       # the line in progress: what followed the last newline read
+        self.dropping = None     # the drop run under way: count_lines' six counts, or None
+        self.drop_span = None    # ... and [first, last] host_mono of the reads it dropped
+        self.episode = False     # dropped since the queue was last under half its bound
+
+    def drop_record(self):
+        return ("drop", self.drop_span[0], self.drop_span[1]) + tuple(self.dropping)
+
+    def hand(self, ev):
+        """Queues @ev ("data" or "overlong"), or drops it whole and counts it into the drop run."""
+        q = self.events
+        if self.dropping is None:
+            if q.offer(ev):
+                return
+            self.dropping = [0] * 6
+            self.drop_span = [ev[1], ev[1]]
+            if not self.episode:
+                self.episode = True
+                self.say("queue full (%d of %d bytes): the output is not keeping up (a hung or slow disk?); "
+                         "whole lines are dropped and counted until it catches up" % (q.level, q.limit))
+        elif q.level <= q.resume and q.offer(self.drop_record(), ev):
+            self.dropping = None
+            return
+        if ev[0] == "data":
+            count_lines(ev[2], self.dropping)
+        else:                                    # an overlong fragment: its console note is what is lost
+            self.dropping[4] += 1
+            self.dropping[5] += ev[2]
+        self.drop_span[1] = ev[1]
+
+    def flush_drops(self, mono):
+        """Queues the drop run's record if it fits (@mono None: whatever the level, ahead of a port event),
+        and ends the episode once the queue is back under half its bound."""
+        q = self.events
+        if self.dropping is not None:
+            if mono is None:
+                q.force(self.drop_record())
+            elif not (q.level <= q.resume and q.offer(self.drop_record())):
+                return
+            self.dropping = None
+        if self.episode and mono is not None and q.level <= q.limit // 2:
+            self.episode = False
+            q.force(("drained", mono))
+
+    def received(self, mono, chunk):
+        buf = self.partial + chunk if self.partial else chunk
+        cut = buf.rfind(b"\n") + 1
+        if cut == 0:
+            if len(buf) > MAX_PARTIAL:
+                self.hand(("overlong", mono, len(buf), buf[:120]))
+                buf = b""
+            self.partial = buf
+        else:
+            self.partial = buf[cut:]
+            self.hand(("data", mono, buf[:cut] if cut < len(buf) else buf))
+        if self.episode:
+            self.flush_drops(mono)
 
     def run(self):
+        try:
+            self.read_port()
+        finally:
+            if self.dropping is not None:        # what was dropped before the stop still gets counted
+                self.flush_drops(None)
+
+    def read_port(self):
         fd, lost_at, last_err = None, None, None
-        put = self.events.put
+        force = self.events.force
         while not self.stop.is_set():
             if fd is None:
+                if self.episode:
+                    self.flush_drops(time.monotonic())
                 dev = self.port or find_port()
                 if dev is None or not os.path.exists(dev):
                     self.stop.wait(0.02)
@@ -680,18 +972,21 @@ class PortReader(threading.Thread):
                 except (OSError, termios.error) as e:
                     msg = "cannot open %s: %s" % (dev, e)
                     if msg != last_err:          # once per distinct failure, not 5 times a second
-                        put(("note", time.monotonic(), msg))
+                        force(("note", time.monotonic(), msg))
                         last_err = msg
                     self.stop.wait(0.2)
                     continue
                 last_err = None
-                put(("open", time.monotonic(), dev, None if lost_at is None else time.monotonic() - lost_at))
+                self.partial = b""
+                force(("open", time.monotonic(), dev, None if lost_at is None else time.monotonic() - lost_at))
                 lost_at = None
             try:
                 r, _, _ = select.select([fd], [], [], 0.1)
             except (OSError, ValueError):
                 r = [fd]                         # let the read report what is wrong with the fd
             if not r:
+                if self.episode:
+                    self.flush_drops(time.monotonic())
                 continue
             why = "EOF"
             try:
@@ -702,9 +997,12 @@ class PortReader(threading.Thread):
                 chunk, why = b"", str(e)
             mono = time.monotonic()
             if chunk:
-                put(("data", mono, chunk))
+                self.received(mono, chunk)
                 continue
-            put(("lost", mono, why))
+            if self.dropping is not None:
+                self.flush_drops(None)           # the gap goes before the loss, where it happened
+            force(("lost", mono, why, self.partial))
+            self.partial = b""
             try:
                 os.close(fd)
             except OSError:
@@ -721,10 +1019,16 @@ def dispatch(lg, ev):
     kind = ev[0]
     if kind == "data":
         lg.data(ev[1], ev[2])
+    elif kind == "drop":
+        lg.dropped(ev)
+    elif kind == "drained":
+        lg.drained(ev[1])
     elif kind == "open":
         lg.port_open(ev[2], ev[3])
     elif kind == "lost":
-        lg.port_lost(ev[2])
+        lg.port_lost(ev[2], ev[3])
+    elif kind == "overlong":
+        lg.overlong(ev[2], ev[3])
     else:
         lg.note(ev[2])
 
@@ -748,8 +1052,11 @@ def main(argv=None):
     lg = Logger(a.outdir, a.iface)
     try:
         lg.note("logger start, %.0f s" % a.seconds)
-        events = queue.SimpleQueue()
-        reader = PortReader(a.port, events, stop)
+        events = Handover(QUEUE_BYTES)
+        lg.handover = events
+        stderr_writer = StderrWriter()
+        stderr_writer.start()
+        reader = PortReader(a.port, events, stop, stderr_writer.say)
         reader.start()
         m0 = time.monotonic()
         next_mark = 0.0
