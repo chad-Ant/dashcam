@@ -1,5 +1,7 @@
 #include "libcamera.h"   // AttributeDictionary (libcamera_attributes.cpp)
 #include "libconfig.h"
+// es3video:: protocol ceilings, for the DisplayPreview range drift check (test 11).
+#include "../../peripherals/es3c28p/lib/es3UsbLink/Es3VideoProtocol.h"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -80,6 +82,7 @@ static bool test_load_real_file() {
     check(cfg.log.telemetryCsv == false,           "log.telemetryCsv default false");
     check(cfg.overlay.vehicleDetail == true,       "overlay.vehicleDetail default true");
     check(cfg.pipeline.branchQueueDepth == 2,      "pipeline.branchQueueDepth default 2");
+    check(!cfg.displayPreview.enabled,             "displayPreview.enabled false (preview off in the shipped file)");
 
     return g_fails == before;
 }
@@ -180,6 +183,24 @@ static bool test_roundtrip() {
     src.network.controlBindAddress  = "127.0.0.1";
     src.network.controlAllowlist    = "127.0.0.1,192.168.1.10";
     src.network.controlAuthToken    = "s3cr3t-psk";
+
+    src.displayPreview.enabled            = true;
+    src.displayPreview.device             = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_12:34:56:78:9A:BC-if00";
+    src.displayPreview.targetFps          = 15;
+    // Unsupported (validateDisplayPreview rejects it), but the file must keep
+    // exactly what the operator wrote: a round trip of the default proves nothing.
+    src.displayPreview.fit                = "stretch";
+    src.displayPreview.jpegQuality        = 80;
+    src.displayPreview.minimumJpegQuality = 30;
+    src.displayPreview.maxJpegBytes       = 32768;
+    src.displayPreview.maxSourceJpegBytes = 2097152;
+    src.displayPreview.chunkDataBytes     = 2048;
+    src.displayPreview.maxFramesInFlight  = 2;
+    src.displayPreview.assemblyTimeoutMs  = 750;
+    src.displayPreview.staleAfterMs       = 800;
+    src.displayPreview.placeholderAfterMs = 3000;
+    src.displayPreview.heartbeatMs        = 1500;
+    src.displayPreview.reconnectMs        = 5000;
 
     CameraConfig csi;
     csi.name        = "front";
@@ -314,6 +335,24 @@ static bool test_roundtrip() {
     check(dst.network.controlAllowlist == "127.0.0.1,192.168.1.10",
                                                          "network.controlAllowlist round-trip");
     check(dst.network.controlAuthToken == "s3cr3t-psk",  "network.controlAuthToken round-trip");
+
+    const DisplayPreviewConfig& dp = dst.displayPreview;
+    check(dp.enabled == true,                            "displayPreview.enabled round-trip");
+    check(dp.device == "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_12:34:56:78:9A:BC-if00",
+                                                         "displayPreview.device round-trip");
+    check(dp.targetFps == 15,                            "displayPreview.targetFps round-trip");
+    check(dp.fit == "stretch",                           "displayPreview.fit round-trip");
+    check(dp.jpegQuality == 80,                          "displayPreview.jpegQuality round-trip");
+    check(dp.minimumJpegQuality == 30,                   "displayPreview.minimumJpegQuality round-trip");
+    check(dp.maxJpegBytes == 32768,                      "displayPreview.maxJpegBytes round-trip");
+    check(dp.maxSourceJpegBytes == 2097152,              "displayPreview.maxSourceJpegBytes round-trip");
+    check(dp.chunkDataBytes == 2048,                     "displayPreview.chunkDataBytes round-trip");
+    check(dp.maxFramesInFlight == 2,                     "displayPreview.maxFramesInFlight round-trip");
+    check(dp.assemblyTimeoutMs == 750,                   "displayPreview.assemblyTimeoutMs round-trip");
+    check(dp.staleAfterMs == 800,                        "displayPreview.staleAfterMs round-trip");
+    check(dp.placeholderAfterMs == 3000,                 "displayPreview.placeholderAfterMs round-trip");
+    check(dp.heartbeatMs == 1500,                        "displayPreview.heartbeatMs round-trip");
+    check(dp.reconnectMs == 5000,                        "displayPreview.reconnectMs round-trip");
     {
         std::ifstream saved(tmpFile);
         const std::string xml((std::istreambuf_iterator<char>(saved)),
@@ -610,6 +649,314 @@ static bool test_obsolete_settings() {
     return g_fails == before;
 }
 
+// ── DisplayPreview helpers ───────────────────────────────────────────────────
+
+/// Every <DisplayPreview> field name, in declaration (and serialization) order.
+static const char* const kPreviewFields[] = {
+    "Enabled", "Device", "TargetFps", "Fit", "JpegQuality", "MinimumJpegQuality",
+    "MaxJpegBytes", "MaxSourceJpegBytes", "ChunkDataBytes", "MaxFramesInFlight",
+    "AssemblyTimeoutMs", "StaleAfterMs", "PlaceholderAfterMs", "HeartbeatMs",
+    "ReconnectMs",
+};
+
+/// True if every field of @p p still holds its built-in default.
+static bool previewIsDefault(const DisplayPreviewConfig& p) {
+    auto same = [](const auto& v) { return v == v.defaultValue(); };
+    return same(p.enabled) && same(p.device) && same(p.targetFps) && same(p.fit) &&
+           same(p.jpegQuality) && same(p.minimumJpegQuality) && same(p.maxJpegBytes) &&
+           same(p.maxSourceJpegBytes) && same(p.chunkDataBytes) &&
+           same(p.maxFramesInFlight) && same(p.assemblyTimeoutMs) &&
+           same(p.staleAfterMs) && same(p.placeholderAfterMs) &&
+           same(p.heartbeatMs) && same(p.reconnectMs);
+}
+
+/// Write @p body inside a <DashcamConfig> root to @p path; false if it cannot.
+static bool writeConfigFile(const std::string& path, const std::string& body) {
+    std::ofstream f(path);
+    if (!f) return false;
+    f << "<?xml version=\"1.0\"?><DashcamConfig>" << body << "</DashcamConfig>";
+    return static_cast<bool>(f);
+}
+
+// ── test 11: <DisplayPreview> defaults, ranges and the default-config writer ──
+
+static bool test_display_preview_defaults() {
+    std::cout << "\n--- Test 11: DisplayPreview defaults + default config file ---\n";
+    const int before = g_fails;
+
+    const DisplayPreviewConfig p;
+    check(!p.enabled,                         "enabled default false (opt-in)");
+    check(p.device == "/dev/dashcam-display", "device default /dev/dashcam-display");
+    check(p.fit == "letterbox",               "fit default letterbox");
+
+    // Name, value, default and range of every numeric field, as the plan sets them.
+    struct IntSpec { const ConfigVar<int>* v; const char* name; int def, lo, hi; };
+    const IntSpec specs[] = {
+        {&p.targetFps,          "TargetFps",          10,      1,      15},
+        {&p.jpegQuality,        "JpegQuality",        65,      20,     95},
+        {&p.minimumJpegQuality, "MinimumJpegQuality", 45,      10,     95},
+        {&p.maxJpegBytes,       "MaxJpegBytes",       65536,   4096,   65536},
+        {&p.maxSourceJpegBytes, "MaxSourceJpegBytes", 1048576, 262144, 8388608},
+        {&p.chunkDataBytes,     "ChunkDataBytes",     1024,    256,    4096},
+        {&p.maxFramesInFlight,  "MaxFramesInFlight",  1,       1,      2},
+        {&p.assemblyTimeoutMs,  "AssemblyTimeoutMs",  500,     100,    5000},
+        {&p.staleAfterMs,       "StaleAfterMs",       500,     100,    9900},
+        {&p.placeholderAfterMs, "PlaceholderAfterMs", 2000,    200,    10000},
+        {&p.heartbeatMs,        "HeartbeatMs",        1000,    200,    4000},
+        {&p.reconnectMs,        "ReconnectMs",        1000,    200,    60000},
+    };
+    for (const auto& s : specs) {
+        const bool ok = s.v->name() == s.name && *s.v == s.def &&
+                        s.v->defaultValue() == s.def && s.v->minValue() == s.lo &&
+                        s.v->maxValue() == s.hi && !s.v->description().empty();
+        check(ok, (std::string(s.name) + " = " + std::to_string(s.def) + " in [" +
+                   std::to_string(s.lo) + ", " + std::to_string(s.hi) + "], described").c_str());
+    }
+    check(!p.enabled.description().empty() && !p.device.description().empty() &&
+          !p.fit.description().empty(), "Enabled / Device / Fit are described");
+    check(p.heartbeatMs.maxValue() < 5000, "HeartbeatMs cap stays under the 5 s device session timeout");
+
+    // Every in-range value must also be encodable as START_VIDEO: the ranges may not
+    // drift past the frozen video-protocol ceilings (Es3VideoProtocol.h).
+    check(p.assemblyTimeoutMs.maxValue()  <= int(es3video::kMaxTimeoutMs) &&
+          p.staleAfterMs.maxValue()       <= int(es3video::kMaxTimeoutMs) &&
+          p.placeholderAfterMs.maxValue() <= int(es3video::kMaxTimeoutMs),
+          "timeout caps within the protocol's kMaxTimeoutMs");
+    check(p.staleAfterMs.maxValue() < p.placeholderAfterMs.maxValue(),
+          "StaleAfterMs cap below PlaceholderAfterMs cap (placeholder > stale always satisfiable)");
+    check(p.maxJpegBytes.maxValue()      <= int(es3video::kMaxJpegBytes) &&
+          p.chunkDataBytes.maxValue()    <= int(es3video::kMaxChunkDataBytes) &&
+          p.maxFramesInFlight.maxValue() <= int(es3video::kMaxCredits) &&
+          p.targetFps.maxValue()         <= int(es3video::kMaxTargetFps),
+          "JPEG / chunk / credit / fps caps within the protocol ceilings");
+
+    // write_default_config is ConfigReader::save() of a default AppConfig, so the
+    // section reaches every build's seeded config/dashcam.xml through the writer.
+    const std::string tmpFile = "/tmp/libconfig_preview_default_test.xml";
+    check(ConfigReader::save(tmpFile, AppConfig{}), "save() of a default AppConfig");
+    std::ifstream in(tmpFile);
+    const std::string xml((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    const auto open  = xml.find("<DisplayPreview>");
+    const auto close = xml.find("</DisplayPreview>");
+    check(open != std::string::npos && close != std::string::npos && open < close,
+          "default file has a <DisplayPreview> section");
+    const std::string section = (open != std::string::npos && close != std::string::npos && open < close)
+                                ? xml.substr(open, close - open) : std::string();
+    bool allTags = true;
+    for (const char* f : kPreviewFields)
+        allTags = allTags && section.find("<" + std::string(f) + " type=\"") != std::string::npos;
+    check(allTags, "... carrying every field, self-described (type/default/range attributes)");
+    check(section.find("default=\"false\">false</Enabled>") != std::string::npos,
+          "... with Enabled false");
+    check(section.find("<MaxSourceJpegBytes type=\"int\"") != std::string::npos &&
+          section.find("max=\"8388608\"") != std::string::npos,
+          "... and int ranges written as plain ints");
+
+    AppConfig reloaded;
+    std::vector<std::string> problems;
+    check(ConfigReader::load(tmpFile, reloaded) && previewIsDefault(reloaded.displayPreview),
+          "the default file loads back to the defaults");
+    check(validateDisplayPreview(reloaded.displayPreview, problems), "the defaults validate");
+
+    fs::remove(tmpFile);
+    return g_fails == before;
+}
+
+// ── test 12: an absent <DisplayPreview> section keeps the preview disabled ────
+
+static bool test_display_preview_absent() {
+    std::cout << "\n--- Test 12: absent DisplayPreview section keeps defaults ---\n";
+    const int before = g_fails;
+
+    std::vector<std::string> warns;
+    dashcam::log::LogCallback log = [&](dashcam::log::LogLevel lvl, const std::string& m) {
+        if (lvl == dashcam::log::LogLevel::WARN) warns.push_back(m);
+    };
+
+    // The shape of every config file already on the car: other sections, no preview.
+    const std::string tmpFile = "/tmp/libconfig_preview_absent_test.xml";
+    if (!writeConfigFile(tmpFile,
+            "<Recording><SegmentSec>120</SegmentSec></Recording>"
+            "<Network><StreamEnabled>true</StreamEnabled></Network>")) {
+        std::cerr << "  SKIP  (cannot write temp file)\n";
+        return true;
+    }
+    AppConfig cfg;
+    check(ConfigReader::load(tmpFile, cfg, log), "an older file without the section loads");
+    check(cfg.recording.segmentSec == 120 && cfg.network.streamEnabled,
+          "... and its other sections are read");
+    check(previewIsDefault(cfg.displayPreview), "every DisplayPreview field keeps its default");
+    check(!cfg.displayPreview.enabled, "... so the preview is disabled");
+    check(warns.empty(), "a missing section is not worth a WARN");
+
+    // An empty section and a partial one behave the same for the omitted fields.
+    check(writeConfigFile(tmpFile, "<DisplayPreview/>"), "write empty-section file");
+    AppConfig empty;
+    check(ConfigReader::load(tmpFile, empty, log) && previewIsDefault(empty.displayPreview),
+          "an empty <DisplayPreview/> keeps every default");
+
+    check(writeConfigFile(tmpFile, "<DisplayPreview><Enabled>true</Enabled></DisplayPreview>"),
+          "write enable-only file");
+    AppConfig partial;
+    std::vector<std::string> problems;
+    check(ConfigReader::load(tmpFile, partial, log) && partial.displayPreview.enabled &&
+          partial.displayPreview.device == "/dev/dashcam-display" &&
+          partial.displayPreview.targetFps == 10 && partial.displayPreview.maxFramesInFlight == 1,
+          "Enabled alone turns it on with the other defaults");
+    check(validateDisplayPreview(partial.displayPreview, problems), "... and that validates");
+    check(warns.empty(), "no WARN for any of them");
+
+    fs::remove(tmpFile);
+    return g_fails == before;
+}
+
+// ── test 13: out-of-range <DisplayPreview> values clamp, one WARN each ────────
+
+static bool test_display_preview_clamping() {
+    std::cout << "\n--- Test 13: DisplayPreview clamping + WARN ---\n";
+    const int before = g_fails;
+
+    const std::string tmpFile = "/tmp/libconfig_preview_clamp_test.xml";
+    if (!writeConfigFile(tmpFile,
+            "<DisplayPreview>"
+            "<Enabled>true</Enabled><Device>/dev/dashcam-display</Device><Fit>letterbox</Fit>"
+            "<TargetFps>60</TargetFps><JpegQuality>5</JpegQuality>"
+            "<MinimumJpegQuality>100</MinimumJpegQuality><MaxJpegBytes>1000000</MaxJpegBytes>"
+            "<MaxSourceJpegBytes>1024</MaxSourceJpegBytes><ChunkDataBytes>8192</ChunkDataBytes>"
+            "<MaxFramesInFlight>4</MaxFramesInFlight><AssemblyTimeoutMs>0</AssemblyTimeoutMs>"
+            "<StaleAfterMs>50000</StaleAfterMs><PlaceholderAfterMs>10</PlaceholderAfterMs>"
+            "<HeartbeatMs>5000</HeartbeatMs><ReconnectMs>-1</ReconnectMs>"
+            "</DisplayPreview>")) {
+        std::cerr << "  SKIP  (cannot write temp file)\n";
+        return true;
+    }
+
+    std::vector<std::string> warns;
+    dashcam::log::LogCallback log = [&](dashcam::log::LogLevel lvl, const std::string& m) {
+        if (lvl == dashcam::log::LogLevel::WARN) warns.push_back(m);
+    };
+    AppConfig cfg;
+    check(ConfigReader::load(tmpFile, cfg, log), "load clamp file");
+    const DisplayPreviewConfig& p = cfg.displayPreview;
+    check(p.targetFps == 15,             "TargetFps 60 -> clamped to max 15");
+    check(p.jpegQuality == 20,           "JpegQuality 5 -> clamped to min 20");
+    check(p.minimumJpegQuality == 95,    "MinimumJpegQuality 100 -> clamped to max 95");
+    check(p.maxJpegBytes == 65536,       "MaxJpegBytes 1000000 -> clamped to max 65536");
+    check(p.maxSourceJpegBytes == 262144, "MaxSourceJpegBytes 1024 -> clamped to min 262144");
+    check(p.chunkDataBytes == 4096,      "ChunkDataBytes 8192 -> clamped to max 4096");
+    check(p.maxFramesInFlight == 2,      "MaxFramesInFlight 4 -> clamped to max 2");
+    check(p.assemblyTimeoutMs == 100,    "AssemblyTimeoutMs 0 -> clamped to min 100");
+    check(p.staleAfterMs == 9900,        "StaleAfterMs 50000 -> clamped to max 9900");
+    check(p.placeholderAfterMs == 200,   "PlaceholderAfterMs 10 -> clamped to min 200");
+    check(p.heartbeatMs == 4000,         "HeartbeatMs 5000 -> clamped to max 4000 (under the 5 s timeout)");
+    check(p.reconnectMs == 200,          "ReconnectMs -1 -> clamped to min 200");
+    check(p.enabled && p.device == "/dev/dashcam-display" && p.fit == "letterbox",
+          "in-range fields are read unchanged");
+
+    check(warns.size() == 12, "exactly one WARN per clamped field (12)");
+    bool named = true;
+    for (const char* f : {"TargetFps", "JpegQuality", "MinimumJpegQuality", "MaxJpegBytes",
+                          "MaxSourceJpegBytes", "ChunkDataBytes", "MaxFramesInFlight",
+                          "AssemblyTimeoutMs", "StaleAfterMs", "PlaceholderAfterMs",
+                          "HeartbeatMs", "ReconnectMs"}) {
+        const std::string tag = "'" + std::string(f) + "'";
+        bool found = false;
+        for (const auto& w : warns) found = found || w.find(tag) != std::string::npos;
+        named = named && found;
+    }
+    check(named, "each WARN names its field");
+
+    // Each value is now in range, yet the pair rules fail: what clamping cannot fix.
+    std::vector<std::string> problems;
+    check(!validateDisplayPreview(p, problems) && problems.size() == 2,
+          "clamped quality and timing pairs still fail validation (2 problems)");
+
+    // Just over the protocol's 10000 ms timeout ceiling: both clamp to their caps,
+    // and the result is a valid, START_VIDEO-encodable pair.
+    check(writeConfigFile(tmpFile,
+              "<DisplayPreview><Enabled>true</Enabled>"
+              "<StaleAfterMs>10000</StaleAfterMs><PlaceholderAfterMs>10001</PlaceholderAfterMs>"
+              "</DisplayPreview>"),
+          "write timeout-ceiling file");
+    warns.clear();
+    AppConfig edge;
+    check(ConfigReader::load(tmpFile, edge, log) && warns.size() == 2,
+          "Stale 10000 / Placeholder 10001 load with one WARN each");
+    check(edge.displayPreview.staleAfterMs == 9900 && edge.displayPreview.placeholderAfterMs == 10000,
+          "... clamped to 9900 / 10000");
+    check(validateDisplayPreview(edge.displayPreview, problems) &&
+          edge.displayPreview.placeholderAfterMs <= int(es3video::kMaxTimeoutMs),
+          "... which validates and stays within the protocol ceiling");
+
+    fs::remove(tmpFile);
+    return g_fails == before;
+}
+
+// ── test 14: validateDisplayPreview() cross-field rules ──────────────────────
+
+static bool test_display_preview_validation() {
+    std::cout << "\n--- Test 14: validateDisplayPreview cross-field rules ---\n";
+    const int before = g_fails;
+
+    auto mentions = [](const std::vector<std::string>& v, const char* what) {
+        return v.size() == 1 && v[0].find(what) != std::string::npos;
+    };
+    std::vector<std::string> problems{"stale entry from an earlier call"};
+
+    DisplayPreviewConfig off;
+    check(validateDisplayPreview(off, problems) && problems.empty(),
+          "defaults (disabled) are valid; the problems list is cleared");
+    DisplayPreviewConfig on;
+    on.enabled = true;
+    check(validateDisplayPreview(on, problems) && problems.empty(), "defaults enabled are valid");
+
+    DisplayPreviewConfig fit = on;
+    fit.fit = "stretch";
+    check(!validateDisplayPreview(fit, problems) && mentions(problems, "Fit"),
+          "Fit 'stretch' is rejected, naming Fit");
+    fit.fit = "Letterbox";
+    check(!validateDisplayPreview(fit, problems), "Fit is matched exactly ('Letterbox' rejected)");
+    fit.fit = "";
+    check(!validateDisplayPreview(fit, problems), "an empty Fit is rejected");
+
+    DisplayPreviewConfig q = on;
+    q.jpegQuality = 65;
+    q.minimumJpegQuality = 65;
+    check(validateDisplayPreview(q, problems), "MinimumJpegQuality == JpegQuality is valid (no retry headroom)");
+    q.minimumJpegQuality = 66;
+    check(!validateDisplayPreview(q, problems) && mentions(problems, "MinimumJpegQuality"),
+          "MinimumJpegQuality > JpegQuality is rejected, naming it");
+
+    DisplayPreviewConfig t = on;
+    t.staleAfterMs = 500;
+    t.placeholderAfterMs = 500;
+    check(!validateDisplayPreview(t, problems) && mentions(problems, "PlaceholderAfterMs"),
+          "PlaceholderAfterMs == StaleAfterMs is rejected, naming it");
+    t.placeholderAfterMs = 501;
+    check(validateDisplayPreview(t, problems), "PlaceholderAfterMs > StaleAfterMs is valid");
+
+    DisplayPreviewConfig dev = on;
+    dev.device = "";
+    check(!validateDisplayPreview(dev, problems) && mentions(problems, "Device"),
+          "Enabled with an empty Device is rejected (no port probing)");
+    dev.enabled = false;
+    check(validateDisplayPreview(dev, problems), "an empty Device is fine while disabled");
+
+    DisplayPreviewConfig all = on;
+    all.fit = "crop";
+    all.jpegQuality = 40;
+    all.minimumJpegQuality = 60;
+    all.staleAfterMs = 3000;
+    all.placeholderAfterMs = 2000;
+    all.device = "";
+    check(!validateDisplayPreview(all, problems) && problems.size() == 4,
+          "every violated rule is reported at once (4)");
+    for (const auto& line : problems) std::cout << "        " << line << "\n";
+
+    return g_fails == before;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -623,6 +970,10 @@ int main() {
     bool t8 = test_load_or_create();
     bool t9 = test_resolve_storage_dir();
     bool t10 = test_obsolete_settings();
+    bool t11 = test_display_preview_defaults();
+    bool t12 = test_display_preview_absent();
+    bool t13 = test_display_preview_clamping();
+    bool t14 = test_display_preview_validation();
 
     std::cout << "\n=== Results ===\n";
     std::cout << "Test 1 (load real file):    " << (t1 ? "PASS" : "FAIL") << "\n";
@@ -635,6 +986,11 @@ int main() {
     std::cout << "Test 8 (loadOrCreate):      " << (t8 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 9 (storage fallback):  " << (t9 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 10 (obsolete settings): " << (t10 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 11 (preview defaults): " << (t11 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 12 (preview absent):   " << (t12 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 13 (preview clamping): " << (t13 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 14 (preview validate): " << (t14 ? "PASS" : "FAIL") << "\n";
 
-    return (t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10) ? 0 : 1;
+    return (t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 &&
+            t11 && t12 && t13 && t14) ? 0 : 1;
 }

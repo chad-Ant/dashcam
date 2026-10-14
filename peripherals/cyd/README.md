@@ -1,5 +1,8 @@
 # CYD dashboard firmware
 
+For the ESP32-S3 ES3C28P capacitive-touch board, use the separate
+[ES3C28P firmware](../es3c28p/README.md).
+
 This is the ESP32-2432S028 dashboard firmware, structured the same way as
 `peripherals/esp32-c3`:
 

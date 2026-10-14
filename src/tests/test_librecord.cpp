@@ -4,9 +4,12 @@
 //     naming, segmented MJPEG/H.264 (gapless, t=0 starts, per-segment sidecars
 //     covering each segment's start), EOS before the first frame (no abort),
 //     stall watchdog, mid-stream source error still finalises, loop-overwrite
-//     retention safety, luma tap for software auto-exposure, splitNow, and
-//     stop()'s hard deadline covering a worker blocked on sidecar I/O, and the
-//     periodic disk sync.
+//     retention safety, luma tap for software auto-exposure (also under a
+//     RecordFps cap), splitNow, stop()'s hard deadline covering a worker
+//     blocked on sidecar I/O, the periodic disk sync, and the compressed
+//     preview tap (rate, timestamps, RecordFps independence, recorded rate
+//     unchanged with any mix of taps and source caps, slow/failing consumers,
+//     a failure just before stop(), no call after stop()).
 //   Part B (first USB camera; SKIPPED when none):
 //     1. Strict precompressed gate: a raw format must be REJECTED.
 //     2. UVC compressed passthrough + ASS sidecar + live-stream tap.
@@ -24,6 +27,7 @@
 
 #include <linux/videodev2.h>
 
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -35,7 +39,9 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,6 +66,7 @@ struct RecorderTestHook {
     static GstElement* pipeline(SegmentedRecorder& r) { return r.pipeline_; }
     static void setSyncHook(SegmentedRecorder& r, std::function<void()> fn) { r.syncTestHook_ = std::move(fn); }
     static void setWorkerHook(SegmentedRecorder& r, std::function<void()> fn) { r.workerTestHook_ = std::move(fn); }
+    static void closePreviewGate(SegmentedRecorder& r) { r.previewGate_.store(false); }  ///< As stop() does first.
 };
 } // namespace dashcam::record
 
@@ -106,13 +113,25 @@ struct MkvInfo {
     bool    ok = false;
     int     frames = 0;
     int64_t firstPts = -1, lastPts = -1;
+    std::set<uint64_t>* hashes = nullptr;   ///< When set: FNV-1a of every frame's bytes.
 };
+
+static uint64_t fnv1a(const uint8_t* p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
 
 static GstPadProbeReturn countProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     auto* mi = static_cast<MkvInfo*>(user);
     GstBuffer* b = GST_PAD_PROBE_INFO_BUFFER(info);
     if (!b) return GST_PAD_PROBE_OK;
     ++mi->frames;
+    GstMapInfo map;
+    if (mi->hashes && gst_buffer_map(b, &map, GST_MAP_READ)) {
+        mi->hashes->insert(fnv1a(map.data, map.size));
+        gst_buffer_unmap(b, &map);
+    }
     if (GST_BUFFER_PTS_IS_VALID(b)) {
         const int64_t pts = static_cast<int64_t>(GST_BUFFER_PTS(b));
         if (mi->firstPts < 0 || pts < mi->firstPts) mi->firstPts = pts;
@@ -121,8 +140,9 @@ static GstPadProbeReturn countProbe(GstPad*, GstPadProbeInfo* info, gpointer use
     return GST_PAD_PROBE_OK;
 }
 
-static MkvInfo probeMkv(const std::string& path) {
+static MkvInfo probeMkv(const std::string& path, std::set<uint64_t>* hashes = nullptr) {
     MkvInfo mi;
+    mi.hashes = hashes;
     const std::string desc = "filesrc location=" + rec::detail::gstQuoted(path) +
                              " ! matroskademux ! fakesink name=sink sync=false";
     GError* err = nullptr;
@@ -665,6 +685,122 @@ static void testLumaTap() {
     fs::remove_all(dir);
 }
 
+// ─── A9b: luma tap under a RecordFps cap ──────────────────────────────────────
+
+// The source kinds the rate tests run on: jpegenc's own caps (what most tests
+// use), an explicit fixed-rate caps filter like the real v4l2src head
+// ("image/jpeg, width, height, framerate=30/1"), and a source whose rate is
+// left to negotiation — the strictest: any caps-constraining element in a tap
+// would pull the camera itself down.
+struct RateSource { const char* tag; std::string desc; };
+static std::vector<RateSource> rateSources(bool withNegotiable) {
+    std::vector<RateSource> v = {
+        {"jpegenc caps", kMjpegSrc},
+        {"fixed caps", std::string(kMjpegSrc) + " ! image/jpeg,width=320,height=240,framerate=30/1"},
+    };
+    if (withNegotiable)
+        v.push_back({"negotiable rate",
+                     "videotestsrc is-live=true pattern=ball ! video/x-raw,width=320,height=240 ! jpegenc"});
+    return v;
+}
+
+// Frames in all owned segments of @p dir; @p hashes collects their bytes' hashes.
+static int recordedFrames(const std::string& dir, bool& allOk, std::set<uint64_t>* hashes = nullptr) {
+    int total = 0;
+    allOk = true;
+    for (const auto& [seq, files] : listSegments(dir)) {
+        const MkvInfo mi = probeMkv(files.first, hashes);
+        total += mi.frames;
+        allOk = allOk && mi.ok;
+    }
+    return total;
+}
+
+// The recording's negotiated frame rate (recq's caps), e.g. "5/1".
+static std::string recFramerate(rec::SegmentedRecorder& r) {
+    std::string out = "none";
+    GstElement* q = gst_bin_get_by_name(GST_BIN(rec::RecorderTestHook::pipeline(r)), "recq");
+    if (!q) return out;
+    GstPad* pad = gst_element_get_static_pad(q, "sink");
+    if (GstCaps* caps = gst_pad_get_current_caps(pad)) {
+        gint n = 0, d = 0;
+        if (gst_caps_get_size(caps) > 0 &&
+            gst_structure_get_fraction(gst_caps_get_structure(caps, 0), "framerate", &n, &d))
+            out = std::to_string(n) + "/" + std::to_string(d);
+        gst_caps_unref(caps);
+    }
+    gst_object_unref(pad);
+    gst_object_unref(q);
+    return out;
+}
+
+// Steady-state rates of a running session over @p windowMs (after the first
+// frame and a 500 ms warm-up), per second.
+struct Rates { double rec = 0, source = 0, preview = 0, luma = 0; };
+static Rates measureRates(rec::SegmentedRecorder& r, int windowMs) {
+    for (int i = 0; i < 60 && r.framesReceived() == 0; ++i) sleepMs(50);
+    feedClockOnly(r, 500);
+    float    luma = 0;
+    uint64_t l0 = 0, l1 = 0;
+    r.latestLuma(luma, l0);                               // seq is set (0) even without a sample
+    const uint64_t f0 = r.framesReceived(), s0 = r.sourceFramesReceived(), p0 = r.previewFramesTapped();
+    const auto t0 = std::chrono::steady_clock::now();
+    feedClockOnly(r, windowMs);
+    const uint64_t f1 = r.framesReceived(), s1 = r.sourceFramesReceived(), p1 = r.previewFramesTapped();
+    r.latestLuma(luma, l1);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    Rates out;
+    out.rec     = double(f1 - f0) / secs;
+    out.source  = double(s1 - s0) / secs;
+    out.preview = double(p1 - p0) / secs;
+    out.luma    = double(l1 - l0) / secs;
+    return out;
+}
+
+static std::string fmtFps(double v) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.1f", v);
+    return b;
+}
+
+// Regression: lumarate (videorate max-rate=2) used to sit in the luma branch;
+// behind the recrate cap its caps negotiation reached through rectee and
+// pulled the RECORDING down to 2 fps (6 frames in 3 s at RecordFps 5).
+static void testLumaUnderRecordFps() {
+    std::cout << "\n--- A9b: luma tap under RecordFps 5 records at 5 fps ---\n";
+    for (const RateSource& src : rateSources(false)) {
+        const std::string tag = src.tag;
+        const std::string dir = makeTempDir("lumacap");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(dashcam::log::getCallback());
+        r.setLumaTap(true);
+        rec::RecorderTestHook::setSource(r, src.desc);
+        auto o = segOpts(dir, 60);
+        o.maxFps = 5;
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), tag + ": start (RecordFps 5, luma tap)");
+        feedClockOnly(r, 3000);
+        const std::string caps = recFramerate(r);
+        float luma = 0;
+        uint64_t lumaSeq = 0;
+        const bool gotLuma = r.latestLuma(luma, lumaSeq);
+        const uint64_t source = r.sourceFramesReceived();
+        check(r.isRecording(), tag + ": recording healthy");
+        check(r.stop(), tag + ": stop finalised");
+        const uint64_t frames = r.framesReceived();
+        bool ok = false;
+        const int total = recordedFrames(dir, ok);
+        check(caps == "5/1", tag + ": recording negotiated at the cap (framerate " + caps + ")");
+        check(frames >= 12 && frames <= 19 && ok && (uint64_t)total == frames,
+              tag + ": ~5 fps recorded, gapless (" + std::to_string(total) + "/" + std::to_string(frames) +
+              " frames in 3 s)");
+        check(source >= 70 && source <= 105, tag + ": camera still at 30 fps (" + std::to_string(source) +
+              " source frames)");
+        check(gotLuma && lumaSeq >= 4 && lumaSeq <= 8, tag + ": luma samples ~2/s (" +
+              std::to_string(lumaSeq) + " in 3 s)");
+        fs::remove_all(dir);
+    }
+}
+
 // ─── A10: splitNow (clock corrected → new segment) ────────────────────────────
 
 static void testSplitNow() {
@@ -936,6 +1072,586 @@ static void testSyncStall() {
     syncStallCase(1000, 6.0, true);                       // worker blocked on the same disk
 }
 
+// ─── A15: compressed preview tap (ES3C28P display preview) ───────────────────
+
+static uint64_t monoUs() {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+}
+
+// Log lines kept for assertions, still forwarded to the real logger.
+struct LogCapture {
+    std::mutex                m;
+    std::vector<std::string>  lines;
+    dashcam::log::LogCallback base = dashcam::log::getCallback();
+    dashcam::log::LogCallback callback() {
+        return [this](dashcam::log::LogLevel lv, const std::string& s) {
+            { std::lock_guard<std::mutex> lk(m); lines.push_back(s); }
+            if (base) base(lv, s);
+        };
+    }
+    int count(const std::string& what) {
+        std::lock_guard<std::mutex> lk(m);
+        int n = 0;
+        for (const auto& l : lines) n += l.find(what) != std::string::npos;
+        return n;
+    }
+    std::string first(const std::string& what) {
+        std::lock_guard<std::mutex> lk(m);
+        for (const auto& l : lines) if (l.find(what) != std::string::npos) return l;
+        return "";
+    }
+};
+
+// Everything a preview consumer saw, plus breaches of the callback contract.
+struct PreviewLog {
+    struct Frame {
+        uint64_t seq = 0, captureUs = 0, arrivalUs = 0, hash = 0;
+        uint32_t width = 0, height = 0, fourcc = 0;
+        bool     jpeg = false;                ///< SOI first and EOI last.
+    };
+    std::mutex         m;
+    std::vector<Frame> frames;
+    std::atomic<int>   delayMs{0};            ///< > 0: a slow consumer.
+    std::atomic<int>   throwAt{0};            ///< > 0: throw from this sequence number on.
+    std::atomic<int>   inCallback{0};
+    std::atomic<int>   afterStop{0};          ///< Calls that began after stop() returned.
+    std::atomic<bool>  stopped{false};
+
+    rec::PreviewFrameCallback callback() {
+        return [this](const rec::PreviewFrame& f) {
+            if (stopped.load()) ++afterStop;
+            ++inCallback;
+            Frame fr;
+            fr.seq       = f.sequence;
+            fr.captureUs = f.captureMonotonicUs;
+            fr.arrivalUs = monoUs();
+            fr.width     = f.width;
+            fr.height    = f.height;
+            fr.fourcc    = f.v4l2PixFmt;
+            fr.jpeg      = f.data && f.size >= 4 && f.data[0] == 0xFF && f.data[1] == 0xD8 &&
+                           f.data[f.size - 2] == 0xFF && f.data[f.size - 1] == 0xD9;
+            fr.hash      = f.data ? fnv1a(f.data, f.size) : 0;
+            { std::lock_guard<std::mutex> lk(m); frames.push_back(fr); }
+            if (const int ms = delayMs.load()) sleepMs(ms);
+            --inCallback;
+            const int t = throwAt.load();
+            if (t > 0 && f.sequence >= uint64_t(t)) throw std::runtime_error("synthetic consumer failure");
+        };
+    }
+    std::vector<Frame> snapshot() { std::lock_guard<std::mutex> lk(m); return frames; }
+    size_t count() { std::lock_guard<std::mutex> lk(m); return frames.size(); }
+};
+
+// Per-frame and rate checks over frames[from..]: JPEG + format + 320x240,
+// sequence = index + 1, capture times increasing and never after arrival.
+struct PreviewCheck {
+    bool     jpeg = true, dims = true, seq = true, mono = true, lag = true;
+    double   fps = 0;                         ///< Over the capture-time span.
+    int64_t  minGapUs = INT64_MAX;
+    uint64_t maxLagUs = 0;                    ///< Worst arrival − capture.
+};
+
+static PreviewCheck checkFrames(const std::vector<PreviewLog::Frame>& v, size_t from = 0) {
+    PreviewCheck c;
+    for (size_t i = from; i < v.size(); ++i) {
+        const auto& f = v[i];
+        c.jpeg = c.jpeg && f.jpeg && f.fourcc == V4L2_PIX_FMT_MJPEG;
+        c.dims = c.dims && f.width == 320 && f.height == 240;
+        c.seq  = c.seq && f.seq == i + 1;
+        c.lag  = c.lag && f.captureUs > 0 && f.captureUs <= f.arrivalUs;
+        if (f.captureUs <= f.arrivalUs) c.maxLagUs = std::max(c.maxLagUs, f.arrivalUs - f.captureUs);
+        if (i > from) {
+            const int64_t gap = int64_t(f.captureUs) - int64_t(v[i - 1].captureUs);
+            c.mono     = c.mono && gap > 0;
+            c.minGapUs = std::min(c.minGapUs, gap);
+        }
+    }
+    if (v.size() >= from + 2 && v.back().captureUs > v[from].captureUs)
+        c.fps = double(v.size() - from - 1) * 1e6 / double(v.back().captureUs - v[from].captureUs);
+    return c;
+}
+
+static bool hasElement(rec::SegmentedRecorder& r, const char* name) {
+    GstElement* e = gst_bin_get_by_name(GST_BIN(rec::RecorderTestHook::pipeline(r)), name);
+    if (e) gst_object_unref(e);
+    return e != nullptr;
+}
+
+// A15a: delivery contract at 10 fps from a 30 fps camera; the recording is the
+// same with the tap as without it, and the tapped bytes are recorded bytes.
+static void testPreviewDelivery() {
+    std::cout << "\n--- A15a: preview tap delivers rate-limited JPEGs, recording unchanged ---\n";
+    uint64_t framesOff = 0;
+    size_t   segsOff   = 0;
+    {
+        const std::string dir = makeTempDir("prevoff");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(dashcam::log::getCallback());
+        rec::RecorderTestHook::setSource(r, kMjpegSrc);
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 2)), "tap off: start");
+        check(!r.previewActive() && !hasElement(r, "srctee"), "tap off: no tee, no preview branch");
+        feedClockOnly(r, 4000);
+        check(r.stop(), "tap off: stop finalised");
+        framesOff = r.framesReceived();
+        bool ok = false;
+        const int total = recordedFrames(dir, ok);
+        segsOff = listSegments(dir).size();
+        check(ok && (uint64_t)total == framesOff, "tap off: gapless (" + std::to_string(total) + "/" +
+              std::to_string(framesOff) + ")");
+        fs::remove_all(dir);
+    }
+
+    PreviewLog pl;
+    LogCapture logs;
+    const std::string dir = makeTempDir("prevon");
+    rec::SegmentedRecorder r;
+    r.setLogCallback(logs.callback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    r.setPreviewTap(pl.callback(), 10);
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 2)), "tap on: start");
+    check(r.previewActive(), "tap on: preview branch active");
+    check(logs.count(" ! tee name=srctee srctee. ! queue name=recq") == 1 &&
+          logs.count(" srctee. ! queue name=previewq max-size-buffers=1 leaky=downstream "
+                     "! appsink name=previewsink ") == 1 &&
+          logs.count("videorate") == 0,
+          "pipeline: tee after the source, preview* branch as specified (no caps-negotiating videorate)");
+    feedClockOnly(r, 4000);
+    check(r.isRecording() && r.lastError().empty(), "tap on: recording healthy");
+    const bool clean = r.stop();
+    pl.stopped.store(true);
+    check(clean, "tap on: stop finalised");
+    check(!r.previewActive(), "no preview branch after stop()");
+
+    const auto v = pl.snapshot();
+    const auto c = checkFrames(v);
+    check(v.size() >= 30 && v.size() <= 44, std::to_string(v.size()) + " preview frames in 4 s at 10 fps");
+    check(r.previewFramesTapped() == v.size(), "previewFramesTapped() == frames delivered (kept after stop)");
+    check(c.jpeg, "every frame is one complete JPEG (SOI..EOI), fourcc MJPG");
+    check(c.dims, "width/height 320x240 from the negotiated caps");
+    check(c.seq, "sequence 1, 2, 3 ... without gaps");
+    check(c.mono, "capture timestamps strictly increasing");
+    check(c.lag && c.maxLagUs < 250000, "capture time <= arrival, lag < 250 ms (max " +
+          std::to_string(c.maxLagUs / 1000) + " ms)");
+    check(c.fps > 8.0 && c.fps <= 10.5, "rate " + std::to_string(c.fps) + " fps <= maxFps 10");
+    check(c.minGapUs >= 74000, "no burst: min capture gap " + std::to_string(c.minGapUs / 1000) + " ms");
+    check(logs.count("capture times from buffer PTS (pipeline clock is CLOCK_MONOTONIC)") == 1,
+          "timestamps from PTS + base time (system clock verified monotonic)");
+
+    const uint64_t framesOn = r.framesReceived();
+    std::set<uint64_t> recorded;
+    bool ok = false;
+    const int total = recordedFrames(dir, ok, &recorded);
+    check(ok && (uint64_t)total == framesOn, "tap on: gapless (" + std::to_string(total) + "/" +
+          std::to_string(framesOn) + ")");
+    check(framesOn * 100 >= framesOff * 85 && framesOn * 100 <= framesOff * 115,
+          "recorded frame count unaffected by the tap (" + std::to_string(framesOn) + " vs " +
+          std::to_string(framesOff) + " without)");
+    const size_t segsOn = listSegments(dir).size();
+    check(segsOn + 1 >= segsOff && segsOn <= segsOff + 1, "segment output unaffected (" +
+          std::to_string(segsOn) + " vs " + std::to_string(segsOff) + " segments)");
+    size_t inFile = 0;
+    for (const auto& f : v) inFile += recorded.count(f.hash);
+    check(!v.empty() && inFile == v.size(), "tapped bytes are recorded bytes (" + std::to_string(inFile) +
+          "/" + std::to_string(v.size()) + " frames found in the segments)");
+    check(pl.afterStop.load() == 0, "no callback after stop()");
+    fs::remove_all(dir);
+}
+
+// A15b: a RecordFps cap below the preview rate does not cap the preview, and
+// sourceFramesReceived() still counts camera frames.  (With the luma tap as
+// well: A15f.)
+static void testPreviewWithRecordFps() {
+    std::cout << "\n--- A15b: RecordFps 5 does not cap the preview (15 fps) ---\n";
+    PreviewLog pl;
+    LogCapture logs;
+    const std::string dir = makeTempDir("prevcap");
+    rec::SegmentedRecorder r;
+    r.setLogCallback(logs.callback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    r.setPreviewTap(pl.callback(), 15);
+    auto o = segOpts(dir, 60);
+    o.maxFps = 5;
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), "start");
+    const std::string line = logs.first("segmented recording pipeline: ");
+    const size_t tee = line.find("tee name=srctee"), rate = line.find("videorate name=recrate");
+    check(tee != std::string::npos && rate != std::string::npos && tee < rate,
+          "preview tee splits off BEFORE the recrate cap");
+    feedClockOnly(r, 3000);
+    const uint64_t source = r.sourceFramesReceived();
+    check(r.isRecording(), "recording healthy");
+    check(r.stop(), "stop finalised");
+
+    const auto v = pl.snapshot();
+    const auto c = checkFrames(v);
+    check(c.fps > 12.0 && c.fps <= 15.75, "preview at " + std::to_string(c.fps) +
+          " fps despite RecordFps 5 (" + std::to_string(v.size()) + " frames)");
+    check(c.jpeg && c.dims && c.seq && c.mono && c.lag, "preview frames well-formed");
+    check(c.minGapUs >= 49000, "no burst: min capture gap " + std::to_string(c.minGapUs / 1000) + " ms");
+    check(source >= 70 && source <= 105, "sourceFramesReceived() counts camera frames (" +
+          std::to_string(source) + " in 3 s)");
+    const uint64_t recorded = r.framesReceived();
+    check(recorded >= 12 && recorded <= 19, "recording capped at 5 fps (" + std::to_string(recorded) +
+          " frames)");
+    bool ok = false;
+    const int total = recordedFrames(dir, ok);
+    check(ok && (uint64_t)total == recorded, "gapless (" + std::to_string(total) + "/" +
+          std::to_string(recorded) + ")");
+    fs::remove_all(dir);
+}
+
+// A15b2: the luma tap and the preview tap together, each at its own rate.
+static void testPreviewWithLuma() {
+    std::cout << "\n--- A15b2: luma tap + preview tap together ---\n";
+    PreviewLog pl;
+    const std::string dir = makeTempDir("prevluma");
+    rec::SegmentedRecorder r;
+    r.setLogCallback(dashcam::log::getCallback());
+    r.setLumaTap(true);
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    r.setPreviewTap(pl.callback(), 10);
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)), "start");
+    check(hasElement(r, "lumasink") && hasElement(r, "previewsink"), "both branches built");
+    feedClockOnly(r, 3000);
+    float luma = 0;
+    uint64_t lumaSeq = 0;
+    const bool gotLuma = r.latestLuma(luma, lumaSeq);
+    check(r.isRecording(), "recording healthy with both taps");
+    check(r.stop(), "stop finalised");
+    check(gotLuma && lumaSeq >= 4 && lumaSeq <= 8, "luma tap ~2 samples/s (" + std::to_string(lumaSeq) + ")");
+    const auto v = pl.snapshot();
+    const auto c = checkFrames(v);
+    check(c.fps > 8.0 && c.fps <= 10.5 && c.jpeg && c.seq && c.mono, "preview at " +
+          std::to_string(c.fps) + " fps, well-formed (" + std::to_string(v.size()) + " frames)");
+    const uint64_t frames = r.framesReceived();
+    std::set<uint64_t> recorded;
+    bool ok = false;
+    const int total = recordedFrames(dir, ok, &recorded);
+    size_t inFile = 0;
+    for (const auto& f : v) inFile += recorded.count(f.hash);
+    check(frames >= 80 && ok && (uint64_t)total == frames, "every camera frame recorded (" +
+          std::to_string(total) + "/" + std::to_string(frames) + ")");
+    check(!v.empty() && inFile == v.size(), "tapped bytes are recorded bytes (" +
+          std::to_string(inFile) + "/" + std::to_string(v.size()) + ")");
+    fs::remove_all(dir);
+}
+
+// A15c: a callback that blocks for 300 ms costs the preview frames, never the
+// recording; when it speeds up again the rate stays capped (no videorate
+// catch-up burst); stop() waits for a call in progress and none starts after.
+static void testPreviewSlowConsumer() {
+    std::cout << "\n--- A15c: slow preview consumer, burst guard, no callback after stop() ---\n";
+    PreviewLog pl;
+    const std::string dir = makeTempDir("prevslow");
+    rec::SegmentedRecorder r;
+    r.setLogCallback(dashcam::log::getCallback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    r.setPreviewTap(pl.callback(), 15);
+    auto o = segOpts(dir, 60);
+    o.stallTimeoutMs = 1000;                              // a blocked source trips this fast
+    pl.delayMs.store(300);
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), "start");
+    feedClockOnly(r, 2500);
+    const uint64_t slowFrames = r.framesReceived();
+    const size_t   slowTaps   = pl.count();
+    check(r.isRecording() && r.lastError().empty(), "recording healthy behind a 300 ms callback");
+    check(slowFrames >= 60, "camera frames keep flowing (" + std::to_string(slowFrames) + " in 2.5 s)");
+    check(slowTaps >= 5 && slowTaps <= 10, "slow consumer got ~1 frame / 300 ms (" +
+          std::to_string(slowTaps) + ")");
+
+    pl.delayMs.store(0);                                  // fast again
+    const uint64_t fastFrom = monoUs() + 400000;          // past the call in flight
+    feedClockOnly(r, 2500);
+    const auto v = pl.snapshot();
+    size_t from = v.size();
+    for (size_t i = 0; i < v.size(); ++i) if (v[i].arrivalUs >= fastFrom) { from = i; break; }
+    const auto c = checkFrames(v, from);
+    check(v.size() - from >= 20, std::to_string(v.size() - from) + " frames in the fast phase");
+    check(c.fps <= 15.75 && c.minGapUs >= 49000, "no catch-up burst after the slow phase (" +
+          std::to_string(c.fps) + " fps, min gap " + std::to_string(c.minGapUs / 1000) + " ms)");
+
+    pl.delayMs.store(300);                                // so stop() lands inside a call
+    sleepMs(450);
+    const int busy = pl.inCallback.load();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool clean = r.stop();
+    const int busyAfter = pl.inCallback.load();
+    pl.stopped.store(true);
+    const double stopS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    sleepMs(500);
+    check(clean && stopS < 2.0, "stop finalised in " + std::to_string(stopS) + " s");
+    std::cout << "    callback in progress when stop() began: " << busy << "\n";
+    check(busyAfter == 0, "stop() returned only after the call in progress returned");
+    check(pl.afterStop.load() == 0, "no callback after stop() returned");
+    const auto all = pl.snapshot();
+    const auto ca = checkFrames(all);
+    check(ca.seq && ca.mono && ca.jpeg, "sequence and timestamps consistent across all phases");
+    bool ok = false;
+    const uint64_t frames = r.framesReceived();
+    const int total = recordedFrames(dir, ok);
+    check(frames >= 140, "recording kept the camera rate (" + std::to_string(frames) + " in ~5.5 s)");
+    check(ok && (uint64_t)total == frames, "gapless (" + std::to_string(total) + "/" +
+          std::to_string(frames) + ")");
+    fs::remove_all(dir);
+}
+
+// A15d: configuration — H.264 gets no branch (INFO), maxFps 0 / empty callback
+// build none, and a change during a session waits for the next start().
+static void testPreviewConfig() {
+    std::cout << "\n--- A15d: preview tap configuration ---\n";
+    {
+        PreviewLog pl;
+        LogCapture logs;
+        const std::string dir = makeTempDir("prev264");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(logs.callback());
+        r.setPreviewTap(pl.callback(), 10);
+        rec::RecorderTestHook::setSource(
+            r, "videotestsrc is-live=true ! video/x-raw,width=320,height=240,framerate=30/1 "
+               "! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30");
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_H264), segOpts(dir, 60)), "H.264: start");
+        check(!r.previewActive() && !hasElement(r, "previewsink") && !hasElement(r, "srctee"),
+              "H.264: no preview branch");
+        check(logs.count("preview tap needs an MJPEG source") == 1, "H.264: logged once at INFO");
+        sleepMs(1500);
+        check(r.isRecording() && pl.count() == 0 && r.previewFramesTapped() == 0,
+              "H.264: recording healthy, no preview frames");
+        check(r.stop(), "H.264: stop finalised");
+        fs::remove_all(dir);
+    }
+    for (int variant = 0; variant < 2; ++variant) {
+        PreviewLog pl;
+        const std::string tag = variant == 0 ? "maxFps 0" : "empty callback";
+        const std::string dir = makeTempDir("prevnone");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(dashcam::log::getCallback());
+        r.setPreviewTap(variant == 0 ? pl.callback() : rec::PreviewFrameCallback{}, variant == 0 ? 0 : 10);
+        rec::RecorderTestHook::setSource(r, kMjpegSrc);
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)), tag + ": start");
+        check(!r.previewActive() && !hasElement(r, "srctee"), tag + ": no branch");
+        sleepMs(500);
+        check(r.stop() && pl.count() == 0, tag + ": recorded, nothing tapped");
+        fs::remove_all(dir);
+    }
+    {
+        PreviewLog a, b;
+        LogCapture logs;
+        const std::string dir = makeTempDir("prevswap");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(logs.callback());
+        rec::RecorderTestHook::setSource(r, kMjpegSrc);
+        r.setPreviewTap(a.callback(), 10);
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)), "swap: start with tap A");
+        sleepMs(700);
+        r.setPreviewTap(b.callback(), 10);                // mid-session: stored, not applied
+        check(logs.count("takes effect at the next start()") == 1, "mid-session change logged at INFO");
+        const size_t aAtSwap = a.count();
+        sleepMs(1000);
+        check(a.count() >= aAtSwap + 7 && b.count() == 0, "running session keeps tap A (A " +
+              std::to_string(a.count()) + ", B " + std::to_string(b.count()) + ")");
+        check(r.stop(), "swap: stop");
+        const size_t aFinal = a.count();
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)), "swap: restart");
+        sleepMs(1000);
+        check(b.count() >= 7 && a.count() == aFinal, "next session delivers to tap B (B " +
+              std::to_string(b.count()) + ")");
+        const auto bf = b.snapshot();
+        check(!bf.empty() && bf.front().seq == 1, "sequence restarts at 1 in the new session");
+        check(r.stop(), "swap: stop again");
+        fs::remove_all(dir);
+    }
+}
+
+// Returns a fatal flow from inside the preview branch (unref: HANDLED owns it).
+static GstPadProbeReturn failFlow(GstPad*, GstPadProbeInfo* info, gpointer) {
+    if (GstBuffer* b = GST_PAD_PROBE_INFO_BUFFER(info)) gst_buffer_unref(b);
+    GST_PAD_PROBE_INFO_FLOW_RETURN(info) = GST_FLOW_ERROR;
+    return GST_PAD_PROBE_HANDLED;
+}
+
+// A15e: a preview failure stops the preview and nothing else — a fatal flow in
+// the branch (which a leaky queue alone would hand back up the tee to the
+// camera), a bus ERROR from a preview* element, and a throwing callback.  In
+// every case the recording stays healthy and gapless and stop() finalises
+// promptly (the dead branch still reaches EOS).
+static void testPreviewFailure() {
+    std::cout << "\n--- A15e: preview failures stay out of the recording ---\n";
+    for (int mode = 0; mode < 3; ++mode) {
+        const char* tags[] = {"fatal flow in branch", "bus ERROR from previewsink", "throwing callback"};
+        const std::string tag = tags[mode];
+        PreviewLog pl;
+        LogCapture logs;
+        const std::string dir = makeTempDir("prevfail");
+        rec::SegmentedRecorder r;
+        r.setLogCallback(logs.callback());
+        rec::RecorderTestHook::setSource(r, kMjpegSrc);
+        if (mode == 2) pl.throwAt.store(4);
+        r.setPreviewTap(pl.callback(), 15);
+        auto o = segOpts(dir, 60);
+        o.stallTimeoutMs = 1000;
+        check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), tag + ": start");
+        feedClockOnly(r, 1000);
+        GstElement* pipe = rec::RecorderTestHook::pipeline(r);
+        if (mode == 0) {
+            GstElement* pq = gst_bin_get_by_name(GST_BIN(pipe), "previewq");
+            GstPad* pad = gst_element_get_static_pad(pq, "src");
+            gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, failFlow, nullptr, nullptr);
+            gst_object_unref(pad);
+            gst_object_unref(pq);
+        } else if (mode == 1) {
+            GstElement* ps = gst_bin_get_by_name(GST_BIN(pipe), "previewsink");
+            GError* e = g_error_new_literal(GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED,
+                                            "synthetic preview failure");
+            gst_element_post_message(ps, gst_message_new_error(GST_OBJECT(ps), e, "record_test"));
+            g_error_free(e);
+            gst_object_unref(ps);
+        }
+        sleepMs(500);                                     // the failure lands
+        const uint64_t framesMid = r.framesReceived();
+        const uint64_t tapsMid   = r.previewFramesTapped();
+        feedClockOnly(r, 1500);
+        const uint64_t framesEnd = r.framesReceived();
+        check(r.isRecording() && r.lastError().empty(), tag + ": recording healthy (" +
+              (r.lastError().empty() ? std::string("no error") : r.lastError()) + ")");
+        check(framesEnd >= framesMid + 35, tag + ": camera frames keep flowing (" +
+              std::to_string(framesEnd - framesMid) + " in 1.5 s)");
+        check(!r.previewActive() && r.previewFramesTapped() == tapsMid && tapsMid > 0,
+              tag + ": preview stopped after " + std::to_string(tapsMid) + " frames");
+        check(logs.count("preview tap error (") >= 1 && logs.count("preview stopped") >= 1,
+              tag + ": WARN \"" + logs.first("preview tap error (") + "\"");
+        check(logs.count("recording unhealthy") == 0, tag + ": recording never marked unhealthy");
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool clean = r.stop();
+        const double stopS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        check(clean && stopS < 2.0, tag + ": stop finalised in " + std::to_string(stopS) + " s");
+        bool ok = false;
+        const uint64_t frames = r.framesReceived();
+        const int total = recordedFrames(dir, ok);
+        check(ok && (uint64_t)total == frames, tag + ": gapless (" + std::to_string(total) + "/" +
+              std::to_string(frames) + ")");
+        fs::remove_all(dir);
+    }
+}
+
+// A15f: the recorded rate is the camera's — or RecordFps — whatever the taps;
+// the preview and luma taps keep their own rates.  Neither tap branch may take
+// part in caps negotiation: a videorate max-rate in one pulled the recording
+// (behind recrate) or, with a negotiable source, the camera itself down to the
+// tap's rate.  The negotiable source runs uncapped only: recrate itself would
+// negotiate it down to RecordFps (the recording's own element, not a tap's —
+// the real v4l2src caps pin the rate, as the fixed-caps rows do).
+static void testPreviewRateMatrix() {
+    std::cout << "\n--- A15f: recorded rate with every mix of RecordFps, luma tap and source caps ---\n";
+    for (const RateSource& src : rateSources(true)) {
+        const std::string kind = src.tag;
+        if (kind == "jpegenc caps") continue;                         // A15a/b/b2 cover it
+        for (const uint32_t cap : {0u, 5u}) {
+            if (cap && kind == "negotiable rate") continue;
+            for (const bool luma : {false, true}) {
+                const std::string tag = std::string(src.tag) + (cap ? ", RecordFps 5" : ", no cap") +
+                                        (luma ? ", luma" : "");
+                const double want = cap ? 5.0 : 30.0;
+                PreviewLog pl;
+                const std::string dir = makeTempDir("prevmatrix");
+                rec::SegmentedRecorder r;
+                r.setLogCallback(dashcam::log::getCallback());
+                r.setLumaTap(luma);
+                rec::RecorderTestHook::setSource(r, src.desc);
+                r.setPreviewTap(pl.callback(), 15);
+                auto o = segOpts(dir, 60);
+                o.maxFps = cap;
+                check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), tag + ": start");
+                const Rates rt = measureRates(r, 2000);
+                const std::string caps = recFramerate(r);
+                check(r.isRecording() && r.previewActive(), tag + ": recording healthy, preview active");
+                check(r.stop(), tag + ": stop finalised");
+                const uint64_t frames = r.framesReceived();
+                bool ok = false;
+                const int total = recordedFrames(dir, ok);
+                const std::string wantCaps = cap ? "5/1" : "30/1";
+                check(caps == wantCaps && rt.rec >= want * 0.8 && rt.rec <= want * 1.2,
+                      tag + ": recording at " + fmtFps(rt.rec) + " fps, caps " + caps + " (want " + wantCaps + ")");
+                check(rt.source >= 27.0 && rt.source <= 33.0, tag + ": camera at " + fmtFps(rt.source) + " fps");
+                check(rt.preview >= 12.0 && rt.preview <= 16.0, tag + ": preview at " + fmtFps(rt.preview) + " fps");
+                if (luma)
+                    check(rt.luma >= 1.0 && rt.luma <= 3.0, tag + ": luma at " + fmtFps(rt.luma) + " samples/s");
+                check(ok && (uint64_t)total == frames, tag + ": gapless (" + std::to_string(total) + "/" +
+                      std::to_string(frames) + ")");
+                fs::remove_all(dir);
+            }
+        }
+    }
+}
+
+// Fails the next buffer leaving previewq and closes the preview gate at that
+// very moment, as a stop() beginning right then does: no later buffer can
+// notice the failure before the EOS reaches the guard.
+struct FailBeforeStop {
+    rec::SegmentedRecorder* r = nullptr;
+    std::atomic<bool>       armed{false}, fired{false};
+};
+static GstPadProbeReturn failAndCloseGate(GstPad*, GstPadProbeInfo* info, gpointer user) {
+    auto* s = static_cast<FailBeforeStop*>(user);
+    if (!s->armed.load() || s->fired.exchange(true)) return GST_PAD_PROBE_OK;
+    rec::RecorderTestHook::closePreviewGate(*s->r);
+    if (GstBuffer* b = GST_PAD_PROBE_INFO_BUFFER(info)) gst_buffer_unref(b);
+    GST_PAD_PROBE_INFO_FLOW_RETURN(info) = GST_FLOW_ERROR;
+    return GST_PAD_PROBE_HANDLED;
+}
+
+// A15g: a branch failure that only the EOS can notice (it landed just before
+// stop() closed the gate).  The queue would refuse that EOS, so the guard must
+// check it like a buffer and send the sink its EOS directly; otherwise the
+// pipeline-wide EOS never comes and stop() waits out eosTimeoutMs.
+static void testPreviewFailureAtStop() {
+    std::cout << "\n--- A15g: preview failure just before stop() ---\n";
+    PreviewLog pl;
+    LogCapture logs;
+    const std::string dir = makeTempDir("prevstopfail");
+    rec::SegmentedRecorder r;
+    r.setLogCallback(logs.callback());
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    r.setPreviewTap(pl.callback(), 15);
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), segOpts(dir, 60)), "start");
+    feedClockOnly(r, 1000);
+    FailBeforeStop fb;
+    fb.r = &r;
+    GstElement* pq  = gst_bin_get_by_name(GST_BIN(rec::RecorderTestHook::pipeline(r)), "previewq");
+    GstPad*     pad = gst_element_get_static_pad(pq, "src");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, failAndCloseGate, &fb, nullptr);
+    gst_object_unref(pad);
+    gst_object_unref(pq);
+    fb.armed.store(true);
+    for (int i = 0; i < 200 && !fb.fired.load(); ++i) sleepMs(5);
+    check(fb.fired.load(), "branch failed with the gate closed");
+    const bool activeBefore = r.previewActive();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool clean = r.stop();
+    const double stopS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    check(activeBefore, "failure not yet noticed before stop() (no buffer checked it)");
+    check(clean && stopS < 2.0, "stop finalised in " + std::to_string(stopS) + " s (eosTimeoutMs 4 s)");
+    check(logs.count("segment finalise timed out") == 0, "the pipeline-wide EOS arrived");
+    check(logs.count("preview tap error (previewq)") >= 1, "WARN \"" + logs.first("preview tap error (") + "\"");
+    bool ok = false;
+    const uint64_t frames = r.framesReceived();
+    const int total = recordedFrames(dir, ok);
+    check(frames >= 25 && ok && (uint64_t)total == frames, "gapless (" + std::to_string(total) + "/" +
+          std::to_string(frames) + ")");
+    fs::remove_all(dir);
+}
+
+static void testPreviewTap() {
+    testPreviewDelivery();
+    testPreviewWithRecordFps();
+    testPreviewWithLuma();
+    testPreviewSlowConsumer();
+    testPreviewConfig();
+    testPreviewFailure();
+    testPreviewRateMatrix();
+    testPreviewFailureAtStop();
+}
+
 static void runPartA() {
     std::cout << "=== Part A: hardware-free ===\n";
     testGoldenSingleFile();
@@ -951,11 +1667,13 @@ static void runPartA() {
     testSourceError();
     testRetention();
     testLumaTap();
+    testLumaUnderRecordFps();
     testSplitNow();
     testStopDeadlineCoversWorker();
     testDurableSync();
     testAbruptExitLowRate();
     testSyncStall();
+    testPreviewTap();
 }
 
 // ─── Part B6: live segmented recording on the real camera ─────────────────────

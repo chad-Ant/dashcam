@@ -1,0 +1,8 @@
+# Replace DISPLAY_SERIAL_HERE with this ES3C28P's ATTRS{serial}, obtained with:
+#   udevadm info --attribute-walk --name=/dev/ttyACM0
+# Native USB Serial/JTAG VID/PID is shared with the C3: NEVER remove the serial match.
+# Install as /etc/udev/rules.d/99-dashcam-display.rules, reload rules and replug.
+# This sorts after 99-dashcam-bridge.rules and removes its broad bridge alias
+# from this display only. Prefer serial-specific rules for BOTH devices.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="DISPLAY_SERIAL_HERE", SYMLINK-="dashcam-bridge", SYMLINK+="dashcam-display", MODE="0660", GROUP="dialout", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="1001", ATTR{serial}=="DISPLAY_SERIAL_HERE", TEST=="power/control", ATTR{power/control}="on"

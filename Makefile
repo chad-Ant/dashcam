@@ -20,6 +20,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/libcamera \
             -Ilib/libcommlink \
             -Ilib/libconfig \
+            -Ilib/libes3display \
             -Ilib/libgpio \
             -Ilib/libi2c \
             -Ilib/liblanedetector \
@@ -31,6 +32,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/libstereocam \
             -Ilib/libtimesync \
             -Ilib/libuart \
+            -Ilib/libvideopreview \
             $(shell pkg-config --cflags \
                 gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 \
                 pugixml opencv4 spdlog)
@@ -45,6 +47,7 @@ LD_TRT  := -L/usr/local/cuda/lib -L/usr/local/cuda/lib64 -lnvinfer -lcudart
 LD_VPI  := -lvpi
 LD_GPIO  := -lgpiod
 LD_ALSA  := -lasound
+LD_JPEG  := $(shell pkg-config --libs libjpeg)
 
 # ─── library source groups ────────────────────────────────────────────────────
 
@@ -82,6 +85,9 @@ LIBSIGN_CU_SRCS   := lib/libsigndetector/libsigndetector_preprocess.cu
 LIBREC_SRCS      := lib/librecord/librecord.cpp lib/librecord/libsegment.cpp \
                     lib/librecord/libretention.cpp
 LIBSTEREO_SRCS := lib/libstereocam/libstereocam.cpp
+LIBPREVIEW_SRCS := lib/libvideopreview/libvideopreview.cpp \
+                   lib/libvideopreview/libvideopreview_convert.cpp
+LIBES3_SRCS     := lib/libes3display/libes3display.cpp
 
 # ─── build directory (timestamped so parallel invocations don't collide) ──────
 
@@ -121,16 +127,26 @@ V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
             $(call make_cu_objs, $(LIBLANE_CU_SRCS) $(LIBDSTATE_CU_SRCS))
 
 # dashcam_v0_4: recording-only app — one UVC camera, compressed passthrough into
-# gapless segments with loop overwrite; no inference, no network (no TRT/OpenCV)
+# gapless segments with loop overwrite, plus the optional ES3C28P display preview
+# (libvideopreview + libes3display, libjpeg); no inference, no network (no TRT/OpenCV)
 V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCAM_FOCUS_SRCS) $(LIBCFG_SRCS) \
                 $(LIBREC_SRCS) $(LIBNET_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) $(LIBTIME_SRCS) \
-                src/dashcam_v0_4.cpp)
+                $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) src/dashcam_v0_4.cpp)
 
 # timesync_test: NTP-first / GPS-fallback clock decisions + clock-jump detection (no privileges)
 TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests/test_timesync.cpp)
 
 # bridge_overlay_test: ESP32-C3 telemetry -> recording overlay mapping (src/bridge_overlay.h, no hardware)
 BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) src/tests/test_bridge_overlay.cpp)
+
+# videopreview_test: libvideopreview MJPEG -> letterboxed preview JPEG (DCT-scaled decode, resize,
+# capped encode) + never-blocking submission, worker and lease pool (synthesized JPEGs, mock sink)
+PREVIEW_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPREVIEW_SRCS) src/tests/test_libvideopreview.cpp)
+
+# es3display_test: libes3display (ES3C28P USB tty owner: handshake, CAPABILITIES/START_VIDEO, credited
+# E3 29 video with control priority + TIOCOUTQ gating, reconnect) against a fake display on a pty
+ES3_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) \
+                     src/tests/test_libes3display.cpp)
 
 # exposure_test: frame-rate-priority auto-exposure loop (pure logic, no camera)
 EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests/test_exposure.cpp)
@@ -194,7 +210,8 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
 ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(FOCUS_TEST_OBJS) $(CAMGST_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
-                   $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS))
+                   $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS) \
+                   $(PREVIEW_TEST_OBJS) $(ES3_TEST_OBJS))
 
 DEPS := $(ALL_OBJS:.o=.d)
 
@@ -211,6 +228,8 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/camera_gst_test \
            $(BUILD_DIR)/timesync_test \
            $(BUILD_DIR)/bridge_overlay_test \
+           $(BUILD_DIR)/videopreview_test \
+           $(BUILD_DIR)/es3display_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
            $(BUILD_DIR)/can_test \
@@ -239,6 +258,19 @@ deadreckoning_test:
 # Convenience alias so `make commlink_test` works without the build-dir prefix.
 commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
 	@echo "Built commlink_test in $(BUILD_DIR)/"
+
+# Same for the library suites the display preview work touches.
+.PHONY: record_test config_test
+record_test: $(BUILD_DIR)/record_test | $(BUILD_DIR)/logs
+	@echo "Built record_test in $(BUILD_DIR)/"
+config_test: $(BUILD_DIR)/config_test | $(BUILD_DIR)/logs
+	@echo "Built config_test in $(BUILD_DIR)/"
+.PHONY: videopreview_test
+videopreview_test: $(BUILD_DIR)/videopreview_test | $(BUILD_DIR)/logs
+	@echo "Built videopreview_test in $(BUILD_DIR)/"
+.PHONY: es3display_test
+es3display_test: $(BUILD_DIR)/es3display_test | $(BUILD_DIR)/logs
+	@echo "Built es3display_test in $(BUILD_DIR)/"
 
 # Each build gets its own logs/ and config/ directories.  Binaries resolve
 # <exe_dir>/logs and <exe_dir>/config at runtime (dashcam::log::init() /
@@ -286,7 +318,7 @@ $(BUILD_DIR)/dashcam_v0_3: $(V03_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)
 
 $(BUILD_DIR)/dashcam_v0_4: $(V04_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
 
 $(BUILD_DIR)/exposure_test: $(EXPO_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
@@ -302,6 +334,12 @@ $(BUILD_DIR)/timesync_test: $(TIMESYNC_TEST_OBJS)
 
 $(BUILD_DIR)/bridge_overlay_test: $(BRIDGE_OVL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/videopreview_test: $(PREVIEW_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
+
+$(BUILD_DIR)/es3display_test: $(ES3_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)

@@ -330,6 +330,25 @@ static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
     readVar(node, s.noFaceFreezes,      log);
 }
 
+static void parseDisplayPreview(pugi::xml_node node, DisplayPreviewConfig& p,
+                                const dashcam::log::LogCallback& log) {
+    readVar(node, p.enabled,            log);
+    readVar(node, p.device,             log);
+    readVar(node, p.targetFps,          log);
+    readVar(node, p.fit,                log);
+    readVar(node, p.jpegQuality,        log);
+    readVar(node, p.minimumJpegQuality, log);
+    readVar(node, p.maxJpegBytes,       log);
+    readVar(node, p.maxSourceJpegBytes, log);
+    readVar(node, p.chunkDataBytes,     log);
+    readVar(node, p.maxFramesInFlight,  log);
+    readVar(node, p.assemblyTimeoutMs,  log);
+    readVar(node, p.staleAfterMs,       log);
+    readVar(node, p.placeholderAfterMs, log);
+    readVar(node, p.heartbeatMs,        log);
+    readVar(node, p.reconnectMs,        log);
+}
+
 // ── section writers ──────────────────────────────────────────────────────────
 
 static void writeOverlay(pugi::xml_node parent, const OverlayConfig& ovl) {
@@ -499,6 +518,25 @@ static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) 
     writeVar(n, s.noFaceFreezes);
 }
 
+static void writeDisplayPreview(pugi::xml_node parent, const DisplayPreviewConfig& p) {
+    pugi::xml_node n = parent.append_child("DisplayPreview");
+    writeVar(n, p.enabled);
+    writeVar(n, p.device);
+    writeVar(n, p.targetFps);
+    writeVar(n, p.fit);
+    writeVar(n, p.jpegQuality);
+    writeVar(n, p.minimumJpegQuality);
+    writeVar(n, p.maxJpegBytes);
+    writeVar(n, p.maxSourceJpegBytes);
+    writeVar(n, p.chunkDataBytes);
+    writeVar(n, p.maxFramesInFlight);
+    writeVar(n, p.assemblyTimeoutMs);
+    writeVar(n, p.staleAfterMs);
+    writeVar(n, p.placeholderAfterMs);
+    writeVar(n, p.heartbeatMs);
+    writeVar(n, p.reconnectMs);
+}
+
 } // namespace
 
 // ── ConfigReader ──────────────────────────────────────────────────────────────
@@ -530,6 +568,8 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
         parseDriverScore(ds, config.driverScore, log);
     if (auto lg  = root.child("Log"))       parseLog      (lg,  config.log,       log);
     if (auto net = root.child("Network"))   parseNetwork  (net, config.network,   log);
+    if (auto dp  = root.child("DisplayPreview"))
+        parseDisplayPreview(dp, config.displayPreview, log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
@@ -566,6 +606,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writeDriverScore(root, config.driverScore);
     writeLog(root, config.log);
     writeNetwork(root, config.network);
+    writeDisplayPreview(root, config.displayPreview);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {
         doLog(log, dashcam::log::LogLevel::ERROR,
@@ -594,6 +635,30 @@ bool ConfigReader::loadOrCreate(const std::string& filePath, AppConfig& config,
           "config '%s' not found — created with default values", filePath.c_str());
     config = defaults;
     return true;
+}
+
+bool validateDisplayPreview(const DisplayPreviewConfig& cfg,
+                            std::vector<std::string>& problems) {
+    problems.clear();
+    const std::string& fit = cfg.fit;
+    if (fit != "letterbox")
+        problems.push_back("DisplayPreview Fit '" + fit +
+                           "' is not supported (only 'letterbox')");
+    if (cfg.minimumJpegQuality > cfg.jpegQuality)
+        problems.push_back("DisplayPreview MinimumJpegQuality " +
+                           std::to_string(static_cast<int>(cfg.minimumJpegQuality)) +
+                           " exceeds JpegQuality " +
+                           std::to_string(static_cast<int>(cfg.jpegQuality)));
+    if (cfg.placeholderAfterMs <= cfg.staleAfterMs)
+        problems.push_back("DisplayPreview PlaceholderAfterMs " +
+                           std::to_string(static_cast<int>(cfg.placeholderAfterMs)) +
+                           " must exceed StaleAfterMs " +
+                           std::to_string(static_cast<int>(cfg.staleAfterMs)));
+    const std::string& device = cfg.device;
+    if (cfg.enabled && device.empty())
+        problems.push_back("DisplayPreview is enabled but Device is empty "
+                           "(no port is probed; set the display's udev alias or by-id path)");
+    return problems.empty();
 }
 
 std::string configDir() { return exeRelativeConfigDir(); }

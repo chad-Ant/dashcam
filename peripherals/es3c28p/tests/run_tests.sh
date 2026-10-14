@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euo pipefail
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$TEST_DIR/../../.." && pwd)"
+# The suite runs as root in the dev container: leave no root-owned __pycache__.
+export PYTHONDONTWRITEBYTECODE=1
+TEST_BUILD="$(mktemp -d)"
+trap 'rm -rf "$TEST_BUILD"' EXIT
+c++ -std=c++11 -Wall -Wextra -Werror "$TEST_DIR/calibration_test.cpp" -o "$TEST_BUILD/calibration"
+"$TEST_BUILD/calibration"
+c++ -std=c++11 -Wall -Wextra -Werror "$TEST_DIR/usb_protocol_test.cpp" -o "$TEST_BUILD/protocol"
+# Video wire contract: C++11 as on the firmware side, C++17 as in the Jetson Makefile.
+for std in c++11 c++17; do
+    c++ -std=$std -Wall -Wextra -Werror "$TEST_DIR/video_protocol_test.cpp" -o "$TEST_BUILD/video_protocol_$std"
+    "$TEST_BUILD/video_protocol_$std" "$TEST_DIR/video_golden_vectors.txt"
+done
+c++ -std=c++11 -Wall -Wextra -Werror -I"$TEST_DIR/../lib/es3UsbLink" "$TEST_DIR/video_state_test.cpp" -o "$TEST_BUILD/video_state"
+"$TEST_BUILD/video_state"
+# The Jetson link library compiles its own copies; they must not drift.
+for header in Es3Protocol.h Es3VideoProtocol.h; do
+    cmp "$TEST_DIR/../lib/es3UsbLink/$header" "$REPO_DIR/lib/libes3display/$header"
+done
+ES3_PROTOCOL_TEST="$TEST_BUILD/protocol" python3 "$TEST_DIR/test_usb_client.py"

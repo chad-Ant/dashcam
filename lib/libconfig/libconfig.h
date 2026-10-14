@@ -466,6 +466,74 @@ struct NetworkConfig {
 };
 
 /**
+ * @brief Live preview of the recording camera on the ES3C28P display over USB.
+ * XML section: @c \<DisplayPreview\>
+ *
+ * The recorder's compressed frames are sampled, DCT-scaled, letterboxed to the
+ * 320x240 panel (16:9 -> 320x180) and re-encoded as baseline JPEG on the Jetson
+ * (libvideopreview), then sent as credited E3 29 video records on the display's
+ * existing USB CDC control link (libes3display).  See
+ * peripherals/es3c28p/VIDEO_STREAMING_PLAN.md; its defaults are provisional until
+ * the hardware feasibility bench passes.
+ *
+ * Opt-in: a config file without this section (every file on the car predates it)
+ * keeps the preview disabled.  No preview setting or failure may affect recording.
+ * Per-field ranges are clamped by ConfigReader::load(); the cross-field rules are
+ * checked by validateDisplayPreview().  libconfig does not depend on the preview
+ * libraries: the app copies these values into their own config structs.
+ *
+ * The timeout ranges stay within the display's START_VIDEO ceiling of 10000 ms
+ * (es3video::kMaxTimeoutMs in peripherals/es3c28p/lib/es3UsbLink/Es3VideoProtocol.h;
+ * config_test checks this and the other protocol caps), with StaleAfterMs capped one
+ * step lower so PlaceholderAfterMs > StaleAfterMs can always be met.
+ */
+struct DisplayPreviewConfig {
+    ConfigVar<bool>        enabled            {"Enabled",            false,                    "Stream a letterboxed live preview of the recording camera to the ES3C28P display over USB. Turn on only after the board runs video-capable firmware and its udev alias (see Device) exists; recording never depends on it"};
+    ConfigVar<std::string> device             {"Device",             "/dev/dashcam-display",   "The display's tty: its udev alias (peripherals/es3c28p/host/99-dashcam-display.rules) or a /dev/serial/by-id/... path. Only this exact path is opened and no port is probed - the ESP32-C3 bridge has the same USB VID:PID, so never use a /dev/ttyACMn number"};
+    ConfigVar<int>         targetFps          {"TargetFps",          10,      1,      15,      1,      "Preview frame-rate ceiling (fps); never more than the camera delivers. 10 until the hardware soak shows 15 holds"};
+    ConfigVar<std::string> fit                {"Fit",                "letterbox",              "How the camera image fits the 320x240 panel. letterbox = the whole image at its own aspect ratio with black bars (16:9 -> 320x180), never stretched or cropped. The only supported value: anything else is rejected at startup (WARN) and the preview stays off"};
+    ConfigVar<int>         jpegQuality        {"JpegQuality",        65,      20,     95,      1,      "Preview JPEG encoder quality (libjpeg 1-100 scale; baseline 4:2:0). A size/quality trade only: the measured encode cost barely changes with it"};
+    ConfigVar<int>         minimumJpegQuality {"MinimumJpegQuality", 45,      10,     95,      1,      "Lowest quality the single re-encode of an oversized frame (over MaxJpegBytes) may use; must not exceed JpegQuality. A frame still oversized after that one retry is dropped"};
+    ConfigVar<int>         maxJpegBytes       {"MaxJpegBytes",       65536,   4096,   65536,   1024,   "Hard cap on one encoded preview frame (bytes); the smaller of this and the display's advertised limit applies. 65536 = the display firmware's JPEG slot size"};
+    ConfigVar<int>         maxSourceJpegBytes {"MaxSourceJpegBytes", 1048576, 262144, 8388608, 65536,  "Size of each preallocated input slot for a compressed camera frame (bytes; a 1080p MJPEG frame is ~160 KiB). A larger camera frame is dropped with a 'source frame too large' status; recording is unaffected"};
+    ConfigVar<int>         chunkDataBytes     {"ChunkDataBytes",     1024,    256,    4096,    256,    "JPEG bytes per USB video CHUNK record (each record adds 20 bytes: 16 of header and CRC, 4 of offset); the display's advertised chunk limit can lower it"};
+    ConfigVar<int>         maxFramesInFlight  {"MaxFramesInFlight",  1,       1,      2,       1,      "Credit window cap: frames sent before the display frees a receive buffer. Start with 1; raise to 2 only if measured stages need overlapping. The display's advertised credits can lower it"};
+    ConfigVar<int>         assemblyTimeoutMs  {"AssemblyTimeoutMs",  500,     100,    5000,    50,     "Deadline (ms) from a frame's START record to its END; an incomplete frame is aborted and dropped, never retransmitted"};
+    ConfigVar<int>         staleAfterMs       {"StaleAfterMs",       500,     100,    9900,    50,     "Time without a newly presented frame (ms) after which the image is visibly marked stale; must be less than PlaceholderAfterMs. Capped at 9900 so a later placeholder still fits the display's 10000 ms protocol limit"};
+    ConfigVar<int>         placeholderAfterMs {"PlaceholderAfterMs", 2000,    200,    10000,   100,    "Time without a newly presented frame (ms) after which the stale image is replaced by the 'Video unavailable' placeholder; must exceed StaleAfterMs. Max 10000 = the display protocol's timeout limit"};
+    ConfigVar<int>         heartbeatMs        {"HeartbeatMs",        1000,    200,    4000,    100,    "Heartbeat interval to the display (ms), sent even while video is paused; the display ends the session after 5 s without one, hence the 4000 ms cap"};
+    ConfigVar<int>         reconnectMs        {"ReconnectMs",        1000,    200,    60000,   100,    "Interval (ms) between attempts to reopen Device after USB loss or a failed handshake; recording continues meanwhile"};
+};
+
+/**
+ * @brief Check the DisplayPreviewConfig rules that per-field clamping cannot express.
+ *
+ * Pure: reads @p cfg only, logs nothing, changes nothing.  The rules:
+ *   - @c Fit is @c "letterbox" (the only supported mode; compared exactly);
+ *   - @c MinimumJpegQuality <= @c JpegQuality (the oversized-frame retry may only
+ *     lower quality);
+ *   - @c PlaceholderAfterMs > @c StaleAfterMs (the stale mark comes first);
+ *   - @c Device is non-empty when @c Enabled (an empty path must not fall back to
+ *     probing ports).
+ *
+ * Intended use, once at startup after ConfigReader::load(): when
+ * @c cfg.displayPreview.enabled is set, call this; on @c false log every entry of
+ * @p problems as a WARN and leave the preview off for this run.  Recording starts
+ * regardless.  Values are reported, never silently repaired, so a typo cannot turn
+ * into a different preview behaviour than the one configured.
+ *
+ * The per-field ranges already keep every timeout within the display's 10000 ms
+ * START_VIDEO ceiling, so the timeouts of a configuration that passes here are also
+ * acceptable to the display (which requires placeholder >= stale).
+ *
+ * @param cfg       Preview settings as loaded (each field already within its range).
+ * @param problems  Cleared, then given one human-readable line per violated rule.
+ * @return @c true if every rule holds (@p problems is then empty).
+ */
+bool validateDisplayPreview(const DisplayPreviewConfig& cfg,
+                            std::vector<std::string>& problems);
+
+/**
  * @brief Aggregated application configuration.
  * Root XML element: @c \<DashcamConfig\>
  */
@@ -479,6 +547,7 @@ struct AppConfig {
     DriverScoreConfig         driverScore;
     LogConfig                 log;
     NetworkConfig             network;
+    DisplayPreviewConfig      displayPreview;
 };
 
 // ─── reader / writer ─────────────────────────────────────────────────────────

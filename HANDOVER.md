@@ -21,7 +21,7 @@ This file has three parts:
 | ESP32-C3 | Bridge firmware 1.0; `HostProtocol` and `CommProtocol` are at 0x07. |
 | Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. Since 2026-10-10: `drive_watch.sh` watches the raw-CAN files, tegrastats runs every 1 s, and `drive_session.sh stop` refuses while the car is moving (`--force` overrides). |
 | Storage | `/media/jetson/backup` sits on the root NVMe: 428 GB free. |
-| Uncommitted | `peripherals/mkr_zero/tools/canstream/` (logger hung-disk bound, tests, README); `peripherals/mkr_zero/libraries/EncoderPan/` (standalone servo/encoder prototype); `lib/libcan/libcan.cpp`, `lib/libgpio/libgpio.cpp`, `lib/libcamera/libcamera.{h,cpp}`, `lib/libconfig/libconfig.{h,cpp}`, `src/tests/test_libconfig.cpp`; since 2026-10-12: `tools/isp_tuning/chart/v2/` (capture helper, tests, docs), `peripherals/cyd/` (the dashboard app the user copied in from a colleague's uncommitted work, with my fixes; bring-up sketch fixes; CH340 driver script; README), `docker_dev/Dockerfile`, `build.sh` and `install_samd_aarch64.py`; this file. |
+| Uncommitted | `peripherals/mkr_zero/tools/canstream/` (logger hung-disk bound, tests, README); `peripherals/mkr_zero/libraries/EncoderPan/` (standalone servo/encoder prototype); `lib/libcan/libcan.cpp`, `lib/libgpio/libgpio.cpp`, `lib/libcamera/libcamera.{h,cpp}`, `lib/libconfig/libconfig.{h,cpp}`, `src/tests/test_libconfig.cpp`; since 2026-10-12: `tools/isp_tuning/chart/v2/` (capture helper, tests, docs), `peripherals/cyd/` (the dashboard app the user copied in from a colleague's uncommitted work, with my fixes; bring-up sketch fixes; CH340 driver script; README), `docker_dev/Dockerfile`, `build.sh` and `install_samd_aarch64.py`; this file. Since 2026-10-13/14: `peripherals/es3c28p/` (colleague's board port + firmware video side; my protocol headers, vectors, tests, Python playback), `lib/libvideopreview/`, `lib/libes3display/`, the preview tap in `lib/librecord/`, `<DisplayPreview>` in `lib/libconfig/`, `src/dashcam_v0_4.cpp`, the Makefile, their tests, and the Dockerfile JPEGDEC pin (image rebuilt). |
 
 ## Workstreams
 
@@ -36,6 +36,7 @@ This file has three parts:
 | GRF-250 ranging | `e46bf71` | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
 | Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
 | CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
+| ES3C28P display preview | Uncommitted | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
@@ -68,15 +69,19 @@ This file has three parts:
    sensor.
 8. **IMX296 v2 chart:** capture the three sheets with `capture_chart.py` (CALIBRATION.md, "Capture") once the CSI
    camera is back. Its first CSI run is also the helper's first CSI test.
-9. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
+9. **ES3C28P preview** (2026-10-14 log section): committed. When the board
+   arrives: flash it, install `peripherals/es3c28p/host/99-dashcam-display.rules` with its serial, run the bench sketches
+   (USB throughput hwcdc vs TinyUSB, JPEG decode/blit), then set `<DisplayPreview><Enabled>true` in the deployed config
+   (the section is absent there, so the preview stays off until added) and soak at 10 fps, then 15 fps.
+10. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
    boot alert, tap-test touch, cover/uncover the LDR (it read ~980 in the room and held the backlight at 32/255).
-10. **Smaller items:**
+11. **Smaller items:**
    - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
    - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
    - a night plate test on an unlit road, and autofocus while driving;
    - whether a link loss minutes after a recovered link-up should stay DEBUG-only (the 00:06 MKR reboot was);
    - item U with a replug, and the optional item O step (both need sudo).
-11. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
+12. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
     warnings and the float control ranges. Left: the `const_cast` in `getCameraStatus()`.
 
 # Reference
@@ -360,6 +365,70 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-10-14 (Jetson, bench): ES3C28P video preview, Jetson side
+
+The plan is `peripherals/es3c28p/VIDEO_STREAMING_PLAN.md` (the colleague's plan plus my "Review additions" and the
+"Frozen protocol v1" section). Built in stages by agents with independent reviews; two stages were cut short by usage
+limits and finished by hand. Nothing is committed. The board itself is not here: everything below is tested against
+fakes on ptys and synthetic JPEGs, plus the real UGREEN frames for timing.
+
+- **Wire protocol v1** (`Es3Protocol.h` + new `Es3VideoProtocol.h`, byte-identical in `peripherals/es3c28p/lib/es3UsbLink/`
+  and `lib/libes3display/`): control commands 07 CAPABILITIES, 08 START_VIDEO, 09 STOP_VIDEO; E3 29 video records
+  (START/CHUNK/END/ABORT, RESULT/PRESENTED/CREDIT/VISIBILITY), reason codes, CRC-32, a bounded multiplexing parser.
+  34 golden vectors in `peripherals/es3c28p/tests/video_golden_vectors.txt`, checked by C++ (C++11 and 17) and Python.
+  Old firmware answers 07 with BadCommand, which the host reads as "video unsupported".
+- **Recorder tap** (`SegmentedRecorder::setPreviewTap`): a leaky side branch split off before the RecordFps cap; its
+  elements are `preview*`, and their errors are WARNs that never stop the recording. Rate limiting is a pad-probe
+  limiter, not `videorate`, because `videorate max-rate` takes part in caps negotiation.
+- **Pre-existing bug fixed on the way:** with a RecordFps cap below the camera rate *and* the luma tap, the luma
+  branch's `videorate max-rate=2` pulled the **recording** down to 2 fps (6 frames in 3 s instead of 15 at RecordFps 5).
+  Not live on the car (RecordFps 30 = camera 30 adds no cap). The luma branch now uses the same probe limiter; regression
+  tests A9b/A15f. Also fixed: a preview failure just before `stop()` made `stop()` wait out the 4 s EOS timeout (A15g).
+- **Config** `<DisplayPreview>`: 15 settings, `Enabled=false`; `validateDisplayPreview()` covers the cross-field rules;
+  the timeout maxima match the protocol's 10 s ceiling (a test guards the drift).
+- **`lib/libvideopreview`**: libjpeg DCT-scaled decode (1/4 for 1080p) → resize → baseline 4:2:0 JPEG, letterbox
+  viewport (16:9 → 0,30 320×180), newest-frame input slots, a non-blocking `submitJpeg()`. On the 60 UGREEN bench frames:
+  6.49 ms p50 / 6.51 ms p95 per frame, 8.2 KiB at q65 (a static indoor scene; night/motion still to measure).
+- **`lib/libes3display`**: the single owner of the board's tty (exact configured path; never probes, the C3 shares the
+  VID:PID). HELLO → CAPABILITIES → START_VIDEO, cumulative credits, one frame in flight by default, control requests
+  ahead of video, TIOCOUTQ gating, heartbeats, reconnect, credit-stall resync. `es3display_test`: 18 groups against a
+  fake board on a pty, incl. unplug/replug and an end-to-end 1080p JPEG → converter → link → fake board. Two test races
+  fixed by hand (7/7 runs pass, 2 under CPU load).
+- **v0.4**: validates the section (WARN + preview off on problems), starts link then converter, sets the tap before
+  every recording start, stops recorder → converter → link at shutdown. The preview never gates recording.
+- **Python** `es3_display.py`: protocol mirror, `capabilities`, and a `play` subcommand for bench playback.
+- **Tests (all PASS, `bin/build_20261013_204351`, full plain `make`, 0 warnings):** config_test, videopreview_test,
+  es3display_test, record_test (4 extra runs, ~144 s), commlink_sim_test, bridge_overlay_test, timesync_test,
+  `dashcam_v0_4 --self-test`, `peripherals/es3c28p/tests/run_tests.sh` (33 Python tests). SIGINT → exit 0 with the
+  preview on and the board absent, and with invalid settings.
+- **Image:** rebuilt with the colleague's JPEGDEC 1.8.4 pin (`l4t-ml-gpio:latest` = `cbab0f86efe7`; previous archived as
+  `build_20261013_211903`). The firmware compiles in it with 0 warnings (552,302 B / 54,036 B).
+- **Compatibility with the colleague's firmware: compatible.** `src/tests/es3_firmware_fake.h` runs the firmware's own
+  `VideoState.h` and parser on a pty, with `es3UsbLink::service()`'s rules mirrored (USB-task vs loop commands, no RX
+  while a loop command is pending, 5 s session, 1 s TX stall, 4 KiB RX budget, events after replies); libjpeg stands in
+  for JPEGDEC. `es3display_test` group [19]: handshake/limits, 30 frames in 3 s at 10 fps with 0 drops, credits after
+  decode, hidden pause/resume, STATUS while streaming, heartbeats, converter frames pass the firmware's checks (4/4 runs).
+  `es3display_test --fake-board PATH` serves the same fake to the real app. **End to end** (`bin/build_20261013_210026`):
+  v0.4 recording the UGREEN at 1080p30 with the preview on, 30 s: 887 frames recorded (30 fps kept), 297 to the
+  converter, 295 presented, 0 drops, ~6 KB per frame, capture→presented p95 77 ms on the pty, SIGINT → exit 0. The first
+  UGREEN buffer of each session is not a JPEG and is skipped (logged once).
+- **Compatibility findings (for the user / the firmware author):** (A) the firmware stops reading USB while a loop-handled
+  command (STATUS, PAGE, ALERT, STOP_AUDIO) waits for the Arduino loop; one taking longer than the host's 500 ms reply
+  timeout makes the host say HELLO again, which resets the video session (it renegotiates; tested). **Decided (user):
+  longer host timeout.** `DisplayLinkConfig::loopReplyTimeoutMs` = 2000 ms for those four commands (PING, CAPABILITIES,
+  START/STOP_VIDEO keep 500 ms); [19] now checks a 700 ms PAGE is answered with the session intact and a 2.5 s one
+  times out and recovers; full build `bin/build_20261013_230621`, es3display_test 3/3, v0.4 self-test and the UGREEN
+  end-to-end (295/296 presented, 887 frames recorded, exit 0) pass again. (B) **left to the firmware author (user passed
+  the review on).** The two behaviour items were fixed by the firmware author on 2026-10-14 (07:02, both header copies
+  still identical): the parser's timeout now rescans and keeps complete records, and `decodeAbort` turns reason Ok into
+  Malformed. Verified: firmware tests (34 Python + C++), full build `bin/build_20261014_000916`, es3display_test,
+  config_test, videopreview_test, v0.4 self-test, firmware compile (552,414 B, 0 warnings). The original findings were
+  four minor protocol review items in the shared header (the parser's
+  partial-record timeout also drops complete records it had absorbed; ABORT with reason Ok is accepted; the plan's
+  Frozen text and the header disagree on the RESULT sequence; no independent content check of parsed control items).
+  The plan says `videorate` for the preview branch; the probe limiter replaces it (TargetFps 11/13/14 give 10/12/13.3 at
+  30 fps). Independent reviews of the converter, link and Python playback were cut off by the usage limit.
 
 ## 2026-10-12 (Jetson, bench): UGREEN work and the CYD toolchain
 

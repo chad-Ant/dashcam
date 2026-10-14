@@ -153,10 +153,11 @@ RUN for i in 1 2 3; do arduino-cli core update-index && break; sleep 10; done \
 # touch-controller libraries only its examples use.  GFX/BusIO come from the
 # MKR layer.
 RUN for i in 1 2 3; do \
-           arduino-cli lib update-index && arduino-cli lib install --no-deps "Adafruit ILI9341@1.6.4" && break; \
+           arduino-cli lib update-index && arduino-cli lib install --no-deps "Adafruit ILI9341@1.6.4" "JPEGDEC@1.8.4" && break; \
            echo "library install attempt $i failed; retrying"; sleep 10; \
        done \
-    && arduino-cli lib list | grep -q "^Adafruit ILI9341 *1.6.4 "
+    && arduino-cli lib list | grep -q "^Adafruit ILI9341 *1.6.4 " \
+    && arduino-cli lib list | grep -q "^JPEGDEC *1.8.4 "
 
 WORKDIR /home/app
 

@@ -3,6 +3,7 @@
 #include <linux/videodev2.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <exception>
 
 namespace dashcam::record {
 
@@ -24,7 +26,7 @@ using dashcam::log::LogLevel;
 
 static void doLog(const dashcam::log::LogCallback& cb, LogLevel lvl, const char* fmt, ...) {
     if (!cb) return;
-    char buf[640];
+    char buf[1536];   // the full pipeline string, with every tap, fits
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -35,6 +37,14 @@ static void doLog(const dashcam::log::LogCallback& cb, LogLevel lvl, const char*
 static int64_t steadyNowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// CLOCK_MONOTONIC in µs: the preview tap's capture-time base (explicitly the
+// kernel clock, which GstSystemClock's MONOTONIC mode also reads).
+static uint64_t monotonicNowUs() {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
 }
 
 static int64_t wallNowMs() {
@@ -153,6 +163,23 @@ void SegmentedRecorder::setOverlayConfig(const dashcam::config::OverlayConfig& c
 
 void SegmentedRecorder::setLogCallback(dashcam::log::LogCallback cb) { log_ = std::move(cb); }
 
+void SegmentedRecorder::setPreviewTap(PreviewFrameCallback cb, uint32_t maxFps) {
+    {
+        std::lock_guard<std::mutex> lock(previewCfgMu_);
+        previewCfgCb_  = std::move(cb);
+        previewCfgFps_ = maxFps;
+    }
+    // The running session keeps its own copy (read on a streaming thread):
+    // swapping it here would race that thread, so the change waits for start().
+    bool active;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        active = pipeline_ != nullptr;
+    }
+    if (active)
+        doLog(log_, LogLevel::INFO, "preview tap change stored — takes effect at the next start()");
+}
+
 bool SegmentedRecorder::isRecording() const {
     return pipeline_ != nullptr && healthy_.load(std::memory_order_relaxed);
 }
@@ -255,6 +282,22 @@ bool SegmentedRecorder::splitNow() {
     return true;
 }
 
+GstPadProbeReturn SegmentedRecorder::onLumaGate(GstPad*, GstPadProbeInfo*, gpointer user) {
+    // lumaq's sink pad, i.e. rectee's push into the luma branch, on the
+    // recording's streaming thread: pass ~2 frames per second and drop the
+    // rest before they are queued.  A probe takes no part in caps negotiation —
+    // a videorate max-rate=2 here negotiated a RecordFps-capped recording down
+    // to 2 fps through the tee.  GCRA on the arrival time (it cannot run
+    // backwards): half a period of tolerance keeps 2/s down to RecordFps 3, and
+    // a gap builds no credit.
+    auto* self = static_cast<SegmentedRecorder*>(user);
+    constexpr int64_t kPeriodNs = 500 * 1000000LL;
+    const int64_t now = steadyNowNs();
+    if (self->lumaDueNs_ != 0 && now + kPeriodNs / 2 < self->lumaDueNs_) return GST_PAD_PROBE_DROP;
+    self->lumaDueNs_ = std::max(now, self->lumaDueNs_) + kPeriodNs;
+    return GST_PAD_PROBE_OK;
+}
+
 GstPadProbeReturn SegmentedRecorder::onSourceProbe(GstPad*, GstPadProbeInfo*, gpointer user) {
     static_cast<SegmentedRecorder*>(user)->sourceCount_.fetch_add(1, std::memory_order_relaxed);
     return GST_PAD_PROBE_OK;
@@ -265,6 +308,154 @@ bool SegmentedRecorder::latestLuma(float& luma, uint64_t& seq) const {
     if (seq == 0) return false;
     luma = luma_.load();
     return true;
+}
+
+// ─── preview tap (previewsink / previewq streaming threads) ──────────────────
+
+void SegmentedRecorder::failPreview(const char* who, const char* what) {
+    // The first failure of a session reports; onPreviewGuard() then cuts the
+    // branch at the tee, so nothing of it reaches the camera source.
+    if (previewFailed_.exchange(true)) return;
+    doLog(log_, LogLevel::WARN, "preview tap error (%s): %s — preview stopped, recording continues",
+          who, what);
+}
+
+GstPadProbeReturn SegmentedRecorder::onPreviewGuard(GstPad*, GstPadProbeInfo* info, gpointer user) {
+    // previewq's sink pad, i.e. the tee's push into the preview branch.  A
+    // leaky queue does not isolate errors: once its downstream returned a fatal
+    // flow, its next chain call hands that flow back to the tee, the tee to the
+    // camera source, and the recording dies.  So check the queue's last result
+    // before every buffer and stop feeding a dead branch.  (A failure in the
+    // microseconds between this check and the queue's chain can still slip
+    // through; the appsink never returns one in practice.)
+    auto* self = static_cast<SegmentedRecorder*>(user);
+    const bool isEvent = (info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) != 0;
+    GstEvent*  ev      = isEvent ? GST_PAD_PROBE_INFO_EVENT(info) : nullptr;
+    const bool isEos   = ev && GST_EVENT_TYPE(ev) == GST_EVENT_EOS;
+    if (!self->previewFailed_.load(std::memory_order_relaxed)) {
+        // EOS is checked like a buffer: once stop() closed the gate no buffer
+        // checks any more, and a failure that landed just before would make
+        // the queue refuse the EOS — and the pipeline-wide EOS never come.
+        if (isEvent && !isEos) return GST_PAD_PROBE_OK;
+        if (!isEvent && !self->previewGate_.load(std::memory_order_relaxed))
+            return GST_PAD_PROBE_DROP;                   // stop() under way: nobody consumes it
+        const GstFlowReturn last = gst_pad_get_last_flow_return(self->previewQSrc_);
+        if (last == GST_FLOW_OK || last == GST_FLOW_FLUSHING) return GST_PAD_PROBE_OK;
+        self->failPreview("previewq", gst_flow_get_name(last));
+    }
+    // Failed: nothing enters the branch any more — not even EOS, which a queue
+    // holding an error turns into a bus ERROR.  The sink still has to reach EOS
+    // for the pipeline-wide EOS that stop() waits on, so send it one directly.
+    if (isEos && self->previewSinkPad_)
+        gst_pad_send_event(self->previewSinkPad_, gst_event_new_eos());
+    return GST_PAD_PROBE_DROP;
+}
+
+void SegmentedRecorder::updatePreviewCaps(GstCaps* caps) {
+    // Re-read only when the caps object changes; the held ref keeps the
+    // pointer comparison safe from address reuse.
+    if (!caps || caps == previewCaps_) return;
+    gst_caps_replace(&previewCaps_, caps);
+    const GstStructure* st = gst_caps_get_size(caps) > 0 ? gst_caps_get_structure(caps, 0) : nullptr;
+    gint w = 0, h = 0;
+    if (st && gst_structure_get_int(st, "width", &w) && gst_structure_get_int(st, "height", &h) &&
+        w > 0 && h > 0) {
+        previewW_ = static_cast<uint32_t>(w);
+        previewH_ = static_cast<uint32_t>(h);
+    } else {                                             // no size in the caps: the requested one
+        previewW_ = videoW_;
+        previewH_ = videoH_;
+    }
+}
+
+uint64_t SegmentedRecorder::previewCaptureUs(GstAppSink* sink, GstSample* sample, GstBuffer* buf,
+                                             uint64_t arrivalUs) {
+    if (previewClock_ == 0) {
+        // Decided once per session; the clock is fixed once frames flow.  The
+        // exact type matters: GstNetClientClock & co. derive from GstSystemClock
+        // but do not tick CLOCK_MONOTONIC.
+        if (GstClock* clock = gst_element_get_clock(GST_ELEMENT(sink))) {
+            GstClockType type = GST_CLOCK_TYPE_REALTIME;
+            const bool system = G_OBJECT_TYPE(clock) == GST_TYPE_SYSTEM_CLOCK;
+            if (system) g_object_get(clock, "clock-type", &type, nullptr);
+            gst_object_unref(clock);
+            previewClock_ = (system && type == GST_CLOCK_TYPE_MONOTONIC) ? 1 : 2;
+            doLog(log_, LogLevel::INFO, previewClock_ == 1
+                      ? "preview tap: capture times from buffer PTS (pipeline clock is CLOCK_MONOTONIC)"
+                      : "preview tap: pipeline clock is not CLOCK_MONOTONIC — capture times are "
+                        "appsink arrival times");
+        }
+    }
+    uint64_t us = arrivalUs;
+    if (previewClock_ == 1) {
+        // Running time + base time = the clock reading at capture (v4l2src
+        // derives the PTS from the kernel's capture timestamp).
+        const GstSegment*  seg  = gst_sample_get_segment(sample);
+        const GstClockTime pts  = GST_BUFFER_PTS(buf);
+        const GstClockTime base = gst_element_get_base_time(GST_ELEMENT(sink));
+        if (seg && seg->format == GST_FORMAT_TIME && GST_CLOCK_TIME_IS_VALID(pts) &&
+            GST_CLOCK_TIME_IS_VALID(base)) {
+            const GstClockTime rt = gst_segment_to_running_time(seg, GST_FORMAT_TIME, pts);
+            if (GST_CLOCK_TIME_IS_VALID(rt)) us = std::min<uint64_t>(arrivalUs, (base + rt) / 1000);
+        }
+    }
+    return std::max(us, previewLastUs_);                 // non-decreasing within the session
+}
+
+void SegmentedRecorder::deliverPreview(GstAppSink* sink, GstSample* sample, GstBuffer* buf) {
+    const uint64_t captureUs = previewCaptureUs(sink, sample, buf, monotonicNowUs());
+    // The branch's only rate limit (every camera frame gets here).  GCRA:
+    // conforming when no more than a quarter period early, so deliveries are
+    // never closer than 3/4 of a period, and no credit builds up behind a slow
+    // camera or callback — no catch-up burst after one.
+    if (previewDueUs_ != 0 && captureUs + previewPeriodUs_ / 4 < previewDueUs_) return;
+    GstMapInfo map;
+    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return;
+    if (map.size > 0) {
+        previewDueUs_  = std::max(captureUs, previewDueUs_) + previewPeriodUs_;
+        previewLastUs_ = captureUs;
+        updatePreviewCaps(gst_sample_get_caps(sample));
+        PreviewFrame f;
+        f.data               = map.data;
+        f.size               = map.size;
+        f.width              = previewW_;
+        f.height             = previewH_;
+        f.v4l2PixFmt         = V4L2_PIX_FMT_MJPEG;
+        f.captureMonotonicUs = captureUs;
+        f.sequence           = previewCount_.fetch_add(1) + 1;
+        // An exception must not unwind through GStreamer's C frames.
+        try {
+            previewCb_(f);
+        } catch (const std::exception& e) {
+            failPreview("callback", e.what());
+        } catch (...) {
+            failPreview("callback", "unknown exception");
+        }
+    }
+    gst_buffer_unmap(buf, &map);
+}
+
+GstFlowReturn SegmentedRecorder::onPreviewSample(GstAppSink* sink, gpointer user) {
+    auto* self = static_cast<SegmentedRecorder*>(user);
+    GstSample* sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_OK;
+    GstBuffer* buf = gst_sample_get_buffer(sample);
+    if (buf && self->previewGate_.load() && !self->previewFailed_.load())
+        self->deliverPreview(sink, sample, buf);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;              // never an error: it would travel up the tee to the camera
+}
+
+void SegmentedRecorder::releasePreview() {
+    // Pipeline at NULL: every streaming thread has stopped, so no callback runs.
+    if (previewQSrc_)    gst_object_unref(previewQSrc_);
+    if (previewSinkPad_) gst_object_unref(previewSinkPad_);
+    previewQSrc_    = nullptr;
+    previewSinkPad_ = nullptr;
+    gst_caps_replace(&previewCaps_, nullptr);
+    previewCb_ = nullptr;
+    previewBranch_.store(false);
+    previewGate_.store(false);
 }
 
 // ─── bus handling (worker thread; stop() thread after the worker joined) ─────
@@ -280,6 +471,16 @@ void SegmentedRecorder::handleMessage(GstMessage* msg) {
         if (src && g_str_has_prefix(src, "luma")) {
             doLog(log_, LogLevel::WARN, "luma tap error (%s): %s — exposure control starved",
                   src, err ? err->message : "?");
+            if (err) g_error_free(err);
+            g_free(dbg);
+            break;
+        }
+        // Likewise the preview tap costs the display, not footage: stop
+        // feeding it (onPreviewGuard) and keep recording.
+        if (src && g_str_has_prefix(src, "preview")) {
+            doLog(log_, LogLevel::WARN, "preview tap error (%s): %s — preview stopped",
+                  src, err ? err->message : "?");
+            previewFailed_.store(true);
             if (err) g_error_free(err);
             g_free(dbg);
             break;
@@ -690,12 +891,31 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
         return fail("invalid segment options");
 
     opts_ = opts;
+
+    // This session's copy of the preview tap (see setPreviewTap()).
+    PreviewFrameCallback previewCb;
+    uint32_t             previewFps = 0;
+    {
+        std::lock_guard<std::mutex> lock(previewCfgMu_);
+        previewCb  = previewCfgCb_;
+        previewFps = std::min<uint32_t>(previewCfgFps_, 1000);
+    }
+    const bool previewWanted = previewCb && previewFps > 0;
+    const bool previewTap    = previewWanted && mjpeg;
+    if (previewWanted && !mjpeg)
+        doLog(log_, LogLevel::INFO, "preview tap needs an MJPEG source — this H.264 session records "
+              "without a preview");
+
     gint frNum = 30, frDen = 1;
     gst_util_double_to_fraction(static_cast<double>(fmt.fps), &frNum, &frDen);
     const std::string rate = std::to_string(frNum) + "/" + std::to_string(frDen);
 
     std::string desc;
     if (testSourceDesc_.empty()) {
+        // Keep the framerate pinned here: the recrate cap's videorate takes
+        // part in caps negotiation, so with a free rate it would slow the
+        // camera itself to RecordFps — and the preview tap and
+        // sourceFramesReceived() with it.
         desc = "v4l2src name=camerasrc device=" + detail::gstQuoted(devicePath) +
                (mjpeg ? " ! image/jpeg" : " ! video/x-h264") +
                ", width=" + std::to_string(fmt.width) +
@@ -703,6 +923,10 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     } else {
         desc = testSourceDesc_;
     }
+    // Preview tap: split the camera's own frames off BEFORE the RecordFps cap,
+    // so the cap does not cap the preview.  The tee carries the recording, so
+    // its failure is the recording's: it is deliberately not named preview*.
+    if (previewTap) desc += " ! tee name=srctee srctee.";
     // MJPEG frames are intra-only, so dropping them to cap the rate is safe.
     if (mjpeg && opts.maxFps > 0 && static_cast<float>(opts.maxFps) < fmt.fps)
         desc += " ! videorate name=recrate drop-only=true max-rate=" + std::to_string(opts.maxFps);
@@ -714,17 +938,29 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
             " muxer-properties=\"properties,offset-to-zero=true\""
             " sink-properties=\"properties,sync=false,async=false,buffer-mode=(int)2\""
             " max-size-time=" + std::to_string(uint64_t(opts.segmentSec) * GST_SECOND);
-    // Luma tap: a leaky branch that decodes ~2 frames/s at thumbnail size.  Its
-    // elements are named luma* so a failure inside it is not mistaken for a
-    // recording failure (see handleMessage); max-errors=-1 keeps a corrupt
-    // JPEG from ever turning into a pipeline error.
+    // Luma tap: a leaky branch that decodes ~2 frames/s at thumbnail size
+    // (onLumaGate() drops the rest ahead of lumaq; no videorate, which would
+    // negotiate the recording's rate through rectee).  Its elements are named
+    // luma* so a failure inside it is not mistaken for a recording failure (see
+    // handleMessage); max-errors=-1 keeps a corrupt JPEG from ever turning into
+    // a pipeline error.
     if (lumaTap)
         desc += " rectee. ! queue name=lumaq max-size-buffers=1 leaky=downstream"
-                " ! videorate name=lumarate drop-only=true max-rate=2"
                 " ! jpegdec name=lumadec max-errors=-1 ! videoscale name=lumascale"
                 " ! videoconvert name=lumaconv ! video/x-raw,format=GRAY8,width=64,height=36"
                 " ! appsink name=lumasink emit-signals=false sync=false async=false"
                 " max-buffers=1 drop=true";
+    // Preview tap: leaky like the luma branch, but compressed (the consumer
+    // does a DCT-scaled decode off the streaming thread) and rate-limited in
+    // deliverPreview() — no videorate, so nothing here can negotiate the
+    // camera's rate.  Every element is named preview* (see handleMessage),
+    // onPreviewGuard() cuts the branch at the tee if it fails, and
+    // enable-last-sample=false keeps the sink from pinning a camera buffer
+    // between frames.
+    if (previewTap)
+        desc += " srctee. ! queue name=previewq max-size-buffers=1 leaky=downstream"
+                " ! appsink name=previewsink emit-signals=false sync=false async=false"
+                " max-buffers=1 drop=true enable-last-sample=false";
 
     doLog(log_, LogLevel::INFO, "segmented recording pipeline: %s", desc.c_str());
 
@@ -752,7 +988,17 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     }
     g_signal_connect(smx, "format-location-full", G_CALLBACK(&SegmentedRecorder::onFormatLocation),
                      this);
+    lumaDueNs_ = 0;
     if (lumaTap) {
+        if (GstElement* q = gst_bin_get_by_name(GST_BIN(pipe), "lumaq")) {
+            GstPad* in = gst_element_get_static_pad(q, "sink");
+            gst_pad_add_probe(in,
+                              static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER |
+                                                           GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                              &SegmentedRecorder::onLumaGate, this, nullptr);
+            gst_object_unref(in);
+            gst_object_unref(q);
+        }
         if (GstElement* sink = gst_bin_get_by_name(GST_BIN(pipe), "lumasink")) {
             GstAppSinkCallbacks cbs;
             std::memset(&cbs, 0, sizeof(cbs));
@@ -760,6 +1006,41 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
             gst_app_sink_set_callbacks(GST_APP_SINK(sink), &cbs, this, nullptr);
             gst_object_unref(sink);
         }
+    }
+    previewCount_.store(0);
+    previewFailed_.store(false);
+    if (previewTap) {
+        GstElement* q    = gst_bin_get_by_name(GST_BIN(pipe), "previewq");
+        GstElement* sink = gst_bin_get_by_name(GST_BIN(pipe), "previewsink");
+        if (q && sink) {
+            previewQSrc_    = gst_element_get_static_pad(q, "src");
+            previewSinkPad_ = gst_element_get_static_pad(sink, "sink");
+            GstPad* in = gst_element_get_static_pad(q, "sink");
+            gst_pad_add_probe(in,
+                              static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER |
+                                                           GST_PAD_PROBE_TYPE_BUFFER_LIST |
+                                                           GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM),
+                              &SegmentedRecorder::onPreviewGuard, this, nullptr);
+            gst_object_unref(in);
+            GstAppSinkCallbacks cbs;
+            std::memset(&cbs, 0, sizeof(cbs));
+            cbs.new_sample = &SegmentedRecorder::onPreviewSample;
+            gst_app_sink_set_callbacks(GST_APP_SINK(sink), &cbs, this, nullptr);
+            previewCb_       = std::move(previewCb);
+            previewPeriodUs_ = 1000000ULL / previewFps;
+            previewW_        = fmt.width;
+            previewH_        = fmt.height;
+            previewClock_    = 0;
+            previewLastUs_   = 0;
+            previewDueUs_    = 0;
+            previewBranch_.store(true);
+            previewGate_.store(true);
+        } else {                                 // never expected: costs the preview only
+            doLog(log_, LogLevel::WARN, "preview tap: branch elements missing — recording without "
+                  "a preview");
+        }
+        if (q) gst_object_unref(q);
+        if (sink) gst_object_unref(sink);
     }
     luma_.store(0.0f);
     lumaSeq_.store(0);
@@ -817,6 +1098,7 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
     if (gst_element_set_state(pipe, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         const std::string busErr = popBusError(pipe);
         gst_element_set_state(pipe, GST_STATE_NULL);
+        releasePreview();
         gst_object_unref(recq_);
         recq_ = nullptr;
         gst_object_unref(smx_);
@@ -912,6 +1194,7 @@ void SegmentedRecorder::teardown() {
 
 bool SegmentedRecorder::stop() {
     if (!pipeline_) return true;
+    previewGate_.store(false);       // the preview tap closes first: no delivery starts after this
 
     // Hard deadline over the WHOLE shutdown — joining the worker included: it
     // can be stuck in a sidecar write/open on a wedged filesystem just as the
@@ -950,6 +1233,7 @@ bool SegmentedRecorder::stop() {
 
     const std::string file = currentFile();
     teardown();
+    releasePreview();                // NULL joined the streaming threads: no callback is running
     const bool clean = [&] {
         std::lock_guard<std::mutex> lock(stateMutex_);
         return openSeqs_.empty();

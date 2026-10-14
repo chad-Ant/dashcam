@@ -63,10 +63,12 @@
 #include "libcamera_focus.h"
 #include "libcommlink.h"
 #include "libconfig.h"
+#include "libes3display.h"
 #include "liblog.h"
 #include "libnetwork.h"
 #include "librecord.h"
 #include "libtimesync.h"
+#include "libvideopreview.h"
 #include "telemetry_log.h"
 
 #include <algorithm>
@@ -1712,6 +1714,58 @@ int main(int argc, char* argv[]) {
             bridgeLog(LogLevel::ERROR, "telemetry bridge: RX thread failed to start — overlay vehicle fields stay dashed");
     }
 
+    // ── ES3C28P display preview (optional, <DisplayPreview>) ─────────────────
+    // A letterboxed 10-15 fps copy of the recording camera on the ES3C28P over
+    // USB.  It never gates recording: bad settings, a missing board or any
+    // preview failure only leave the display without video.  The recorder's
+    // tap hands each camera JPEG to the converter (a copy that never blocks);
+    // the converter feeds the link, the single owner of the board's tty.
+    // Declared in this order so the converter (which holds the link as its
+    // sink) is destroyed first.
+    dashcam::es3display::Es3DisplayLink display;
+    dashcam::preview::VideoPreview      preview;
+    bool previewOn = false;
+    const auto& dp = cfg.displayPreview;
+    if ((bool)dp.enabled) {
+        std::vector<std::string> problems;
+        if (!dashcam::config::validateDisplayPreview(dp, problems)) {
+            for (const auto& p : problems) log(LogLevel::WARN, "display preview: " + p);
+            log(LogLevel::WARN, "display preview: off for this run — fix <DisplayPreview> in dashcam.xml "
+                                "(recording is unaffected)");
+        } else {
+            dashcam::es3display::DisplayLinkConfig lc;
+            lc.device             = std::string(dp.device);
+            lc.heartbeatMs        = static_cast<uint32_t>((int)dp.heartbeatMs);
+            lc.reconnectMs        = static_cast<uint32_t>((int)dp.reconnectMs);
+            lc.chunkDataBytes     = static_cast<uint16_t>((int)dp.chunkDataBytes);
+            lc.maxFramesInFlight  = static_cast<uint8_t>((int)dp.maxFramesInFlight);
+            lc.targetFps          = static_cast<uint8_t>((int)dp.targetFps);
+            lc.maxJpegBytes       = static_cast<uint32_t>((int)dp.maxJpegBytes);
+            lc.assemblyTimeoutMs  = static_cast<uint16_t>((int)dp.assemblyTimeoutMs);
+            lc.staleAfterMs       = static_cast<uint16_t>((int)dp.staleAfterMs);
+            lc.placeholderAfterMs = static_cast<uint16_t>((int)dp.placeholderAfterMs);
+            dashcam::preview::PreviewConfig pc;
+            pc.targetFps          = static_cast<uint32_t>((int)dp.targetFps);
+            pc.jpegQuality        = (int)dp.jpegQuality;
+            pc.minimumJpegQuality = (int)dp.minimumJpegQuality;
+            pc.maxJpegBytes       = static_cast<size_t>((int)dp.maxJpegBytes);
+            pc.maxSourceJpegBytes = static_cast<size_t>((int)dp.maxSourceJpegBytes);
+            auto displayLog = quietRepeats(recLog);
+            std::string why;
+            if (!dashcam::es3display::validateConfig(lc, &why) || !display.start(lc, displayLog)) {
+                log(LogLevel::WARN, "display preview: link not started" + (why.empty() ? std::string() : " — " + why) +
+                                    " (recording is unaffected)");
+            } else if (!preview.start(pc, display, displayLog)) {
+                display.stop();
+                log(LogLevel::WARN, "display preview: converter not started (recording is unaffected)");
+            } else {
+                previewOn = true;
+                log(LogLevel::INFO, "display preview: on, " + lc.device + " at up to " +
+                                    std::to_string((int)dp.targetFps) + " fps (the board may come and go)");
+            }
+        }
+    }
+
     std::set<std::string> notesSeen;   // resolver warnings are logged once each
     uint64_t    sessions = 0;          // sessions that delivered frames
     std::string pendingStart;          // "recording ..." line, logged once frames flow
@@ -1800,6 +1854,15 @@ int main(int argc, char* argv[]) {
 
         const bool mjpeg = f.pixelFormat == V4L2_PIX_FMT_MJPEG;
         recorder.setLumaTap(frameRateExposure && mjpeg);
+        if (previewOn) {
+            // Possibly another camera or format: drop the waiting frame and the
+            // cached geometry before this session's first frame.  The recorder
+            // keeps the callable for every later session; preview outlives them.
+            preview.invalidateSource();
+            recorder.setPreviewTap([&preview](const rec::PreviewFrame& pf) {
+                preview.submitJpeg(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs);
+            }, static_cast<uint32_t>((int)dp.targetFps));
+        }
         if (!recorder.start(rc.cam->address, fmt, opts)) {
             scheduleRetry(rc.cam->address + ": " + recorder.lastError());
             return false;
@@ -1939,6 +2002,23 @@ int main(int argc, char* argv[]) {
     stopRecording();
     footageFinal.store(true);
     heartbeat.beat();
+    if (previewOn) {
+        // After the recorder: no tap callback runs once stop() has returned.
+        // Both stops are bounded (the worker finishes one ~7 ms conversion; the
+        // link cancels its I/O and sends a best-effort STOP_VIDEO).
+        const dashcam::preview::PreviewStats ps = preview.stats();
+        preview.stop();
+        const dashcam::es3display::DisplayLinkStats ds = display.stats();
+        display.stop();
+        char b[256];
+        std::snprintf(b, sizeof(b), "display preview: %llu frames converted, %llu presented, %llu dropped, "
+                                    "%llu connect(s); capture->presented p95 %.0f ms",
+                      (unsigned long long)ps.processed, (unsigned long long)ds.framesPresented,
+                      (unsigned long long)ds.framesDropped, (unsigned long long)ds.connects,
+                      ds.captureLatency.p95Ms);
+        log(LogLevel::INFO, b);
+        heartbeat.beat();
+    }
     timeRun.store(false);
     bridge.close();
     telemetryCsv.close();

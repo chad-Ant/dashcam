@@ -218,6 +218,28 @@ struct RecordingFormat {
 using CompressedFrameCallback =
     std::function<void(const uint8_t* data, size_t len, bool keyframe)>;
 
+// ─── preview tap (SegmentedRecorder) ──────────────────────────────────────────
+
+/**
+ * @brief One compressed camera frame handed to the preview tap (see
+ *        SegmentedRecorder::setPreviewTap()).
+ *
+ * A VIEW, not a copy: @c data points into the camera's own buffer and is valid
+ * ONLY for the duration of the callback — copy anything you retain.
+ */
+struct PreviewFrame {
+    const uint8_t* data = nullptr;   ///< One complete JPEG, byte-identical to the recorded frame.
+    size_t   size       = 0;         ///< Byte count of @c data (never 0).
+    uint32_t width      = 0;         ///< Frame width from the negotiated caps.
+    uint32_t height     = 0;         ///< Frame height from the negotiated caps.
+    uint32_t v4l2PixFmt = 0;         ///< Fourcc of @c data — V4L2_PIX_FMT_MJPEG (the only tapped format).
+    uint64_t captureMonotonicUs = 0; ///< CLOCK_MONOTONIC µs of the capture (see setPreviewTap()).
+    uint64_t sequence   = 0;         ///< 1, 2, 3 … within a session: the frame's delivery index.
+};
+
+/// Preview tap consumer; see SegmentedRecorder::setPreviewTap() for its contract.
+using PreviewFrameCallback = std::function<void(const PreviewFrame&)>;
+
 // ─── Recorder ─────────────────────────────────────────────────────────────────
 
 /**
@@ -459,10 +481,12 @@ struct SegmentOptions {
  * g_assert-aborts the whole process on that).  Sidecar events are timed from
  * the pipeline clock and replayed into each new .ass from a short ring, so the
  * first GOP of every segment is covered even though splitmuxsink announces a
- * new fragment only after that GOP completes.
+ * new fragment only after that GOP completes.  With setPreviewTap() (MJPEG), a
+ * tee right after the caps also feeds a leaky preview branch (see there).
  *
  * Thread safety: start()/stop() from one control thread; everything else
- * (overlay data, health, watermark, fragment flag) is safe from any thread.
+ * (overlay data, health, watermark, fragment flag, preview tap) is safe from
+ * any thread.
  */
 class SegmentedRecorder {
 public:
@@ -484,12 +508,77 @@ public:
      * Call before start().  The tap is a leaky side branch: it never delays or
      * drops recorded frames, and the recording itself stays passthrough.
      * Ignored for H.264 (decoding it would cost a full-rate software decode).
+     * The ~2/s sampling is a pad probe ahead of the branch's queue, not a
+     * videorate: a videorate's max-rate takes part in caps negotiation, and
+     * behind a RecordFps cap it pulled the RECORDING down to 2 fps.
      */
     void        setLumaTap(bool enabled) { lumaTap_ = enabled; }
 
     /// Newest mean luma (0..255, lower two-thirds of the frame — the road, not
     /// the sky) and its sample number; false before the first sample.
     bool        latestLuma(float& luma, uint64_t& seq) const;
+
+    /**
+     * @brief MJPEG only: hand the camera's own compressed frames, at most
+     *        @p maxFps per second, to @p cb (e.g. the ES3C28P display preview).
+     *
+     * Configuration, like setLumaTap(): start() reads it and builds a leaky side
+     * branch that splits off BEFORE the RecordFps cap — a recording cap does not
+     * cap the preview — and never delays, drops or alters a recorded frame:
+     * @verbatim
+     *   source ! tee name=srctee ! [recrate] ! … ! queue name=recq ! splitmuxsink
+     *   srctee. ! queue name=previewq (1 buffer, leaky)
+     *           ! appsink name=previewsink (1 buffer, drop)
+     * @endverbatim
+     * The branch has no caps-constraining element, so it cannot negotiate the
+     * camera's or the recording's frame rate (a videorate max-rate here could).
+     * An empty @p cb or @p maxFps 0 builds no branch; so does an H.264 session
+     * (logged at INFO: the preview needs MJPEG).  Values above the camera rate
+     * pass every frame (clamped to 1000).
+     *
+     * The callback:
+     *   - runs on the preview branch's own GStreamer streaming thread (never the
+     *     recording's) and must not block: copy the bytes into a bounded pool and
+     *     return.  A slow callback only costs the preview frames.
+     *   - gets a PreviewFrame VIEW that is valid only during the call.
+     *   - is invoked only between start() and stop(): stop() closes the tap
+     *     first, and returns only after a call in progress has returned — it is
+     *     never invoked after stop() returns.
+     *   - must not throw: an exception is caught and stops the preview.
+     * Rate: a GCRA limiter on the capture time (tolerance a quarter period)
+     * gates each delivery — at most @p maxFps on average, no two deliveries
+     * closer than 3/4 of a period, and no catch-up burst after a slow camera or
+     * callback.  It passes whole camera frames, so a rate that does not fit the
+     * camera's frame grid comes out lower (at 30 fps: 11 → 10, 13 → 12,
+     * 14 → 13.3; every other rate up to 15 is exact).
+     *
+     * captureMonotonicUs: buffer PTS → running time + base time when the
+     * pipeline clock is GStreamer's own system clock in CLOCK_MONOTONIC mode
+     * (the default for this pipeline; checked per session, not assumed) — for
+     * v4l2src that is the kernel's capture timestamp.  Otherwise (another clock,
+     * or no PTS) it is the time the frame reached the appsink, later than the
+     * capture by the branch latency.  Never later than the arrival time, and
+     * non-decreasing within a session.
+     *
+     * Failure isolation: an ERROR from a preview* element, a fatal flow inside
+     * the branch or a throwing callback is logged at WARN and stops the preview
+     * until the next start().  The branch is then cut at the tee, so the failure
+     * never travels up to the camera source, and the recording stays healthy.
+     *
+     * Thread safety: callable at any time from any thread.  While a session is
+     * active the new setting is STORED for the next start() (logged at INFO);
+     * the running session keeps the tap it started with.  The callable is kept
+     * and copied into every later session, so what it references must outlive
+     * every session that uses it: replacing the tap does not detach a running
+     * session — only stop() does.
+     */
+    void        setPreviewTap(PreviewFrameCallback cb, uint32_t maxFps);
+
+    /// Frames handed to the preview callback this session (kept after stop()).
+    uint64_t    previewFramesTapped() const { return previewCount_.load(); }
+
+    /// The session has a preview branch that has not failed (MJPEG, tap set).
+    bool        previewActive() const { return previewBranch_.load() && !previewFailed_.load(); }
 
     /**
      * @brief Start a session.  Segment SEQs continue after the highest owned
@@ -560,6 +649,7 @@ private:
     bool                           lumaTap_ = false;
     std::atomic<float>             luma_{0.0f};
     std::atomic<uint64_t>          lumaSeq_{0};
+    int64_t                        lumaDueNs_ = 0;    ///< Luma gate (rectee thread only; reset by start()).
 
     // session
     GstElement*          pipeline_ = nullptr;
@@ -591,6 +681,28 @@ private:
     std::function<void()> workerTestHook_;      ///< Test hook: runs where the worker writes the sidecar.
     std::atomic<uint64_t> sourceCount_{0};      ///< Frames entering the RecordFps cap.
     bool                  hasRateCap_ = false;
+
+    // preview tap.  The configured pair is guarded by previewCfgMu_; start()
+    // copies it into the session fields, which are written only by start()
+    // (before PLAYING) and stop() (after NULL), so the streaming threads that
+    // read them never race a writer.
+    mutable std::mutex    previewCfgMu_;
+    PreviewFrameCallback  previewCfgCb_{};      ///< setPreviewTap(): used by the next start().
+    uint32_t              previewCfgFps_ = 0;
+    PreviewFrameCallback  previewCb_{};         ///< This session's tap; empty = no branch.
+    uint64_t              previewPeriodUs_ = 0; ///< 1 s / maxFps for this session.
+    GstPad*               previewQSrc_    = nullptr;  ///< Owned ref: previewq's src pad (guard).
+    GstPad*               previewSinkPad_ = nullptr;  ///< Owned ref: previewsink's sink pad.
+    std::atomic<bool>     previewBranch_{false};  ///< The session built the branch.
+    std::atomic<bool>     previewGate_{false};    ///< Deliveries allowed (stop() clears it first).
+    std::atomic<bool>     previewFailed_{false};  ///< Branch failed: cut at the tee until start().
+    std::atomic<uint64_t> previewCount_{0};
+    // previewsink's streaming thread only (reset by start() before PLAYING).
+    GstCaps*              previewCaps_ = nullptr; ///< Owned ref: the caps previewW_/H_ came from.
+    uint32_t              previewW_ = 0, previewH_ = 0;
+    int                   previewClock_  = 0;     ///< 0 undecided, 1 PTS on CLOCK_MONOTONIC, 2 arrival.
+    uint64_t              previewLastUs_ = 0;     ///< Newest delivered capture time.
+    uint64_t              previewDueUs_  = 0;     ///< GCRA: theoretical time of the next delivery.
 
     // durability: a dedicated sync thread owns every sync descriptor, so a
     // slow or stuck disk never blocks the worker's bus handling, watchdog or
@@ -631,12 +743,21 @@ private:
     void setSyncSidecar(const std::string& path);
     void stopSyncThread();                       ///< Final syncs, then join.
     void teardown();                             ///< EOS/finalise + NULL; stop()'s body.
+    void failPreview(const char* who, const char* what);  ///< First failure: WARN, cut the branch.
+    void releasePreview();                       ///< Pipeline at NULL: drop the session's tap state.
+    void deliverPreview(GstAppSink* sink, GstSample* sample, GstBuffer* buf);
+    uint64_t previewCaptureUs(GstAppSink* sink, GstSample* sample, GstBuffer* buf,
+                              uint64_t arrivalUs);
+    void updatePreviewCaps(GstCaps* caps);
 
     static gchar*            onFormatLocation(GstElement* smx, guint fragmentId,
                                               GstSample* first, gpointer self);
     static GstPadProbeReturn onRecqProbe(GstPad* pad, GstPadProbeInfo* info, gpointer self);
     static GstFlowReturn     onLumaSample(GstAppSink* sink, gpointer self);
+    static GstPadProbeReturn onLumaGate(GstPad* pad, GstPadProbeInfo* info, gpointer self);
     static GstPadProbeReturn onSourceProbe(GstPad* pad, GstPadProbeInfo* info, gpointer self);
+    static GstFlowReturn     onPreviewSample(GstAppSink* sink, gpointer self);
+    static GstPadProbeReturn onPreviewGuard(GstPad* pad, GstPadProbeInfo* info, gpointer self);
 };
 
 // ─── loop overwrite (libretention.cpp) ────────────────────────────────────────

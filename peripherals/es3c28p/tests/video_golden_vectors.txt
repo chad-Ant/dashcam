@@ -1,0 +1,49 @@
+# ES3C28P USB video preview protocol v1 golden vectors (frozen 2026-10-13).
+# One vector per line: <name> <hex> [<extra>]; '#' starts a comment.
+#   rec.*    valid E3 29 video records (complete wire bytes)
+#   ctl.*    valid E3 28 control frames for CAPABILITIES / START_VIDEO / STOP_VIDEO
+#   crc32.*  <input hex> <CRC-32/ISO-HDLC value as 8 hex digits>
+#   bad.*    malformed input; extra = "drop" (the parser yields nothing for it and
+#            still yields a valid record that follows) or the Reason a well-framed
+#            record must be answered with.
+# Field values: tests/test_usb_client.py expected_vectors() and
+# tests/video_protocol_test.cpp buildVectors(); both must reproduce every byte.
+# Session token 0x89ABCDEF throughout. Change only with a protocol version bump.
+
+rec.start e32901011000efcdab89010000004001b40003200000112233445566778817fe
+rec.chunk_first e32901021400efcdab890100000000000000ffd8e32801050200e67fe3290102ffd9c84d
+rec.chunk_next e32901021400efcdab890100000000040000e0e1e2e3e4e5e6e7e8e9eaebecedeeef151a
+rec.end e32901030400efcdab89010000002639f4cb32d0
+rec.abort e32901040100efcdab89020000000a2fcd
+rec.result_ok e32901810100efcdab890100000000b726
+rec.result_decode_failed e32901810100efcdab8903000000091df3
+rec.presented e32901820800efcdab890100000039300000a05b0000718d
+rec.credit e32901830400efcdab890000000003000000eea4
+rec.visibility e32901840100efcdab89000000000205a2
+
+ctl.capabilities_request e32801010700d35c
+ctl.capabilities_reply e3280101871201014001f0004001f00000000100000402007a7d
+ctl.capabilities_unsupported e3280101ff01019a21
+ctl.start_video_request e32801020817010000001e004001b4000000010000040af401f401d007721e
+ctl.start_video_reply e32801028808efcdab8901000000c94b
+ctl.stop_video_request e32801030904efcdab890c9a
+ctl.stop_video_reply e32801038900240a
+
+crc32.check 313233343536373839 cbf43926
+crc32.bytes_0_255 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff 29058c73
+
+bad.crc e32901011000efcdab89010000004001b4000320000011223344556677881701 drop
+bad.length e32901010f00efcdab89010000000000000000000000000000000000001458 drop
+bad.version e32902830400efcdab890000000003000000a34c drop
+bad.zero_token e329018304000000000000000000030000006013 drop
+bad.frame_id_on_credit e32901830400efcdab890700000003000000f663 drop
+bad.zero_frame_id e32901030400efcdab890000000000000000206b drop
+bad.unknown_type e32901050100efcdab890100000000c281 drop
+bad.empty_chunk e32901020400efcdab8901000000000000000f82 drop
+bad.oversize_chunk e32901020510efcdab89010000005555555555555555 drop
+bad.control_crc e32801010700d3a3 drop
+bad.start_too_large e32901011000efcdab89010000004001b4000100010000000000000000004951 TooLarge
+bad.start_zero_width e32901011000efcdab89010000000000b40003200000000000000000000048b0 BadDimensions
+bad.chunk_past_ceiling e32901021400efcdab8901000000faff000000000000000000000000000000000000fd93 BadOffset
+bad.result_reason e32901810100efcdab89010000007fcfa9 Malformed
+bad.visibility_demand e32901840100efcdab89000000000324b2 Malformed
