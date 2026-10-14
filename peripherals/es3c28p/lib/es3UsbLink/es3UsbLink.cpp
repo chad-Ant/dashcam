@@ -86,7 +86,31 @@ void Es3UsbLink::dispatch(const es3proto::Frame& frame)
     } else if (frame.type == es3proto::StopVideo) {
         uint32_t token = 0;
         if (!decodeStopVideoRequest(frame.payload, frame.length, token)) { queueError(frame, BadPayload); return; }
-        _video.stop(token); queueReply(frame);
+        _video.stopSurface(es3map::Surface::Camera, token); queueReply(frame);
+    } else if (frame.type == es3map::CmdMapCapabilities) {
+        if (frame.length) { queueError(frame, BadPayload); return; }
+        if (!_video.available()) { queueError(frame, NotReady); return; }
+        uint8_t data[es3map::kMapCapabilitiesReplyBytes];
+        const auto caps = _video.capabilities();
+        const size_t size = es3map::encodeMapCapabilitiesReply(es3map::capabilities(caps), caps, data, sizeof(data));
+        queueReply(frame, data, size);
+    } else if (frame.type == es3map::CmdStartMap) {
+        if (!_video.available()) { queueError(frame, NotReady); return; }
+        const auto caps = _video.capabilities();
+        es3map::StartMapRequest config;
+        if (!es3map::decodeStartMapRequest(frame.payload, frame.length, es3map::capabilities(caps), caps, config)) {
+            queueError(frame, BadPayload); return;
+        }
+        es3map::StartMapReply response;
+        response.sessionToken = _video.startMap(config); response.initialGrant = 1;
+        if (!response.sessionToken) { queueError(frame, NotReady); return; }
+        uint8_t data[es3map::kStartMapReplyBytes];
+        const size_t size = es3map::encodeStartMapReply(response, data, sizeof(data));
+        queueReply(frame, data, size);
+    } else if (frame.type == es3map::CmdStopMap) {
+        uint32_t token = 0;
+        if (!es3map::decodeStopMapRequest(frame.payload, frame.length, token)) { queueError(frame, BadPayload); return; }
+        _video.stopSurface(es3map::Surface::Map, token); queueReply(frame);
     } else {
         Command command; command.frame = frame; command.epoch = _epoch.load();
         if (xQueueSend(_commands, &command, 0) != pdTRUE) { reset(); return; }

@@ -21,6 +21,12 @@ for std in c++11 c++17; do
 done
 c++ -std=c++11 -Wall -Wextra -Werror -I"$TEST_DIR/../lib/es3UsbLink" "$TEST_DIR/video_state_test.cpp" -o "$TEST_BUILD/video_state"
 "$TEST_BUILD/video_state"
+for std in c++11 c++17; do
+    c++ -std=$std -Wall -Wextra -Werror -I"$TEST_DIR/../lib/es3UsbLink" \
+        -I"$TEST_DIR/../lib/es3Video" -I"$TEST_DIR/../lib/es3Map" \
+        "$TEST_DIR/map_surface_test.cpp" -o "$TEST_BUILD/map_surface_$std"
+    "$TEST_BUILD/map_surface_$std"
+done
 # The Jetson link library compiles its own copies; they must not drift.
 for header in Es3Protocol.h Es3VideoProtocol.h Es3MapProtocol.h; do
     cmp "$TEST_DIR/../lib/es3UsbLink/$header" "$REPO_DIR/lib/libes3display/$header"

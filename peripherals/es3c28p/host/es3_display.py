@@ -80,9 +80,9 @@ class Parser:
         return frames
 
 
-def page_payload(index, title, lines):
-    if not 0 <= index < 5 or len(lines) != 4:
-        raise ValueError("page index must be 0..4 with exactly four lines")
+def page_payload(index, title, lines, page_count=5):
+    if not 1 <= page_count <= 8 or not 0 <= index < page_count or len(lines) != 4:
+        raise ValueError("page index outside negotiated page count or not exactly four lines")
     fields = []
     for field in [title, *lines]:
         value = field.encode("ascii")
@@ -666,7 +666,36 @@ class Es3Display:
                     sd=bool(sd), calibrated=bool(calibrated), audio_playing=bool(playing))
 
     def set_page(self, index, title, lines):
-        self.request(PAGE, page_payload(index, title, lines))
+        count = 5
+        if index >= 5:
+            # Capability-gate extended pages; old boards retain their five pages.
+            caps = self.map_capabilities()
+            if caps is None:
+                raise ValueError("display does not support map pages")
+            count = caps["page_count"]
+        self.request(PAGE, page_payload(index, title, lines, count))
+
+    def map_capabilities(self):
+        caps = self.capabilities()
+        if caps is None:
+            return None
+        try:
+            body = self.request(CMD_MAP_CAPABILITIES)
+        except RemoteError as exc:
+            if exc.code in (ERR_BAD_COMMAND, ERR_NOT_READY):
+                return None
+            raise
+        try:
+            return parse_map_capabilities(body, caps)
+        except ValueError as exc:
+            raise RemoteError(f"unusable map capabilities reply: {exc}") from None
+
+    def start_map(self, map_caps, video_caps, **request):
+        body = self.request(CMD_START_MAP, start_map_payload(map_caps, video_caps, **request))
+        return parse_start_map_reply(body)
+
+    def stop_map(self, token):
+        self.request(CMD_STOP_MAP, stop_map_payload(token))
 
     def alert(self, volume=80):
         if not 0 <= volume <= 100:
@@ -1326,7 +1355,7 @@ def main():
     alert = commands.add_parser("alert")
     alert.add_argument("--volume", type=int, default=80)
     page = commands.add_parser("page")
-    page.add_argument("index", type=int, choices=range(5))
+    page.add_argument("index", type=int, choices=range(6))
     page.add_argument("--title", required=True)
     page.add_argument("--line", action="append", required=True, help="repeat exactly four times")
     play = commands.add_parser("play", help="bench playback of baseline JPEG files (protocol diagnostics)",

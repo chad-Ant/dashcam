@@ -9,11 +9,11 @@ static uint16_t output[320*240 + 2];
 int main(int argc, char** argv) {
     assert(argc == 2);
     const std::string root=argv[1];
-    for (const char* name : {"color420.jpg", "color422.jpg", "odd.jpg", "gray.jpg"}) {
+    for (const char* name : {"color420.jpg", "color422.jpg", "color444map.jpg", "odd.jpg", "gray.jpg"}) {
         std::ifstream file(root+"/"+name,std::ios::binary);
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),{});
         const bool odd=std::string(name)=="odd.jpg";
-        const int width=odd?319:320, height=odd?179:180;
+        const int width=odd?319:320, height=odd?179:(std::string(name)=="color444map.jpg"?224:180);
         output[0]=0xbeef; output[width*height+1]=0xcafe;
         assert(decoder.decode(bytes.data(),bytes.size(),output+1,width,height));
         assert(output[0]==0xbeef && output[width*height+1]==0xcafe);

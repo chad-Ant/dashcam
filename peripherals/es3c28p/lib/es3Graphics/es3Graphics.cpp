@@ -407,7 +407,7 @@ void Es3Graphics::update()
         handleDashboardTouch();
     }
     if (_pageDirty && !_calibrating && !_calibrationTesting) {
-        if (!_videoVisible || _activePage != 0) drawPage();
+        if (!_videoVisible || _mapInfo) drawPage();
         else _videoStatus = 255;
         _pageDirty = false;
     }
@@ -570,14 +570,15 @@ void Es3Graphics::printCentered(const char* text, int centerX, int y, uint16_t c
 void Es3Graphics::drawTabs()
 {
     for (uint8_t i = 0; i < _pageCount; ++i) {
-        const int x = static_cast<int>(i) * kTabWidth;
-        gTft.fillRect(x, kTabTop, kTabWidth, kTabHeight, ILI9341_WHITE);
-        gTft.drawRect(x, kTabTop, kTabWidth, kTabHeight, ILI9341_DARKGREY);
+        const int x = es3map::tabEdge(i, _pageCount);
+        const int width = es3map::tabEdge(i + 1, _pageCount) - x;
+        gTft.fillRect(x, kTabTop, width, kTabHeight, ILI9341_WHITE);
+        gTft.drawRect(x, kTabTop, width, kTabHeight, ILI9341_DARKGREY);
         if (i == _activePage) {
-            gTft.drawFastHLine(x + 1, kTabTop + 1, kTabWidth - 2, ILI9341_BLUE);
-            gTft.drawFastHLine(x + 1, kTabTop + 2, kTabWidth - 2, ILI9341_BLUE);
+            gTft.drawFastHLine(x + 1, kTabTop + 1, width - 2, ILI9341_BLUE);
+            gTft.drawFastHLine(x + 1, kTabTop + 2, width - 2, ILI9341_BLUE);
         }
-        printCentered(_pages[i].tab, x + kTabWidth / 2, kTabTop + 4, ILI9341_BLACK);
+        printCentered(_pages[i].tab, x + width / 2, kTabTop + 4, ILI9341_BLACK);
     }
 }
 
@@ -591,6 +592,7 @@ void Es3Graphics::drawField(const char* label, int y, uint16_t colour)
 
 void Es3Graphics::drawPage()
 {
+    if (_activePage == es3map::kMapPage) { drawMapPage(); return; }
     if (_videoEver && _activePage == 0) {
         gTft.fillScreen(ILI9341_BLACK);
         _videoStatus = 255;
@@ -904,10 +906,11 @@ void Es3Graphics::drawCalibrationTest()
     gTft.setTextColor(ILI9341_CYAN);
     gTft.setCursor(110, 204);
     gTft.print("Tab targets");
-    for (int tab = 0; tab < kTabCount; ++tab) {
-        const int x = tab * kTabWidth;
-        gTft.drawRect(x, kTabTop, kTabWidth, kTabHeight, ILI9341_WHITE);
-        gTft.drawFastVLine(x + kTabWidth / 2, kTabTop + 3, 10, ILI9341_YELLOW);
+    for (uint8_t tab = 0; tab < _pageCount; ++tab) {
+        const int x = es3map::tabEdge(tab, _pageCount);
+        const int width = es3map::tabEdge(tab + 1, _pageCount) - x;
+        gTft.drawRect(x, kTabTop, width, kTabHeight, ILI9341_WHITE);
+        gTft.drawFastVLine(x + width / 2, kTabTop + 3, 10, ILI9341_YELLOW);
     }
 }
 
@@ -976,11 +979,17 @@ void Es3Graphics::handleDashboardTouch()
         drawTabs();
         return; // first tap reveals navigation; second tap selects a page
     }
+    if (_activePage == es3map::kMapPage && screenY < kTabTop &&
+        (_mapInfo || screenY >= es3map::kAttributionTop)) {
+        _mapInfo = !_mapInfo;
+        drawPage();
+        return;
+    }
     if (screenY < kTabTop) {
         (void)handleBrightnessControlTouch(screenX, screenY);
         return;
     }
-    const int selectedPage = screenX / kTabWidth;
+    const int selectedPage = es3map::tabAt(screenX, _pageCount);
     if (selectedPage < 0 || selectedPage >= _pageCount) {
         return;
     }
@@ -990,6 +999,7 @@ void Es3Graphics::handleDashboardTouch()
         }
         return;
     }
+    _mapInfo = false;
     _activePage = static_cast<uint8_t>(selectedPage);
     drawPage();
 }
@@ -1000,31 +1010,55 @@ bool Es3Graphics::videoCoversTabs() const
     return uint32_t(_videoConfig.viewportY) + _videoConfig.viewportH > kTabTop;
 }
 
+void Es3Graphics::drawMapPage()
+{
+    gTft.fillRect(0, 0, 320, es3map::kTabTop, ILI9341_BLACK);
+    gTft.setTextSize(1); gTft.setTextColor(ILI9341_WHITE);
+    gTft.setCursor(2, 4);
+    gTft.print(_video && !_video->available() ? "Map unavailable - image memory" :
+        (_hostConnected ? "Waiting for map" : "JETSON OFFLINE"));
+    if (_mapInfo) {
+        printCentered("MAP INFORMATION", 160, 40, ILI9341_CYAN);
+        printCentered("Map data: OpenStreetMap contributors", 160, 72, ILI9341_WHITE);
+        printCentered("Open Database License (ODbL)", 160, 96, ILI9341_WHITE);
+        printCentered("openstreetmap.org/copyright", 160, 120, ILI9341_WHITE);
+        printCentered("Tap to return to map", 160, 164, ILI9341_CYAN);
+    }
+    // Built-in fallback credit; actual streamed frames include host/provider
+    // attribution. Never overwrite that strip when marking a retained map stale.
+    static const uint8_t copyrightGlyph[] = {0x3c, 0x42, 0x99, 0xa1, 0xa1, 0x99, 0x42, 0x3c};
+    gTft.drawBitmap(2, 212, copyrightGlyph, 8, 8, ILI9341_WHITE);
+    gTft.setCursor(12, 212);
+    gTft.print("OpenStreetMap contributors");
+    drawTabs();
+}
+
 void Es3Graphics::updateVideo()
 {
     if (!_video) return;
     const uint32_t now = millis();
-    const auto demand = (_calibrating || _calibrationTesting) ? es3video::DemandCalibrating :
-                        (_activePage == 0 ? es3video::DemandActive : es3video::DemandHidden);
-    _video->setDemand(demand);
+    const bool blocked = _calibrating || _calibrationTesting || _mapInfo;
     es3video::StartVideoRequest config;
-    const uint32_t token = _video->snapshot(config);
-    if (token) _videoEver = true;
-    const bool visible = _videoEver && demand == es3video::DemandActive;
-    if (token != _videoToken || visible != _videoVisible) {
+    es3map::Binding binding;
+    const uint32_t token = _video->view(_activePage, blocked, config, binding);
+    const bool map = binding.surface == es3map::Surface::Map;
+    if (token && !map) _videoEver = true;
+    const bool visible = !blocked && _activePage == binding.page() &&
+        (token || (_videoVisible && binding.surface == _binding.surface));
+    if (token != _videoToken || visible != _videoVisible || binding.surface != _binding.surface) {
         _video->release(_videoImage, false, 0);
         const bool keepLastFrame = !token && visible && _videoVisible;
-        _videoToken = token; _videoVisible = visible; _videoConfig = config;
+        _videoToken = token; _videoVisible = visible;
+        _videoConfig = config; _binding = binding;
         _videoStatus = 255; _navigation = false;
         if (!keepLastFrame) {
             _lastFrameMs = now;
-            if (demand != es3video::DemandCalibrating) drawPage();
+            if (!_calibrating && !_calibrationTesting) drawPage();
         }
     }
     if (!visible) return;
     if (_navigation && int32_t(now - _navigationUntil) >= 0) {
         _navigation = false;
-        // Remove tabs; subsequent image strips restore the underlying video.
         gTft.fillRect(0, kTabTop, kScreenWidth, kTabHeight, ILI9341_BLACK);
     }
     if (_videoImage.slot < 0 && _video->acquire(_videoImage)) {
@@ -1035,8 +1069,7 @@ void Es3Graphics::updateVideo()
         const int width = config.viewportW;
         const int rows = min<int>(8, config.viewportH - _videoRow);
         memcpy(_videoStrip, _videoImage.pixels + _videoRow * width, width * rows * 2);
-        // One bounded SPI transaction; touch, controls and audio run before
-        // the next strip. drawRGBBitmap expects native-endian RGB565 words.
+        // One bounded SPI transaction; touch and controls run between strips.
         gTft.drawRGBBitmap(config.viewportX, config.viewportY + _videoRow, _videoStrip, width, rows);
         _videoRow += rows;
         if (_navigation && config.viewportY + _videoRow > kTabTop) drawTabs();
@@ -1046,21 +1079,32 @@ void Es3Graphics::updateVideo()
         }
     }
     const uint32_t age = now - _lastFrameMs;
-    const uint8_t status = age >= config.placeholderAfterMs ? 2 : (age >= config.staleAfterMs ? 1 : 0);
+    const uint8_t status = age >= config.placeholderAfterMs ? 2 :
+        (age >= config.staleAfterMs || !token || !_hostConnected ? 1 : 0);
     if (status != _videoStatus && _videoImage.slot < 0) {
         _videoStatus = status;
-        if (status == 2) {
-            gTft.fillRect(config.viewportX, config.viewportY, config.viewportW, config.viewportH, ILI9341_BLACK);
-            printCentered("Video unavailable", 160, 112, ILI9341_WHITE);
+        if (map) {
+            if (status) {
+                gTft.fillRect(0, 0, 320, es3map::kStatusHeight, ILI9341_BLACK);
+                gTft.setTextSize(1); gTft.setTextColor(ILI9341_YELLOW);
+                gTft.setCursor(2, 4);
+                gTft.print(!_hostConnected ? "JETSON OFFLINE - MAP STALE" :
+                    (status == 2 ? "Map unavailable - last known" : "MAP STALE - last known"));
+            }
+            // Fresh JPEG restores its own status. Neither stale threshold
+            // clears imagery/attribution or paints over the tab strip.
+        } else {
+            if (status == 2) {
+                gTft.fillRect(config.viewportX, config.viewportY, config.viewportW, config.viewportH, ILI9341_BLACK);
+                printCentered("Video unavailable", 160, 112, ILI9341_WHITE);
+            }
+            const int y = config.viewportY >= 10 ? 1 : config.viewportY;
+            if (status || config.viewportY >= 10) gTft.fillRect(0, y, 150, 9, ILI9341_BLACK);
+            gTft.setTextSize(1); gTft.setTextColor(status ? ILI9341_YELLOW : ILI9341_GREEN);
+            gTft.setCursor(2, y);
+            if (status) gTft.print(_hostConnected ? "VIDEO STALE" : "JETSON OFFLINE");
+            else if (config.viewportY >= 10) gTft.print("LIVE USB");
         }
-        // Use a black bar when present; full-height video gets a small stale
-        // overlay only when footage has stopped, cleared by the next frame.
-        const int y = config.viewportY >= 10 ? 1 : config.viewportY;
-        if (status || config.viewportY >= 10) gTft.fillRect(0, y, 150, 9, ILI9341_BLACK);
-        gTft.setTextSize(1); gTft.setTextColor(status ? ILI9341_YELLOW : ILI9341_GREEN);
-        gTft.setCursor(2, y);
-        if (status) gTft.print(_hostConnected ? "VIDEO STALE" : "JETSON OFFLINE");
-        else if (config.viewportY >= 10) gTft.print("LIVE USB");
         if (!videoCoversTabs() || _navigation) drawTabs();
     }
 }

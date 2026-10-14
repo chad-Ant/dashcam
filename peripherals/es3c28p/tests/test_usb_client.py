@@ -374,6 +374,7 @@ class SerialTests(unittest.TestCase):
         self.ignore_status = False
         self.bad_identity = False
         self.video = False
+        self.map = False
         self.worker = threading.Thread(target=self.board, daemon=True)
         self.worker.start()
 
@@ -404,6 +405,20 @@ class SerialTests(unittest.TestCase):
                     continue
                 elif kind == es3.CAPABILITIES:
                     response = es3.capabilities_payload(**CAPS)
+                elif kind in (es3.CMD_MAP_CAPABILITIES, es3.CMD_START_MAP, es3.CMD_STOP_MAP) and not self.map:
+                    os.write(self.master, es3.encode(seq, es3.ERROR, bytes((es3.ERR_BAD_COMMAND,))))
+                    continue
+                elif kind == es3.CMD_MAP_CAPABILITIES:
+                    response = es3.map_capabilities_payload(BOARD_CAPS, page_count=6, map_page=5,
+                        viewport_x=0, viewport_y=0, viewport_w=320, viewport_h=224,
+                        max_jpeg_bytes=65536)
+                elif kind == es3.CMD_START_MAP:
+                    m = es3.parse_map_capabilities(es3.map_capabilities_payload(BOARD_CAPS, **MAP_CAPS), BOARD_CAPS)
+                    es3.parse_start_map(body, m, BOARD_CAPS)
+                    response = es3.start_map_reply_payload(TOKEN, 1)
+                elif kind == es3.CMD_STOP_MAP:
+                    es3.parse_stop_map(body)
+                    response = b""
                 elif kind == es3.START_VIDEO:
                     es3.parse_start_video(body, es3.parse_capabilities(es3.capabilities_payload(**CAPS)))
                     # A device->host record may precede the reply on the same stream.
@@ -430,6 +445,25 @@ class SerialTests(unittest.TestCase):
             display.ping()
         self.assertEqual([kind for kind, _ in self.requests].count(es3.HELLO), 2)
         self.assertIn((es3.ALERT, bytes((25,))), self.requests)
+
+    def test_map_page_requires_capability(self):
+        self.video = True
+        with es3.Es3Display(self.device, timeout=0.5) as display:
+            with self.assertRaises(ValueError):
+                display.set_page(5, "MAP", ["", "", "", ""])
+            self.assertNotIn(es3.PAGE, [kind for kind, _ in self.requests])
+            display.ping()
+            self.map = True
+            display.set_page(5, "MAP", ["", "", "", ""])
+            m = display.map_capabilities()
+            reply = display.start_map(m, BOARD_CAPS, **START_MAP_REQUEST)
+            self.assertEqual(reply["session_token"], TOKEN)
+            display.stop_map(TOKEN)
+            with self.assertRaises(ValueError):
+                display.set_page(6, "BAD", ["", "", "", ""])
+        pages = [body for kind, body in self.requests if kind == es3.PAGE]
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0][0], 5)
 
     def test_timeout_closes_without_replaying_command(self):
         with es3.Es3Display(self.device, timeout=0.1) as display:

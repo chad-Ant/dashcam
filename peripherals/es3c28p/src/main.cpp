@@ -23,6 +23,7 @@ static constexpr Es3DashboardPage kDemoPages[] = {
     {"CAM", "CAMERAS", "Road:    standby", "Cabin:   standby", "Lanes:   waiting", "Storage: -- GB free", false, false, false},
     {"SYS", "SYSTEM HEALTH", "Jetson:  offline", "C3 link: waiting", "CPU temp: -- C", "Battery: --.- V", false, false, false},
     {"SET", "QUICK CONTROLS", "Recording: start", "Audio alert: on", kBrightness.enabled ? "Screen:      auto" : "Screen:      manual", "Tap SET tab to calibrate", true, false, true},
+    {"MAP", "POSITION MAP", "Waiting for Jetson", "", "", "", false, false, false},
 };
 
 static Es3Storage gStorage;

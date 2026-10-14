@@ -17,6 +17,7 @@ public:
         int jpeg = -1, image = -1;
         uint32_t token = 0, frame = 0, bytes = 0;
         uint16_t width = 0, height = 0;
+        uint32_t visibilityEpoch = 0;
     };
     struct Image {
         int slot = -1;
@@ -56,6 +57,7 @@ public:
     void setDemand(Demand value) {
         if (value == demand) return;
         demand = value;
+        if (value != DemandActive) ++_visibilityEpoch;
         if (!token) return;
         visibility();
         if (value != DemandActive) {
@@ -138,6 +140,7 @@ public:
         job.jpeg = source; job.image = destination; job.token = token;
         job.frame = inputs[source].frame; job.bytes = inputs[source].bytes;
         job.width = config.viewportW; job.height = config.viewportH;
+        job.visibilityEpoch = _visibilityEpoch;
         return true;
     }
     void finishJob(const Job& job, bool ok, uint32_t duration) {
@@ -146,7 +149,7 @@ public:
         image.state = Free;
         if (job.token != token || !token) return;
         credit();
-        if (!ok || demand != DemandActive) {
+        if (!ok || demand != DemandActive || job.visibilityEpoch != _visibilityEpoch) {
             result(job.frame, ok ? ReasonHidden : ReasonDecodeFailed); return;
         }
         // Retain only the newest completed image, never replace a drawing lease.
@@ -179,6 +182,7 @@ public:
     }
 private:
     uint32_t _lastFrame = 0, _started = 0;
+    uint32_t _visibilityEpoch = 0;
     Event _events[32]; unsigned _head = 0, _count = 0;
     bool _fault = false;
     void emit(const Event& e) {

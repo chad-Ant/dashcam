@@ -400,8 +400,19 @@ plan's "Implementation record" lists everything below in more detail, plus the f
   End to end (`es3display_test --fake-map-board`): v0.4 + UGREEN 1080p30 + preview + map, tabs cycling: recording
   kept 30 fps, 3 clean source switches, camera p95 49 ms, map 1 fps without GPS (redraws on change or 1 s).
 - **Measured** (synthetic tiles): compose ~1 ms, encode 1.4-3.9 ms; warm map shown 4 ms after the tab, cold 53 ms.
-- **Not done / open**: firmware side (plan's list); real OSM frame sizes (this network could not resolve the tile CDN
-  during the test, and earlier only over IPv6 with ~6 KB/s); GPS-to-map end to end through the real C3 bridge (no
+- **Real tiles (later on 2026-10-14, network better):** the bench router (192.168.0.1) returns NXDOMAIN for every
+  openstreetmap.org name (8.8.8.8 and 1.1.1.1 resolve them; the tile server answers in ~0.45 s per 34 KB tile). With
+  `docker run --dns 1.1.1.1`, `navigation_test --live 48.8584 2.2945 16`: 4 tiles (128 KiB), frame 33.8 KB at q80
+  4:4:4 (half the 64 KiB cap), encode ~6 ms. Fixed a stop-log bug (cache counters read after closing: "cache 0 tiles").
+  Before relying on the map in the car, check `getent hosts tile.openstreetmap.org` on the hotspot.
+- **Demo drive (2026-10-14):** `navigation_test --drive OUTDIR` spoofs 4 Hz GNSS along the Champs-Elysees (1,870 m:
+  parked, 60 km/h, 3 s GNSS outage, stop) through the real service and OSM tiles: 479 frames in 129 s, 14 tile
+  downloads (446 KiB), frames <= 35.8 KB, encode <= 6.1 ms; dot -> arrow at 5 km/h, last-known 1.5 s into the outage,
+  arrow back at once, dot at the stop. Possible tweaks: marker colour vs OSM's blue POIs; small-font legibility on the
+  panel; zoom 15 for more look-ahead. Outputs (not in the repo): `~/drive_logs/es3c28p_20261014/map_demo/`.
+- **Saved outside the repo** (`~/drive_logs/es3c28p_20261014/`): both work logs (preview, navigation), the e2e/SIGINT
+  scripts, the UGREEN bench frames (camera captures: never commit), the stage-1/2 agent reports, the demo outputs.
+- **Not done / open**: firmware side (plan's list); GPS-to-map end to end through the real C3 bridge (no
   bridge on the bench; covered by unit tests); a heading-up mode (out of scope by decision).
 
 ## 2026-10-14 (Jetson, bench): ES3C28P video preview, Jetson side

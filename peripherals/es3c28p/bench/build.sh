@@ -7,7 +7,7 @@ case "${1:-}" in
 esac
 arduino-cli lib install --no-deps "JPEGDEC@1.8.4"
 args=(compile --warnings all --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=${ES3_USB_MODE:-hwcdc},CDCOnBoot=cdc"
-      --library "$BOARD_DIR/lib/es3Board" --library "$BOARD_DIR/lib/es3Video" --library "$BOARD_DIR/lib/es3UsbLink" --library "$BOARD_DIR/lib/es3Graphics"
+      --library "$BOARD_DIR/lib/es3Board" --library "$BOARD_DIR/lib/es3Video" --library "$BOARD_DIR/lib/es3Map" --library "$BOARD_DIR/lib/es3UsbLink" --library "$BOARD_DIR/lib/es3Graphics"
       --library "$BOARD_DIR/lib/es3Storage" --library "$BOARD_DIR/lib/es3Audio")
 if [ -n "${2:-}" ]; then args+=(--upload --port "$2"); fi
 exec arduino-cli "${args[@]}" "$BOARD_DIR/bench/$sketch"

@@ -25,9 +25,9 @@ set "FQBN=esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSR
 set "WARN=--warnings all"
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" --library "%SKETCH_DIR%\lib\es3Board" --library "%SKETCH_DIR%\lib\es3UsbLink" --library "%SKETCH_DIR%\lib\es3Video" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" --library "%SKETCH_DIR%\lib\es3Board" --library "%SKETCH_DIR%\lib\es3UsbLink" --library "%SKETCH_DIR%\lib\es3Video" --library "%SKETCH_DIR%\lib\es3Map" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" --library "%SKETCH_DIR%\lib\es3Board" --library "%SKETCH_DIR%\lib\es3UsbLink" --library "%SKETCH_DIR%\lib\es3Video" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" --library "%SKETCH_DIR%\lib\es3Board" --library "%SKETCH_DIR%\lib\es3UsbLink" --library "%SKETCH_DIR%\lib\es3Video" --library "%SKETCH_DIR%\lib\es3Map" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

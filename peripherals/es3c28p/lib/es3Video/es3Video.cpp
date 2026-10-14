@@ -42,8 +42,30 @@ uint32_t Es3Video::start(const StartVideoRequest& request)
     if (!_ready || !validStartVideo(request, capabilities())) return 0;
     lock();
     if (++_nextToken == 0) ++_nextToken;
-    _state.start(_nextToken, request);
-    unlock(); return _nextToken;
+    const uint32_t token = _state.startCamera(_nextToken, request, capabilities()) ? _nextToken : 0;
+    unlock(); return token;
+}
+uint32_t Es3Video::startMap(const es3map::StartMapRequest& request)
+{
+    if (!_ready) return 0;
+    lock();
+    if (++_nextToken == 0) ++_nextToken;
+    const uint32_t token = _state.startMap(_nextToken, request, capabilities()) ? _nextToken : 0;
+    unlock(); return token;
+}
+void Es3Video::stopSurface(es3map::Surface surface, uint32_t token)
+{
+    if (!_ready) return;
+    lock(); _state.stopSurface(surface, token); unlock();
+}
+uint32_t Es3Video::view(uint8_t page, bool blocked, StartVideoRequest& config, es3map::Binding& binding)
+{
+    if (!_ready) return 0;
+    lock();
+    _state.view(page, blocked);
+    config = _state.config; binding = _state.binding;
+    const uint32_t token = _state.token;
+    unlock(); return token;
 }
 void Es3Video::stop(uint32_t token)
 {

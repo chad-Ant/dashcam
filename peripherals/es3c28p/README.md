@@ -15,12 +15,14 @@ navigation**, with voice and video preview operating in separate modes. Voice is
 The [navigation plan](NAVIGATION_PLAN.md) covers an OpenStreetMap-based position
 and direction-of-travel display: online tiles cached and rendered on the Jetson,
 then sent over USB to the ES3C28P and shown on a new MAP tab (north-up).
-The Jetson side and the map wire extension (`Es3MapProtocol.h`) are implemented;
-the firmware side is not yet (the plan's "Firmware work" list).
+The Jetson side, frozen map wire extension (`Es3MapProtocol.h`) and firmware
+receiver are implemented. See [NAVIGATION_IMPLEMENTATION.md](NAVIGATION_IMPLEMENTATION.md)
+for board behavior, validation and remaining hardware checks. The plan remains
+the unchanged design record.
 
 ESP32-S3 port of `../cyd`, for the LCDWiki **ES3C28P N16R8** capacitive-touch
 board (16 MB flash, 8 MB OPI PSRAM). The existing CYD firmware remains separate.
-This is the same dashboard demo: Live, Trip, Camera, System and Settings tabs,
+The dashboard has Live, Trip, Camera, System, Settings and Map tabs,
 320 x 224 SD splash above the tab strip, touch calibration with SD persistence,
 brightness controls, and streamed notification WAV playback. Page values are
 placeholders until the Jetson supplies page text over the native USB channel.
@@ -38,6 +40,7 @@ lib/es3Storage/            four-bit SDMMC storage and calibration records
 lib/es3Audio/              ES8311 codec and modern ESP-IDF I2S DMA output
 lib/es3UsbLink/            USB task, multiplexed controls/video and frozen protocol
 lib/es3Video/              bounded PSRAM pools, assembly and JPEG decode worker
+lib/es3Map/                map/camera surface binding and shared six-tab geometry
 bench/                     USB sink and JPEG-from-SD feasibility sketches
 host/es3_display.py        Jetson USB client and command-line tool (stdlib only)
 host/99-dashcam-display.rules serial-specific persistent-device rule template
@@ -207,7 +210,8 @@ python3 peripherals/es3c28p/host/es3_display.py --device /dev/ttyACM0 stop-audio
 `watch` polls status once per second and reconnects after USB loss. Use a
 by-id path or the udev alias so reconnect still works if the tty number
 changes. Other commands execute once and are never replayed on timeout.
-Page indices are Live=0, Trip=1, Camera=2, System=3, Settings=4. Page commands
+Page indices are Live=0, Trip=1, Camera=2, System=3, Settings=4, Map=5.
+The Python client capability-checks page 5 before sending it. Page commands
 copy a title and four printable ASCII lines, each at most 23 characters.
 Updating Live replaces its splash with those fields; all tabs retain local
 touch behavior. Page content is held in RAM until reboot or replacement.
@@ -258,9 +262,17 @@ Only the application loop executes graphics/audio commands.
 | CAPABILITIES | 07 | empty | 18-byte video limits (or unavailable) |
 | START_VIDEO | 08 | 23-byte negotiated settings | session token u32, initial cumulative grant u32 |
 | STOP_VIDEO | 09 | session token u32 | empty |
+| MAP_CAPABILITIES | 0A | empty | 16-byte frozen map capabilities |
+| START_MAP | 0B | 27-byte map settings | session token u32, initial grant u32 |
+| STOP_MAP | 0C | session token u32 | empty; wrong source/stale token is a no-op |
 
 Video records use the frozen `Es3VideoProtocol.h` framing and golden vectors;
 the initial credit window is one. See [VIDEO_IMPLEMENTATION.md](VIDEO_IMPLEMENTATION.md).
+Map images use that same receiver, bound to MAP instead of LIVE. The viewport
+is exactly (0,0,320,224); tabs stay visible. Tap the attribution strip for local
+map/licence information and tap again to close it. Stale map notices occupy
+only the top 16 pixels, preserving map attribution. Camera/map ownership,
+GPS direction/dot selection and tile rendering are coordinated by the Jetson.
 
 ## Validation
 
@@ -276,7 +288,8 @@ failures, fragmented frames, timeouts, wrong-device rejection, port reopening
 and pseudo-tty disconnects. Physical ES3C28P validation is still required:
 check HELLO/status, page updates, USB unplug/replug and the offline indicator;
 verify colors/orientation,
-all five tabs, the calibration SAVE/reboot cycle, manual brightness, SD
+all six tabs, map/camera switching, attribution information, stale map notices,
+the calibration SAVE/reboot cycle, manual brightness, SD
 splash and missing-card fallback, and the complete boot tone without a
 repeating tail. With an external LDR, also verify both sides of the threshold
 and the gradual fade. Compilation does not establish that these hardware

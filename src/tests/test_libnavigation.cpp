@@ -888,7 +888,86 @@ static int runLive(double lat, double lon, int zoom) {
     return s.http200 + s.tileDiskHits > 0 ? 0 : 1;
 }
 
+/// navigation_test --drive OUTDIR: a demo drive for evaluating the render.
+/// Spoofed 4 Hz GNSS along the Champs-Elysees (a straight avenue, so the line
+/// between its two ends follows the road), with the service's default OSM
+/// provider: standstill (dot), accelerate to 60 km/h (arrow), a 3 s GNSS outage
+/// mid-way (last known), stop at Place de la Concorde (dot).  Every frame the
+/// service offers is written to OUTDIR/frame_NNNNN.jpg plus OUTDIR/frames.csv.
+/// Needs internet (only the visible tiles along the route are requested).
+static int runDrive(const std::string& outDir) {
+    struct RecordingSink : IPreviewSink {
+        std::string dir;
+        std::FILE*  csv = nullptr;
+        int         n   = 0;
+        int64_t     t0  = nowMs();
+        PreviewDemand demand() const override {
+            PreviewDemand d;
+            d.active = true, d.canvasW = 320, d.canvasH = 224, d.maxJpegBytes = 65536;
+            return d;
+        }
+        bool offerFrame(EncodedFrameLease&& f) override {
+            char name[64];
+            std::snprintf(name, sizeof(name), "frame_%05d.jpg", n++);
+            std::ofstream(dir + "/" + name, std::ios::binary)
+                .write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
+            if (csv) std::fprintf(csv, "%s,%lld,%zu,%d\n", name, (long long)(nowMs() - t0), f.size(), f.quality());
+            f.release();
+            return true;
+        }
+    } sink;
+    sink.dir = outDir;
+    sink.csv = std::fopen((outDir + "/frames.csv").c_str(), "w");
+    if (!sink.csv) return 2;
+    std::fprintf(sink.csv, "file,ms,bytes,quality\n");
+    NavigationService nav;
+    NavigationServiceConfig c;
+    c.cachePath = outDir + "/tiles.sqlite";
+    if (!nav.start(c, sink, [](dashcam::log::LogLevel, const std::string& m) { std::printf("  log: %s\n", m.c_str()); }))
+        return 2;
+
+    // Avenue des Champs-Elysees: Arc de Triomphe end -> Place de la Concorde end.
+    const double lat0 = 48.87340, lon0 = 2.29660, lat1 = 48.86610, lon1 = 2.31960;
+    const double kDeg = M_PI / 180.0;
+    const double dy = (lat1 - lat0) * 111320.0, dx = (lon1 - lon0) * 111320.0 * std::cos(lat0 * kDeg);
+    const double length = std::hypot(dx, dy);
+    const float  course = float(std::fmod(std::atan2(dx, dy) / kDeg + 360.0, 360.0));
+    std::printf("drive: %.0f m at course %.1f deg\n", length, double(course));
+    double dist = 0.0, speed = 0.0;   // m, km/h
+    int    phase = 0;                 // 0 standstill, 1 drive, 2 stopped at the end
+    int64_t phaseStart = nowMs(), outageStart = -1;
+    const int64_t start = nowMs();
+    while (true) {
+        const double t = (nowMs() - phaseStart) / 1000.0;
+        if (phase == 0 && t >= 4.0) { phase = 1; phaseStart = nowMs(); }
+        if (phase == 1) {
+            const double remaining = length - dist;
+            const double target = remaining < 60.0 ? std::max(0.0, remaining * 1.0) : 60.0;   // brake at the end
+            speed += std::clamp(target - speed, -6.0, 3.0);   // per 250 ms step
+            dist += speed / 3.6 * 0.25;
+            if (remaining <= 0.5 || (remaining < 5.0 && speed < 1.0)) { phase = 2; phaseStart = nowMs(); speed = 0; }
+        }
+        if (phase == 2 && t >= 5.0) break;
+        const double f = std::min(1.0, dist / length);
+        const bool outage = phase == 1 && dist > length * 0.45 && dist < length * 0.45 + 50.0;   // ~3 s at 60 km/h
+        if (outage && outageStart < 0) outageStart = nowMs();
+        if (!outage)
+            nav.offerGps(fix(lat0 + f * (lat1 - lat0), lon0 + f * (lon1 - lon0), float(speed), speed >= 5.0 ? course : NAN));
+        sleepMs(250);
+    }
+    const NavigationStats s = nav.stats();
+    nav.stop();
+    std::fclose(sink.csv);
+    std::printf("drive: %.0f s, %d frames, %llu tile downloads (%llu KiB), %llu cached, last frame %u B, "
+                "max encode %.1f ms; outage began at %.1f s\n",
+                (nowMs() - start) / 1000.0, sink.n, (unsigned long long)s.http200,
+                (unsigned long long)(s.httpBytes / 1024), (unsigned long long)s.cacheTiles, s.lastJpegBytes,
+                s.lastEncodeMs, outageStart < 0 ? -1.0 : (outageStart - start) / 1000.0);
+    return sink.n > 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--drive") return runDrive(argv[2]);
     if (argc >= 4 && std::string(argv[1]) == "--live")
         return runLive(std::atof(argv[2]), std::atof(argv[3]), argc >= 5 ? std::atoi(argv[4]) : 16);
     std::printf("navigation_test: libnavigation without network or hardware\n");

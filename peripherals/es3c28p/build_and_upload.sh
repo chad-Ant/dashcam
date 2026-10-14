@@ -16,7 +16,7 @@ arduino-cli lib install --no-deps "JPEGDEC@1.8.4"
 
 port="${1:-}"
 
-args=(compile --warnings all --fqbn "$FQBN" --library "$STORAGE_DIR" --library "$GRAPHICS_DIR" --library "$AUDIO_DIR" --library "$SKETCH_DIR/lib/es3Board" --library "$SKETCH_DIR/lib/es3UsbLink" --library "$SKETCH_DIR/lib/es3Video")
+args=(compile --warnings all --fqbn "$FQBN" --library "$STORAGE_DIR" --library "$GRAPHICS_DIR" --library "$AUDIO_DIR" --library "$SKETCH_DIR/lib/es3Board" --library "$SKETCH_DIR/lib/es3UsbLink" --library "$SKETCH_DIR/lib/es3Video" --library "$SKETCH_DIR/lib/es3Map")
 if [ -n "$port" ]; then
     args+=(--upload --port "$port")
 fi

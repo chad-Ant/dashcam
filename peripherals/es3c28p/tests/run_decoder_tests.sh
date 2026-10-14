@@ -15,6 +15,7 @@ for left, right, color in [(0, 105, 'red'), (106, 212, 'lime'), (213, 319, 'blue
     draw.rectangle((left, 0, right, 179), fill=color)
 image.save(out/'color420.jpg', quality=90, subsampling=2)
 image.save(out/'color422.jpg', quality=90, subsampling=1)
+image.resize((320, 224)).save(out/'color444map.jpg', quality=80, subsampling=0)
 image.resize((319, 179)).save(out/'odd.jpg', quality=80)
 image.convert('L').save(out/'gray.jpg')
 image.save(out/'progressive.jpg', progressive=True)

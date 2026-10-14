@@ -678,9 +678,9 @@ void NavigationService::stop() {
     for (auto& t : m.workers)
         if (t.joinable()) t.join();   // a transfer in progress aborts through its progress callback
     m.workers.clear();
+    const NavigationStats s = stats();   // before closing: the cache counters come from it
     m.disk.close();
     m.diskOk = false;
-    const NavigationStats s = stats();
     m.logf(LogLevel::DEBUG,
            "navigation: stopped (%llu frames offered, %llu HTTP requests, %llu disk hits, cache %llu tiles)",
            (unsigned long long)s.framesOffered, (unsigned long long)s.httpRequests,

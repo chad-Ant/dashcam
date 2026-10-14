@@ -46,7 +46,7 @@ struct Es3BrightnessConfig {
 
 class Es3Graphics {
 public:
-    static constexpr uint8_t kMaxPages = 5;
+    static constexpr uint8_t kMaxPages = es3map::kPageCount;
 
     explicit Es3Graphics(Es3Storage& storage);
 
@@ -106,6 +106,9 @@ private:
     uint8_t _videoStatus = 255;
     bool _videoVisible = false, _navigation = false, _videoEver = false;
     uint16_t _videoStrip[320 * 8]; // internal RAM; only loop owns TFT/SPI
+    es3map::Binding _binding;
+    bool _mapInfo = false;
+    void drawMapPage();
     void updateVideo();
     bool videoCoversTabs() const;
 
@@ -114,10 +117,8 @@ private:
         uint16_t y;
     };
 
-    static constexpr uint8_t kTabCount = 5;
     static constexpr int kScreenWidth = 320;
     static constexpr int kScreenHeight = 240;
-    static constexpr int kTabWidth = 64;
     static constexpr int kTabHeight = 16;
     static constexpr int kTabTop = kScreenHeight - kTabHeight;
     static constexpr int kCalibrationMargin = 24;

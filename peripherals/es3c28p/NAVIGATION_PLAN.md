@@ -488,8 +488,15 @@ ids above 0C.
 compose 0.6-1.0 ms, encode 1.4-3.9 ms (320x224 q80 4:4:4); warm map on screen
 4 ms after the tab is shown (cold: 53 ms incl. disk + PNG); tap on MAP -> first
 map frame at the board 40 ms on a pty (STATUS poll + STOP_VIDEO + START_MAP).
-Not measured: real OSM tile frame sizes (this bench's network could not reach
-the tile CDN reliably); expect them well above the 7-16 KB of synthetic frames.
+Real OSM tiles (2026-10-14, `navigation_test --live 48.8584 2.2945 16`, Paris,
+zoom 16): the view needed 4 tiles, 128 KiB (about 32 KiB each, ~0.45 s each over
+this link); the composed frame is 33.8 KB at q80 4:4:4 (half the 64 KiB cap),
+encode 5.9-6.2 ms, compose 0.6 ms. Dense city areas may be larger: the q70/q60
+retries cover the cap. DNS note: this bench's router (192.168.0.1) answers
+NXDOMAIN for every openstreetmap.org name while 8.8.8.8 / 1.1.1.1 resolve them
+(the test used `docker run --dns 1.1.1.1`); a phone hotspot uses its own DNS, but
+check `getent hosts tile.openstreetmap.org` on the car's network before relying
+on the map.
 
 **Firmware work (not done; for the firmware author):**
 1. Answer 0A with page_count 6, map_page 5, viewport 0,0,320,224, flags 1; add
