@@ -412,7 +412,12 @@ plan's "Implementation record" lists everything below in more detail, plus the f
   panel; zoom 15 for more look-ahead. Outputs (not in the repo): `~/drive_logs/es3c28p_20261014/map_demo/`.
 - **Saved outside the repo** (`~/drive_logs/es3c28p_20261014/`): both work logs (preview, navigation), the e2e/SIGINT
   scripts, the UGREEN bench frames (camera captures: never commit), the stage-1/2 agent reports, the demo outputs.
-- **Not done / open**: firmware side (plan's list); GPS-to-map end to end through the real C3 bridge (no
+- **Colleague's firmware map work went into `91f01aa`** (committed with my changes on the user's "commit and push";
+  not reviewed by me): `lib/es3Map/MapSurface.h`, `NAVIGATION_IMPLEMENTATION.md`, `tests/map_surface_test.cpp`, and
+  changes in es3Graphics/es3UsbLink/es3Video/main/build scripts/tests. Checked before power-off: shared headers still
+  identical, `run_tests.sh` passes (38 Python + map surface test), firmware compiles with 0 warnings (555,038 B).
+  Next session: review it against the plan's "Firmware work" list and run the Jetson link against it.
+- **Not done / open**: firmware side (plan's list; partly in progress by the colleague, see above); GPS-to-map end to end through the real C3 bridge (no
   bridge on the bench; covered by unit tests); a heading-up mode (out of scope by decision).
 
 ## 2026-10-14 (Jetson, bench): ES3C28P video preview, Jetson side
