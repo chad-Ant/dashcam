@@ -90,6 +90,9 @@ const char* commandName(uint8_t type) {
     case es3proto::Capabilities: return "CAPABILITIES";
     case es3proto::StartVideo:   return "START_VIDEO";
     case es3proto::StopVideo:    return "STOP_VIDEO";
+    case es3map::CmdMapCapabilities: return "MAP_CAPABILITIES";
+    case es3map::CmdStartMap:        return "START_MAP";
+    case es3map::CmdStopMap:         return "STOP_MAP";
     default:                     return "?";
     }
 }
@@ -179,6 +182,15 @@ bool validateConfig(const DisplayLinkConfig& c, std::string* why) {
         return fail("placeholderAfterMs must be staleAfterMs-10000");
     if (c.creditStallMs != 0 && (c.creditStallMs < 100 || c.creditStallMs > 60000))
         return fail("creditStallMs must be 0 (auto) or 100-60000");
+    if (c.map) {
+        if (c.mapTargetFps < 1 || c.mapTargetFps > es3video::kMaxTargetFps) return fail("mapTargetFps must be 1-30");
+        if (c.mapMaxJpegBytes < 1024 || c.mapMaxJpegBytes > es3video::kMaxJpegBytes)
+            return fail("mapMaxJpegBytes must be 1024-65536");
+        if (c.mapStaleAfterMs < 1 || c.mapStaleAfterMs > es3video::kMaxTimeoutMs)
+            return fail("mapStaleAfterMs must be 1-10000");
+        if (c.mapPlaceholderAfterMs < c.mapStaleAfterMs || c.mapPlaceholderAfterMs > es3video::kMaxTimeoutMs)
+            return fail("mapPlaceholderAfterMs must be mapStaleAfterMs-10000");
+    }
     if (why) why->clear();
     return true;
 }
@@ -237,7 +249,7 @@ ControlRequest ControlRequest::alert(uint8_t volume) {
 ControlRequest ControlRequest::page(uint8_t index, const std::string& title,
                                     const std::array<std::string, 4>& lines) {
     ControlRequest r;
-    if (index >= kPageCount || !printableField(title) ||
+    if (index >= kMaxPageCount || !printableField(title) ||
         !std::all_of(lines.begin(), lines.end(), printableField)) {
         return r;
     }
@@ -301,6 +313,8 @@ struct Es3DisplayLink::Impl {
             bool     user = false;
             Queued   app;                  ///< user == true.
             es3video::StartVideoRequest video;  ///< type == StartVideo.
+            es3map::StartMapRequest     map;    ///< type == CmdStartMap.
+            uint32_t                    stopToken = 0;  ///< type == StopVideo / CmdStopMap (a source switch).
         } ctl;
         uint8_t  nextSeq = 0;
         int64_t  lastRequestUs = 0;        ///< Last request fully written (heartbeat base).
@@ -314,8 +328,17 @@ struct Es3DisplayLink::Impl {
         uint32_t maxJpeg = 0;
         uint8_t  window = 0;
 
+        // Map surface (per open).
+        bool     wantMapCaps = false, mapKnown = false, mapSupported = false;
+        es3map::MapCapabilities mapCaps;
+        uint32_t mapMaxJpeg = 0, mapGeneration = 0;
+        uint8_t  page = 0xff;              ///< Board's active page from STATUS; 0xff unknown.
+        int64_t  nextPollUs = 0;
+
         // Video session.
+        enum class Kind : uint8_t { None = 0, Video = 1, Map = 2 };
         struct Session {
+            Kind     kind = Kind::None;
             uint32_t token = 0;
             es3video::StartVideoRequest req;
             uint32_t grant = 0, started = 0, results = 0, nextFrameId = 1;
@@ -366,6 +389,7 @@ struct Es3DisplayLink::Impl {
 
     // Published by the worker.
     std::atomic<uint64_t> demandWord{0};
+    std::atomic<uint64_t> mapDemandWord{0};
     std::atomic<uint8_t>  stateValue{static_cast<uint8_t>(LinkState::Disconnected)};
 
     // Handoff between API callers and the worker (handoffMu).
@@ -375,12 +399,29 @@ struct Es3DisplayLink::Impl {
     uint16_t          acceptMaxW = 0, acceptMaxH = 0;
     uint32_t          acceptMaxJpeg = 0;
     EncodedFrameLease pending;
+    bool              acceptMap = false;
+    uint16_t          acceptMapW = 0, acceptMapH = 0;
+    uint32_t          acceptMapJpeg = 0;
+    uint8_t           acceptPages = kPageCount;   ///< PAGE indexes the board has.
+    EncodedFrameLease mapPending;
     std::array<Queued, kControlQueueDepth> queue{};
     size_t            qHead = 0, qCount = 0;
 
     // Caller-side counters.
     std::atomic<uint64_t> framesOffered{0}, framesAccepted{0}, framesRefused{0}, framesReplaced{0},
-        controlEnqueued{0}, controlRejected{0}, controlQueueFull{0};
+        controlEnqueued{0}, controlRejected{0}, controlQueueFull{0}, mapOffered{0}, mapAccepted{0};
+
+    /// The map surface's IPreviewSink (Es3DisplayLink::mapSink()).
+    class MapSink : public dashcam::preview::IPreviewSink {
+    public:
+        explicit MapSink(Impl& m) : m_(m) {}
+        dashcam::preview::PreviewDemand demand() const override;
+        bool offerFrame(EncodedFrameLease&& frame) override;
+
+    private:
+        Impl& m_;
+    };
+    MapSink mapSinkObj{*this};
 
     // Snapshot for stats() (statsMu).
     mutable std::mutex statsMu;
@@ -415,6 +456,10 @@ struct Es3DisplayLink::Impl {
     bool kernelQueueAllows();
     bool needNegotiation(uint16_t& w, uint16_t& h);
     bool buildStartVideo(int64_t now, uint16_t w, uint16_t h);
+    bool buildStartMap();
+    Io::Kind desiredKind() const;
+    bool sourceSwitch();   ///< Builds the STOP for a session the active page no longer wants.
+    EncodedFrameLease& pendingFor(Io::Kind k) { return k == Io::Kind::Map ? mapPending : pending; }
 
     void readInput();
     void feedParser(const uint8_t* data, size_t size);
@@ -480,27 +525,48 @@ void Es3DisplayLink::Impl::setState(LinkState s) {
     io->st.state = s;
 }
 
-/// Recompute what offerFrame() accepts and what demand() reports; a frame
-/// still pending when video goes inactive is released here.
+/// Recompute what both sinks accept and what their demand() reports; a frame
+/// still pending when its surface goes inactive is released here.
 void Es3DisplayLink::Impl::publishVideo() {
-    Io&        w      = *io;
-    const bool active = w.fd >= 0 && w.helloOk && w.videoSupported && !w.stopping &&
-                        (w.s.token == 0 || w.s.visibility == es3video::DemandActive);
-    EncodedFrameLease dropped;
+    Io&        w       = *io;
+    using Kind         = Io::Kind;
+    const bool base    = w.fd >= 0 && w.helloOk && !w.stopping;
+    const bool visible = w.s.visibility == es3video::DemandActive;
+    // With a map-capable board the active page decides the camera's turn: LIVE only.
+    const bool videoTurn = !w.mapSupported || w.page == 0;
+    const bool videoActive = base && w.videoSupported && videoTurn &&
+                             (w.s.token == 0 ? true : (w.s.kind == Kind::Video && visible));
+    const bool mapActive = base && w.mapSupported && w.page == w.mapCaps.mapPage && w.s.token != 0 &&
+                           w.s.kind == Kind::Map && visible;
+    EncodedFrameLease dropped, droppedMap;
     {
         std::lock_guard<std::mutex> lk(handoffMu);
-        acceptVideo   = active;
+        acceptVideo   = videoActive;
         acceptMaxW    = w.videoSupported ? w.caps.maxWidth : 0;
         acceptMaxH    = w.videoSupported ? w.caps.maxHeight : 0;
         acceptMaxJpeg = w.videoSupported ? w.maxJpeg : 0;
-        if (!active && pending) dropped = std::move(pending);
-        demandWord.store(w.videoSupported ? packDemand(active, w.caps.canvasWidth, w.caps.canvasHeight, w.maxJpeg)
+        if (!videoActive && pending) dropped = std::move(pending);
+        demandWord.store(w.videoSupported ? packDemand(videoActive, w.caps.canvasWidth, w.caps.canvasHeight, w.maxJpeg)
                                           : 0,
                          std::memory_order_release);
+        acceptMap     = mapActive;
+        acceptMapW    = w.mapSupported ? w.mapCaps.viewportW : 0;
+        acceptMapH    = w.mapSupported ? w.mapCaps.viewportH : 0;
+        acceptMapJpeg = w.mapSupported ? w.mapMaxJpeg : 0;
+        acceptPages   = w.mapSupported ? w.mapCaps.pageCount : kPageCount;
+        if (!mapActive && mapPending) droppedMap = std::move(mapPending);
+        mapDemandWord.store(w.mapSupported ? packDemand(mapActive, w.mapCaps.viewportW, w.mapCaps.viewportH,
+                                                        w.mapMaxJpeg)
+                                           : 0,
+                            std::memory_order_release);
     }
     if (dropped) {
         ++w.st.framesReleased;
         dropped.release();
+    }
+    if (droppedMap) {
+        ++w.st.framesReleased;
+        droppedMap.release();
     }
 }
 
@@ -520,6 +586,10 @@ void Es3DisplayLink::Impl::publishStats() {
     w.st.sessionResults   = w.s.results;
     w.st.visibility       = w.s.visibility;
     w.st.kernelQueueLimit = w.fd >= 0 ? w.outqLimit : 0;
+    w.st.mapSupported     = w.mapSupported;
+    w.st.mapCapabilities  = w.mapCaps;
+    w.st.activePage       = w.page;
+    w.st.sessionKind      = static_cast<uint8_t>(w.s.token ? w.s.kind : Io::Kind::None);
     const es3video::MuxParser::Stats& ps = w.parser.stats();
     w.st.parserGarbageBytes = ps.garbageBytes;
     w.st.parserCrcErrors    = ps.crcErrors;
@@ -672,6 +742,37 @@ bool Es3DisplayLink::offerFrame(EncodedFrameLease&& frame) {
     return true;
 }
 
+dashcam::preview::IPreviewSink& Es3DisplayLink::mapSink() { return impl_->mapSinkObj; }
+
+PreviewDemand Es3DisplayLink::Impl::MapSink::demand() const {
+    const uint64_t w = m_.mapDemandWord.load(std::memory_order_acquire);
+    PreviewDemand  d;
+    d.active       = (w >> 63) != 0;
+    d.canvasW      = static_cast<uint16_t>(w >> 40);
+    d.canvasH      = static_cast<uint16_t>(w >> 24);
+    d.maxJpegBytes = static_cast<size_t>(w & 0xffffffu);
+    return d;
+}
+
+bool Es3DisplayLink::Impl::MapSink::offerFrame(EncodedFrameLease&& frame) {
+    Impl& m = m_;
+    m.mapOffered.fetch_add(1, std::memory_order_relaxed);
+    if (!frame || frame.data() == nullptr || frame.size() == 0) return false;
+    EncodedFrameLease replaced;
+    {
+        std::lock_guard<std::mutex> lk(m.handoffMu);
+        if (!m.running.load(std::memory_order_acquire) || !m.acceptMap || frame.width() != m.acceptMapW ||
+            frame.height() != m.acceptMapH || frame.size() > m.acceptMapJpeg)
+            return false;   // the caller keeps the lease
+        replaced     = std::move(m.mapPending);
+        m.mapPending = std::move(frame);
+    }
+    m.mapAccepted.fetch_add(1, std::memory_order_relaxed);
+    if (replaced) replaced.release();
+    m.wake();
+    return true;
+}
+
 bool Es3DisplayLink::enqueueControl(const ControlRequest& request) {
     Impl& m = *impl_;
     if (!request.valid() || !isApplicationCommand(request.command) || request.length > es3proto::kMaxPayload) {
@@ -680,7 +781,8 @@ bool Es3DisplayLink::enqueueControl(const ControlRequest& request) {
     }
     {
         std::lock_guard<std::mutex> lk(m.handoffMu);
-        if (!m.running.load(std::memory_order_acquire) || !m.acceptControl) {
+        if (!m.running.load(std::memory_order_acquire) || !m.acceptControl ||
+            (request.command == es3proto::Page && request.payload[0] >= m.acceptPages)) {
             m.controlRejected.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -716,6 +818,8 @@ DisplayLinkStats Es3DisplayLink::stats() const {
     s.controlEnqueued  = m.controlEnqueued.load(std::memory_order_relaxed);
     s.controlRejected  = m.controlRejected.load(std::memory_order_relaxed);
     s.controlQueueFull = m.controlQueueFull.load(std::memory_order_relaxed);
+    s.mapFramesOffered  = m.mapOffered.load(std::memory_order_relaxed);
+    s.mapFramesAccepted = m.mapAccepted.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -847,6 +951,10 @@ bool Es3DisplayLink::Impl::openDevice(int64_t now) {
     w.helloOk = w.connectedOnce = false;
     w.capsKnown = w.videoSupported = false;
     w.caps = es3video::Capabilities{};
+    w.wantMapCaps = w.mapKnown = w.mapSupported = false;
+    w.mapCaps     = es3map::MapCapabilities{};
+    w.page        = 0xff;
+    w.nextPollUs  = 0;
     w.s    = Io::Session{};
     w.resyncWanted         = false;
     w.negotiateNotBeforeUs = 0;
@@ -887,6 +995,8 @@ void Es3DisplayLink::Impl::closeDevice(const std::string& why, bool unexpected) 
     const bool wasConnected = w.helloOk;
     w.helloOk = w.wantHello = w.wantCaps = false;
     w.capsKnown = w.videoSupported = false;
+    w.wantMapCaps = w.mapKnown = w.mapSupported = false;
+    w.page        = 0xff;
     publishVideo();
     setState(LinkState::Disconnected);
     w.nextOpenUs = nowUs() + int64_t(cfg.reconnectMs) * 1000;
@@ -1005,6 +1115,7 @@ int Es3DisplayLink::Impl::pollTimeoutMs(int64_t now) const {
     auto      until = [&](int64_t at) { t = std::min(t, at - now); };
     if (w.ctl.busy && w.ctl.written) until(w.ctl.deadlineUs);
     if (!w.ctl.busy && w.helloOk && !w.stopping) until(w.lastRequestUs + int64_t(cfg.heartbeatMs) * 1000);
+    if (!w.ctl.busy && w.helloOk && !w.stopping && w.mapSupported) until(w.nextPollUs);
     if (w.waitingOutq) t = std::min<int64_t>(t, int64_t(w.pollOutDrains ? kOutqSafetyMs : kOutqSliceMs) * 1000);
     if (w.cur.active && w.cur.startWrittenUs) until(w.cur.startWrittenUs + int64_t(cfg.assemblyTimeoutMs) * 1000);
     if (w.s.token) until(w.s.progressUs + int64_t(stallBoundMs()) * 1000);
@@ -1080,6 +1191,8 @@ void Es3DisplayLink::Impl::buildControlFrame(uint8_t type, const uint8_t* payloa
     w.ctl.written    = false;
     w.ctl.seq        = w.nextSeq;
     w.ctl.type       = type;
+    w.ctl.user       = false;   // per request: the callers set what applies after this
+    w.ctl.stopToken  = 0;
     if (type == es3proto::Ping) ++w.st.pingsSent;
 }
 
@@ -1092,7 +1205,9 @@ bool Es3DisplayLink::Impl::buildControl(int64_t now) {
         if (!w.stopSent && !w.stopDone && w.helloOk && w.s.token) {
             uint8_t p[es3video::kStopVideoRequestBytes];
             es3video::encodeStopVideoRequest(w.s.token, p, sizeof(p));
-            buildControlFrame(es3proto::StopVideo, p, sizeof(p));
+            buildControlFrame(w.s.kind == Io::Kind::Map ? uint8_t(es3map::CmdStopMap)
+                                                                 : uint8_t(es3proto::StopVideo),
+                              p, sizeof(p));
             w.stopSent = true;
             ++w.st.stopVideoSent;
             return true;
@@ -1108,6 +1223,11 @@ bool Es3DisplayLink::Impl::buildControl(int64_t now) {
     if (w.wantCaps) {
         w.wantCaps = false;
         buildControlFrame(es3proto::Capabilities, nullptr, 0);
+        return true;
+    }
+    if (w.wantMapCaps) {
+        w.wantMapCaps = false;
+        buildControlFrame(es3map::CmdMapCapabilities, nullptr, 0);
         return true;
     }
 
@@ -1130,9 +1250,24 @@ bool Es3DisplayLink::Impl::buildControl(int64_t now) {
         return true;
     }
 
+    using Kind = Io::Kind;
+    if (sourceSwitch()) return true;
+    const Kind want = desiredKind();
+    if (want == Kind::Map && now >= w.negotiateNotBeforeUs &&
+        (w.s.token == 0 || (w.s.kind == Kind::Map && w.resyncWanted)) && buildStartMap())
+        return true;
     uint16_t vw = 0, vh = 0;
-    if (w.videoSupported && now >= w.negotiateNotBeforeUs && needNegotiation(vw, vh) &&
-        buildStartVideo(now, vw, vh)) {
+    if (w.videoSupported && want == Kind::Video && (w.s.token == 0 || w.s.kind == Kind::Video) &&
+        now >= w.negotiateNotBeforeUs && needNegotiation(vw, vh) && buildStartVideo(now, vw, vh)) {
+        return true;
+    }
+
+    // The board's active page decides the image source (map-capable boards only).
+    if (w.mapSupported && now >= w.nextPollUs) {
+        const bool shown = w.s.token != 0 && w.s.visibility == es3video::DemandActive;
+        w.nextPollUs = now + int64_t(shown ? kPagePollActiveMs : kPagePollIdleMs) * 1000;
+        ++w.st.pagePolls;
+        buildControlFrame(es3proto::Status, nullptr, 0);
         return true;
     }
 
@@ -1162,6 +1297,64 @@ bool Es3DisplayLink::Impl::needNegotiation(uint16_t& vw, uint16_t& vh) {
         return true;
     }
     return false;
+}
+
+/// Which surface the board's receiver should serve: the camera on LIVE, the map
+/// on the map page, None (keep the current session, paused) elsewhere.  Without
+/// the map extension it is always the camera, exactly as before.
+Es3DisplayLink::Impl::Io::Kind Es3DisplayLink::Impl::desiredKind() const {
+    const Io& w = *io;
+    using Kind  = Io::Kind;
+    if (!w.mapSupported) return w.videoSupported ? Kind::Video : Kind::None;
+    if (w.page == w.mapCaps.mapPage) return Kind::Map;
+    if (w.page == 0) return w.videoSupported ? Kind::Video : Kind::None;
+    return Kind::None;
+}
+
+bool Es3DisplayLink::Impl::sourceSwitch() {
+    Io& w = *io;
+    using Kind = Io::Kind;
+    if (!w.mapSupported || w.s.token == 0) return false;
+    const Kind want = desiredKind();
+    if (want == Kind::None || want == w.s.kind) return false;
+    // The receiver is single: end this session before the other may start.
+    abandonCurrent(false, 0);
+    uint8_t p[es3video::kStopVideoRequestBytes];
+    es3video::encodeStopVideoRequest(w.s.token, p, sizeof(p));
+    buildControlFrame(w.s.kind == Kind::Map ? uint8_t(es3map::CmdStopMap) : uint8_t(es3proto::StopVideo), p,
+                      sizeof(p));
+    w.ctl.stopToken = w.s.token;
+    ++w.st.sourceSwitches;
+    logLine(LogLevel::DEBUG, "ES3 display: page %u - switching the image receiver from %s to %s", unsigned(w.page),
+            w.s.kind == Kind::Map ? "map" : "camera", want == Kind::Map ? "map" : "camera");
+    return true;
+}
+
+bool Es3DisplayLink::Impl::buildStartMap() {
+    Io&                     w = *io;
+    es3map::StartMapRequest r;
+    r.page               = w.mapCaps.mapPage;
+    r.viewportX          = w.mapCaps.viewportX;
+    r.viewportY          = w.mapCaps.viewportY;
+    r.viewportW          = w.mapCaps.viewportW;
+    r.viewportH          = w.mapCaps.viewportH;
+    r.maxJpegBytes       = w.mapMaxJpeg;
+    r.chunkBytes         = w.chunk;
+    r.targetFps          = cfg.mapTargetFps;
+    r.assemblyTimeoutMs  = cfg.assemblyTimeoutMs;
+    r.staleAfterMs       = cfg.mapStaleAfterMs;
+    r.placeholderAfterMs = cfg.mapPlaceholderAfterMs;
+    r.generation         = ++w.mapGeneration;
+    uint8_t p[es3map::kStartMapRequestBytes];
+    if (es3map::encodeStartMapRequest(r, w.mapCaps, w.caps, p, sizeof(p)) == 0) {
+        negotiationFailed("the START_MAP request does not fit the board's map capabilities");
+        return false;
+    }
+    abandonCurrent(false, 0);
+    buildControlFrame(es3map::CmdStartMap, p, sizeof(p));
+    w.ctl.map = r;
+    setState(LinkState::Negotiated);
+    return true;
 }
 
 bool Es3DisplayLink::Impl::buildStartVideo(int64_t now, uint16_t vw, uint16_t vh) {
@@ -1219,14 +1412,21 @@ bool Es3DisplayLink::Impl::buildVideo(int64_t now) {
     Io& w = *io;
     w.waitingOutq = false;
     if (w.stopping || !w.videoSupported || w.s.token == 0) return false;
-    if (w.ctl.busy && w.ctl.type == es3proto::StartVideo) return false;   // renegotiating
+    if (w.ctl.busy && (w.ctl.type == es3proto::StartVideo || w.ctl.type == es3map::CmdStartMap ||
+                       w.ctl.type == es3proto::StopVideo || w.ctl.type == es3map::CmdStopMap))
+        return false;   // (re)negotiating or switching the source
+    if (w.mapSupported) {   // a switch is due: nothing more for the outgoing surface
+        const Io::Kind want = desiredKind();
+        if (want != Io::Kind::None && want != w.s.kind) return false;
+    }
 
     if (!w.cur.active) {
         if (w.s.visibility != es3video::DemandActive || w.resyncWanted) return false;
         bool ready = false;
         {
             std::lock_guard<std::mutex> lk(handoffMu);
-            ready = pending && pending.width() == w.s.req.viewportW && pending.height() == w.s.req.viewportH;
+            EncodedFrameLease& src = pendingFor(w.s.kind);
+            ready = src && src.width() == w.s.req.viewportW && src.height() == w.s.req.viewportH;
         }
         if (!ready) return false;
         const bool credit = w.s.started < w.s.grant && w.s.started - w.s.results < w.window;
@@ -1241,9 +1441,9 @@ bool Es3DisplayLink::Impl::buildVideo(int64_t now) {
         {
             std::lock_guard<std::mutex> lk(handoffMu);
             // Re-check: offerFrame() may have replaced it meanwhile.
-            if (!pending || pending.width() != w.s.req.viewportW || pending.height() != w.s.req.viewportH)
-                return false;
-            w.cur.lease = std::move(pending);
+            EncodedFrameLease& src = pendingFor(w.s.kind);
+            if (!src || src.width() != w.s.req.viewportW || src.height() != w.s.req.viewportH) return false;
+            w.cur.lease = std::move(src);
         }
         w.s.creditBlocked = false;
         es3video::StartInfo info;
@@ -1435,6 +1635,52 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
                  c.maxJpegBytes, w.maxJpeg, unsigned(c.maxChunkBytes), unsigned(w.chunk), unsigned(c.maxCredits),
                  unsigned(w.window));
         setState(LinkState::Negotiated);
+        if (cfg.map && !w.mapKnown) w.wantMapCaps = true;   // the map shares these limits
+        publishVideo();
+        return;
+    }
+    case es3map::CmdMapCapabilities: {
+        es3map::MapCapabilities m;
+        w.mapKnown = true;
+        if (!es3map::decodeMapCapabilitiesReply(f.payload, f.length, w.caps, m)) {
+            w.mapSupported = false;
+            logQuiet(QCaps, LogLevel::WARN,
+                     "ES3 display: unusable MAP_CAPABILITIES reply (%u bytes, map protocol %u) - no map",
+                     unsigned(f.length), f.length ? unsigned(f.payload[0]) : 0u);
+            publishVideo();
+            return;
+        }
+        w.mapSupported = true;
+        w.mapCaps      = m;
+        w.mapMaxJpeg   = std::min<uint32_t>(cfg.mapMaxJpegBytes, m.maxJpegBytes);
+        w.nextPollUs   = 0;   // learn the active page at once
+        logQuiet(QCaps, LogLevel::INFO, "ES3 display: map v%u on page %u of %u, viewport %u,%u %ux%u, JPEG %u B",
+                 unsigned(m.mapProtocolVersion), unsigned(m.mapPage), unsigned(m.pageCount), m.viewportX,
+                 m.viewportY, m.viewportW, m.viewportH, w.mapMaxJpeg);
+        publishVideo();
+        return;
+    }
+    case es3map::CmdStartMap: {
+        es3map::StartMapReply r;
+        if (!es3map::decodeStartMapReply(f.payload, f.length, r)) {
+            negotiationFailed("malformed START_MAP reply");
+            return;
+        }
+        endSession();
+        w.s.kind        = Io::Kind::Map;
+        w.s.token       = r.sessionToken;
+        w.s.req         = es3map::sessionLimits(done.map);
+        w.s.grant       = r.initialGrant;
+        w.s.nextFrameId = 1;
+        w.s.visibility  = es3video::DemandActive;   // the board re-sends VISIBILITY now
+        w.s.progressUs  = nowUs();
+        w.resyncWanted  = false;
+        ++w.st.sessions;
+        ++w.st.mapSessions;
+        w.quiet[QNegotiate].clear();
+        logLine(LogLevel::DEBUG, "ES3 display: map session %08x (generation %u), grant %u", r.sessionToken,
+                done.map.generation, r.initialGrant);
+        setState(LinkState::Active);
         publishVideo();
         return;
     }
@@ -1445,6 +1691,7 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
             return;
         }
         endSession();   // the old token's frames can no longer complete
+        w.s.kind        = Io::Kind::Video;
         w.s.token       = r.sessionToken;
         w.s.req         = done.video;
         w.s.grant       = r.initialGrant;
@@ -1462,7 +1709,14 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
         return;
     }
     case es3proto::StopVideo:
-        if (w.stopping) w.stopDone = true;
+    case es3map::CmdStopMap:
+        if (w.stopping) {
+            w.stopDone = true;
+        } else if (done.stopToken && done.stopToken == w.s.token) {   // a source switch
+            endSession();
+            setState(LinkState::Negotiated);
+            publishVideo();
+        }
         return;
     case es3proto::Status:
         if (f.length == 9) {
@@ -1471,7 +1725,15 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
             tmp.command = es3proto::Status;
             tmp.length  = f.length;
             std::memcpy(tmp.payload, f.payload, f.length);
-            w.st.haveStatus = parseDeviceStatus(tmp, w.st.lastStatus) || w.st.haveStatus;
+            DeviceStatus ds;
+            if (parseDeviceStatus(tmp, ds)) {
+                w.st.lastStatus = ds;
+                w.st.haveStatus = true;
+                if (ds.page != w.page) {
+                    w.page = ds.page;
+                    publishVideo();
+                }
+            }
         }
         break;
     default:
@@ -1509,8 +1771,25 @@ void Es3DisplayLink::Impl::onError(Io::Control& done, uint8_t code) {
     case es3proto::StartVideo:
         negotiationFailed(std::string("START_VIDEO refused: ") + errorName(code));
         return;
+    case es3map::CmdMapCapabilities:
+        w.mapKnown     = true;
+        w.mapSupported = false;
+        logQuiet(QCaps, (code == es3proto::BadCommand || code == es3proto::NotReady) ? LogLevel::INFO : LogLevel::WARN,
+                 "ES3 display: no map on this firmware (MAP_CAPABILITIES: %s) - camera preview only", errorName(code));
+        publishVideo();
+        return;
+    case es3map::CmdStartMap:
+        negotiationFailed(std::string("START_MAP refused: ") + errorName(code));
+        return;
     case es3proto::StopVideo:
-        if (w.stopping) w.stopDone = true;
+    case es3map::CmdStopMap:
+        if (w.stopping) {
+            w.stopDone = true;
+        } else if (done.stopToken && done.stopToken == w.s.token) {   // the board no longer has it either
+            endSession();
+            setState(LinkState::Negotiated);
+            publishVideo();
+        }
         return;
     default:
         break;
@@ -1574,7 +1853,10 @@ void Es3DisplayLink::Impl::onVideo(const es3video::Record& r) {
         if (d == w.s.visibility) return;
         w.s.visibility = d;
         w.s.progressUs = now;
-        logLine(LogLevel::DEBUG, "ES3 display: video demand %s",
+        // Hidden right after being shown: the user just left that tab, so learn the
+        // new page now rather than at the next 1 s poll (a faster camera/map switch).
+        if (w.mapSupported && d != es3video::DemandActive) w.nextPollUs = 0;
+        logLine(LogLevel::DEBUG, "ES3 display: %s demand %s", w.s.kind == Io::Kind::Map ? "map" : "video",
                 d == es3video::DemandActive ? "active" : d == es3video::DemandHidden ? "hidden" : "calibrating");
         setState(d == es3video::DemandActive ? LinkState::Active : LinkState::Paused);
         publishVideo();
@@ -1705,15 +1987,17 @@ void Es3DisplayLink::Impl::negotiationFailed(const std::string& why) {
     endSession();
     setState(LinkState::Negotiated);
     // The pending frame would trigger the retry at once; newer frames will do.
-    EncodedFrameLease dropped;
+    EncodedFrameLease dropped, droppedMap;
     {
         std::lock_guard<std::mutex> lk(handoffMu);
         if (pending) dropped = std::move(pending);
+        if (mapPending) droppedMap = std::move(mapPending);
     }
-    if (dropped) {
-        ++w.st.framesReleased;
-        dropped.release();
-    }
+    for (EncodedFrameLease* l : {&dropped, &droppedMap})
+        if (*l) {
+            ++w.st.framesReleased;
+            l->release();
+        }
     publishVideo();
 }
 

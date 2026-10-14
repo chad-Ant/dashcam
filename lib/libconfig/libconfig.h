@@ -534,6 +534,43 @@ bool validateDisplayPreview(const DisplayPreviewConfig& cfg,
                             std::vector<std::string>& problems);
 
 /**
+ * @brief Position map on the ES3C28P's MAP tab (lib/libnavigation).
+ * XML section: @c \<Navigation\>
+ *
+ * See peripherals/es3c28p/NAVIGATION_PLAN.md.  Online raster tiles (OpenStreetMap
+ * by default) are fetched only while the map is on screen, cached on disk, and
+ * composed on the Jetson; GPS comes from the existing ESP32-C3 bridge telemetry.
+ * Opt-in (absent section = off).  The display link itself (device path, heartbeat,
+ * reconnect, chunk size, frames in flight) is configured in \<DisplayPreview\>,
+ * whose settings apply to the map too even while the camera preview is disabled.
+ * Navigation failures never affect recording or startup.
+ */
+struct NavigationConfig {
+    ConfigVar<bool>        enabled           {"Enabled",           false, "Show the position map on the ES3C28P's MAP tab. Needs map-capable display firmware; the link settings come from <DisplayPreview> (its Device etc.) even when the camera preview there is disabled"};
+    ConfigVar<std::string> providerUrl       {"ProviderUrl",       "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "XYZ raster tile URL template with {z} {x} {y}; 256x256 PNG tiles. https only (http is accepted for 127.0.0.1/localhost test servers). The OSM default is subject to the OSMF tile usage policy: visible map only, no prefetch or offline download"};
+    ConfigVar<std::string> providerId        {"ProviderId",        "osm-standard", "Cache namespace for ProviderUrl: change it when the provider or its style changes so old tiles are not shown as the new style"};
+    ConfigVar<std::string> userAgent         {"UserAgent",         "DashcamES3Map/1.0 (+https://github.com/chad-Ant/dashcam)", "HTTP User-Agent identifying this application to the tile server (required by the OSM policy); never a generic library or browser string"};
+    ConfigVar<std::string> attribution       {"Attribution",       "\xC2\xA9 OpenStreetMap contributors", "Credit drawn in the map's bottom strip whenever map imagery is visible (required by the tile/data licence)"};
+    ConfigVar<std::string> cachePath         {"CachePath",         "/user/output/navcache/tiles.sqlite", "SQLite tile cache file on persistent storage (the directory is created)"};
+    ConfigVar<int>         cacheBudgetMB     {"CacheBudgetMB",     256,  16,  4096, 16, "Disk budget for cached tiles (MiB); least-recently-used tiles outside the current view are evicted beyond it"};
+    ConfigVar<int>         zoom              {"Zoom",              16,   12,  18,   1,  "Map zoom level (16: about 2.4 m per pixel at the equator)"};
+    ConfigVar<int>         maxFps            {"MaxFps",            4,    1,   10,   1,  "Map frame-rate ceiling while the MAP tab is shown; also the START_MAP target fps"};
+    ConfigVar<int>         warmFps           {"WarmFps",           1,    0,   4,    1,  "Re-render rate while the MAP tab is hidden (from the disk cache only, nothing sent), so switching to the map shows a fresh frame at once; 0 = no warm rendering"};
+    ConfigVar<int>         jpegQuality       {"JpegQuality",       80,   40,  95,   1,  "Map JPEG quality (4:4:4 for legible text); retried at 70 then 60 if a frame exceeds the display's JPEG limit"};
+    ConfigVar<int>         gpsStaleMs        {"GpsStaleMs",        1500, 500, 10000, 100, "A bridge telemetry sample older than this (ms) shows the position as 'Last known' (grey marker)"};
+    ConfigVar<int>         staleAfterMs      {"StaleAfterMs",      2000, 100, 9900, 100, "Display side: time without a new map frame (ms) before the board marks the map stale"};
+    ConfigVar<int>         placeholderAfterMs{"PlaceholderAfterMs",5000, 200, 10000, 100, "Display side: time without a new map frame (ms) before the board shows 'Map unavailable'; must exceed StaleAfterMs"};
+};
+
+/**
+ * @brief Check the NavigationConfig rules clamping cannot express: ProviderUrl has
+ *        {z} {x} {y} and is https (http only to 127.0.0.1/localhost); UserAgent,
+ *        Attribution, ProviderId and CachePath are non-empty; PlaceholderAfterMs >
+ *        StaleAfterMs.  Pure; same use as validateDisplayPreview().
+ */
+bool validateNavigation(const NavigationConfig& cfg, std::vector<std::string>& problems);
+
+/**
  * @brief Aggregated application configuration.
  * Root XML element: @c \<DashcamConfig\>
  */
@@ -548,6 +585,7 @@ struct AppConfig {
     LogConfig                 log;
     NetworkConfig             network;
     DisplayPreviewConfig      displayPreview;
+    NavigationConfig          navigation;
 };
 
 // ─── reader / writer ─────────────────────────────────────────────────────────

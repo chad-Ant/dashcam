@@ -12,6 +12,12 @@ The [voice-command plan](VOICE_COMMAND_PLAN.md) covers ES3C28P microphone
 capture and offline Jetson recognition for **English, tap-to-speak tab
 navigation**, with voice and video preview operating in separate modes. Voice is not implemented.
 
+The [navigation plan](NAVIGATION_PLAN.md) covers an OpenStreetMap-based position
+and direction-of-travel display: online tiles cached and rendered on the Jetson,
+then sent over USB to the ES3C28P and shown on a new MAP tab (north-up).
+The Jetson side and the map wire extension (`Es3MapProtocol.h`) are implemented;
+the firmware side is not yet (the plan's "Firmware work" list).
+
 ESP32-S3 port of `../cyd`, for the LCDWiki **ES3C28P N16R8** capacitive-touch
 board (16 MB flash, 8 MB OPI PSRAM). The existing CYD firmware remains separate.
 This is the same dashboard demo: Live, Trip, Camera, System and Settings tabs,

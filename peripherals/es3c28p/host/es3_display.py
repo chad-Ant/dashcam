@@ -469,6 +469,86 @@ def parse_stop_video(body):
     return struct.unpack("<I", body)[0]
 
 
+# ─── map extension v1 (Es3MapProtocol.h; tests/map_golden_vectors.txt) ───────
+
+CMD_MAP_CAPABILITIES = 0x0A
+CMD_START_MAP = 0x0B
+CMD_STOP_MAP = 0x0C
+MAP_VERSION = 1
+MAP_MAX_PAGES = 8
+MAP_FLAG_TAB = 0x01
+MAP_CAPABILITIES_FORMAT = "<BBBHHHHIB"       # 16 bytes
+MAP_CAPABILITIES_FIELDS = ("map_protocol_version", "page_count", "map_page", "viewport_x", "viewport_y",
+                           "viewport_w", "viewport_h", "max_jpeg_bytes", "flags")
+START_MAP_FORMAT = "<BBHHHHIHBHHHI"         # 27 bytes
+START_MAP_FIELDS = ("map_protocol_version", "page", "viewport_x", "viewport_y", "viewport_w", "viewport_h",
+                    "max_jpeg_bytes", "chunk_bytes", "target_fps", "assembly_timeout_ms", "stale_after_ms",
+                    "placeholder_after_ms", "generation")
+
+
+def valid_map_capabilities(m, caps):
+    """The board's map limits, checked against its video capabilities (shared canvas/decoder)."""
+    return (valid_capabilities(caps) and m["map_protocol_version"] == MAP_VERSION
+            and 1 <= m["page_count"] <= MAP_MAX_PAGES and m["map_page"] < m["page_count"]
+            and 0 < m["viewport_w"] <= caps["max_width"] and 0 < m["viewport_h"] <= caps["max_height"]
+            and m["viewport_x"] + m["viewport_w"] <= caps["canvas_width"]
+            and m["viewport_y"] + m["viewport_h"] <= caps["canvas_height"]
+            and 0 < m["max_jpeg_bytes"] <= caps["max_jpeg_bytes"])
+
+
+def map_capabilities_payload(caps, **fields):
+    m = dict(map_protocol_version=MAP_VERSION, flags=MAP_FLAG_TAB)
+    m.update(fields)
+    if set(m) != set(MAP_CAPABILITIES_FIELDS) or not valid_map_capabilities(m, caps):
+        raise ValueError("invalid map capabilities")
+    return struct.pack(MAP_CAPABILITIES_FORMAT, *(m[name] for name in MAP_CAPABILITIES_FIELDS))
+
+
+def parse_map_capabilities(body, caps):
+    if len(body) != struct.calcsize(MAP_CAPABILITIES_FORMAT):
+        raise ValueError("map capabilities reply must be 16 bytes")
+    m = dict(zip(MAP_CAPABILITIES_FIELDS, struct.unpack(MAP_CAPABILITIES_FORMAT, body)))
+    if not valid_map_capabilities(m, caps):
+        raise ValueError(f"unsupported map capabilities {m}")
+    return m
+
+
+def valid_start_map(r, m, caps):
+    if not valid_map_capabilities(m, caps) or r["map_protocol_version"] != MAP_VERSION or r["page"] != m["map_page"]:
+        return False
+    if any(r[k] != m[k] for k in ("viewport_x", "viewport_y", "viewport_w", "viewport_h")):
+        return False
+    return (0 < r["max_jpeg_bytes"] <= m["max_jpeg_bytes"] and 0 < r["chunk_bytes"] <= caps["max_chunk_bytes"]
+            and 0 < r["target_fps"] <= MAX_TARGET_FPS
+            and 0 < r["assembly_timeout_ms"] <= MAX_TIMEOUT_MS and 0 < r["stale_after_ms"] <= MAX_TIMEOUT_MS
+            and r["stale_after_ms"] <= r["placeholder_after_ms"] <= MAX_TIMEOUT_MS)
+
+
+def start_map_payload(m, caps, **fields):
+    """START_MAP request body; the viewport defaults to the board's map viewport."""
+    r = dict(map_protocol_version=MAP_VERSION, page=m["map_page"], viewport_x=m["viewport_x"],
+             viewport_y=m["viewport_y"], viewport_w=m["viewport_w"], viewport_h=m["viewport_h"], generation=0)
+    r.update(fields)
+    if set(r) != set(START_MAP_FIELDS) or not valid_start_map(r, m, caps):
+        raise ValueError("START_MAP request outside the board's map capabilities")
+    return struct.pack(START_MAP_FORMAT, *(r[name] for name in START_MAP_FIELDS))
+
+
+def parse_start_map(body, m, caps):
+    if len(body) != struct.calcsize(START_MAP_FORMAT):
+        raise ValueError("START_MAP request must be 27 bytes")
+    r = dict(zip(START_MAP_FIELDS, struct.unpack(START_MAP_FORMAT, body)))
+    if not valid_start_map(r, m, caps):
+        raise ValueError("START_MAP request outside the board's map capabilities")
+    return r
+
+
+start_map_reply_payload = start_video_reply_payload
+parse_start_map_reply = parse_start_video_reply
+stop_map_payload = stop_video_payload
+parse_stop_map = parse_stop_video
+
+
 class RemoteError(RuntimeError):
     def __init__(self, message, code=None):
         super().__init__(message)

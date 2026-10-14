@@ -14,10 +14,15 @@ for std in c++11 c++17; do
     c++ -std=$std -Wall -Wextra -Werror "$TEST_DIR/video_protocol_test.cpp" -o "$TEST_BUILD/video_protocol_$std"
     "$TEST_BUILD/video_protocol_$std" "$TEST_DIR/video_golden_vectors.txt"
 done
+# Map extension (Es3MapProtocol.h): the same two standards.
+for std in c++11 c++17; do
+    c++ -std=$std -Wall -Wextra -Werror "$TEST_DIR/map_protocol_test.cpp" -o "$TEST_BUILD/map_protocol_$std"
+    "$TEST_BUILD/map_protocol_$std" "$TEST_DIR/map_golden_vectors.txt"
+done
 c++ -std=c++11 -Wall -Wextra -Werror -I"$TEST_DIR/../lib/es3UsbLink" "$TEST_DIR/video_state_test.cpp" -o "$TEST_BUILD/video_state"
 "$TEST_BUILD/video_state"
 # The Jetson link library compiles its own copies; they must not drift.
-for header in Es3Protocol.h Es3VideoProtocol.h; do
+for header in Es3Protocol.h Es3VideoProtocol.h Es3MapProtocol.h; do
     cmp "$TEST_DIR/../lib/es3UsbLink/$header" "$REPO_DIR/lib/libes3display/$header"
 done
 ES3_PROTOCOL_TEST="$TEST_BUILD/protocol" python3 "$TEST_DIR/test_usb_client.py"

@@ -6,7 +6,8 @@
 # re-encode) into gapless 3-minute MKV segments with an .ass clock sidecar,
 # starting as soon as the program starts.  Loop overwrite keeps its own
 # footage under <Recording><MaxFootageGB> and free space above <MinFreeGB>.
-# No lane detection, no driver monitoring, no network.
+# No lane detection, no driver monitoring.  The optional ES3C28P display
+# (<DisplayPreview> camera preview, <Navigation> map) is off by default.
 #
 # Startup is fast: the newest existing bin/build_*/dashcam_v0_4 is reused and
 # only compiled when none exists (or with --rebuild).  Inside the container a
@@ -14,10 +15,11 @@
 # its teardown watchdog fired); a clean exit (SIGINT/SIGTERM) ends the loop.
 # No terminal is needed, so systemd can run this script (see below).
 #
-# Storage: /user/output/{configs,footage,logs} are bind mounts onto
+# Storage: /user/output/{configs,footage,logs,navcache} are bind mounts onto
 # $MEDIA_DIR; if the footage mount is unusable the program records into
 # <repo>/footage_fallback/ (same loop-overwrite rules) and moves back when the
-# mount works again.
+# mount works again.  navcache holds the <Navigation> map tile cache (SQLite,
+# <CacheBudgetMB>), so tiles survive restarts instead of being downloaded again.
 #
 # Autostart at boot (needs sudo once):
 #   sudo cp /home/$USER/dashcam/docker_dev/dashcam-v04.service /etc/systemd/system/
@@ -57,6 +59,7 @@ exec docker run $TTY_FLAGS --rm --name "$CONTAINER_NAME" --stop-timeout 20 \
     -v $MEDIA_DIR/configs:/user/output/configs \
     -v $MEDIA_DIR/footage:/user/output/footage \
     -v $MEDIA_DIR/logs:/user/output/logs \
+    -v $MEDIA_DIR/navcache:/user/output/navcache \
     -v /etc/localtime:/etc/localtime:ro \
     -v /etc/timezone:/etc/timezone:ro \
     $IMAGE_NAME bash -c '

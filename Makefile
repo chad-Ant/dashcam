@@ -26,6 +26,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/liblanedetector \
             -Ilib/liblog \
             -Ilib/libmidi \
+            -Ilib/libnavigation \
             -Ilib/libnetwork \
             -Ilib/librecord \
             -Ilib/libspi \
@@ -35,7 +36,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g \
             -Ilib/libvideopreview \
             $(shell pkg-config --cflags \
                 gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 \
-                pugixml opencv4 spdlog)
+                pugixml opencv4 spdlog libcurl libpng sqlite3)
 
 LD_BASE := $(shell pkg-config --libs \
                gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 \
@@ -47,6 +48,7 @@ LD_TRT  := -L/usr/local/cuda/lib -L/usr/local/cuda/lib64 -lnvinfer -lcudart
 LD_VPI  := -lvpi
 LD_GPIO  := -lgpiod
 LD_ALSA  := -lasound
+LD_NAV   := $(shell pkg-config --libs libcurl libpng sqlite3)
 LD_JPEG  := $(shell pkg-config --libs libjpeg)
 
 # ─── library source groups ────────────────────────────────────────────────────
@@ -88,6 +90,8 @@ LIBSTEREO_SRCS := lib/libstereocam/libstereocam.cpp
 LIBPREVIEW_SRCS := lib/libvideopreview/libvideopreview.cpp \
                    lib/libvideopreview/libvideopreview_convert.cpp
 LIBES3_SRCS     := lib/libes3display/libes3display.cpp
+LIBNAV_SRCS     := lib/libnavigation/libnavigation.cpp lib/libnavigation/nav_geo.cpp \
+                   lib/libnavigation/nav_tiles.cpp lib/libnavigation/nav_compose.cpp
 
 # ─── build directory (timestamped so parallel invocations don't collide) ──────
 
@@ -128,10 +132,11 @@ V03_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIB
 
 # dashcam_v0_4: recording-only app — one UVC camera, compressed passthrough into
 # gapless segments with loop overwrite, plus the optional ES3C28P display preview
-# (libvideopreview + libes3display, libjpeg); no inference, no network (no TRT/OpenCV)
+# and map (libvideopreview + libes3display + libnavigation: libjpeg, libcurl, libpng, sqlite3);
+# no inference (no TRT/OpenCV)
 V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCAM_FOCUS_SRCS) $(LIBCFG_SRCS) \
                 $(LIBREC_SRCS) $(LIBNET_SRCS) $(LIBUART_SRCS) $(LIBCOMM_SRCS) $(LIBTIME_SRCS) \
-                $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) src/dashcam_v0_4.cpp)
+                $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) $(LIBNAV_SRCS) src/dashcam_v0_4.cpp)
 
 # timesync_test: NTP-first / GPS-fallback clock decisions + clock-jump detection (no privileges)
 TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests/test_timesync.cpp)
@@ -142,6 +147,10 @@ BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) src/tests/test_bridge_overla
 # videopreview_test: libvideopreview MJPEG -> letterboxed preview JPEG (DCT-scaled decode, resize,
 # capped encode) + never-blocking submission, worker and lease pool (synthesized JPEGs, mock sink)
 PREVIEW_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPREVIEW_SRCS) src/tests/test_libvideopreview.cpp)
+
+# navigation_test: libnavigation (GPS state, Web Mercator, tile PNG/HTTP caching rules, SQLite tile
+# cache, map compositor, NavigationService against a fake HTTP tile server on 127.0.0.1) — no network
+NAV_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPREVIEW_SRCS) $(LIBNAV_SRCS) src/tests/test_libnavigation.cpp)
 
 # es3display_test: libes3display (ES3C28P USB tty owner: handshake, CAPABILITIES/START_VIDEO, credited
 # E3 29 video with control priority + TIOCOUTQ gating, reconnect) against a fake display on a pty
@@ -211,7 +220,7 @@ ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
                    $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS) \
-                   $(PREVIEW_TEST_OBJS) $(ES3_TEST_OBJS))
+                   $(PREVIEW_TEST_OBJS) $(ES3_TEST_OBJS) $(NAV_TEST_OBJS))
 
 DEPS := $(ALL_OBJS:.o=.d)
 
@@ -229,6 +238,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/timesync_test \
            $(BUILD_DIR)/bridge_overlay_test \
            $(BUILD_DIR)/videopreview_test \
+           $(BUILD_DIR)/navigation_test \
            $(BUILD_DIR)/es3display_test \
            $(BUILD_DIR)/scan_cameras \
            $(BUILD_DIR)/config_test \
@@ -268,6 +278,10 @@ config_test: $(BUILD_DIR)/config_test | $(BUILD_DIR)/logs
 .PHONY: videopreview_test
 videopreview_test: $(BUILD_DIR)/videopreview_test | $(BUILD_DIR)/logs
 	@echo "Built videopreview_test in $(BUILD_DIR)/"
+
+.PHONY: navigation_test
+navigation_test: $(BUILD_DIR)/navigation_test | $(BUILD_DIR)/logs
+	@echo "Built navigation_test in $(BUILD_DIR)/"
 .PHONY: es3display_test
 es3display_test: $(BUILD_DIR)/es3display_test | $(BUILD_DIR)/logs
 	@echo "Built es3display_test in $(BUILD_DIR)/"
@@ -318,7 +332,7 @@ $(BUILD_DIR)/dashcam_v0_3: $(V03_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)
 
 $(BUILD_DIR)/dashcam_v0_4: $(V04_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG) $(LD_NAV)
 
 $(BUILD_DIR)/exposure_test: $(EXPO_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
@@ -337,6 +351,9 @@ $(BUILD_DIR)/bridge_overlay_test: $(BRIDGE_OVL_OBJS)
 
 $(BUILD_DIR)/videopreview_test: $(PREVIEW_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
+
+$(BUILD_DIR)/navigation_test: $(NAV_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG) $(LD_NAV)
 
 $(BUILD_DIR)/es3display_test: $(ES3_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)

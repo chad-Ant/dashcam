@@ -518,6 +518,42 @@ static void writeDriverScore(pugi::xml_node parent, const DriverScoreConfig& s) 
     writeVar(n, s.noFaceFreezes);
 }
 
+static void parseNavigation(pugi::xml_node node, NavigationConfig& n,
+                            const dashcam::log::LogCallback& log) {
+    readVar(node, n.enabled,            log);
+    readVar(node, n.providerUrl,        log);
+    readVar(node, n.providerId,         log);
+    readVar(node, n.userAgent,          log);
+    readVar(node, n.attribution,        log);
+    readVar(node, n.cachePath,          log);
+    readVar(node, n.cacheBudgetMB,      log);
+    readVar(node, n.zoom,               log);
+    readVar(node, n.maxFps,             log);
+    readVar(node, n.warmFps,            log);
+    readVar(node, n.jpegQuality,        log);
+    readVar(node, n.gpsStaleMs,         log);
+    readVar(node, n.staleAfterMs,       log);
+    readVar(node, n.placeholderAfterMs, log);
+}
+
+static void writeNavigation(pugi::xml_node parent, const NavigationConfig& c) {
+    pugi::xml_node n = parent.append_child("Navigation");
+    writeVar(n, c.enabled);
+    writeVar(n, c.providerUrl);
+    writeVar(n, c.providerId);
+    writeVar(n, c.userAgent);
+    writeVar(n, c.attribution);
+    writeVar(n, c.cachePath);
+    writeVar(n, c.cacheBudgetMB);
+    writeVar(n, c.zoom);
+    writeVar(n, c.maxFps);
+    writeVar(n, c.warmFps);
+    writeVar(n, c.jpegQuality);
+    writeVar(n, c.gpsStaleMs);
+    writeVar(n, c.staleAfterMs);
+    writeVar(n, c.placeholderAfterMs);
+}
+
 static void writeDisplayPreview(pugi::xml_node parent, const DisplayPreviewConfig& p) {
     pugi::xml_node n = parent.append_child("DisplayPreview");
     writeVar(n, p.enabled);
@@ -570,6 +606,8 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
     if (auto net = root.child("Network"))   parseNetwork  (net, config.network,   log);
     if (auto dp  = root.child("DisplayPreview"))
         parseDisplayPreview(dp, config.displayPreview, log);
+    if (auto nv  = root.child("Navigation"))
+        parseNavigation(nv, config.navigation, log);
 
     if (auto cams = root.child("Cameras")) {
         config.cameras.clear();
@@ -607,6 +645,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writeLog(root, config.log);
     writeNetwork(root, config.network);
     writeDisplayPreview(root, config.displayPreview);
+    writeNavigation(root, config.navigation);
 
     if (!doc.save_file(filePath.c_str(), "  ")) {
         doLog(log, dashcam::log::LogLevel::ERROR,
@@ -658,6 +697,31 @@ bool validateDisplayPreview(const DisplayPreviewConfig& cfg,
     if (cfg.enabled && device.empty())
         problems.push_back("DisplayPreview is enabled but Device is empty "
                            "(no port is probed; set the display's udev alias or by-id path)");
+    return problems.empty();
+}
+
+bool validateNavigation(const NavigationConfig& cfg, std::vector<std::string>& problems) {
+    problems.clear();
+    const std::string& url = cfg.providerUrl;
+    const bool https = url.rfind("https://", 0) == 0;
+    const bool localHttp = url.rfind("http://127.0.0.1", 0) == 0 || url.rfind("http://localhost", 0) == 0;
+    if (!https && !localHttp)
+        problems.push_back("Navigation ProviderUrl '" + url + "' must be https:// (http only for 127.0.0.1/localhost)");
+    for (const char* key : {"{z}", "{x}", "{y}"})
+        if (url.find(key) == std::string::npos)
+            problems.push_back(std::string("Navigation ProviderUrl lacks ") + key);
+    const std::string& ua = cfg.userAgent;
+    if (ua.empty()) problems.push_back("Navigation UserAgent is empty (the tile server must be able to identify the app)");
+    const std::string& attr = cfg.attribution;
+    if (attr.empty()) problems.push_back("Navigation Attribution is empty (the map licence requires visible credit)");
+    const std::string& id = cfg.providerId;
+    if (id.empty()) problems.push_back("Navigation ProviderId is empty");
+    const std::string& cache = cfg.cachePath;
+    if (cache.empty()) problems.push_back("Navigation CachePath is empty");
+    if (cfg.placeholderAfterMs <= cfg.staleAfterMs)
+        problems.push_back("Navigation PlaceholderAfterMs " +
+                           std::to_string(static_cast<int>(cfg.placeholderAfterMs)) + " must exceed StaleAfterMs " +
+                           std::to_string(static_cast<int>(cfg.staleAfterMs)));
     return problems.empty();
 }
 

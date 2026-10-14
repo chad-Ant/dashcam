@@ -83,6 +83,7 @@
 #ifndef LIBES3DISPLAY_H
 #define LIBES3DISPLAY_H
 
+#include "Es3MapProtocol.h"
 #include "Es3VideoProtocol.h"
 #include "liblog.h"
 #include "libvideopreview.h"
@@ -101,7 +102,10 @@ namespace dashcam::es3display {
 constexpr size_t   kControlQueueDepth = 8;     ///< Application requests waiting for the slot.
 constexpr size_t   kLatencyWindow     = 128;   ///< Samples behind each p50/p95.
 constexpr size_t   kPageTextBytes     = es3proto::kTextBytes;  ///< 24: 23 chars + NUL.
-constexpr uint8_t  kPageCount         = 5;     ///< Live, Trip, Camera, System, Settings.
+constexpr uint8_t  kPageCount         = 5;     ///< Live, Trip, Camera, System, Settings (firmware without the map).
+constexpr uint8_t  kMaxPageCount      = es3map::kMaxPages;  ///< PAGE index ceiling; the board's page_count gates it.
+constexpr uint32_t kPagePollActiveMs  = 1000;  ///< STATUS poll while a session's surface is visible.
+constexpr uint32_t kPagePollIdleMs    = 250;   ///< ... while none is (the host must notice LIVE / MAP).
 constexpr char     kDeviceIdentity[]  = "ES3C28P";  ///< The HELLO reply that identifies the board.
 
 // ─── configuration ────────────────────────────────────────────────────────────
@@ -134,6 +138,14 @@ struct DisplayLinkConfig {
     /// No credit/RESULT progress for this long with frames outstanding →
     /// renegotiate.  0 = max(2000, 4 × assemblyTimeoutMs); else 100–60000.
     uint32_t creditStallMs      = 0;
+    /// Map surface (lib/libnavigation): ask MAP_CAPABILITIES and coordinate
+    /// camera/map by the board's active page.  The fields below are the map
+    /// session's START_MAP settings (<Navigation> MaxFps/StaleAfterMs/PlaceholderAfterMs).
+    bool     map                   = false;
+    uint8_t  mapTargetFps          = 4;      ///< 1-30.
+    uint32_t mapMaxJpegBytes       = 65536;  ///< 1024-65536; the board's limit can lower it.
+    uint16_t mapStaleAfterMs       = 2000;   ///< 1-10000.
+    uint16_t mapPlaceholderAfterMs = 5000;   ///< mapStaleAfterMs-10000.
     /// Hold video records while TIOCOUTQ reports at least this many bytes.
     /// 0 = one full CHUNK record (chunk + 20 B): about one record queued at a time.
     uint32_t txQueueLimitBytes  = 0;
@@ -198,7 +210,8 @@ struct ControlRequest {
     static ControlRequest status();                       ///< Reply: see parseDeviceStatus().
     static ControlRequest stopAudio();
     static ControlRequest alert(uint8_t volume);          ///< volume 0–100; plays /alert.wav.
-    /// @p index < kPageCount; title and lines printable ASCII, at most 23 chars.
+    /// @p index < kMaxPageCount (the link refuses an index the board does not
+    /// have: 0-4, or 0-5 with the MAP tab); title and lines printable ASCII, at most 23 chars.
     static ControlRequest page(uint8_t index, const std::string& title,
                                const std::array<std::string, 4>& lines);
 };
@@ -298,6 +311,14 @@ struct DisplayLinkStats {
     LatencySummary captureLatency;   ///< Lease capture time → PRESENTED (an upper bound incl. the ACK).
     LatencySummary controlLatency;   ///< enqueueControl() → Ok reply.
     uint32_t       lastDecodeUs = 0, lastBlitUs = 0;  ///< From the last PRESENTED.
+
+    // Map surface (Es3MapProtocol.h).
+    bool                    mapSupported = false;   ///< MAP_CAPABILITIES answered with a valid set.
+    es3map::MapCapabilities mapCapabilities;
+    uint8_t                 activePage   = 0xff;    ///< From the last STATUS; 0xff = not known yet.
+    uint8_t                 sessionKind  = 0;       ///< 0 none, 1 video, 2 map.
+    uint64_t mapSessions = 0, sourceSwitches = 0, pagePolls = 0;
+    uint64_t mapFramesOffered = 0, mapFramesAccepted = 0;
     bool           haveStatus = false;
     DeviceStatus   lastStatus;       ///< Last STATUS reply.
 };
@@ -346,6 +367,26 @@ public:
      *        at once).  Never blocks; on false the caller keeps the lease.
      */
     bool offerFrame(dashcam::preview::EncodedFrameLease&& frame) override;
+
+    /**
+     * @brief The MAP surface's sink, for libnavigation's NavigationService.
+     *
+     * demand(): canvas = the board's map viewport (320x224 on the ES3C28P),
+     * maxJpegBytes = min(config, board); active only while a map session
+     * exists and the board shows the MAP tab.  offerFrame(): exactly the map
+     * viewport size, else refused.  With cfg.map false or firmware without
+     * the extension, demand() stays inactive with a zero canvas.
+     *
+     * Source coordination (inside the link): with a map-capable board the link
+     * polls STATUS for the active page (kPagePollIdleMs while nothing is shown,
+     * kPagePollActiveMs otherwise) and binds the board's single image receiver
+     * to the camera on LIVE (page 0) and to the map on the map page: STOP_VIDEO
+     * then START_MAP, or STOP_MAP then START_VIDEO.  Other pages keep the
+     * current session, paused by the board's VISIBILITY.  The camera preview's
+     * demand() is inactive whenever the map owns the receiver, so the converter
+     * does no work (the recorder tap's frames are refused before any copy).
+     */
+    dashcam::preview::IPreviewSink& mapSink();
 
     /**
      * @brief Queue an application request (page / alert / stop audio / status

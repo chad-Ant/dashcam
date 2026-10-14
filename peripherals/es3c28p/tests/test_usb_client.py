@@ -19,6 +19,7 @@ from unittest import mock
 
 MODULE = Path(__file__).resolve().parents[1] / "host" / "es3_display.py"
 VECTORS = Path(__file__).resolve().parent / "video_golden_vectors.txt"
+MAP_VECTORS = Path(__file__).resolve().parent / "map_golden_vectors.txt"
 spec = importlib.util.spec_from_file_location("es3_display", MODULE)
 es3 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(es3)
@@ -92,16 +93,64 @@ def expected_vectors():
     return v
 
 
-def load_vectors():
+def load_vectors(path=VECTORS):
     vectors = {}
-    for number, line in enumerate(VECTORS.read_text().splitlines(), 1):
+    for number, line in enumerate(path.read_text().splitlines(), 1):
         fields = line.split("#", 1)[0].split()
         if not fields:
             continue
         if len(fields) not in (2, 3) or fields[0] in vectors:
-            raise AssertionError(f"{VECTORS.name}:{number}: malformed or duplicate vector")
+            raise AssertionError(f"{path.name}:{number}: malformed or duplicate vector")
         vectors[fields[0]] = (bytes.fromhex(fields[1]), fields[2] if len(fields) == 3 else None)
     return vectors
+
+
+# Field values behind tests/map_golden_vectors.txt; map_protocol_test.cpp builds
+# the same vectors independently with Es3MapProtocol.h. The video capabilities
+# are the ES3C28P firmware's own (one credit).
+MAP_TOKEN = 0x2468ACE0
+BOARD_CAPS = dict(video_protocol_version=1, codec_mask=1, canvas_width=320, canvas_height=240, max_width=320,
+                  max_height=240, max_jpeg_bytes=65536, max_chunk_bytes=1024, max_credits=1, flags=0)
+MAP_CAPS = dict(page_count=6, map_page=5, viewport_x=0, viewport_y=0, viewport_w=320, viewport_h=224,
+                max_jpeg_bytes=65536)
+START_MAP_REQUEST = dict(max_jpeg_bytes=65536, chunk_bytes=1024, target_fps=4, assembly_timeout_ms=500,
+                         stale_after_ms=2000, placeholder_after_ms=5000, generation=7)
+
+
+def expected_map_vectors():
+    m = es3.parse_map_capabilities(es3.map_capabilities_payload(BOARD_CAPS, **MAP_CAPS), BOARD_CAPS)
+    good = struct.unpack(es3.START_MAP_FORMAT, es3.start_map_payload(m, BOARD_CAPS, **START_MAP_REQUEST))
+    fields = dict(zip(es3.START_MAP_FIELDS, good))
+
+    def start_map_raw(**changes):
+        f = dict(fields)
+        f.update(changes)
+        return struct.pack(es3.START_MAP_FORMAT, *(f[name] for name in es3.START_MAP_FIELDS))
+
+    return {
+        "ctl.map_capabilities_request": (es3.encode(0x10, es3.CMD_MAP_CAPABILITIES), None),
+        "ctl.map_capabilities_reply": (es3.encode(0x10, es3.CMD_MAP_CAPABILITIES | es3.REPLY,
+                                                  es3.map_capabilities_payload(BOARD_CAPS, **MAP_CAPS)), None),
+        "ctl.map_capabilities_unsupported": (es3.encode(0x10, es3.ERROR, bytes((es3.ERR_BAD_COMMAND,))), None),
+        "ctl.start_map_request": (es3.encode(0x11, es3.CMD_START_MAP,
+                                             es3.start_map_payload(m, BOARD_CAPS, **START_MAP_REQUEST)), None),
+        "ctl.start_map_reply": (es3.encode(0x11, es3.CMD_START_MAP | es3.REPLY,
+                                           es3.start_map_reply_payload(MAP_TOKEN, 1)), None),
+        "ctl.start_map_busy": (es3.encode(0x11, es3.ERROR, bytes((es3.ERR_NOT_READY,))), None),
+        "ctl.stop_map_request": (es3.encode(0x12, es3.CMD_STOP_MAP, es3.stop_map_payload(MAP_TOKEN)), None),
+        "ctl.stop_map_reply": (es3.encode(0x12, es3.CMD_STOP_MAP | es3.REPLY), None),
+        "rec.map_start": (es3.encode_start(MAP_TOKEN, 1, 320, 224, 30000, 0x0102030405060708), None),
+        "pay.start_map_wrong_page": (start_map_raw(page=1), "reject"),
+        "pay.start_map_wrong_viewport": (start_map_raw(viewport_y=8), "reject"),
+        "pay.start_map_jpeg_too_large": (start_map_raw(max_jpeg_bytes=65537), "reject"),
+        "pay.start_map_chunk_too_large": (start_map_raw(chunk_bytes=1025), "reject"),
+        "pay.start_map_placeholder_before_stale": (start_map_raw(placeholder_after_ms=1999), "reject"),
+        "pay.start_map_version": (start_map_raw(map_protocol_version=2), "reject"),
+        "pay.map_caps_page_out_of_range": (struct.pack(es3.MAP_CAPABILITIES_FORMAT, 1, 6, 6, 0, 0, 320, 224,
+                                                       65536, 1), "reject"),
+        "pay.map_caps_viewport_off_canvas": (struct.pack(es3.MAP_CAPABILITIES_FORMAT, 1, 6, 5, 0, 30, 320, 224,
+                                                         65536, 1), "reject"),
+    }
 
 
 def feed_items(parser, data, split=None, now=0):
@@ -292,6 +341,28 @@ class VideoProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             es3.parse_stop_video(bytes(4))
         self.assertEqual(es3.parse_stop_video(es3.stop_video_payload(TOKEN)), TOKEN)
+
+
+class MapProtocolTests(unittest.TestCase):
+    def test_golden_vectors(self):
+        self.assertEqual({k: (v[0].hex(), v[1]) for k, v in load_vectors(MAP_VECTORS).items()},
+                         {k: (v[0].hex(), v[1]) for k, v in expected_map_vectors().items()})
+
+    def test_rejected_payloads(self):
+        m = es3.parse_map_capabilities(es3.map_capabilities_payload(BOARD_CAPS, **MAP_CAPS), BOARD_CAPS)
+        for name, (body, extra) in expected_map_vectors().items():
+            if not name.startswith("pay."):
+                continue
+            self.assertEqual(extra, "reject")
+            parse = es3.parse_map_capabilities if name.startswith("pay.map_caps") else (
+                lambda b, c: es3.parse_start_map(b, m, c))
+            with self.assertRaises(ValueError, msg=name):
+                parse(body, BOARD_CAPS)
+
+    def test_map_frames_are_ordinary_video_records(self):
+        rec = es3.decode_record(expected_map_vectors()["rec.map_start"][0])
+        self.assertEqual(es3.record_fields(rec)["width"], 320)
+        self.assertEqual(es3.record_fields(rec)["height"], 224)
 
 
 class SerialTests(unittest.TestCase):

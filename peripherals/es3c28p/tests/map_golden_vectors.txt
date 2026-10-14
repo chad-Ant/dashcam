@@ -1,0 +1,31 @@
+# ES3C28P map extension v1 golden vectors (Es3MapProtocol.h, 2026-10-14).
+# One vector per line: <name> <hex> [<extra>]; '#' starts a comment.
+#   ctl.*  complete E3 28 control frames for MAP_CAPABILITIES / START_MAP / STOP_MAP
+#   rec.*  complete E3 29 records sent under a map session token
+#   pay.*  a control PAYLOAD (not a frame) that must be rejected; extra = "reject"
+#          (START_MAP: decodeStartMapRequest false; map caps: decodeMapCapabilitiesReply false)
+# Board: video caps 320x240 canvas/max, 65536-byte JPEG, 1024-byte chunks, 1 credit;
+# map page 5 of 6, viewport 0,0,320,224. Map token 0x2468ACE0.
+# Field values: tests/test_usb_client.py expected_map_vectors() and
+# tests/map_protocol_test.cpp; both must reproduce every byte.
+# Change only with a map extension version bump.
+
+ctl.map_capabilities_request e32801100a00dc5e
+ctl.map_capabilities_reply e32801108a10010605000000004001e000000001000117d4
+ctl.map_capabilities_unsupported e3280110ff0101894c
+ctl.start_map_request e32801110b1b0105000000004001e00000000100000404f401d007881307000000a4e7
+ctl.start_map_reply e32801118b08e0ac682401000000b67e
+ctl.start_map_busy e3280111ff01037f1a
+ctl.stop_map_request e32801120c04e0ac6824e209
+ctl.stop_map_reply e32801128c008281
+
+rec.map_start e32901011000e0ac6824010000004001e000307500000807060504030201f67c
+
+pay.start_map_wrong_page 0101000000004001e00000000100000404f401d007881307000000 reject
+pay.start_map_wrong_viewport 0105000008004001e00000000100000404f401d007881307000000 reject
+pay.start_map_jpeg_too_large 0105000000004001e00001000100000404f401d007881307000000 reject
+pay.start_map_chunk_too_large 0105000000004001e00000000100010404f401d007881307000000 reject
+pay.start_map_placeholder_before_stale 0105000000004001e00000000100000404f401d007cf0707000000 reject
+pay.start_map_version 0205000000004001e00000000100000404f401d007881307000000 reject
+pay.map_caps_page_out_of_range 010606000000004001e0000000010001 reject
+pay.map_caps_viewport_off_canvas 01060500001e004001e0000000010001 reject

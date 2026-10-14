@@ -37,6 +37,7 @@ This file has three parts:
 | Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
 | CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
 | ES3C28P display preview | Uncommitted | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
+| ES3C28P map | Uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. | Firmware side (plan's "Firmware work"); real-tile sizes; enable `<Navigation>`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
@@ -69,7 +70,11 @@ This file has three parts:
    sensor.
 8. **IMX296 v2 chart:** capture the three sheets with `capture_chart.py` (CALIBRATION.md, "Capture") once the CSI
    camera is back. Its first CSI run is also the helper's first CSI test.
-9. **ES3C28P preview** (2026-10-14 log section): committed. When the board
+9. **ES3C28P map** (`peripherals/es3c28p/NAVIGATION_PLAN.md`; 2026-10-14 navigation log section): **Jetson side
+   implemented** (uncommitted), firmware side not. Decided by the user: MAP tab (page 5), north-up, phone hotspot /
+   car WiFi with online OSM tiles + cache, warm map while hidden. Next: the firmware author implements the plan's
+   "Firmware work" list; measure real OSM frame sizes once the tile CDN is reachable; then enable `<Navigation>`.
+   **ES3C28P preview** (2026-10-14 log section): committed. When the board
    arrives: flash it, install `peripherals/es3c28p/host/99-dashcam-display.rules` with its serial, run the bench sketches
    (USB throughput hwcdc vs TinyUSB, JPEG decode/blit), then set `<DisplayPreview><Enabled>true` in the deployed config
    (the section is absent there, so the preview stays off until added) and soak at 10 fps, then 15 fps.
@@ -365,6 +370,39 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-10-14 (Jetson, bench): ES3C28P map, Jetson side
+
+Plan: `peripherals/es3c28p/NAVIGATION_PLAN.md` (the colleague's; reviewed and updated with the user's answers: MAP tab
+as page 5, north-up, internet from a phone hotspot / car WiFi; a "warm map" section added at the user's request). The
+plan's "Implementation record" lists everything below in more detail, plus the firmware to-do list. Nothing committed.
+
+- **Map wire extension v1** (`Es3MapProtocol.h`, both copies cmp-checked): MAP_CAPABILITIES 0x0A (16 B), START_MAP
+  0x0B (27 B, fixed map viewport 0,0,320,224), STOP_MAP 0x0C; map frames are ordinary E3 29 records; one receiver
+  (NotReady while the other session exists). 17 golden vectors; C++11/17 and Python agree; Xtensa compile OK.
+- **`lib/libnavigation`**: GPS freshness/marker state, Web Mercator (checked against the slippy-map formula),
+  PNG validation, HTTP caching (max-age/Age/Expires/heuristic, stale-if-error/-while-revalidate, ETag/Last-Modified
+  revalidation), SQLite LRU cache sparing the view, 320x224 compositor with a 5x7 font (Adafruit GFX glcdfont, BSD),
+  4:4:4 JPEG, and NavigationService (4 fps shown, warm 1 fps hidden from disk only, no HTTP while hidden, 403 = off
+  for the run, jittered backoff with Retry-After, stall-based HTTP timeout for slow hotspots, bounded stop()).
+- **`lib/libes3display`**: `DisplayLinkConfig::map`, `mapSink()`, STATUS page polling (250 ms / 1 s / at once on
+  hidden), camera on LIVE and map on page 5 with STOP-then-START switching, page 5 gated on the board's page count;
+  firmware without the extension behaves exactly as before.
+- **Config / app**: `<Navigation>` (14 settings, off by default, `validateNavigation()`); v0.4 starts one link for
+  preview and/or map (link settings from `<DisplayPreview>`), one telemetry callback fan-out (CSV, GPS time, map), the
+  map goes "last known" when the bridge drops; shutdown navigation -> preview -> link. `launchcode_v0_4.sh` mounts
+  `$MEDIA_DIR/navcache` (the default `CachePath` was outside every mount).
+- **Tests (all PASS, full plain `make`, 0 warnings)**: navigation_test (new: 7 groups incl. a fake HTTP tile server:
+  no requests while hidden, User-Agent, 304 revalidation, restart on the cache, 403, 429+Retry-After, server down,
+  HTML instead of PNG, bounded stop), es3display_test [20] (map surface vs a map-capable fake board: tap -> first map
+  frame 40 ms, no camera frame after the switch, nothing sent on other tabs), config_test 15, run_tests.sh (37 Python
+  + map vectors), v0.4 self-test, SIGINT -> exit 0 with navigation on (board absent; invalid settings).
+  End to end (`es3display_test --fake-map-board`): v0.4 + UGREEN 1080p30 + preview + map, tabs cycling: recording
+  kept 30 fps, 3 clean source switches, camera p95 49 ms, map 1 fps without GPS (redraws on change or 1 s).
+- **Measured** (synthetic tiles): compose ~1 ms, encode 1.4-3.9 ms; warm map shown 4 ms after the tab, cold 53 ms.
+- **Not done / open**: firmware side (plan's list); real OSM frame sizes (this network could not resolve the tile CDN
+  during the test, and earlier only over IPv6 with ~6 KB/s); GPS-to-map end to end through the real C3 bridge (no
+  bridge on the bench; covered by unit tests); a heading-up mode (out of scope by decision).
 
 ## 2026-10-14 (Jetson, bench): ES3C28P video preview, Jetson side
 

@@ -64,6 +64,7 @@
 #include "libcommlink.h"
 #include "libconfig.h"
 #include "libes3display.h"
+#include "libnavigation.h"
 #include "liblog.h"
 #include "libnetwork.h"
 #include "librecord.h"
@@ -1432,6 +1433,26 @@ static int selfTestSupervision() {
 // Wraps a log callback: each distinct message is logged once at its own level,
 // repeats at DEBUG.  For chatty retry loops (a missing bridge, an offline NTP
 // server) that would otherwise write the same line every few seconds forever.
+// ─── bridge telemetry -> map position ─────────────────────────────────────────
+
+// The map's copy of one bridge sample (libnavigation does not know libcommlink).
+// Coordinates are promoted from float: the float step is sub-pixel at zoom 16.
+static dashcam::navigation::GpsSample navGpsSample(const dashcam::commlink::Telemetry& t) {
+    dashcam::navigation::GpsSample s;
+    s.latitude   = double(t.latitude);
+    s.longitude  = double(t.longitude);
+    s.speedKmh   = t.gpsSpeedKmh;
+    s.courseDeg  = t.heading;   // the MKR's filtered course; NaN while unreliable
+    s.fixType    = t.fixType;
+    s.satellites = t.satellites;
+    s.fixValid   = t.fixValid != 0;
+    s.gpsFix     = (t.flags & hostproto::TLM_FLAG_GPS_FIX) != 0;
+    s.gpsPresent = (t.flags & hostproto::TLM_FLAG_GPS_PRESENT) != 0;
+    s.receivedUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+    return s;
+}
+
 static dashcam::log::LogCallback quietRepeats(dashcam::log::LogCallback log) {
     auto seen = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
     return [log, seen](LogLevel lvl, const std::string& msg) {
@@ -1675,6 +1696,98 @@ int main(int argc, char* argv[]) {
         log(LogLevel::INFO, "time: NTP disabled (<Network><TimeSyncEnabled>)");
     }
 
+    // ── ES3C28P display: camera preview and map (optional) ───────────────────
+    // <DisplayPreview>: a letterboxed 10-15 fps copy of the recording camera on
+    // the board's LIVE tab.  <Navigation>: the position map on its MAP tab.  One
+    // link owns the board's tty for both (its device/heartbeat/chunk settings
+    // come from <DisplayPreview> even when the camera preview is off) and binds
+    // the board's single image receiver to whichever tab is shown.  Nothing here
+    // gates recording: bad settings, a missing board or any failure only leave
+    // the display without that picture.  The recorder's tap hands each camera
+    // JPEG to the converter (a copy that never blocks); the map service follows
+    // the bridge's GPS and keeps a warm map while its tab is hidden.
+    // Declared before the bridge (its telemetry callback feeds the map) and in
+    // this order so the producers (which hold the link as their sink) go first.
+    dashcam::es3display::Es3DisplayLink     display;
+    dashcam::preview::VideoPreview          preview;
+    dashcam::navigation::NavigationService  navigation;
+    bool previewOn = false, navigationOn = false;
+    const auto& dp = cfg.displayPreview;
+    const auto& nv = cfg.navigation;
+    bool wantPreview = (bool)dp.enabled, wantMap = (bool)nv.enabled;
+    if (wantPreview) {
+        std::vector<std::string> problems;
+        if (!dashcam::config::validateDisplayPreview(dp, problems)) {
+            for (const auto& p : problems) log(LogLevel::WARN, "display preview: " + p);
+            log(LogLevel::WARN, "display preview: off for this run — fix <DisplayPreview> in dashcam.xml "
+                                "(recording is unaffected)");
+            wantPreview = false;
+        }
+    }
+    if (wantMap) {
+        std::vector<std::string> problems;
+        if (!dashcam::config::validateNavigation(nv, problems)) {
+            for (const auto& p : problems) log(LogLevel::WARN, "navigation: " + p);
+            log(LogLevel::WARN, "navigation: off for this run — fix <Navigation> in dashcam.xml "
+                                "(recording is unaffected)");
+            wantMap = false;
+        }
+    }
+    if (wantPreview || wantMap) {
+        dashcam::es3display::DisplayLinkConfig lc;
+        lc.device                = std::string(dp.device);
+        lc.heartbeatMs           = static_cast<uint32_t>((int)dp.heartbeatMs);
+        lc.reconnectMs           = static_cast<uint32_t>((int)dp.reconnectMs);
+        lc.chunkDataBytes        = static_cast<uint16_t>((int)dp.chunkDataBytes);
+        lc.maxFramesInFlight     = static_cast<uint8_t>((int)dp.maxFramesInFlight);
+        lc.targetFps             = static_cast<uint8_t>((int)dp.targetFps);
+        lc.maxJpegBytes          = static_cast<uint32_t>((int)dp.maxJpegBytes);
+        lc.assemblyTimeoutMs     = static_cast<uint16_t>((int)dp.assemblyTimeoutMs);
+        lc.staleAfterMs          = static_cast<uint16_t>((int)dp.staleAfterMs);
+        lc.placeholderAfterMs    = static_cast<uint16_t>((int)dp.placeholderAfterMs);
+        lc.map                   = wantMap;
+        lc.mapTargetFps          = static_cast<uint8_t>((int)nv.maxFps);
+        lc.mapStaleAfterMs       = static_cast<uint16_t>((int)nv.staleAfterMs);
+        lc.mapPlaceholderAfterMs = static_cast<uint16_t>((int)nv.placeholderAfterMs);
+        auto displayLog = quietRepeats(recLog);
+        std::string why;
+        if (!dashcam::es3display::validateConfig(lc, &why) || !display.start(lc, displayLog)) {
+            log(LogLevel::WARN, "display: link not started" + (why.empty() ? std::string() : " — " + why) +
+                                " (recording is unaffected)");
+        } else {
+            if (wantPreview) {
+                dashcam::preview::PreviewConfig pc;
+                pc.targetFps          = static_cast<uint32_t>((int)dp.targetFps);
+                pc.jpegQuality        = (int)dp.jpegQuality;
+                pc.minimumJpegQuality = (int)dp.minimumJpegQuality;
+                pc.maxJpegBytes       = static_cast<size_t>((int)dp.maxJpegBytes);
+                pc.maxSourceJpegBytes = static_cast<size_t>((int)dp.maxSourceJpegBytes);
+                previewOn = preview.start(pc, display, displayLog);
+                log(previewOn ? LogLevel::INFO : LogLevel::WARN,
+                    previewOn ? "display preview: on, " + lc.device + " at up to " +
+                                    std::to_string((int)dp.targetFps) + " fps (the board may come and go)"
+                              : std::string("display preview: converter not started (recording is unaffected)"));
+            }
+            if (wantMap) {
+                dashcam::navigation::NavigationServiceConfig ncfg;
+                ncfg.providerUrl      = std::string(nv.providerUrl);
+                ncfg.providerId       = std::string(nv.providerId);
+                ncfg.userAgent        = std::string(nv.userAgent);
+                ncfg.attribution      = std::string(nv.attribution);
+                ncfg.cachePath        = std::string(nv.cachePath);
+                ncfg.cacheBudgetBytes = uint64_t((int)nv.cacheBudgetMB) << 20;
+                ncfg.zoom             = (int)nv.zoom;
+                ncfg.maxFps           = (int)nv.maxFps;
+                ncfg.warmFps          = (int)nv.warmFps;
+                ncfg.jpegQuality      = (int)nv.jpegQuality;
+                ncfg.gpsStaleMs       = static_cast<uint32_t>((int)nv.gpsStaleMs);
+                navigationOn = navigation.start(ncfg, display.mapSink(), quietRepeats(recLog));
+                if (!navigationOn) log(LogLevel::WARN, "navigation: map service not started (recording is unaffected)");
+            }
+            if (!previewOn && !navigationOn) display.stop();
+        }
+    }
+
     // The ESP32-C3 bridge (MKR Zero: CAN, GNSS, IMU) feeds the overlay's vehicle
     // fields — speed, acceleration, position, heading — and, when enabled, GPS
     // time. Optional: without the bridge the link retries quietly in its own
@@ -1691,9 +1804,13 @@ int main(int argc, char* argv[]) {
                             " (+ bridge_status_*.csv)");
     dashcam::commlink::CommLink bridge;
     const bool gpsTime = clockSet && (bool)net.gpsTimeFallback;
-    if (gpsTime || telemetryCsv.isOpen()) {
-        bridge.setTelemetryCallback([&timeKeeper, &telemetryCsv, gpsTime](const dashcam::commlink::Telemetry& t) {
+    // One callback fans out to every consumer (setting a second one would
+    // silently replace the first).  Each only copies: no I/O on the RX thread.
+    if (gpsTime || telemetryCsv.isOpen() || navigationOn) {
+        bridge.setTelemetryCallback([&timeKeeper, &telemetryCsv, &navigation, gpsTime,
+                                     navigationOn](const dashcam::commlink::Telemetry& t) {
             telemetryCsv.pushTelemetry(t, epochMs());
+            if (navigationOn) navigation.offerGps(navGpsSample(t));
             if (!gpsTime) return;
             dashcam::timesync::UtcFields u;
             u.year = t.year; u.month = t.month; u.day = t.day;
@@ -1705,6 +1822,10 @@ int main(int argc, char* argv[]) {
         bridge.setStatusCallback([&telemetryCsv](const dashcam::commlink::BridgeStatus& st) {
             telemetryCsv.pushStatus(st, epochMs());
         });
+    if (navigationOn)   // a dropped bridge turns the live marker into "last known" at once
+        bridge.setConnectionCallback([&navigation](bool connected) {
+            if (!connected) navigation.bridgeLost();
+        });
     {
         dashcam::commlink::CommLinkConfig bcfg;          // by-id discovery, auto-stream
         auto bridgeLog = quietRepeats(recLog);
@@ -1712,58 +1833,6 @@ int main(int argc, char* argv[]) {
             bridgeLog(LogLevel::INFO, "telemetry bridge (ESP32-C3) not present — retrying in the background");
         if (!bridge.start())
             bridgeLog(LogLevel::ERROR, "telemetry bridge: RX thread failed to start — overlay vehicle fields stay dashed");
-    }
-
-    // ── ES3C28P display preview (optional, <DisplayPreview>) ─────────────────
-    // A letterboxed 10-15 fps copy of the recording camera on the ES3C28P over
-    // USB.  It never gates recording: bad settings, a missing board or any
-    // preview failure only leave the display without video.  The recorder's
-    // tap hands each camera JPEG to the converter (a copy that never blocks);
-    // the converter feeds the link, the single owner of the board's tty.
-    // Declared in this order so the converter (which holds the link as its
-    // sink) is destroyed first.
-    dashcam::es3display::Es3DisplayLink display;
-    dashcam::preview::VideoPreview      preview;
-    bool previewOn = false;
-    const auto& dp = cfg.displayPreview;
-    if ((bool)dp.enabled) {
-        std::vector<std::string> problems;
-        if (!dashcam::config::validateDisplayPreview(dp, problems)) {
-            for (const auto& p : problems) log(LogLevel::WARN, "display preview: " + p);
-            log(LogLevel::WARN, "display preview: off for this run — fix <DisplayPreview> in dashcam.xml "
-                                "(recording is unaffected)");
-        } else {
-            dashcam::es3display::DisplayLinkConfig lc;
-            lc.device             = std::string(dp.device);
-            lc.heartbeatMs        = static_cast<uint32_t>((int)dp.heartbeatMs);
-            lc.reconnectMs        = static_cast<uint32_t>((int)dp.reconnectMs);
-            lc.chunkDataBytes     = static_cast<uint16_t>((int)dp.chunkDataBytes);
-            lc.maxFramesInFlight  = static_cast<uint8_t>((int)dp.maxFramesInFlight);
-            lc.targetFps          = static_cast<uint8_t>((int)dp.targetFps);
-            lc.maxJpegBytes       = static_cast<uint32_t>((int)dp.maxJpegBytes);
-            lc.assemblyTimeoutMs  = static_cast<uint16_t>((int)dp.assemblyTimeoutMs);
-            lc.staleAfterMs       = static_cast<uint16_t>((int)dp.staleAfterMs);
-            lc.placeholderAfterMs = static_cast<uint16_t>((int)dp.placeholderAfterMs);
-            dashcam::preview::PreviewConfig pc;
-            pc.targetFps          = static_cast<uint32_t>((int)dp.targetFps);
-            pc.jpegQuality        = (int)dp.jpegQuality;
-            pc.minimumJpegQuality = (int)dp.minimumJpegQuality;
-            pc.maxJpegBytes       = static_cast<size_t>((int)dp.maxJpegBytes);
-            pc.maxSourceJpegBytes = static_cast<size_t>((int)dp.maxSourceJpegBytes);
-            auto displayLog = quietRepeats(recLog);
-            std::string why;
-            if (!dashcam::es3display::validateConfig(lc, &why) || !display.start(lc, displayLog)) {
-                log(LogLevel::WARN, "display preview: link not started" + (why.empty() ? std::string() : " — " + why) +
-                                    " (recording is unaffected)");
-            } else if (!preview.start(pc, display, displayLog)) {
-                display.stop();
-                log(LogLevel::WARN, "display preview: converter not started (recording is unaffected)");
-            } else {
-                previewOn = true;
-                log(LogLevel::INFO, "display preview: on, " + lc.device + " at up to " +
-                                    std::to_string((int)dp.targetFps) + " fps (the board may come and go)");
-            }
-        }
     }
 
     std::set<std::string> notesSeen;   // resolver warnings are logged once each
@@ -2002,6 +2071,17 @@ int main(int argc, char* argv[]) {
     stopRecording();
     footageFinal.store(true);
     heartbeat.beat();
+    if (navigationOn) {
+        const dashcam::navigation::NavigationStats ns = navigation.stats();
+        navigation.stop();   // bounded: an HTTP transfer in progress aborts
+        char b[200];
+        std::snprintf(b, sizeof(b), "navigation: %llu map frames offered, %llu tile downloads (%llu KiB), "
+                                    "%llu tiles cached",
+                      (unsigned long long)ns.framesOffered, (unsigned long long)ns.http200,
+                      (unsigned long long)(ns.httpBytes / 1024), (unsigned long long)ns.cacheTiles);
+        log(LogLevel::INFO, b);
+        heartbeat.beat();
+    }
     if (previewOn) {
         // After the recorder: no tap callback runs once stop() has returned.
         // Both stops are bounded (the worker finishes one ~7 ms conversion; the
@@ -2009,7 +2089,6 @@ int main(int argc, char* argv[]) {
         const dashcam::preview::PreviewStats ps = preview.stats();
         preview.stop();
         const dashcam::es3display::DisplayLinkStats ds = display.stats();
-        display.stop();
         char b[256];
         std::snprintf(b, sizeof(b), "display preview: %llu frames converted, %llu presented, %llu dropped, "
                                     "%llu connect(s); capture->presented p95 %.0f ms",
@@ -2019,6 +2098,7 @@ int main(int argc, char* argv[]) {
         log(LogLevel::INFO, b);
         heartbeat.beat();
     }
+    display.stop();   // after both producers; a no-op when it never started
     timeRun.store(false);
     bridge.close();
     telemetryCsv.close();

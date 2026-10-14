@@ -293,6 +293,7 @@ static bool decodeJpeg(const uint8_t* d, size_t n, std::vector<uint8_t>& row, in
 // ─── the fake ES3C28P ─────────────────────────────────────────────────────────
 
 struct FakeFrame {
+    bool     map = false;   ///< Assembled under a map session.
     uint32_t token = 0, frameId = 0, bytes = 0;
     uint16_t w = 0, h = 0;
     uint64_t ts = 0;
@@ -308,6 +309,7 @@ struct FakeCounters {
         dimMismatch = 0, noCredit = 0, staleFromHost = 0, orphan = 0, aborts = 0, assemblyTimeouts = 0,
         rejectedStarts = 0, startDuringAssembly = 0, withheldCredits = 0, startsWhileHidden = 0;
     int64_t  bytesWhileHidden = 0, videoBytes = 0;
+    int mapCaps = 0, startMap = 0, startMapRejected = 0, stopMap = 0, busyRefusals = 0;
     int      maxInFlight = 0;
     size_t   maxChunk = 0;
     uint64_t lastStartTs = 0;
@@ -329,6 +331,21 @@ public:
     std::atomic<int>     readRate{0};        ///< Bytes/s the fake reads (0 = as fast as it can).
     std::atomic<int64_t> stallUntilMs{0};    ///< Reads nothing before this time.
     std::atomic<int>     sessionTimeoutMs{5000};
+    std::atomic<int>     mapMode{0};         ///< 0 firmware without the map (BadCommand), 1 map extension.
+
+    /// The user taps another tab (map firmware): the bound surface's VISIBILITY follows.
+    void setPage(int page) {
+        std::lock_guard<std::mutex> lk(m_);
+        const uint8_t before = effectiveDemand();
+        page_                = page;
+        const uint8_t after  = effectiveDemand();
+        if (after != es3video::DemandActive) hiddenSinceMs_ = nowMs();
+        if (token_ && after != before) sendVisibility(token_, after);
+    }
+    int page() {
+        std::lock_guard<std::mutex> lk(m_);
+        return page_;
+    }
 
     ~FakeDisplay() { unplug(); }
 
@@ -360,6 +377,7 @@ public:
             session_ = false;
             endVideoLocked();
             visibility_ = es3video::DemandActive;
+            page_       = 0;
         }
         outq::arm(uint64_t(sb.st_rdev));
         master_ = fd;
@@ -384,7 +402,7 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         visibility_ = d;
         if (d != es3video::DemandActive) hiddenSinceMs_ = nowMs();
-        if (token_) sendVisibility(token_, d);
+        if (token_) sendVisibility(token_, effectiveDemand());
     }
 
     void grantOne() {
@@ -480,6 +498,17 @@ private:
     uint32_t                    token_ = 0, grant_ = 0, credited_ = 0, firstResults_ = 0, lastFrameId_ = 0;
     es3video::StartVideoRequest req_, lastReq_;
     uint8_t                     visibility_ = es3video::DemandActive;
+    int                         page_ = 0;
+    bool                        mapSession_ = false;   ///< token_ belongs to a map session.
+    es3map::MapCapabilities     mapCaps_;
+
+    /// Demand of the bound surface: the visibility knob, and with the map
+    /// extension also the page (camera on LIVE, map on page 5), as the firmware does.
+    uint8_t effectiveDemand() const {
+        if (visibility_ != es3video::DemandActive || mapMode.load() == 0) return visibility_;
+        const bool onIt = mapSession_ ? page_ == 5 : page_ == 0;
+        return onIt ? uint8_t(es3video::DemandActive) : uint8_t(es3video::DemandHidden);
+    }
     int64_t                     hiddenSinceMs_ = 0;
     bool                        assembling_ = false;
     uint32_t                    asmId_ = 0, asmBytes_ = 0, asmGot_ = 0;
@@ -540,6 +569,7 @@ private:
         creditBack();
     }
     void endVideoLocked() {
+        mapSession_ = false;
         token_ = grant_ = credited_ = firstResults_ = lastFrameId_ = 0;
         assembling_ = false;
         events_.clear();
@@ -648,13 +678,14 @@ private:
             return;
         case es3proto::Status: {
             const uint32_t up = uint32_t(now);
-            const uint8_t  p[9] = {uint8_t(up), uint8_t(up >> 8), uint8_t(up >> 16), uint8_t(up >> 24), 0, 80, 1, 1, 0};
+            const uint8_t  p[9] = {uint8_t(up), uint8_t(up >> 8), uint8_t(up >> 16), uint8_t(up >> 24),
+                                   uint8_t(page_), 80, 1, 1, 0};
             ++c_.status;
             reply(f, p, sizeof(p));
             return;
         }
         case es3proto::Page:
-            if (f.length != 1 + 5 * es3proto::kTextBytes || f.payload[0] >= 5) break;
+            if (f.length != 1 + 5 * es3proto::kTextBytes || f.payload[0] >= (mapMode.load() ? 6 : 5)) break;
             ++c_.page;
             c_.lastPageTitle.assign(reinterpret_cast<const char*>(f.payload + 1),
                                     strnlen(reinterpret_cast<const char*>(f.payload + 1), es3proto::kTextBytes));
@@ -693,6 +724,11 @@ private:
         }
         case es3proto::StartVideo: {
             ++c_.startVideo;
+            if (mapSession_ && token_) {   // one receiver: the map must be stopped first
+                ++c_.busyRefusals;
+                error(f, es3proto::NotReady);
+                return;
+            }
             es3video::StartVideoRequest r;
             if (!es3video::decodeStartVideoRequest(f.payload, f.length, caps_, r)) {
                 ++c_.startVideoRejected;
@@ -709,13 +745,64 @@ private:
             rep.initialGrant = grant_;
             uint8_t p[es3video::kStartVideoReplyBytes];
             reply(f, p, es3video::encodeStartVideoReply(rep, p, sizeof(p)));
-            sendVisibility(token_, visibility_);   // fresh demand for every new session
+            sendVisibility(token_, effectiveDemand());   // fresh demand for every new session
+            return;
+        }
+        case es3map::CmdMapCapabilities: {
+            ++c_.mapCaps;
+            if (mapMode.load() == 0 || caps_.maxCredits == 0) { error(f, es3proto::BadCommand); return; }
+            mapCaps_.pageCount    = 6;
+            mapCaps_.mapPage      = 5;
+            mapCaps_.viewportX    = 0;
+            mapCaps_.viewportY    = 0;
+            mapCaps_.viewportW    = 320;
+            mapCaps_.viewportH    = 224;
+            mapCaps_.maxJpegBytes = caps_.maxJpegBytes;
+            mapCaps_.flags        = es3map::kFlagMapTab;
+            uint8_t p[es3map::kMapCapabilitiesReplyBytes];
+            reply(f, p, es3map::encodeMapCapabilitiesReply(mapCaps_, caps_, p, sizeof(p)));
+            return;
+        }
+        case es3map::CmdStartMap: {
+            ++c_.startMap;
+            if (mapMode.load() == 0) { error(f, es3proto::BadCommand); return; }
+            if (!mapSession_ && token_) {   // the camera still owns the receiver
+                ++c_.busyRefusals;
+                error(f, es3proto::NotReady);
+                return;
+            }
+            es3map::StartMapRequest r;
+            if (!es3map::decodeStartMapRequest(f.payload, f.length, mapCaps_, caps_, r)) {
+                ++c_.startMapRejected;
+                error(f, es3proto::BadPayload);
+                return;
+            }
+            endVideoLocked();
+            mapSession_ = true;
+            token_      = ++tokenCounter_;
+            req_        = es3map::sessionLimits(r);
+            grant_      = uint32_t(std::min(initialGrant.load(), devMaxCredits.load()));
+            es3map::StartMapReply rep;
+            rep.sessionToken = token_;
+            rep.initialGrant = grant_;
+            uint8_t p[es3map::kStartMapReplyBytes];
+            reply(f, p, es3map::encodeStartMapReply(rep, p, sizeof(p)));
+            sendVisibility(token_, effectiveDemand());
+            return;
+        }
+        case es3map::CmdStopMap: {
+            ++c_.stopMap;
+            if (mapMode.load() == 0) { error(f, es3proto::BadCommand); return; }
+            uint32_t t = 0;
+            if (es3map::decodeStopMapRequest(f.payload, f.length, t) && mapSession_ && t == token_) endVideoLocked();
+            reply(f, nullptr, 0);
             return;
         }
         case es3proto::StopVideo: {
             ++c_.stopVideo;
             uint32_t t = 0;
-            if (es3video::decodeStopVideoRequest(f.payload, f.length, t) && t == token_) endVideoLocked();
+            if (es3video::decodeStopVideoRequest(f.payload, f.length, t) && !mapSession_ && t == token_)
+                endVideoLocked();
             reply(f, nullptr, 0);   // a stale token is a no-op that still gets the reply
             return;
         }
@@ -734,7 +821,7 @@ private:
             ++c_.staleFromHost;
             return;
         }
-        if (visibility_ != es3video::DemandActive && now - hiddenSinceMs_ > 100) {
+        if (effectiveDemand() != es3video::DemandActive && now - hiddenSinceMs_ > 100) {
             c_.bytesWhileHidden += int64_t(es3video::kOverheadBytes + r.payloadLength);
             if (r.type == es3video::RecordStart) ++c_.startsWhileHidden;
         }
@@ -757,7 +844,7 @@ private:
             }
             if (why == es3video::ReasonOk) why = es3video::checkStartForSession(si, req_);
             if (why == es3video::ReasonOk && r.frameId <= lastFrameId_) why = es3video::ReasonBadFrameId;
-            if (why == es3video::ReasonOk && visibility_ != es3video::DemandActive) why = es3video::ReasonHidden;
+            if (why == es3video::ReasonOk && effectiveDemand() != es3video::DemandActive) why = es3video::ReasonHidden;
             lastFrameId_ = std::max(lastFrameId_, r.frameId);
             if (why != es3video::ReasonOk) {
                 ++c_.rejectedStarts;
@@ -803,6 +890,7 @@ private:
                 return;
             }
             FakeFrame fr;
+            fr.map = mapSession_;
             fr.token   = token_;
             fr.frameId = asmId_;
             fr.bytes   = asmGot_;
@@ -888,7 +976,7 @@ struct Rig {
 };
 
 /// Fills a lease from @p j and offers it: 1 accepted, 0 refused (lease kept, then freed), -1 no free slot.
-static int offerJpeg(Es3DisplayLink& link, EncodedFramePool& pool, const Jpeg& j, uint64_t ts, uint16_t w = 0,
+static int offerJpeg(dashcam::preview::IPreviewSink& link, EncodedFramePool& pool, const Jpeg& j, uint64_t ts, uint16_t w = 0,
                      uint16_t h = 0, int64_t* durUs = nullptr) {
     EncodedFrameLease l = pool.tryAcquire();
     if (!l) return -1;
@@ -904,7 +992,7 @@ static int offerJpeg(Es3DisplayLink& link, EncodedFramePool& pool, const Jpeg& j
 /// Offers frames from @p jpegs round robin every @p periodMs until stopped.
 class Producer {
 public:
-    Producer(Es3DisplayLink& link, std::vector<Jpeg> jpegs, int periodMs, size_t slots = 3)
+    Producer(dashcam::preview::IPreviewSink& link, std::vector<Jpeg> jpegs, int periodMs, size_t slots = 3)
         : link_(link), jpegs_(std::move(jpegs)), periodMs_(periodMs),
           pool(EncodedFramePool::create(slots, es3video::kMaxJpegBytes)) {}
     ~Producer() { stop(); }
@@ -931,7 +1019,7 @@ public:
     std::atomic<int64_t>  maxOfferUs{0};
 
 private:
-    Es3DisplayLink&   link_;
+    dashcam::preview::IPreviewSink& link_;
     std::vector<Jpeg> jpegs_;
     int               periodMs_;
     std::atomic<bool> run_{false};
@@ -1776,7 +1864,8 @@ static void testRequests() {
               std::memcmp(p.payload + 1, "CAMERA", 6) == 0 && p.payload[7] == 0 &&
               std::memcmp(p.payload + 1 + 4 * 24, "four", 4) == 0,
           "PAGE: index + five NUL-padded 24-byte fields");
-    check(!ControlRequest::page(5, "X", {"", "", "", ""}).valid(), "page index 5 rejected");
+    check(!ControlRequest::page(8, "X", {"", "", "", ""}).valid() && ControlRequest::page(5, "MAP", {"", "", "", ""}).valid(),
+          "page index 8 rejected by the factory, 5 (MAP) built");
     check(!ControlRequest::page(0, std::string(24, 'A'), {"", "", "", ""}).valid(), "24-char title rejected");
     check(ControlRequest::page(0, std::string(23, 'A'), {"", "", "", ""}).valid(), "23-char title accepted");
     check(!ControlRequest::page(0, "tab\there", {"", "", "", ""}).valid(), "non-printable text rejected");
@@ -1793,7 +1882,126 @@ static void testRequests() {
     check(!r.link.enqueueControl(hello) && !r.link.enqueueControl(video) &&
               !r.link.enqueueControl(ControlRequest::alert(200)),
           "protocol-internal commands and invalid requests are rejected");
-    check(r.link.stats().controlRejected == 3, "rejections counted");
+    check(!r.link.enqueueControl(ControlRequest::page(5, "MAP", {"", "", "", ""})),
+          "page 5 refused by a link whose board has no MAP tab");
+    check(r.link.stats().controlRejected == 4, "rejections counted");
+}
+
+static std::vector<Jpeg> mapFrames() {
+    return {makeJpeg(320, 224, gradient(7), 80), makeJpeg(320, 224, gradient(8), 80)};
+}
+
+static void testMapSurface() {
+    std::printf("\n[20] map surface: MAP_CAPABILITIES, page-driven camera/map switching, single receiver\n");
+    {   // Firmware without the extension: the map stays off, the camera is unchanged.
+        Rig r;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated (old firmware)");
+        check(waitFor([&] { return r.fake.counters().mapCaps == 1; }, 1000), "MAP_CAPABILITIES asked once");
+        sleepMs(300);
+        const DisplayLinkStats s = r.link.stats();
+        const auto md = r.link.mapSink().demand();
+        check(!s.mapSupported && !md.active && md.canvasW == 0 && s.pagePolls == 0,
+              "BadCommand: no map, map sink inactive with no canvas, no page polling");
+        Producer p(r.link, smallFrames(), 30);
+        p.start();
+        check(waitFor([&] { return r.fake.counters().framesOk >= 3; }, 2000), "camera preview flows as before");
+        p.stop();
+        check(!r.link.enqueueControl(ControlRequest::page(5, "MAP", {"", "", "", ""})), "page 5 refused");
+    }
+    {
+        Rig r;
+        r.fake.mapMode      = 1;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated (map firmware)");
+        check(waitFor([&] { return r.link.stats().mapSupported && r.link.stats().activePage == 0; }, 1500),
+              "map v1 found; first STATUS says page 0 (LIVE)");
+        DisplayLinkStats s = r.link.stats();
+        check(s.mapCapabilities.mapPage == 5 && s.mapCapabilities.viewportH == 224 && s.mapCapabilities.pageCount == 6,
+              "map page 5 of 6, viewport 320x224");
+        auto md = r.link.mapSink().demand();
+        check(!md.active && md.canvasW == 320 && md.canvasH == 224 && md.maxJpegBytes == 65536,
+              "on LIVE: map sink inactive, but reports its 320x224 canvas (warm rendering)");
+        check(r.link.enqueueControl(ControlRequest::page(5, "MAP", {"", "", "", ""})), "page 5 accepted");
+
+        Producer cam(r.link, smallFrames(), 30);
+        Producer map(r.link.mapSink(), mapFrames(), 100);
+        cam.start();
+        map.start();
+        check(waitFor([&] { return r.fake.counters().framesOk >= 3; }, 2000), "LIVE: camera frames flow");
+        check(map.accepted.load() == 0, "LIVE: map frames refused (the caller keeps them)");
+
+        // The user taps MAP.
+        const int64_t t0       = nowMs();
+        const int     camBefore = r.fake.counters().framesOk;
+        r.fake.setPage(5);
+        bool firstMap = waitFor([&] {
+            for (const FakeFrame& f : r.fake.frames())
+                if (f.map) return true;
+            return false;
+        }, 2000);
+        const int64_t switchMs = nowMs() - t0;
+        check(firstMap, "MAP tab: STOP_VIDEO, START_MAP, map frames arrive (" + std::to_string(switchMs) + " ms)");
+        check(switchMs < 600, "switch to the first map frame within 600 ms (poll 250 ms + two round trips)");
+        sleepMs(600);
+        int camAfter = 0, mapOk = 0;
+        bool sizesOk = true;
+        for (const FakeFrame& f : r.fake.frames()) {
+            if (f.map) {
+                ++mapOk;
+                sizesOk = sizesOk && f.decodeOk && f.decW == 320 && f.decH == 224;
+            } else {
+                ++camAfter;
+            }
+        }
+        check(mapOk >= 3 && sizesOk, std::to_string(mapOk) + " map frames, 320x224, decoded");
+        check(camAfter <= camBefore + 1, "no camera frame after the switch (" + std::to_string(camAfter - camBefore) +
+                                             " in flight at most)");
+        s = r.link.stats();
+        check(r.fake.counters().stopVideo >= 1 && r.fake.counters().startMap == 1 && r.fake.counters().busyRefusals == 0 &&
+                  s.sessionKind == 2 && s.sourceSwitches == 1,
+              "one switch, the camera stopped before the map started (no NotReady)");
+        check(!r.link.demand().active && r.link.mapSink().demand().active,
+              "camera demand inactive (converter idle), map demand active");
+
+        // A wrong-size map frame is refused.
+        auto pool = EncodedFramePool::create(1, es3video::kMaxJpegBytes);
+        const Jpeg wrong = makeJpeg(320, 180, gradient(3), 80);
+        check(offerJpeg(r.link.mapSink(), *pool, wrong, nowUs()) == 0, "a 320x180 frame is refused by the map sink");
+
+        // TRIP: the map session stays, paused; nothing is sent.
+        r.fake.setPage(1);
+        check(waitFor([&] { return r.link.state() == LinkState::Paused; }, 1000), "TRIP: paused (VISIBILITY hidden)");
+        sleepMs(400);
+        const int64_t hiddenBytes = r.fake.counters().bytesWhileHidden;
+        sleepMs(600);
+        check(r.fake.counters().bytesWhileHidden == hiddenBytes && r.link.stats().sourceSwitches == 1,
+              "no image bytes while another tab shows, no switch");
+        check(!r.link.mapSink().demand().active && !r.link.demand().active, "both demands inactive");
+
+        // Back to LIVE: STOP_MAP, START_VIDEO, camera frames again.
+        const size_t nFrames = r.fake.frames().size();
+        r.fake.setPage(0);
+        check(waitFor([&] {
+                  const auto fr = r.fake.frames();
+                  for (size_t i = nFrames; i < fr.size(); ++i)
+                      if (!fr[i].map) return true;
+                  return false;
+              }, 2000),
+              "LIVE again: STOP_MAP, START_VIDEO, camera frames");
+        check(r.fake.counters().stopMap >= 1 && r.link.stats().sourceSwitches == 2 && r.link.stats().sessionKind == 1 &&
+                  r.fake.counters().busyRefusals == 0,
+              "second switch clean");
+        cam.stop();
+        map.stop();
+        check(cam.ownershipBugs.load() == 0 && map.ownershipBugs.load() == 0, "lease ownership kept on every refusal");
+
+        // A new HELLO (timeout) restarts from LIVE with the camera; map known.
+        s = r.link.stats();
+        check(s.pagePolls >= 4, std::to_string(s.pagePolls) + " page polls");
+    }
 }
 
 static std::atomic<bool> g_fakeRun{true};
@@ -1829,8 +2037,49 @@ static int runFakeBoard(const std::string& path) {
     return 0;
 }
 
+/// es3display_test --fake-map-board PATH: the contract fake WITH the map
+/// extension (no firmware implements it yet), cycling the tabs LIVE, MAP, TRIP,
+/// MAP every 4 s, for an end-to-end run of the app with preview + navigation.
+static int runFakeMapBoard(const std::string& path) {
+    std::signal(SIGINT, onFakeSignal);
+    std::signal(SIGTERM, onFakeSignal);
+    FakeDisplay fd;
+    fd.mapMode = 1;
+    if (!fd.plug(path)) {
+        std::fprintf(stderr, "cannot create the pty / symlink %s\n", path.c_str());
+        return 1;
+    }
+    std::printf("fake ES3C28P with the map extension at %s (tabs cycle every 4 s)\n", path.c_str());
+    std::fflush(stdout);
+    static const int kCycle[] = {0, 5, 1, 5};
+    int     step = 0;
+    int64_t next = nowMs() + 4000;
+    while (g_fakeRun) {
+        sleepMs(50);
+        if (nowMs() < next) continue;
+        next += 4000;
+        int cam = 0, map = 0, bad = 0;
+        for (const FakeFrame& f : fd.frames()) {
+            (f.map ? map : cam)++;
+            if (!f.decodeOk || (f.map && (f.decW != 320 || f.decH != 224))) ++bad;
+        }
+        const FakeCounters c = fd.counters();
+        std::printf("page %d | camera frames %d, map frames %d, bad %d | startVideo %d stopVideo %d startMap %d "
+                    "stopMap %d busy %d | status polls %d\n",
+                    fd.page(), cam, map, bad, c.startVideo, c.stopVideo, c.startMap, c.stopMap, c.busyRefusals,
+                    c.status);
+        std::fflush(stdout);
+        step = (step + 1) % 4;
+        fd.setPage(kCycle[step]);
+    }
+    fd.unplug();
+    ::unlink(path.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--fake-board") return runFakeBoard(argv[2]);
+    if (argc == 3 && std::string(argv[1]) == "--fake-map-board") return runFakeMapBoard(argv[2]);
     std::printf("es3display_test: Es3DisplayLink vs a fake ES3C28P on a pty\n");
     const uint8_t chk[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
     check(refCrc32(chk, 9) == 0xCBF43926u && es3video::crc32(chk, 9) == 0xCBF43926u,
@@ -1856,6 +2105,7 @@ int main(int argc, char** argv) {
     testEndToEnd();
     testRequests();
     testFirmwareCompatibility();
+    testMapSurface();
     std::printf("\n%s (%d failure%s, %.1f s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails, g_fails == 1 ? "" : "s",
                 double(nowMs() - t0) / 1000.0);
     return g_fails ? 1 : 0;

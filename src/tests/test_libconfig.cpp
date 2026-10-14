@@ -957,6 +957,70 @@ static bool test_display_preview_validation() {
     return g_fails == before;
 }
 
+// ── test 15: <Navigation> defaults, round trip, absence, clamping, rules ─────
+
+static bool test_navigation() {
+    std::cout << "\n--- Test 15: Navigation section ---\n";
+    const int before = g_fails;
+    std::vector<std::string> warns;
+    dashcam::log::LogCallback log = [&](dashcam::log::LogLevel lvl, const std::string& m) {
+        if (lvl == dashcam::log::LogLevel::WARN) warns.push_back(m);
+    };
+    const NavigationConfig d;
+    std::vector<std::string> problems;
+    check(!d.enabled && d.zoom == 16 && d.maxFps == 4 && d.warmFps == 1 && d.jpegQuality == 80 &&
+              d.cacheBudgetMB == 256 && d.gpsStaleMs == 1500 && d.staleAfterMs == 2000 &&
+              d.placeholderAfterMs == 5000,
+          "defaults: off, zoom 16, 4 fps, warm 1 fps, q80, 256 MiB, GPS stale 1.5 s, 2 s / 5 s");
+    check(std::string(d.providerUrl) == "https://tile.openstreetmap.org/{z}/{x}/{y}.png" &&
+              std::string(d.attribution) == "\xC2\xA9 OpenStreetMap contributors",
+          "OSM provider and its attribution (UTF-8 copyright sign)");
+    check(validateNavigation(d, problems), "the defaults validate");
+    check(d.placeholderAfterMs.maxValue() <= es3video::kMaxTimeoutMs && d.staleAfterMs.maxValue() < d.placeholderAfterMs.maxValue() &&
+              d.maxFps.maxValue() <= es3video::kMaxTargetFps,
+          "map timeouts and fps fit the display protocol (START_MAP shares the video limits)");
+
+    const std::string tmpFile = "/tmp/libconfig_navigation_test.xml";
+    AppConfig out;
+    out.navigation.enabled     = true;
+    out.navigation.providerUrl = std::string("http://127.0.0.1:8080/t/{z}/{x}/{y}.png");
+    out.navigation.zoom        = 17;
+    out.navigation.warmFps     = 0;
+    out.navigation.cachePath   = std::string("/tmp/navcache.sqlite");
+    check(ConfigReader::save(tmpFile, out, log), "save");
+    AppConfig in;
+    check(ConfigReader::load(tmpFile, in, log) && in.navigation.enabled && in.navigation.zoom == 17 &&
+              in.navigation.warmFps == 0 && std::string(in.navigation.cachePath) == "/tmp/navcache.sqlite" &&
+              std::string(in.navigation.attribution) == std::string(d.attribution),
+          "round trip (incl. the UTF-8 attribution)");
+    check(validateNavigation(in.navigation, problems), "a localhost http provider validates (test servers)");
+
+    check(writeConfigFile(tmpFile, "<Recording><SegmentSec>60</SegmentSec></Recording>"), "write file w/o section");
+    AppConfig old;
+    check(ConfigReader::load(tmpFile, old, log) && !old.navigation.enabled && old.navigation.zoom == 16,
+          "a file without <Navigation> keeps it off");
+
+    warns.clear();
+    check(writeConfigFile(tmpFile, "<Navigation><Zoom>21</Zoom><MaxFps>0</MaxFps>"
+                                   "<PlaceholderAfterMs>60000</PlaceholderAfterMs></Navigation>"),
+          "write out-of-range file");
+    AppConfig cl;
+    check(ConfigReader::load(tmpFile, cl, log) && cl.navigation.zoom == 18 && cl.navigation.maxFps == 1 &&
+              cl.navigation.placeholderAfterMs == 10000 && warns.size() == 3,
+          "zoom 21 -> 18, fps 0 -> 1, placeholder 60000 -> 10000, one WARN each");
+
+    NavigationConfig bad;
+    bad.providerUrl        = std::string("http://tile.example.org/{z}/{y}.png");
+    bad.userAgent          = std::string("");
+    bad.attribution        = std::string("");
+    bad.staleAfterMs       = 3000;
+    bad.placeholderAfterMs = 3000;
+    check(!validateNavigation(bad, problems) && problems.size() == 5,
+          "plain http, missing {x}, empty UserAgent and Attribution, placeholder <= stale: 5 problems");
+    fs::remove(tmpFile);
+    return g_fails == before;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -974,6 +1038,7 @@ int main() {
     bool t12 = test_display_preview_absent();
     bool t13 = test_display_preview_clamping();
     bool t14 = test_display_preview_validation();
+    bool t15 = test_navigation();
 
     std::cout << "\n=== Results ===\n";
     std::cout << "Test 1 (load real file):    " << (t1 ? "PASS" : "FAIL") << "\n";
@@ -990,7 +1055,8 @@ int main() {
     std::cout << "Test 12 (preview absent):   " << (t12 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 13 (preview clamping): " << (t13 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 14 (preview validate): " << (t14 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 15 (navigation):       " << (t15 ? "PASS" : "FAIL") << "\n";
 
     return (t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 &&
-            t11 && t12 && t13 && t14) ? 0 : 1;
+            t11 && t12 && t13 && t14 && t15) ? 0 : 1;
 }
