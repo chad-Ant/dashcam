@@ -1,4 +1,5 @@
 #include "es3Video.h"
+#include "VideoBuffers.h"
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 
@@ -10,20 +11,15 @@ bool Es3Video::begin()
     if (!psramFound()) return false;
     _mutex = xSemaphoreCreateMutex();
     if (!_mutex) return false;
-    bool ok = true;
-    for (int i = 0; i < 2; ++i) {
-        _state.jpeg[i] = static_cast<uint8_t*>(heap_caps_malloc(kMaxJpegBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        _state.pixels[i] = static_cast<uint16_t*>(heap_caps_malloc(320 * 240 * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        ok = ok && _state.jpeg[i] && _state.pixels[i];
-    }
+    const bool ok = allocateBuffers(_state, _pixelCapacity, _panReady,
+        [](size_t bytes) { return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); },
+        [](void* buffer) { heap_caps_free(buffer); });
     _nextToken = esp_random();
     if (ok && xTaskCreatePinnedToCore(task, "es3-jpeg", 8192, this, 1, &_task, 0) == pdPASS) {
         _ready = true; return true;
     }
-    for (int i = 0; i < 2; ++i) {
-        heap_caps_free(_state.jpeg[i]); heap_caps_free(_state.pixels[i]);
-        _state.jpeg[i] = nullptr; _state.pixels[i] = nullptr;
-    }
+    freeBuffers(_state, _pixelCapacity, [](void* buffer) { heap_caps_free(buffer); });
+    _panReady = false;
     vSemaphoreDelete(_mutex); _mutex = nullptr;
     return false;
 }
@@ -53,17 +49,26 @@ uint32_t Es3Video::startMap(const es3map::StartMapRequest& request)
     const uint32_t token = _state.startMap(_nextToken, request, capabilities()) ? _nextToken : 0;
     unlock(); return token;
 }
+uint32_t Es3Video::startPan(const es3map::StartPanRequest& request)
+{
+    if (!panAvailable()) return 0;
+    lock();
+    if (++_nextToken == 0) ++_nextToken;
+    const uint32_t token = _state.startPan(_nextToken, request, capabilities()) ? _nextToken : 0;
+    unlock(); return token;
+}
 void Es3Video::stopSurface(es3map::Surface surface, uint32_t token)
 {
     if (!_ready) return;
     lock(); _state.stopSurface(surface, token); unlock();
 }
-uint32_t Es3Video::view(uint8_t page, bool blocked, StartVideoRequest& config, es3map::Binding& binding)
+uint32_t Es3Video::view(uint8_t page, bool blocked, StartVideoRequest& config, es3map::Binding& binding, es3map::PanSnapshot* pan)
 {
     if (!_ready) return 0;
     lock();
     _state.view(page, blocked);
     config = _state.config; binding = _state.binding;
+    if (pan) { pan->session = _state.panConfig; pan->pose = _state.pose; pan->poseReceivedMs = _state.poseReceivedMs; }
     const uint32_t token = _state.token;
     unlock(); return token;
 }
@@ -107,6 +112,11 @@ bool Es3Video::acquire(VideoState::Image& image)
     if (!_ready) return false;
     lock(); const bool result = _state.acquire(image); unlock(); return result;
 }
+void Es3Video::present(const VideoState::Image& image, uint32_t duration)
+{
+    if (!_ready) return;
+    lock(); _state.present(image, duration); unlock();
+}
 void Es3Video::release(VideoState::Image& image, bool presented, uint32_t duration)
 {
     if (!_ready) return;
@@ -126,7 +136,7 @@ void Es3Video::decodeLoop()
         if (!haveJob) { vTaskDelay(1); continue; }
         const uint32_t started = micros();
         const bool ok = _decoder.decode(_state.jpeg[job.jpeg], job.bytes,
-                                        _state.pixels[job.image], job.width, job.height);
+                                        _state.pixels[job.image], job.width, job.height, _pixelCapacity[job.image]);
         const uint32_t duration = micros() - started;
         lock(); _state.finishJob(job, ok, duration); unlock();
         vTaskDelay(1);

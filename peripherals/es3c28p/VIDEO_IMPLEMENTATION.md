@@ -1,5 +1,8 @@
 # ES3C28P video firmware implementation
 
+Follow-up: [2026-10-16 review/refactor](REVIEW_2026-10-16.md) records startup,
+resource and parsing fixes, graphics source separation, and current validation.
+
 Implemented against the **Frozen protocol v1** and **Review additions** in
 [VIDEO_STREAMING_PLAN.md](VIDEO_STREAMING_PLAN.md). That plan was not modified.
 The Jetson application and camera capture changes are outside this firmware work.

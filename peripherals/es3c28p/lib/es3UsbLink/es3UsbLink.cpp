@@ -6,6 +6,7 @@
 
 bool Es3UsbLink::begin()
 {
+    if (_task) return true;
     _commands = xQueueCreate(1, sizeof(Command));
     _responses = xQueueCreate(1, sizeof(Response));
     if (!_commands || !_responses) {
@@ -87,6 +88,26 @@ void Es3UsbLink::dispatch(const es3proto::Frame& frame)
         uint32_t token = 0;
         if (!decodeStopVideoRequest(frame.payload, frame.length, token)) { queueError(frame, BadPayload); return; }
         _video.stopSurface(es3map::Surface::Camera, token); queueReply(frame);
+    } else if (frame.type == es3map::CmdPanCapabilities) {
+        if (frame.length) { queueError(frame, BadPayload); return; }
+        if (!_video.panAvailable()) { queueError(frame, NotReady); return; }
+        const auto caps = _video.capabilities();
+        uint8_t data[es3map::kPanCapabilitiesReplyBytes];
+        const size_t size = es3map::encodePanCapabilitiesReply(es3map::panCapabilities(),
+            es3map::capabilities(caps), caps, data, sizeof(data));
+        queueReply(frame, data, size);
+    } else if (frame.type == es3map::CmdStartPan) {
+        if (!_video.panAvailable()) { queueError(frame, NotReady); return; }
+        const auto caps = _video.capabilities();
+        es3map::StartPanRequest config;
+        if (!es3map::decodeStartPanRequest(frame.payload, frame.length, es3map::panCapabilities(),
+                es3map::capabilities(caps), caps, config)) { queueError(frame, BadPayload); return; }
+        es3map::StartPanReply response;
+        response.sessionToken = _video.startPan(config); response.initialGrant = 1;
+        if (!response.sessionToken) { queueError(frame, NotReady); return; }
+        uint8_t data[es3map::kStartMapReplyBytes];
+        const size_t size = es3map::encodeStartPanReply(response, data, sizeof(data));
+        queueReply(frame, data, size);
     } else if (frame.type == es3map::CmdMapCapabilities) {
         if (frame.length) { queueError(frame, BadPayload); return; }
         if (!_video.available()) { queueError(frame, NotReady); return; }

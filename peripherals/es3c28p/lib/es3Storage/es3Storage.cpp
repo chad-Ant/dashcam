@@ -4,11 +4,34 @@
 
 #include <SD_MMC.h>
 #include "es3Board.h"
-#include <cstdio>
-#include <cstdlib>
+#include "CalibrationStore.h"
 
 namespace {
-constexpr char kTouchCalibrationFile[] = "/es3c28p_touch.cal";
+// The policy is portable/testable; this adapter alone touches SD_MMC.
+struct CalibrationFiles {
+    bool exists(const char* path) { return SD_MMC.exists(path); }
+    bool remove(const char* path) { return SD_MMC.remove(path); }
+    bool rename(const char* from, const char* to) { return SD_MMC.rename(from, to); }
+    bool read(const char* path, Es3TouchCalibrationRecord& record) {
+        File file = SD_MMC.open(path, FILE_READ);
+        if (!file || file.isDirectory()) return false;
+        const size_t size = file.size();
+        if (!size || size >= es3storage::kCalibrationBytes) return false;
+        char text[es3storage::kCalibrationBytes];
+        return file.read(reinterpret_cast<uint8_t*>(text), size) == size &&
+            es3storage::parseCalibration(text, size, record);
+    }
+    bool write(const char* path, const Es3TouchCalibrationRecord& record) {
+        char text[es3storage::kCalibrationBytes];
+        const size_t size = es3storage::formatCalibration(record, text);
+        if (!size) return false;
+        File file = SD_MMC.open(path, FILE_WRITE);
+        if (!file) return false;
+        const bool ok = file.write(reinterpret_cast<const uint8_t*>(text), size) == size;
+        file.flush(); file.close();
+        return ok;
+    }
+};
 }  // namespace
 
 Es3Storage::Es3Storage()
@@ -65,64 +88,23 @@ bool Es3Storage::exists(const char* path) const
 
 bool Es3Storage::loadTouchCalibration(Es3TouchCalibrationRecord& record) const
 {
-    if (!_available || !SD_MMC.exists(kTouchCalibrationFile)) {
-        return false;
-    }
-    File file = SD_MMC.open(kTouchCalibrationFile, FILE_READ);
-    if (!file) {
-        return false;
-    }
-    char line[96]{};
-    const size_t bytes = file.readBytesUntil('\n', line, sizeof(line) - 1);
-    file.close();
-    if (bytes == 0) {
-        return false;
-    }
-
-    int rawXAxis = 0;
-    Es3TouchCalibrationRecord parsed{};
-    const int fields = std::sscanf(line, "ES3C28P_TOUCH_CAL_V3 %d %d %d %d %d %d %d %d", &rawXAxis,
-                                   &parsed.xAtLeft, &parsed.xAtLeftMiddle,
-                                   &parsed.xAtRightMiddle, &parsed.xAtRight,
-                                   &parsed.yAtTop, &parsed.yAtCenter, &parsed.yAtBottom);
-    if (fields != 8 || (rawXAxis != 0 && rawXAxis != 1)) {
-        return false;
-    }
-    parsed.xAxisIsRawX = rawXAxis == 1;
-    if (!es3CalibrationIsSane(parsed)) {
-        return false;
-    }
-    record = parsed;
-    return true;
+    if (!_available) return false;
+    CalibrationFiles files;
+    return es3storage::loadCalibration(files, record);
 }
 
 bool Es3Storage::saveTouchCalibration(const Es3TouchCalibrationRecord& record)
 {
-    if (!_available || !es3CalibrationIsSane(record)) {
-        return false;
-    }
-    if (SD_MMC.exists(kTouchCalibrationFile) && !SD_MMC.remove(kTouchCalibrationFile)) {
-        return false;
-    }
-    File file = SD_MMC.open(kTouchCalibrationFile, FILE_WRITE);
-    if (!file) {
-        return false;
-    }
-    const int written = file.printf("ES3C28P_TOUCH_CAL_V3 %d %d %d %d %d %d %d %d\n",
-                                   record.xAxisIsRawX ? 1 : 0,
-                                   record.xAtLeft, record.xAtLeftMiddle,
-                                   record.xAtRightMiddle, record.xAtRight,
-                                   record.yAtTop, record.yAtCenter, record.yAtBottom);
-    file.close();
-    return written > 0;
+    if (!_available) return false;
+    CalibrationFiles files;
+    return es3storage::saveCalibration(files, record);
 }
 
 bool Es3Storage::clearTouchCalibration()
 {
-    if (!_available || !SD_MMC.exists(kTouchCalibrationFile)) {
-        return _available;
-    }
-    return SD_MMC.remove(kTouchCalibrationFile);
+    if (!_available) return false;
+    CalibrationFiles files;
+    return es3storage::clearCalibration(files);
 }
 
 bool Es3Storage::openRead(const char* path, File& file)
@@ -137,18 +119,7 @@ bool Es3Storage::openRead(const char* path, File& file)
         file = SD_MMC.open(path + 1, FILE_READ);
     }
     if (!file) {
-        // The card may have been removed and reinserted after startup. Remount
-        // once before reporting a missing file so FAT directory state is fresh.
-        Serial0.printf("[es3] SD retrying after remount: %s\n", path);
-        if (remount()) {
-            file = SD_MMC.open(path, FILE_READ);
-            if (!file && path[1] != '\0') {
-                file = SD_MMC.open(path + 1, FILE_READ);
-            }
-        }
-    }
-    if (!file) {
-        Serial0.printf("[es3] SD cannot open %s; refreshed root contains:\n", path);
+        Serial0.printf("[es3] SD cannot open %s; root contains:\n", path);
         logRootDirectory();
         return false;
     }
@@ -165,7 +136,8 @@ void Es3Storage::logRootDirectory() const
         Serial0.println("[es3]   <root unavailable>");
         return;
     }
-    for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
+    unsigned listed = 0;
+    for (File entry = root.openNextFile(); entry && listed < 32; entry = root.openNextFile(), ++listed) {
         Serial0.printf("[es3]   %s%s (%lu bytes)\n", entry.name(),
                       entry.isDirectory() ? "/" : "",
                       static_cast<unsigned long>(entry.size()));

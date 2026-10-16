@@ -11,18 +11,9 @@
 #include <Arduino.h>
 #include "es3Storage.h"
 #include "es3Video.h"
+#include "PanRaster.h"
 
-struct Es3DashboardPage {
-    const char* tab;
-    const char* title;
-    const char* line1;
-    const char* line2;
-    const char* line3;
-    const char* line4;
-    bool showBrightnessControl;
-    bool showSdSplash;
-    bool allowTouchCalibration;
-};
+#include "PageConfig.h"
 
 /**
  * Ambient-light to screen-backlight mapping.
@@ -109,6 +100,14 @@ private:
     es3map::Binding _binding;
     bool _mapInfo = false;
     void drawMapPage();
+    es3video::VideoState::Image _panBackground, _panChrome;
+    es3map::PanRaster _panRaster;
+    uint32_t _panSeenSeq = 0;
+    uint16_t _panRow = 0;
+    bool _panDrawing = false, _panDrawMap = false, _panDrawChrome = false;
+    bool _panBackgroundDirty = false, _panChromeDirty = false;
+    void clearPan();
+    void updatePan(const es3map::PanSnapshot& pan, uint32_t now);
     void updateVideo();
     bool videoCoversTabs() const;
 

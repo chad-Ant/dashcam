@@ -21,7 +21,7 @@ public:
     /** Initialises the ES3C28P SD bus and checks for a readable card. */
     bool begin();
 
-    /** Reinitialises the SD filesystem after a card insertion or replacement. */
+    /** Reinitialises SD after card replacement. Close all File handles first. */
     bool remount();
 
     bool available() const;
@@ -33,13 +33,13 @@ public:
     /** Reads /es3c28p_touch.cal. Returns false for absent, malformed, or bad data. */
     bool loadTouchCalibration(Es3TouchCalibrationRecord& record) const;
 
-    /** Replaces /es3c28p_touch.cal with a validated calibration record. */
+    /** Verifies a temporary record, retains a backup, then promotes it. */
     bool saveTouchCalibration(const Es3TouchCalibrationRecord& record);
 
     /** Removes the calibration file; no error if it is already absent. */
     bool clearTouchCalibration();
 
-    /** Opens a readable SD-card file without exposing SD bus configuration. */
+    /** Opens a readable file; missing files never unmount active readers. */
     bool openRead(const char* path, File& file);
 
 private:

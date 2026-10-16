@@ -5,17 +5,22 @@
 #include <vector>
 #include <stdio.h>
 static Es3JpegDecoder decoder;
-static uint16_t output[320*240 + 2];
+static uint16_t output[512*384 + 2];
 int main(int argc, char** argv) {
     assert(argc == 2);
     const std::string root=argv[1];
-    for (const char* name : {"color420.jpg", "color422.jpg", "color444map.jpg", "odd.jpg", "gray.jpg"}) {
+    for (const char* name : {"color420.jpg", "color422.jpg", "color444map.jpg", "odd.jpg", "gray.jpg", "pan420.jpg", "panodd420.jpg", "chrome444.jpg"}) {
         std::ifstream file(root+"/"+name,std::ios::binary);
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),{});
         const bool odd=std::string(name)=="odd.jpg";
-        const int width=odd?319:320, height=odd?179:(std::string(name)=="color444map.jpg"?224:180);
+        const bool pan=std::string(name)=="pan420.jpg", panOdd=std::string(name)=="panodd420.jpg";
+        const int width=pan?512:(panOdd?511:(odd?319:320));
+        const int height=pan?384:(panOdd?383:(odd?179:(std::string(name)=="color444map.jpg"?224:
+            (std::string(name)=="chrome444.jpg"?32:180))));
         output[0]=0xbeef; output[width*height+1]=0xcafe;
-        assert(decoder.decode(bytes.data(),bytes.size(),output+1,width,height));
+        if (pan || panOdd) assert(!decoder.decode(bytes.data(),bytes.size(),output+1,width,height));
+        assert(!decoder.decode(bytes.data(),bytes.size(),output+1,width,height,width*height-1));
+        assert(decoder.decode(bytes.data(),bytes.size(),output+1,width,height,width*height));
         assert(output[0]==0xbeef && output[width*height+1]==0xcafe);
         if (std::string(name).find("color")==0) {
             const uint16_t red=output[1+40*320+40], green=output[1+40*320+160], blue=output[1+40*320+280];
@@ -27,12 +32,12 @@ int main(int argc, char** argv) {
         // may reach RGB output or cause the decoder to walk outside input.
         for (size_t i=2;i+9<bytes.size();++i) if (bytes[i]==0xff && bytes[i+1]==0xc0) {
             auto corrupt=bytes; corrupt[i+5]=0xff; corrupt[i+6]=0xff;
-            assert(!decoder.decode(corrupt.data(),corrupt.size(),output+1,width,height));
+            assert(!decoder.decode(corrupt.data(),corrupt.size(),output+1,width,height,width*height));
             corrupt=bytes; corrupt[i+2]=0xff; corrupt[i+3]=0xff;
-            assert(!decoder.decode(corrupt.data(),corrupt.size(),output+1,width,height));
+            assert(!decoder.decode(corrupt.data(),corrupt.size(),output+1,width,height,width*height));
             break;
         }
-        assert(!decoder.decode(bytes.data(),bytes.size()-2,output+1,width,height));
+        assert(!decoder.decode(bytes.data(),bytes.size()-2,output+1,width,height,width*height));
         assert(!decoder.decode(bytes.data(),bytes.size(),output+1,320,240));
     }
     for (const char* name : {"progressive.jpg", "large.jpg", "broken.jpg"}) {

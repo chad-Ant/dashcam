@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Convert a 24-bit uncompressed BMP to CYD display-wire RGB565.
+"""Convert a 24-bit uncompressed BMP to ES3C28P display-wire RGB565.
 
 The output is headerless: exactly two bytes per pixel, top-to-bottom, with
 the most significant RGB565 byte first. It needs only Python's standard
-library and deliberately validates the CYD splash dimensions by default.
+library and deliberately validates the ES3C28P splash dimensions by default.
 """
 
 from __future__ import annotations
@@ -36,8 +36,10 @@ def main() -> None:
     if dib_size < 40 or planes != 1 or bits_per_pixel != 24 or compression != 0:
         fail("input must be an uncompressed 24-bit BMP")
     height = abs(signed_height)
-    if width != args.width or height != args.height:
+    if width <= 0 or height <= 0 or width != args.width or height != args.height:
         fail(f"expected {args.width}x{args.height}, got {width}x{height}")
+    if pixel_offset < 14 + dib_size or pixel_offset > len(data):
+        fail("BMP pixel data overlaps the header or starts outside the file")
     row_bytes = (width * 3 + 3) & ~3
     if pixel_offset + row_bytes * height > len(data):
         fail("BMP pixel data is truncated")

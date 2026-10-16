@@ -1,7 +1,10 @@
 # ES3C28P position map — implementation plan
 
 Date: 2026-10-14. Status: Jetson side implemented 2026-10-14 (see "Implementation
-record" near the end); firmware side not implemented. Covers the Jetson application and ES3C28P firmware. Existing
+record" near the end); firmware side not implemented. Extension v2, board-side
+panning (smooth movement), was added the same day at the user's request: see
+"Extension v2: board-side panning" near the end (Jetson side implemented,
+firmware side not). Covers the Jetson application and ES3C28P firmware. Existing
 VIDEO_STREAMING_PLAN.md and VOICE_COMMAND_PLAN.md remain unchanged. Reviewed 2026-10-14 against the
 code: the user's UI/network answers, the float-precision result, the build
 dependencies, the five-page touch points and the STATUS polling cost are folded
@@ -196,6 +199,8 @@ Initial freshness policy:
   retain the last location as a hollow/gray marker labeled `Last known`.
 - No dead reckoning, extrapolation or automatic road snapping. Never substitute
   zero coordinates on errors. Clear validity immediately on a new invalid fix.
+  (Extension v2 moves the marker smoothly by interpolating between two received
+  fixes, shown one fix interval late: still no extrapolation.)
 - Existing MKR code invalidates a silent GNSS fix after 1,000 ms even while
   bridge telemetry continues. Test that behavior end to end. Transport receive
   time is not GNSS measurement time, and repeated bridge packets are not fixes.
@@ -445,7 +450,7 @@ C++ `tests/map_protocol_test.cpp` and Python `test_usb_client.py`):
 Map frames are ordinary E3 29 records under the map token. One receiver: a
 START_MAP while a video session exists (or START_VIDEO while a map session
 exists) is refused with NotReady. The voice plan's future commands must take
-ids above 0C.
+ids above 0E (0D/0E are extension v2).
 
 **What the Jetson does:**
 - `lib/libes3display`: asks MAP_CAPABILITIES after CAPABILITIES (`DisplayLinkConfig::map`);
@@ -511,6 +516,111 @@ on the map.
    attribution strip (y 208-223). Local stale / "Map unavailable" notices go in
    the top strip only, with the START_MAP stale/placeholder times (2 s / 5 s).
 5. Report the active page in STATUS byte 4 (already done).
+
+## Extension v2: board-side panning (2026-10-14)
+
+Asked by the user: the map should move like a video, not in 4 Hz steps. Chosen
+(the user's "plan B"): the board scrolls the map itself. Whole frames at 10-15 fps
+were the alternative; they would cost about 340-510 KB/s of USB (real map frames
+are ~34 KB) and probably exceed what the board can decode and draw.
+
+**How it works.** The Jetson sends a background larger than the map area
+(512x384 by default, map imagery only) once every several seconds, the two fixed
+strips ("chrome": status on top, attribution + scale at the bottom, 320x32) when
+they change, and a 32-byte pose 20 times a second. The board crops the
+background around the pose and draws the marker itself. At 60 km/h in Paris (real
+OSM tiles, zoom 16) that was one background every ~12 s, 51-60 KB each, so about
+5 KB/s of images plus 0.6 KB/s of poses, instead of hundreds of KB/s.
+
+**Wire contract** (`Es3MapProtocol.h` v2 section + one record type in
+`Es3VideoProtocol.h`; vectors `tests/pan_golden_vectors.txt`, C++
+`tests/pan_protocol_test.cpp`; v1 bytes and vectors unchanged):
+
+| Item | Bytes | Meaning |
+| --- | --- | --- |
+| 0D PAN_CAPABILITIES | request empty; reply 9 B | pan_version u8 (1), max_background_w u16, max_background_h u16, chrome_top_h u8, chrome_bottom_h u8, max_pose_hz u8, flags u8 (none). Firmware without v2: BadCommand, and the Jetson uses START_MAP + whole frames as before |
+| 0E START_PAN | request 31 B; reply as START_MAP | the 27 START_MAP bytes, then background_w u16, background_h u16 (map area <= background <= the advertised maximum). Opens a map session: STOP_MAP ends it, START_VIDEO refused while it exists |
+| background image | ordinary E3 29 frame | exactly background_w x background_h; START `source_timestamp_us` = `packOrigin(x, y)`, the world pixel of its top-left corner (u32 each) |
+| chrome image | ordinary E3 29 frame | exactly viewport_w x (top_h + bottom_h); first top_h rows -> top of the viewport, the rest -> its bottom |
+| E3 29 type 10 MAP_POSE | 16 B payload, frame_id 0 | seq u32 (1, 2, 3...; keep only increasing), x_q4 u32, y_q4 u32 (world pixels x 16: map-area centre and marker), course_cdeg u16 (0-35999, clockwise from north, for the arrow), marker u8 (0 none, 1 dot, 2 arrow, 3 last known), flags u8. Uncredited, never answered |
+
+`es3map::computePanView()` is the shared integer arithmetic for the crop and the
+marker position (no floating point on the board); `es3map::checkPanStart()`
+classifies a START in a panning session.
+
+**Firmware work (v2, for the firmware author; not done):**
+1. Answer 0D with 1, the background maximum the PSRAM budget allows (the Jetson
+   asks for 512x384; two RGB565 copies are 786 KB), 16, 16, 30, 0.
+2. 0E like 0B (`es3map::decodeStartPanRequest`, `panSession()` for the geometry,
+   `sessionLimits(request.map)` for the VideoState limits), same token, credit,
+   NotReady and replacement rules.
+3. In a panning session check STARTs with `checkPanStart()` instead of
+   `checkStartForSession()`. A newer image may supersede only a not yet presented
+   image of the same kind. Backgrounds need a decode target of background size
+   (RGB565 in PSRAM), not a strip blit; chrome decodes like a small frame.
+4. MAP_POSE: accept for the current panning token with seq > last seq and
+   `decodeMapPose()` == Ok; otherwise ignore it. Keep the newest pose only.
+5. Drawing (application loop, as today): top strip = chrome rows 0-15 at y 0-15,
+   bottom strip = chrome rows 16-31 at y 208-223, map area y 16-207 = the
+   background crop from `computePanView(origin, bgW, bgH, 320, 192, pose)`, then
+   the marker at markerX/16, 16 + markerY/16 when markerVisible. Redraw the map
+   area when the crop or the marker changes (up to the panel's rate; the Jetson
+   sends at most max_pose_hz). Marker shapes as the Jetson drew them (blue
+   20,100,255; white halo 255,255,255; grey 120,120,120): dot = white disc r 8.5
+   + blue disc r 6; last known = white disc r 8.5 + grey ring r 7, 2.5 px wide;
+   arrow = white triangle (0,14) (-10,-10) (10,-10) + blue triangle (0,11)
+   (-7.5,-8) (7.5,-8) in units where y points up, rotated clockwise by the course.
+6. Poses, like complete images, restart the stale/placeholder timers (images can
+   be seconds apart while poses keep coming). Until a background and a chrome
+   have arrived, show the local waiting notice. The board may drop both when the
+   map is hidden: the Jetson resends them whenever VISIBILITY turns active.
+7. Test with JPEGDEC that 4:2:0 baselines decode (backgrounds are 4:2:0 to fit
+   the 64 KB slot; chrome is 4:4:4).
+
+**Jetson side (implemented 2026-10-14, uncommitted):**
+- `lib/libes3display`: asks 0D after 0A when `DisplayLinkConfig::mapPan`;
+  START_PAN instead of START_MAP when the board has v2; `panSink()`
+  (`navigation::IMapPanSink`): one pending background, one chrome (sent first),
+  one pose (newest wins, at most max_pose_hz, sent between any two records,
+  also between the chunks of a background). A START_PAN refused other than
+  NotReady falls back to whole frames until reconnect. The whole-frame map sink
+  stays inactive during a panning session.
+- `lib/libnavigation`: `PoseInterpolator` (keeps only new fixes from the 10 Hz
+  telemetry, smooths their 100 ms-quantised arrival times, shows the position one
+  fix interval + 50 ms late, linearly between the two real fixes, holds past the
+  newest; restarts after a 2 s gap or a 2000 px jump), the background planner
+  (new background when the map area, now or 1 s ahead, would come within 8 px of
+  its edge; centred 2 s ahead along the velocity, lead capped at 60% of the
+  margin), `composePanBackground()` / `composePanChrome()` (scale bar and north
+  mark move into the bottom strip; LOADING in the status strip while tiles are
+  missing), and the service's panning loop (20 Hz poses, chrome every 0.5 s and
+  at once on a marker/GPS-state change, sent only when it changed; background 4:2:0
+  q75 with three retries 10 lower). The tiles of the next background are requested
+  about 3 s before it is due, so it is complete when sent.
+- `<Navigation>`: `Panning` (on), `PoseHz` 20, `PanBackgroundWidth/Height`
+  512x384, `PanJpegQuality` 75. v0.4 passes `display.panSink()`.
+
+**Deliberate choices / deviations:**
+- Interpolation, not extrapolation: about 0.35 s of lag, but the marker is never
+  somewhere the car was not. CAN speed / wheel-count odometry (`lib/libdeadreckoning`)
+  could later cut the lag; it needs the calibration and telemetry plumbing first.
+- Tile use: a background covers 512x384 instead of 320x192 (up to 9 tiles instead
+  of 4-6), and the next background's tiles are fetched ~3 s early. Still only around
+  the current position (no route prefetch, nothing while hidden); in the Paris
+  demo 25 tile downloads for 1.9 km.
+- Dense city backgrounds come close to the 64 KB slot at q75 4:2:0 (largest
+  59.9 KB); the quality retries cover denser areas.
+
+**Measured / tested:** `pan_protocol_test` (20 vectors, C++11/17);
+`es3display_test` [21] (50 checks vs a panning fake board: 30 poses/s cap, seq
+order, poses interleaved with a 55 KB background over a 120 KB/s reader, nothing
+while hidden, fallback when START_PAN is refused, mapPan off) and [22]
+(NavigationService -> link -> fake board over the pty); `navigation_test` [8]
+(interpolation steadiness 1.86-2.17 px per 50 ms against 2.0 true, never off the
+path; planner; images) and [9] (20.0 poses/s, east at 35.0 px/s against 35.4 true,
+marker centred in the background offered before every pose). `navigation_test
+--pan-drive OUTDIR` renders a simulated board at 30 fps over the real OSM drive
+(output kept outside the repo).
 
 ## 10. Sources checked for this plan
 

@@ -99,6 +99,13 @@ int main() {
     start(5); const uint8_t okReason = ReasonOk;
     state.accept(makeRecord(RecordAbort,7,5,&okReason,1),0);
     assert(event(RecordResult,5,ReasonMalformed));assert(state.grant==6);
+    // Millis rollover must preserve the exact assembly timeout boundary.
+    setup(); StartInfo rollover; rollover.width=320; rollover.height=180;
+    rollover.jpegBytes=sizeof(sample);
+    deliver(encodeStart(7,1,rollover,wire,sizeof(wire)),UINT32_MAX-200);
+    state.expire(298); assert(state.grant==1);
+    state.expire(299); assert(state.grant==2);
+    assert(event(RecordResult,1,ReasonAssemblyTimeout));
     // Fixed event queue fails closed instead of silently losing grants.
     setup();for (unsigned i=1;i<40;++i) { state.setDemand(DemandHidden);start(i); }
     assert(state.fault());state.reset();assert(!state.fault());

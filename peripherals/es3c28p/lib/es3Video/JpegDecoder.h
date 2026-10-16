@@ -7,9 +7,9 @@
 // One decoder instance per worker. Output is valid only on true.
 class Es3JpegDecoder {
 public:
-    bool decode(uint8_t* data, uint32_t bytes, uint16_t* output, int width, int height) {
-        if (!data || !output || bytes < 4 || bytes > 65536 || width < 1 || width > 320 ||
-            height < 1 || height > 240 || data[0] != 0xff || data[1] != 0xd8 ||
+    bool decode(uint8_t* data, uint32_t bytes, uint16_t* output, int width, int height, uint32_t capacityPixels = 320 * 240) {
+        if (!data || !output || bytes < 4 || bytes > 65536 || width < 1 || width > 512 ||
+            height < 1 || height > 384 || uint32_t(width * height) > capacityPixels || data[0] != 0xff || data[1] != 0xd8 ||
             data[bytes - 2] != 0xff || data[bytes - 1] != 0xd9) return false;
         if (!baselineHeader(data, bytes, width, height)) return false;
         _output = output; _width = width; _height = height; _written = 0; _badBlock = false;

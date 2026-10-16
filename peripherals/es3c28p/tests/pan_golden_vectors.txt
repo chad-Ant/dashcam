@@ -1,0 +1,35 @@
+# ES3C28P map extension v2 (board-side panning) golden vectors (Es3MapProtocol.h, 2026-10-14).
+# One vector per line: <name> <hex> [<extra>]; '#' starts a comment.
+#   ctl.*  complete E3 28 control frames for PAN_CAPABILITIES / START_PAN
+#   rec.*  complete E3 29 records of a panning session (background START, chrome START, MAP_POSE)
+#   bad.*  well-framed MAP_POSE records with bad fields; extra = "ignore" (decodeMapPose Malformed)
+#   pay.*  a control PAYLOAD (not a frame) that must be rejected; extra = "reject"
+# Board: video caps 320x240, 65536-byte JPEG, 1024-byte chunks, 1 credit; map page 5 of 6,
+# viewport 0,0,320,224; pan: background up to 640x480, strips 16+16, 30 poses/s.
+# START_PAN: background 512x384, 2 fps, 500/2000/5000 ms, generation 9. Token 0x2468ACE0.
+# Field values: tests/pan_protocol_test.cpp (C++ only; `pan_protocol_test --print`).
+# Change only with a pan version bump.
+
+ctl.pan_capabilities_reply e32801208d09018002e00110101e007bab
+ctl.pan_capabilities_request e32801200d00ee02
+ctl.pan_capabilities_unsupported e3280120ff01016060
+ctl.start_pan_reply e32801218e08e0ac6824010000008143
+ctl.start_pan_request e32801210e1f0105000000004001e00000000100000402f401d007881309000000000280016483
+
+rec.map_pose e32901101000e0ac682400000000030000008815340854609205aa690200dda2
+rec.map_pose_dot e32901101000e0ac682400000000040000008815340854609205000001003618
+rec.pan_background_start e32901011000e0ac6824010000000002800180bb0000644083004a255900a95b
+rec.pan_chrome_start e32901011000e0ac68240200000040012000c40900000000000000000000b679
+
+bad.map_pose_course e32901101000e0ac682400000000050000001000000010000000a08c0200231e ignore
+bad.map_pose_marker e32901101000e0ac68240000000005000000100000001000000000000400c810 ignore
+bad.map_pose_seq_zero e32901101000e0ac68240000000000000000100000001000000000000100cbc7 ignore
+
+pay.pan_caps_background_below_map 018002640010101e00 reject
+pay.pan_caps_no_map_area 018002e00170701e00 reject
+pay.pan_caps_pose_rate 018002e00110100000 reject
+pay.pan_caps_version 028002e00110101e00 reject
+pay.start_pan_background_narrow 0105000000004001e00000000100000402f401d0078813090000003f018001 reject
+pay.start_pan_background_short 0105000000004001e00000000100000402f401d0078813090000000002bf00 reject
+pay.start_pan_background_too_wide 0105000000004001e00000000100000402f401d00788130900000081028001 reject
+pay.start_pan_wrong_page 0100000000004001e00000000100000402f401d00788130900000000028001 reject

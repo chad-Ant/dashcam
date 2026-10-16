@@ -602,14 +602,15 @@ class Es3Display:
             os.close(self.fd)
             self.fd = None
 
-    def _wait(self, deadline, write=False):
+    def _wait(self, deadline, write=False, poll=False):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("ES3C28P USB request timed out")
         readable, writable, _ = select.select([] if write else [self.fd],
-                                              [self.fd] if write else [], [], remaining)
-        if not (writable if write else readable):
+                                              [self.fd] if write else [], [], min(remaining, 0.05) if poll else remaining)
+        if not (writable if write else readable) and not poll:
             raise TimeoutError("ES3C28P USB request timed out")
+        return bool(writable if write else readable)
 
     def request(self, kind, payload=b""):
         if self.fd is None:
@@ -629,13 +630,16 @@ class Es3Display:
                     raise OSError(errno.EIO, "USB write returned no progress")
                 offset += count
             while True:
-                self._wait(deadline)
-                try:
-                    data = os.read(self.fd, 256)
-                except BlockingIOError:
-                    continue
-                if not data:
-                    raise OSError(errno.EIO, "USB device disconnected")
+                # Empty polls expire a truncated prefix even when the peer has
+                # already sent the complete reply and will send nothing else.
+                data = b""
+                if self._wait(deadline, poll=True):
+                    try:
+                        data = os.read(self.fd, 256)
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        raise OSError(errno.EIO, "USB device disconnected")
                 reply = None
                 for item_kind, item in self.parser.feed(data):
                     if item_kind == "video":
@@ -1099,14 +1103,16 @@ class Player:
             try:
                 data = os.read(self.fd, 4096)
             except BlockingIOError:
-                return
-            if not data:
+                data = None
+            if data == b"":
                 raise OSError(errno.EIO, "USB device disconnected")
-            for kind, item in self.display.parser.feed(data):
+            for kind, item in self.display.parser.feed(data or b""):
                 if kind == "video":
                     self._on_record(item)
                 else:
                     self.unmatched += 1   # a control frame outside any request (late reply)
+            if data is None:
+                return
 
     def _drain(self):
         while self.display.video_records:

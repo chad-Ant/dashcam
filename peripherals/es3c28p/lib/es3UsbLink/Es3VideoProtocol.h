@@ -28,6 +28,10 @@
  *   02 CHUNK  offset u32, data[1..N]     83 CREDIT     cumulative_grant u32
  *   03 END    crc32 u32 (whole JPEG)     84 VISIBILITY demand u8 (0 active,
  *   04 ABORT  reason u8                                 1 hidden, 2 calibrating)
+ * Map extension v2 (Es3MapProtocol.h, 2026-10-14) adds one host -> device type:
+ *   10 MAP_POSE  16-byte pose of a panning map session (fields and rules there)
+ * It is session-wide (frame_id 0) and is never credited or answered. Firmware
+ * without the extension never opens a panning session, so it never sees one.
  * Every record carries the nonzero session token from the START_VIDEO reply.
  * frame_id is 1, 2, 3... within a session for types 01..04, 81 and 82, and
  * zero for CREDIT and VISIBILITY. N is the CHUNK data ceiling: kMaxChunkDataBytes
@@ -123,6 +127,7 @@ constexpr size_t kResultPayloadBytes     = 1;
 constexpr size_t kPresentedPayloadBytes  = 8;
 constexpr size_t kCreditPayloadBytes     = 4;
 constexpr size_t kVisibilityPayloadBytes = 1;
+constexpr size_t kMapPosePayloadBytes    = 16;  ///< Map extension v2; fields in Es3MapProtocol.h.
 constexpr size_t kCapabilitiesRequestBytes = 0;
 constexpr size_t kCapabilitiesReplyBytes = 18;
 constexpr size_t kStartVideoRequestBytes = 23;
@@ -145,6 +150,7 @@ enum RecordType : uint8_t {
     RecordChunk      = 0x02,
     RecordEnd        = 0x03,
     RecordAbort      = 0x04,
+    RecordMapPose    = 0x10,  ///< Map extension v2 (Es3MapProtocol.h).
     RecordResult     = 0x81,
     RecordPresented  = 0x82,
     RecordCredit     = 0x83,
@@ -226,11 +232,17 @@ inline uint32_t crc32(const uint8_t* data, size_t size) { return crc32Update(0, 
 
 // ─── type predicates ──────────────────────────────────────────────────────────
 
-inline bool isHostToDevice(uint8_t type) { return type >= RecordStart && type <= RecordAbort; }
+inline bool isHostToDevice(uint8_t type)
+{
+    return (type >= RecordStart && type <= RecordAbort) || type == RecordMapPose;
+}
 inline bool isDeviceToHost(uint8_t type) { return type >= RecordResult && type <= RecordVisibility; }
 inline bool knownType(uint8_t type) { return isHostToDevice(type) || isDeviceToHost(type); }
-/** CREDIT and VISIBILITY are session-wide and carry frame_id 0; all others name a frame. */
-inline bool namesFrame(uint8_t type) { return type != RecordCredit && type != RecordVisibility; }
+/** CREDIT, VISIBILITY and MAP_POSE are session-wide and carry frame_id 0; all others name a frame. */
+inline bool namesFrame(uint8_t type)
+{
+    return type != RecordCredit && type != RecordVisibility && type != RecordMapPose;
+}
 
 /**
  * @brief Framing check of the fields every header carries.
@@ -251,6 +263,7 @@ inline Reason checkFraming(uint8_t type, size_t payloadLength, uint32_t sessionT
     case RecordPresented:  expected = kPresentedPayloadBytes; break;
     case RecordCredit:     expected = kCreditPayloadBytes; break;
     case RecordVisibility: expected = kVisibilityPayloadBytes; break;
+    case RecordMapPose:    expected = kMapPosePayloadBytes; break;
     case RecordChunk:
         if (maxChunkData > kMaxChunkDataBytes) maxChunkData = kMaxChunkDataBytes;
         if (payloadLength <= kChunkOffsetBytes) return ReasonBadLength;
@@ -431,6 +444,8 @@ inline Reason checkRecord(uint8_t type, uint32_t sessionToken, uint32_t frameId,
     case RecordPresented:  { PresentedInfo v; return decodePresented(r, v); }
     case RecordCredit:     { uint32_t v = 0; return decodeCredit(r, v); }
     case RecordVisibility: { Demand v = DemandActive; return decodeVisibility(r, v); }
+    // Field rules live with the map extension (es3map::decodeMapPose).
+    case RecordMapPose:    return checkFraming(type, payloadLength, sessionToken, frameId);
     default:               return ReasonMalformed;
     }
 }
@@ -834,6 +849,7 @@ inline const char* recordTypeName(uint8_t type)
     case RecordPresented:  return "PRESENTED";
     case RecordCredit:     return "CREDIT";
     case RecordVisibility: return "VISIBILITY";
+    case RecordMapPose:    return "MAP_POSE";
     default:               return "UNKNOWN";
     }
 }

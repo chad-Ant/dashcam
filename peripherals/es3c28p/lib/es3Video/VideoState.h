@@ -2,6 +2,7 @@
 // Portable ownership/assembly engine. Caller serializes every method; decode
 // and TFT operations occur OUTSIDE that lock while holding the returned lease.
 #include "Es3VideoProtocol.h"
+#include "Es3MapProtocol.h"
 
 namespace es3video {
 class VideoState {
@@ -11,6 +12,10 @@ public:
         State state = Free;
         uint32_t token = 0, frame = 0, bytes = 0, received = 0, crc = 0;
         uint32_t started = 0, decodeUs = 0;
+        uint16_t width = 0, height = 0;
+        uint64_t origin = 0;
+        es3map::PanImage kind = es3map::PanImageNone;
+        bool presented = false;
     };
     struct Event { uint8_t bytes[24]; size_t size = 0; };
     struct Job {
@@ -23,6 +28,9 @@ public:
         int slot = -1;
         uint32_t token = 0, frame = 0, decodeUs = 0;
         uint16_t* pixels = nullptr;
+        uint16_t width = 0, height = 0;
+        uint64_t origin = 0;
+        es3map::PanImage kind = es3map::PanImageNone;
     };
     struct Stats {
         uint32_t assembled = 0, decoded = 0, presented = 0;
@@ -30,20 +38,28 @@ public:
         uint32_t reasons[kReasonCount]{};
     } stats;
     uint8_t* jpeg[2]{};
-    uint16_t* pixels[2]{};
-    Slot inputs[2], images[2];
+    // Slots 0/1: camera, whole map, or panning backgrounds. Slots 2/3:
+    // panning strips only. No image of one kind can evict the other kind.
+    uint16_t* pixels[4]{};
+    Slot inputs[2], images[4];
+    bool panning = false;
+    es3map::PanSession panConfig;
+    es3map::MapPose pose;
+    uint32_t poseReceivedMs = 0;
     StartVideoRequest config;
     uint32_t token = 0, grant = 0;
     Demand demand = DemandCalibrating;
 
     void reset() {
         token = 0; grant = 0; _lastFrame = _started = 0;
+        panning = false; pose = es3map::MapPose(); poseReceivedMs = 0;
         _head = _count = 0; _fault = false;
         // Leased buffers cannot be reclaimed until their owners return them.
         for (int i = 0; i < 2; ++i) {
             if (inputs[i].state != Working) inputs[i].state = Free;
-            if (images[i].state != Working) images[i].state = Free;
         }
+        for (int i = 0; i < 4; ++i)
+            if (images[i].state != Working) images[i].state = Free;
     }
     void start(uint32_t session, const StartVideoRequest& request) {
         reset(); config = request; token = session; grant = 1;
@@ -64,6 +80,8 @@ public:
             for (int i = 0; i < 2; ++i) {
                 if (inputs[i].state == Receiving || inputs[i].state == Ready)
                     reject(i, ReasonHidden);
+            }
+            for (int i = 0; i < 4; ++i) {
                 if (images[i].state == Ready) {
                     result(images[i].frame, ReasonHidden); images[i].state = Free;
                 }
@@ -78,13 +96,23 @@ public:
     void accept(const Record& r, uint32_t now) {
         if (!token || r.sessionToken != token || r.type >= 0x80) return;
         expire(now);
+        if (r.type == RecordMapPose) {
+            es3map::MapPose candidate;
+            if (panning && demand == DemandActive &&
+                es3map::decodeMapPose(r, candidate) == ReasonOk && candidate.seq > pose.seq) {
+                pose = candidate; poseReceivedMs = now;
+            }
+            return; // no credit and no reply, including malformed/stale poses
+        }
         if (r.type == RecordStart) {
             if (r.frameId <= _lastFrame) { result(r.frameId, ReasonBadFrameId); return; }
             if (_started >= grant) { result(r.frameId, ReasonNoCredit); return; }
             _lastFrame = r.frameId; ++_started;
             StartInfo info;
             Reason reason = decodeStart(r, info);
-            if (reason == ReasonOk) reason = checkStartForSession(info, config);
+            es3map::PanImage kind = es3map::PanImageNone;
+            if (reason == ReasonOk) reason = panning ? es3map::checkPanStart(info, panConfig, kind) :
+                checkStartForSession(info, config);
             if (reason == ReasonOk && demand != DemandActive) reason = ReasonHidden;
             int slot = -1;
             for (int i = 0; i < 2; ++i) if (inputs[i].state == Free) { slot = i; break; }
@@ -92,6 +120,8 @@ public:
             if (reason != ReasonOk) { result(r.frameId, reason); credit(); return; }
             Slot& s = inputs[slot]; s = Slot(); s.state = Receiving;
             s.token = token; s.frame = r.frameId; s.bytes = info.jpegBytes; s.started = now;
+            s.width = info.width; s.height = info.height;
+            s.origin = info.sourceTimestampUs; s.kind = kind;
             stats.jpegBytes = info.jpegBytes;
             return;
         }
@@ -126,20 +156,28 @@ public:
         int source = -1, destination = -1;
         for (int i = 0; i < 2; ++i) {
             if (inputs[i].state == Ready) source = i;
-            if (images[i].state == Free) destination = i;
         }
         if (source < 0) return false;
+        const int first = inputs[source].kind == es3map::PanImageChrome ? 2 : 0;
+        for (int i = first; i < first + 2; ++i)
+            if (images[i].state == Free) destination = i;
         if (destination < 0) {
-            for (int i = 0; i < 2; ++i) if (images[i].state == Ready) {
+            for (int i = first; i < first + 2; ++i) if (images[i].state == Ready) {
                 result(images[i].frame, ReasonSuperseded); destination = i; break;
             }
         }
-        if (destination < 0) { reject(source, ReasonBusy); return false; }
+        if (destination < 0) {
+            // A panning draw may briefly lease both old and replacement images
+            // while swapping. Retain the ready input until the old lease is
+            // returned; do not lose a rarely updated strip/background to Busy.
+            if (!panning) reject(source, ReasonBusy);
+            return false;
+        }
         inputs[source].state = Working;
         images[destination] = inputs[source];
         job.jpeg = source; job.image = destination; job.token = token;
         job.frame = inputs[source].frame; job.bytes = inputs[source].bytes;
-        job.width = config.viewportW; job.height = config.viewportH;
+        job.width = inputs[source].width; job.height = inputs[source].height;
         job.visibilityEpoch = _visibilityEpoch;
         return true;
     }
@@ -153,7 +191,7 @@ public:
             result(job.frame, ok ? ReasonHidden : ReasonDecodeFailed); return;
         }
         // Retain only the newest completed image, never replace a drawing lease.
-        for (int i = 0; i < 2; ++i) if (images[i].state == Ready) {
+        for (int i = 0; i < 4; ++i) if (images[i].state == Ready && images[i].kind == image.kind) {
             result(images[i].frame, ReasonSuperseded); images[i].state = Free;
         }
         image.state = Ready; image.decodeUs = duration;
@@ -161,25 +199,35 @@ public:
     }
     bool acquire(Image& image) {
         if (!token || demand != DemandActive) return false;
-        for (int i = 0; i < 2; ++i) if (images[i].state == Ready) {
+        for (int i = 0; i < 4; ++i) if (images[i].state == Ready) {
             Slot& s = images[i]; s.state = Working;
             image.slot = i; image.token = s.token; image.frame = s.frame;
-            image.decodeUs = s.decodeUs; image.pixels = pixels[i]; return true;
+            image.decodeUs = s.decodeUs; image.pixels = pixels[i];
+            image.width = s.width; image.height = s.height; image.origin = s.origin; image.kind = s.kind;
+            return true;
         }
         return false;
     }
+    // Panning holds its displayed images across many poses. Acknowledge once,
+    // separately from releasing the lease, so they cannot be decoded over.
+    void present(const Image& image, uint32_t blitUs) {
+        if (image.slot < 0 || image.slot >= 4 || !token || image.token != token) return;
+        Slot& slot = images[image.slot];
+        if (slot.presented) return;
+        slot.presented = true;
+        PresentedInfo info; info.decodeUs = image.decodeUs; info.blitUs = blitUs;
+        Event e; e.size = encodePresented(token, image.frame, info, e.bytes, sizeof(e.bytes)); emit(e);
+        ++stats.presented; stats.blitUs = blitUs;
+    }
     void release(Image& image, bool presented, uint32_t blitUs) {
         if (image.slot < 0) return;
+        if (presented) present(image, blitUs);
+        else if (token && token == image.token && !images[image.slot].presented)
+            result(image.frame, ReasonHidden);
         images[image.slot].state = Free;
-        if (token && token == image.token) {
-            if (presented) {
-                PresentedInfo info; info.decodeUs = image.decodeUs; info.blitUs = blitUs;
-                Event e; e.size = encodePresented(token, image.frame, info, e.bytes, sizeof(e.bytes)); emit(e);
-                ++stats.presented; stats.blitUs = blitUs;
-            } else result(image.frame, ReasonHidden);
-        }
         image = Image();
     }
+
 private:
     uint32_t _lastFrame = 0, _started = 0;
     uint32_t _visibilityEpoch = 0;

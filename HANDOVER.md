@@ -36,8 +36,8 @@ This file has three parts:
 | GRF-250 ranging | `e46bf71` | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
 | Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
 | CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
-| ES3C28P display preview | Uncommitted | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
-| ES3C28P map | Uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. | Firmware side (plan's "Firmware work"); real-tile sizes; enable `<Navigation>`. |
+| ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
+| ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
@@ -70,10 +70,12 @@ This file has three parts:
    sensor.
 8. **IMX296 v2 chart:** capture the three sheets with `capture_chart.py` (CALIBRATION.md, "Capture") once the CSI
    camera is back. Its first CSI run is also the helper's first CSI test.
-9. **ES3C28P map** (`peripherals/es3c28p/NAVIGATION_PLAN.md`; 2026-10-14 navigation log section): **Jetson side
-   implemented** (uncommitted), firmware side not. Decided by the user: MAP tab (page 5), north-up, phone hotspot /
-   car WiFi with online OSM tiles + cache, warm map while hidden. Next: the firmware author implements the plan's
-   "Firmware work" list; measure real OSM frame sizes once the tile CDN is reachable; then enable `<Navigation>`.
+9. **ES3C28P map** (`peripherals/es3c28p/NAVIGATION_PLAN.md`; 2026-10-14 navigation log sections): **Jetson side
+   implemented, including ES3C28P whole-frame and panning firmware** (panning changes uncommitted). Decided by the user:
+   MAP tab (page 5), north-up, phone hotspot / car WiFi with online OSM tiles + cache, warm map while hidden.
+   Software tests and HWCDC/TinyUSB builds pass; no board was flashed for this update. Next: bench the real
+   board with the Jetson, including pose-only freshness, background/strip swaps, low-speed dots, reconnects,
+   camera/map exclusion and memory fallback; measure actual redraw rate and USB traffic, then enable `<Navigation>`.
    **ES3C28P preview** (2026-10-14 log section): committed. When the board
    arrives: flash it, install `peripherals/es3c28p/host/99-dashcam-display.rules` with its serial, run the bench sketches
    (USB throughput hwcdc vs TinyUSB, JPEG decode/blit), then set `<DisplayPreview><Enabled>true` in the deployed config
@@ -370,6 +372,102 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-10-16: ES3C28P code review and refactor
+
+User requested a full review/refactor after the panning work. Detailed findings, ownership map, test commands and
+hardware limits: `peripherals/es3c28p/REVIEW_2026-10-16.md`. Existing uncommitted work was retained; the three design
+plans and shared protocol headers were hash-checked unchanged. No board was flashed and no deployment was changed.
+
+- **P1 startup defect fixed:** the shipped Settings text `Tap SET tab to calibrate` was 24 characters, exceeding
+  the 23-character page limit. `setPages()` failed and short-circuited graphics initialization. The shorter label
+  and actual default table (`src/DashboardConfig.h`) now have a portable regression test.
+- **Other fixes:** calibration saves verify a temporary file and preserve a backup instead of deleting the old
+  record first; malformed/oversized calibration text is rejected safely. Missing SD files no longer remount the
+  filesystem underneath WAV playback. BMP height/extent arithmetic and header overlap are validated. Python
+  control requests/playback poll idle parsers so a buffered reply behind a truncated record is recovered without
+  replaying the command. Startup allocation cleanup resets capacities, WAV metadata scanning is bounded, and
+  successful USB initialization is idempotent.
+- **Refactor:** dashboard, touch/calibration, SD images and streaming presentation now have separate graphics
+  source files with the same single loop-task panel owner. Portable allocation, persistence, page validation
+  and media-header helpers permit direct fault-injection tests. Wire format, map/camera behavior, PSRAM pool
+  sizes and task stack reservations are unchanged; voice remains unimplemented.
+- **Checks:** expanded C++11/C++17 suite and 39 Python tests; ASan/UBSan resource/media/state/raster tests;
+  pinned JPEGDEC fixtures; HWCDC and TinyUSB builds all pass. No compiler warnings. Final flash/static RAM:
+  HWCDC 543,610/54,740 bytes, TinyUSB 580,190/73,900 bytes. Static RAM and PSRAM are unchanged; flash is
+  about 15.7 KB smaller than the prior panning builds. Commands and evidence are in the review record.
+- **Hardware next:** verify first boot/calibration and SAVE/reboot/backup recovery; missing assets during audio;
+  map/camera/tab/reconnect transitions; throughput, tearing, touch latency and stack/heap minima during a soak.
+  Card replacement now requires restart or explicit remount after all File handles are closed. No claim of FAT
+  power-loss atomicity or measured panel performance is made.
+
+## 2026-10-15 handover: ES3C28P navigation panning firmware completed
+
+Firmware implementation and validation completed 2026-10-14; recorded here 2026-10-15. This supersedes the older
+entries saying that firmware panning is pending or rejects 0D. Detailed implementation and hardware acceptance:
+`peripherals/es3c28p/NAVIGATION_IMPLEMENTATION.md`. No commit, deployment or board flash was performed.
+
+- **Negotiation and compatibility:** implements PAN_CAPABILITIES (0D) and START_PAN (0E) against the already
+  updated shared headers. Advertises backgrounds up to 512x384, 16-pixel top/bottom strips and up to 30 pose
+  inputs/s. STOP_MAP ends either map mode. Whole-frame maps and camera preview remain supported; map and camera
+  sessions exclude each other. The navigation/video/voice plans and shared protocol headers were unchanged
+  by this firmware work (hash-checked).
+- **Receive/decode:** backgrounds and 320x32 status/attribution images use independent pairs of RGB565 buffers;
+  only the same image kind supersedes a queued image. Valid increasing MAP_POSE sequences for the current
+  visible session can arrive between JPEG chunks without credits or replies. Foreign, stale and invalid poses
+  are ignored. Decoder output capacity is checked explicitly for the larger images.
+- **Display:** new portable `lib/es3Map/PanRaster.h` crops the retained background and draws the dot, heading
+  arrow or last-known ring locally, clipped to the map area. The board applies the host pose directly; GPS
+  smoothing stays on the Jetson. Each draw freezes its pose and image leases, writes at most eight rows per
+  loop and coalesces subsequent poses. Unchanged strips remain on screen. PRESENTED is sent once per image;
+  retained buffers cannot be overwritten by decode. Valid poses refresh freshness even without new JPEGs;
+  stale/disconnect notices affect only the top strip. Visibility/session changes release retained leases.
+- **Memory/fallback:** two compressed inputs, two 512x384 backgrounds and two 320x32 strip buffers total
+  958,464 bytes of PSRAM (startup upgrade peak 1,265,664 bytes). If the optional allocation fails, the original
+  438,272-byte whole-frame pipeline remains available and panning returns NotReady for host fallback.
+- **Validation passed:** `tests/run_tests.sh` (C++11/C++17 wire, receiver, surface and raster checks, shared-header
+  parity, 38 Python tests); pan receiver/raster ASan + UBSan; JPEGDEC sanitizer fixtures including 512x384 and
+  511x383 baseline 4:2:0 backgrounds and 320x32 4:4:4 strips. Tests cover interleaved poses, retained leases,
+  same-kind replacement, temporary buffer contention, crop bounds, marker directions/colors and malformed JPEGs.
+  Arduino ESP32 3.2.0 / JPEGDEC 1.8.4 builds pass with `--warnings all` and no warnings in both modes:
+  HWCDC 559,370 bytes flash / 54,740 bytes static RAM; TinyUSB 595,914 / 73,900. PSRAM is additional.
+- **Still needs hardware:** connect to the actual Jetson sender, verify long pose-only intervals, independent
+  asset swaps, marker trails/clipping, low-speed dots, GPS loss, reconnects, tab changes and whole-frame fallback.
+  Measure touch responsiveness, tearing, actual redraw cadence and USB bandwidth. The host's ~5 KB/s simulation
+  and 20 Hz pose delivery are not measured board performance or a promise of 20 screen redraws/s.
+
+## 2026-10-14 (Jetson, bench): ES3C28P map extension v2, board-side panning (Jetson side)
+
+The user asked for a map that moves like the camera stream, with interpolation between GPS fixes, and chose the
+board-scrolls option ("plan B"). Design, wire table and the firmware to-do list: NAVIGATION_PLAN.md, "Extension v2:
+board-side panning". Nothing committed. The firmware half followed the same evening (entry above).
+
+- **Wire (additive; v1 bytes and vectors unchanged, both header copies cmp-checked):** 0D PAN_CAPABILITIES (9 B),
+  0E START_PAN (START_MAP's 27 B + background size), background and chrome images as ordinary E3 29 frames (told
+  apart by size; the background START carries its world origin), E3 29 type 10 MAP_POSE (16 B, 1/16 px world
+  position, course, marker, seq). Shared integer view math `computePanView()`. 20 vectors in
+  `tests/pan_golden_vectors.txt`, new `pan_protocol_test` in `run_tests.sh`. Firmware without v2 answers 0D with
+  BadCommand and keeps getting whole frames (checked against the pre-panning firmware: 555,014 B, suites pass).
+- **Link:** asks 0D after 0A, START_PAN when available, `panSink()` with one pending background/chrome/pose, poses
+  sent between any two records at most at the board's rate; falls back to whole frames if START_PAN is refused.
+- **Navigation:** `PoseInterpolator` (one fix interval + 50 ms behind, never extrapolates), background planner (new
+  background before the old one runs out, centred ahead), pan background/chrome compositing, 20 Hz service loop,
+  next background's tiles fetched ~3 s early. `<Navigation>` gains Panning / PoseHz / PanBackgroundWidth/Height /
+  PanJpegQuality; v0.4 wires `display.panSink()`.
+- **Tests (all PASS, plain `make`, 0 warnings):** es3display_test [21] pan surface, [22] navigation -> link -> fake
+  board over the pty; navigation_test [8] helpers, [9] service with a fake panning sink; config_test round trip.
+- **Real-tile simulation:** `navigation_test --pan-drive OUTDIR` (needs `docker run --dns 1.1.1.1` on this bench)
+  drives the Champs-Elysees route through a simulated board at 30 fps: 15 backgrounds in 155 s (51-60 KB at q75
+  4:2:0, one every ~12 s at 60 km/h), 3,094 poses, 25 tile downloads, interpolation delay 350 ms. Video and frames:
+  `~/drive_logs/es3c28p_20261014/pan_demo2/` (not in the repo).
+- **Checked 2026-10-15 against the colleague's v2 firmware (working tree, no board):** both header copies still
+  byte-identical; `run_tests.sh` (incl. pan vectors and the panning receiver/raster checks) and
+  `run_decoder_tests.sh` pass; firmware build 0 warnings, 559,370 B. The firmware advertises 512x384 / 16+16 /
+  30 poses/s, which are the Jetson's defaults, so no Jetson change is needed. Not reviewed line by line; the
+  Jetson tests use a contract fake, not this firmware code, so the first real check of the pair is on the bench.
+- **Open:** commit both halves (Jetson + firmware, all uncommitted); bench the pair (USB throughput, 4:2:0
+  decode/draw time, redraw rate at 20 poses/s, fallback); CAN-aided motion between fixes (would cut the 0.35 s
+  lag) is a possible later step.
 
 ## 2026-10-14 (Jetson, bench): ES3C28P map, Jetson side
 

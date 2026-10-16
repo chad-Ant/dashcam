@@ -19,6 +19,9 @@ The Jetson side, frozen map wire extension (`Es3MapProtocol.h`) and firmware
 receiver are implemented. See [NAVIGATION_IMPLEMENTATION.md](NAVIGATION_IMPLEMENTATION.md)
 for board behavior, validation and remaining hardware checks. The plan remains
 the unchanged design record.
+The board also supports panning: a retained background up to 512x384, separate
+status/attribution images and small pose updates for local cropping and marker
+drawing. Whole-frame mode remains available if panning memory cannot be allocated.
 
 ESP32-S3 port of `../cyd`, for the LCDWiki **ES3C28P N16R8** capacitive-touch
 board (16 MB flash, 8 MB OPI PSRAM). The existing CYD firmware remains separate.
@@ -29,13 +32,17 @@ placeholders until the Jetson supplies page text over the native USB channel.
 The USB client can update pages, request status and play/stop alerts. Automatic
 publishing of the dashcam application's vehicle telemetry is not wired in yet.
 
+The [2026-10-16 review record](REVIEW_2026-10-16.md) documents fixes, ownership,
+refactoring, validation and remaining hardware checks.
+
 ## Layout
 
 ```text
 es3c28p.ino                 Arduino CLI entry marker
-src/main.cpp               page data, brightness configuration, setup/loop
+src/main.cpp               brightness configuration, setup/loop
+src/DashboardConfig.h      tested default page table and auto-brightness enable
 lib/es3Board/              board pins and shared touch/codec I2C bus
-lib/es3Graphics/           ILI9341V IPS display, FT6336G touch, dashboard
+lib/es3Graphics/           dashboard, touch, assets and stream presentation sources
 lib/es3Storage/            four-bit SDMMC storage and calibration records
 lib/es3Audio/              ES8311 codec and modern ESP-IDF I2S DMA output
 lib/es3UsbLink/            USB task, multiplexed controls/video and frozen protocol
@@ -96,11 +103,20 @@ as the CYD component. The supplied tone uses 8 kHz.
 SDMMC tries 20 MHz, then 10 MHz, without formatting on failure. Insert the
 card before boot; avoid swapping it during playback or image rendering.
 
+Missing SD assets fail without remounting the filesystem under active audio
+readers. After replacing a card, restart the board or explicitly close all
+files before `Es3Storage::remount()`. WAV metadata scanning is limited to 256
+chunks whose headers start within the first 64 KiB; normal PCM alert files
+remain supported.
+
 On first boot, tap and release each of the twelve calibration targets, then
 use the touch-check screen to verify the mapping and choose SAVE. Although
 capacitive coordinates are already pixels, this preserves the CYD's wizard
 and learns the panel's orientation. The record lives at
 `/es3c28p_touch.cal`, independently of the classic CYD's calibration file.
+Saving verifies a temporary record before replacing the primary and retains
+`.cal.bak` for recovery; boot falls back to that backup if the primary is invalid.
+This protects against failed writes/renames, not every SD power-loss failure.
 Re-tap the active SET tab to recalibrate. With no SD card the wizard still
 works, but calibration is lost on reboot. Out-of-range, repeated or unordered
 calibration knots are rejected before piecewise mapping.
@@ -112,8 +128,9 @@ manual PWM brightness (`B=8..255`), starting at full brightness. The lower
 limit keeps the controls visible; brightness resets on reboot.
 
 For CYD-style automatic brightness, connect a 3.3 V LDR voltage divider to
-GPIO2 and enable `kBrightness` in `src/main.cpp`. Measure the divider's dark
-and bright ADC readings, and set `darkRaw`, `brightRaw`, and
+GPIO2 and enable `kAutoBrightness` in `src/DashboardConfig.h`. Measure the
+divider's dark and bright ADC readings, then set `kBrightness.darkRaw`,
+`brightRaw`, and
 `brightThresholdRaw` accordingly; the supplied values are examples.
 The external divider uses 11 dB ADC attenuation. GPIO9 is the battery
 monitor, not a light sensor. Settings then adjusts the raw light threshold
@@ -265,6 +282,8 @@ Only the application loop executes graphics/audio commands.
 | MAP_CAPABILITIES | 0A | empty | 16-byte frozen map capabilities |
 | START_MAP | 0B | 27-byte map settings | session token u32, initial grant u32 |
 | STOP_MAP | 0C | session token u32 | empty; wrong source/stale token is a no-op |
+| PAN_CAPABILITIES | 0D | empty | 9-byte background/strip/pose limits |
+| START_PAN | 0E | 31-byte map settings and background dimensions | session token u32, initial grant u32 |
 
 Video records use the frozen `Es3VideoProtocol.h` framing and golden vectors;
 the initial credit window is one. See [VIDEO_IMPLEMENTATION.md](VIDEO_IMPLEMENTATION.md).
@@ -273,6 +292,11 @@ is exactly (0,0,320,224); tabs stay visible. Tap the attribution strip for local
 map/licence information and tap again to close it. Stale map notices occupy
 only the top 16 pixels, preserving map attribution. Camera/map ownership,
 GPS direction/dot selection and tile rendering are coordinated by the Jetson.
+In panning mode, the board draws the selected marker and crops the background
+from uncredited MAP_POSE records (E3 29 type 10). It advertises up to 30 poses/s,
+with panel redraws coalescing to the newest pose. Accepted poses refresh map
+freshness even when image transfers are seconds apart. STOP_MAP ends either
+map mode. The screen viewport and existing control/video formats are unchanged.
 
 ## Validation
 
@@ -281,6 +305,7 @@ Arduino ESP32 3.2.0. Run the host tests from the repository root:
 
 ```sh
 peripherals/es3c28p/tests/run_tests.sh
+peripherals/es3c28p/tests/run_sanitizer_tests.sh
 ```
 
 These cover calibration validation, C++/Python framing compatibility, CRC

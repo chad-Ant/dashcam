@@ -1,13 +1,13 @@
 /** @file es3Audio.cpp */
 
 #include "es3Audio.h"
+#include "WavHeader.h"
 
 #include <cstring>
 #include "es3Board.h"
 
 namespace {
 constexpr uint32_t kMinimumSampleRate = 8000;
-constexpr uint32_t kMaximumSampleRate = 16000;
 constexpr uint32_t kDmaBufferCount = 8;
 constexpr uint32_t kDmaFrames = 128;
 constexpr uint8_t kBlocksPerUpdate = 4;
@@ -125,106 +125,20 @@ void Es3Audio::closeOutput()
     }
 }
 
-bool Es3Audio::readExact(uint8_t* destination, size_t count)
-{
-    return _file.read(destination, count) == count;
-}
-
-bool Es3Audio::readU16(uint16_t& value)
-{
-    uint8_t bytes[2]{};
-    if (!readExact(bytes, sizeof(bytes))) {
-        return false;
-    }
-    value = static_cast<uint16_t>(bytes[0]) |
-            static_cast<uint16_t>(bytes[1]) << 8;
-    return true;
-}
-
-bool Es3Audio::readU32(uint32_t& value)
-{
-    uint8_t bytes[4]{};
-    if (!readExact(bytes, sizeof(bytes))) {
-        return false;
-    }
-    value = static_cast<uint32_t>(bytes[0]) |
-            static_cast<uint32_t>(bytes[1]) << 8 |
-            static_cast<uint32_t>(bytes[2]) << 16 |
-            static_cast<uint32_t>(bytes[3]) << 24;
-    return true;
-}
-
-bool Es3Audio::parseWavHeader()
-{
-    uint8_t riff[4]{};
-    uint32_t riffSize = 0;
-    uint8_t wave[4]{};
-    if (!readExact(riff, sizeof(riff)) || !readU32(riffSize) || !readExact(wave, sizeof(wave)) ||
-        std::memcmp(riff, "RIFF", 4) != 0 || std::memcmp(wave, "WAVE", 4) != 0) {
-        return false;
-    }
-
-    if (riffSize < 4 || _file.size() < 12 || riffSize > _file.size() - 8) {
-        return false;
-    }
-    const uint32_t riffEnd = riffSize + 8;
-    bool foundFormat = false;
-    while (_file.position() <= riffEnd && riffEnd - _file.position() >= 8) {
-        uint8_t chunkId[4]{};
-        uint32_t chunkSize = 0;
-        if (!readExact(chunkId, sizeof(chunkId)) || !readU32(chunkSize)) {
-            return false;
-        }
-        const uint32_t chunkStart = _file.position();
-        if (chunkSize > riffEnd - chunkStart) {
-            return false;
-        }
-        if (std::memcmp(chunkId, "fmt ", 4) == 0) {
-            uint16_t format = 0;
-            uint16_t channels = 0;
-            uint32_t sampleRate = 0;
-            uint32_t byteRate = 0;
-            uint16_t blockAlign = 0;
-            uint16_t bitsPerSample = 0;
-            if (chunkSize < 16 || !readU16(format) || !readU16(channels) ||
-                !readU32(sampleRate) || !readU32(byteRate) || !readU16(blockAlign) ||
-                !readU16(bitsPerSample) || format != 1 || channels != 1 ||
-                bitsPerSample != 8 || blockAlign != 1 || byteRate != sampleRate ||
-                sampleRate < kMinimumSampleRate || sampleRate > kMaximumSampleRate) {
-                return false;
-            }
-            _sampleRate = sampleRate;
-            foundFormat = true;
-        } else if (std::memcmp(chunkId, "data", 4) == 0) {
-            if (!foundFormat || chunkSize == 0) {
-                return false;
-            }
-            _dataRemaining = chunkSize;
-            return true;
-        }
-
-        if ((chunkSize & 1U) > riffEnd - chunkStart - chunkSize) {
-            return false;
-        }
-        const uint32_t nextChunk = chunkStart + chunkSize + (chunkSize & 1U);
-        if (nextChunk > _file.size() || !_file.seek(nextChunk)) {
-            return false;
-        }
-    }
-    return false;
-}
-
 bool Es3Audio::playWav(const char* path)
 {
     if (!_ready || path == nullptr) {
         return false;
     }
     stop();
-    if (!_storage.openRead(path, _file) || !parseWavHeader() || !openOutput(_sampleRate)) {
+    es3audio::WavHeader<File> header(_file);
+    if (!_storage.openRead(path, _file) || !header.parse() || !openOutput(header.sampleRate())) {
         Serial0.printf("[es3] audio unsupported or unavailable: %s\n", path);
         stop();
         return false;
     }
+    _sampleRate = header.sampleRate();
+    _dataRemaining = header.dataBytes();
     _playing = _dataRemaining > 0;
     digitalWrite(Es3Board::amplifierDisable, LOW);
     Serial0.printf("[es3] audio playing: %s\n", path);

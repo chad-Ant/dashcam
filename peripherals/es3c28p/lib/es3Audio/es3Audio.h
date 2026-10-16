@@ -48,8 +48,4 @@ private:
     bool openOutput(uint32_t sampleRate);
     void closeOutput();
     bool readBlock();
-    bool parseWavHeader();
-    bool readU16(uint16_t& value);
-    bool readU32(uint32_t& value);
-    bool readExact(uint8_t* destination, size_t count);
 };

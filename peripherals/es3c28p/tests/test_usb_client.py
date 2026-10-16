@@ -372,6 +372,7 @@ class SerialTests(unittest.TestCase):
         self.requests = []
         self.stop = threading.Event()
         self.ignore_status = False
+        self.truncated_prefix = False
         self.bad_identity = False
         self.video = False
         self.map = False
@@ -429,6 +430,8 @@ class SerialTests(unittest.TestCase):
                 # Send stale sequence then fragmented matching reply.
                 wire = es3.encode((seq + 1) % 256, kind | es3.REPLY, response)
                 wire += es3.encode(seq, kind | es3.REPLY, response)
+                if self.truncated_prefix and kind == es3.STATUS:
+                    wire = es3.encode_chunk(TOKEN, 1, 0, bytes(512))[:18] + wire
                 for offset in range(0, len(wire), 3):
                     os.write(self.master, wire[offset:offset + 3])
                     time.sleep(0.001)
@@ -464,6 +467,14 @@ class SerialTests(unittest.TestCase):
         pages = [body for kind, body in self.requests if kind == es3.PAGE]
         self.assertEqual(len(pages), 1)
         self.assertEqual(pages[0][0], 5)
+
+    def test_request_recovers_buffered_reply_without_more_bytes(self):
+        with es3.Es3Display(self.device, timeout=0.8) as display:
+            self.truncated_prefix = True
+            self.assertEqual(display.status()["uptime_ms"], 1234)
+            self.assertIsNotNone(display.fd)
+            self.assertEqual(display.parser.timeouts, 1)
+        self.assertEqual([kind for kind, _ in self.requests].count(es3.STATUS), 1)
 
     def test_timeout_closes_without_replaying_command(self):
         with es3.Es3Display(self.device, timeout=0.1) as display:

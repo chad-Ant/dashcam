@@ -27,11 +27,24 @@ inline MapCapabilities capabilities(const es3video::Capabilities& video) {
     m.maxJpegBytes = video.maxJpegBytes; m.flags = kFlagMapTab;
     return m;
 }
+inline PanCapabilities panCapabilities() {
+    PanCapabilities p;
+    p.maxBackgroundW = 512; p.maxBackgroundH = 384;
+    p.chromeTopH = 16; p.chromeBottomH = 16; p.maxPoseHz = 30;
+    return p;
+}
 enum class Surface : uint8_t { Camera, Map };
 struct Binding {
     Surface surface = Surface::Camera;
     uint32_t generation = 0;
+    bool panning = false;
     uint8_t page() const { return surface == Surface::Map ? kMapPage : 0; }
+};
+
+struct PanSnapshot {
+    PanSession session;
+    MapPose pose;
+    uint32_t poseReceivedMs = 0;
 };
 
 class SurfaceState : public es3video::VideoState {
@@ -54,9 +67,20 @@ public:
                   const es3video::Capabilities& caps) {
         if (!session || !validStartMap(request, capabilities(caps), caps) ||
             (token && binding.surface != Surface::Map)) return false;
-        binding.surface = Surface::Map; binding.generation = request.generation;
+        binding = Binding(); binding.surface = Surface::Map; binding.generation = request.generation;
         demand = currentDemand();
         start(session, sessionLimits(request));
+        return true;
+    }
+    bool startPan(uint32_t session, const StartPanRequest& request,
+                  const es3video::Capabilities& caps) {
+        if (!session || !validStartPan(request, panCapabilities(), capabilities(caps), caps) ||
+            (token && binding.surface != Surface::Map)) return false;
+        binding = Binding(); binding.surface = Surface::Map;
+        binding.generation = request.map.generation; binding.panning = true;
+        demand = currentDemand();
+        start(session, sessionLimits(request.map));
+        panning = true; panConfig = panSession(request, panCapabilities());
         return true;
     }
     void stopSurface(Surface source, uint32_t session) {
