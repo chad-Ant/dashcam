@@ -16,14 +16,19 @@ for %%I in ("%SKETCH_DIR%\lib\cydGraphics") do set "GRAPHICS_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\lib\cydStorage") do set "STORAGE_DIR=%%~fI"
 for %%I in ("%SKETCH_DIR%\lib\cydAudio") do set "AUDIO_DIR=%%~fI"
 
+for %%I in ("%SKETCH_DIR%\lib\cydNavigation") do set "NAVIGATION_DIR=%%~fI"
+
+arduino-cli lib install --no-deps "JPEGDEC@1.8.4"
+if errorlevel 1 exit /b 1
+
 rem The CYD uses a classic ESP32 and a CH340 serial adapter, not ESP32-C3 USB CDC.
 set "FQBN=esp32:esp32:esp32"
 set "WARN=--warnings all"
 
 if "%~1"=="" (
-    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" --library "%NAVIGATION_DIR%" "%SKETCH_DIR%"
 ) else (
-    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" "%SKETCH_DIR%"
+    arduino-cli compile %WARN% --upload --port "%~1" --fqbn "%FQBN%" --library "%STORAGE_DIR%" --library "%GRAPHICS_DIR%" --library "%AUDIO_DIR%" --library "%NAVIGATION_DIR%" "%SKETCH_DIR%"
 )
 
 exit /b %ERRORLEVEL%

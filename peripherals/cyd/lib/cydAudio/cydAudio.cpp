@@ -1,3 +1,4 @@
+#include "CydLog.h"
 /** @file cydAudio.cpp */
 
 #include "cydAudio.h"
@@ -45,7 +46,7 @@ bool CydAudio::begin()
     // queue as an error. Real write failures are reported by update().
     esp_log_level_set("dac_continuous", ESP_LOG_NONE);
     _ready = true;
-    Serial.printf("[cyd] audio ready: GPIO%d DAC\n", kSpeakerDacPin);
+    cydLog("[cyd] audio ready: GPIO%d DAC\n", kSpeakerDacPin);
     return true;
 }
 
@@ -169,12 +170,12 @@ bool CydAudio::playWav(const char* path)
     }
     stop();
     if (!_storage.openRead(path, _file) || !parseWavHeader() || !openDac(_sampleRate)) {
-        Serial.printf("[cyd] audio unsupported or unavailable: %s\n", path);
+        cydLog("[cyd] audio unsupported or unavailable: %s\n", path);
         _file.close();
         return false;
     }
     _playing = _dataRemaining > 0;
-    Serial.printf("[cyd] audio playing: %s\n", path);
+    cydLog("[cyd] audio playing: %s\n", path);
     return _playing;
 }
 
@@ -225,7 +226,7 @@ void CydAudio::update()
             return;
         }
         if (result != ESP_OK) {
-            Serial.println("[cyd] audio DMA write failed");
+            cydLog("[cyd] audio DMA write failed");
             stop();
             return;
         }

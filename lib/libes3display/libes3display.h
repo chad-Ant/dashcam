@@ -273,7 +273,7 @@ struct DisplayLinkStats {
     uint64_t disconnects     = 0;  ///< tty closures after an open.
     uint64_t rehellos        = 0;  ///< HELLO again on the same tty (timeout / NoSession).
     uint64_t helloTimeouts   = 0;
-    uint64_t helloRejected   = 0;  ///< Wrong identity: not an ES3C28P.
+    uint64_t helloRejected   = 0;  ///< Wrong identity: neither ES3C28P nor CYD.
     uint64_t noSessionErrors = 0;
 
     // Control.

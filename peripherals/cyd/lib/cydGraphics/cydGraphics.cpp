@@ -1,3 +1,4 @@
+#include "CydLog.h"
 /** @file cydGraphics.cpp */
 
 #include "cydGraphics.h"
@@ -108,7 +109,8 @@ bool CydGraphics::setPages(const CydDashboardPage* pages, uint8_t count)
             return false;
         }
     }
-    _pages = pages;
+    for (uint8_t i = 0; i < count; ++i) _ownedPages[i] = pages[i];
+    _pages = _ownedPages;
     _pageCount = count;
     return true;
 }
@@ -142,7 +144,7 @@ bool CydGraphics::setBrightnessThresholdRaw(uint16_t raw)
         return false;
     }
     _brightnessConfig.brightThresholdRaw = raw;
-    Serial.printf("[cyd] brightness threshold L=%u\n", raw);
+    cydLog("[cyd] brightness threshold L=%u\n", raw);
     if (_started && _pages[_activePage].showBrightnessControl) {
         drawBrightnessControls();
     }
@@ -159,7 +161,7 @@ bool CydGraphics::drawBmp24FromSd(const char* path, int x, int y,
 
     File file;
     if (!_storage.openRead(path, file)) {
-        Serial.printf("[cyd] splash open failed: %s\n", path);
+        cydLog("[cyd] splash open failed: %s\n", path);
         return false;
     }
     const uint32_t startedUs = micros();
@@ -192,7 +194,7 @@ bool CydGraphics::drawBmp24FromSd(const char* path, int x, int y,
     if (!headerOk || signature != 0x4D42 || dibSize < 40 ||
         bitmapWidth != width || absoluteHeight != height || planes != 1 ||
         bitsPerPixel != 24 || compression != 0) {
-        Serial.printf("[cyd] splash format error: sig=%04X %lux%ld bpp=%u compression=%lu\n",
+        cydLog("[cyd] splash format error: sig=%04X %lux%ld bpp=%u compression=%lu\n",
                       signature, static_cast<unsigned long>(bitmapWidth),
                       static_cast<long>(bitmapHeight), bitsPerPixel,
                       static_cast<unsigned long>(compression));
@@ -205,7 +207,7 @@ bool CydGraphics::drawBmp24FromSd(const char* path, int x, int y,
     // The BMP file-size field is optional in practice; trust the filesystem
     // size, which makes the loader work with common exporters that leave it 0.
     if (pixelEnd > file.size()) {
-        Serial.printf("[cyd] splash truncated: offset=%lu need=%lu actual=%lu header=%lu\n",
+        cydLog("[cyd] splash truncated: offset=%lu need=%lu actual=%lu header=%lu\n",
                       static_cast<unsigned long>(pixelOffset),
                       static_cast<unsigned long>(pixelEnd),
                       static_cast<unsigned long>(file.size()),
@@ -219,7 +221,7 @@ bool CydGraphics::drawBmp24FromSd(const char* path, int x, int y,
     for (uint16_t sourceRow = 0; sourceRow < height; ++sourceRow) {
         const uint32_t offset = pixelOffset + static_cast<uint32_t>(sourceRow) * rowBytes;
         if (!file.seek(offset) || file.read(bgr, rowBytes) != rowBytes) {
-            Serial.printf("[cyd] splash read error at row %u\n", sourceRow);
+            cydLog("[cyd] splash read error at row %u\n", sourceRow);
             file.close();
             return false;
         }
@@ -235,7 +237,7 @@ bool CydGraphics::drawBmp24FromSd(const char* path, int x, int y,
     }
     file.close();
     const uint32_t elapsedUs = micros() - startedUs;
-    Serial.printf("[cyd] BMP splash rendered: %s (%lu bytes, %lu ms, SD %lu MHz)\n",
+    cydLog("[cyd] BMP splash rendered: %s (%lu bytes, %lu ms, SD %lu MHz)\n",
                   path, static_cast<unsigned long>(pixelEnd),
                   static_cast<unsigned long>((elapsedUs + 500U) / 1000U),
                   static_cast<unsigned long>(_storage.spiFrequencyHz() / 1000000U));
@@ -252,13 +254,13 @@ bool CydGraphics::drawRgb565FromSd(const char* path, int x, int y,
 
     File file;
     if (!_storage.openRead(path, file)) {
-        Serial.printf("[cyd] RGB565 splash open failed: %s\n", path);
+        cydLog("[cyd] RGB565 splash open failed: %s\n", path);
         return false;
     }
 
     const uint32_t expectedBytes = static_cast<uint32_t>(width) * height * 2U;
     if (file.size() != expectedBytes) {
-        Serial.printf("[cyd] RGB565 splash size error: %s expected=%lu actual=%lu\n",
+        cydLog("[cyd] RGB565 splash size error: %s expected=%lu actual=%lu\n",
                       path, static_cast<unsigned long>(expectedBytes),
                       static_cast<unsigned long>(file.size()));
         file.close();
@@ -281,7 +283,7 @@ bool CydGraphics::drawRgb565FromSd(const char* path, int x, int y,
         if (file.read(reinterpret_cast<uint8_t*>(pixels), byteCount) != byteCount) {
             gTft.endWrite();
             file.close();
-            Serial.printf("[cyd] RGB565 splash read error: %s\n", path);
+            cydLog("[cyd] RGB565 splash read error: %s\n", path);
             return false;
         }
         gTft.writePixels(pixels, pixelsThisBlock, true, true);
@@ -291,7 +293,7 @@ bool CydGraphics::drawRgb565FromSd(const char* path, int x, int y,
     file.close();
 
     const uint32_t elapsedUs = micros() - startedUs;
-    Serial.printf("[cyd] RGB565 splash rendered: %s (%lu bytes, %lu ms, SD %lu MHz)\n",
+    cydLog("[cyd] RGB565 splash rendered: %s (%lu bytes, %lu ms, SD %lu MHz)\n",
                   path, static_cast<unsigned long>(expectedBytes),
                   static_cast<unsigned long>((elapsedUs + 500U) / 1000U),
                   static_cast<unsigned long>(_storage.spiFrequencyHz() / 1000000U));
@@ -336,7 +338,7 @@ bool CydGraphics::begin()
 
     _calibrationValid = _storage.loadTouchCalibration(_calibration);
     _started = true;
-    Serial.printf("[cyd] graphics ready; SD %s; calibration %s\n",
+    cydLog("[cyd] graphics ready; SD %s; calibration %s\n",
                   _storage.available() ? "OK" : "not found",
                   _calibrationValid ? "loaded" : "needed");
     if (_calibrationValid) {
@@ -423,14 +425,14 @@ void CydGraphics::updateBrightness(bool force)
     }
     if (now - _lastBrightnessLogMs >= 1000U) {
         _lastBrightnessLogMs = now;
-        Serial.printf("[cyd] LDR raw=%d, backlight=%u->%u/255\n",
+        cydLog("[cyd] LDR raw=%d, backlight=%u->%u/255\n",
                       _filteredLightRaw, _brightnessDuty, _brightnessTargetDuty);
     }
 }
 
 void CydGraphics::drawBrightnessStatus()
 {
-    if (!_brightnessConfigured) {
+    if (!_brightnessConfigured || mapVisible()) {
         return;
     }
     // This diagnostic remains on every dashboard page. It makes it possible
@@ -508,7 +510,8 @@ void CydGraphics::printCentered(const char* text, int centerX, int y, uint16_t c
 void CydGraphics::drawTabs()
 {
     for (uint8_t i = 0; i < _pageCount; ++i) {
-        const int x = static_cast<int>(i) * kTabWidth;
+        const int x = int(i) * kScreenWidth / _pageCount;
+        const int kTabWidth = (int(i) + 1) * kScreenWidth / _pageCount - x;
         gTft.fillRect(x, kTabTop, kTabWidth, kTabHeight, ILI9341_WHITE);
         gTft.drawRect(x, kTabTop, kTabWidth, kTabHeight, ILI9341_DARKGREY);
         if (i == _activePage) {
@@ -529,6 +532,11 @@ void CydGraphics::drawField(const char* label, int y, uint16_t colour)
 
 void CydGraphics::drawPage()
 {
+    if (_activePage == 5) {
+        mapPlaceholder("Waiting for map");
+        drawTabs();
+        return;
+    }
     const CydDashboardPage& page = _pages[_activePage];
     gTft.fillRect(0, 0, kScreenWidth, kTabTop, ILI9341_BLACK);
     if (page.showSdSplash) {
@@ -538,7 +546,7 @@ void CydGraphics::drawPage()
                                             kScreenWidth, kTabTop);
         } else if (_storage.exists(kSplashBmpFile)) {
             // Keep the existing asset usable while cards are migrated to raw.
-            Serial.println("[cyd] legacy BMP splash; use /splash.rgb565 for faster loading");
+            cydLog("[cyd] legacy BMP splash; use /splash.rgb565 for faster loading");
             splashDrawn = drawBmp24FromSd(kSplashBmpFile, 0, 0,
                                            kScreenWidth, kTabTop);
         } else {
@@ -802,7 +810,7 @@ void CydGraphics::handleCalibration()
 
     _calibrationTouchHeld = true;
     _calibrationSamples[_calibrationTarget] = raw;
-    Serial.printf("[cyd] calibration %u raw=%u,%u\n", _calibrationTarget + 1, raw.x, raw.y);
+    cydLog("[cyd] calibration %u raw=%u,%u\n", _calibrationTarget + 1, raw.x, raw.y);
     ++_calibrationTarget;
     if (_calibrationTarget == kCalibrationPointCount) {
         _calibrationCompletePending = true;
@@ -852,8 +860,9 @@ void CydGraphics::drawCalibrationTest()
     gTft.setTextColor(ILI9341_CYAN);
     gTft.setCursor(110, 204);
     gTft.print("Tab targets");
-    for (int tab = 0; tab < kTabCount; ++tab) {
-        const int x = tab * kTabWidth;
+    for (int tab = 0; tab < _pageCount; ++tab) {
+        const int x = tab * kScreenWidth / _pageCount;
+        const int kTabWidth = (tab + 1) * kScreenWidth / _pageCount - x;
         gTft.drawRect(x, kTabTop, kTabWidth, kTabHeight, ILI9341_WHITE);
         gTft.drawFastVLine(x + kTabWidth / 2, kTabTop + 3, 10, ILI9341_YELLOW);
     }
@@ -863,7 +872,7 @@ void CydGraphics::saveCalibration()
 {
     _calibrationTesting = false;
     const bool saved = _storage.saveTouchCalibration(_calibration);
-    Serial.printf("[cyd] touch calibration verified; SD save %s\n", saved ? "OK" : "failed");
+    cydLog("[cyd] touch calibration verified; SD save %s\n", saved ? "OK" : "failed");
     drawPage();
 }
 
@@ -884,7 +893,7 @@ void CydGraphics::handleCalibrationTest()
     if (!mapTouch(raw, screenX, screenY)) {
         return;
     }
-    Serial.printf("[cyd] touch check raw=%u,%u mapped=%d,%d\n",
+    cydLog("[cyd] touch check raw=%u,%u mapped=%d,%d\n",
                   raw.x, raw.y, screenX, screenY);
     if (screenY >= 52 && screenY < 80) {
         if (screenX >= 14 && screenX < 144) {
@@ -918,12 +927,12 @@ void CydGraphics::handleDashboardTouch()
     if (!mapTouch(raw, screenX, screenY)) {
         return;
     }
-    Serial.printf("[cyd] touch raw=%u,%u mapped=%d,%d\n", raw.x, raw.y, screenX, screenY);
+    cydLog("[cyd] touch raw=%u,%u mapped=%d,%d\n", raw.x, raw.y, screenX, screenY);
     if (screenY < kTabTop) {
         (void)handleBrightnessControlTouch(screenX, screenY);
         return;
     }
-    const int selectedPage = screenX / kTabWidth;
+    const int selectedPage = ((screenX + 1) * _pageCount - 1) / kScreenWidth;
     if (selectedPage < 0 || selectedPage >= _pageCount) {
         return;
     }
@@ -935,4 +944,46 @@ void CydGraphics::handleDashboardTouch()
     }
     _activePage = static_cast<uint8_t>(selectedPage);
     drawPage();
+}
+
+void CydGraphics::mapPlaceholder(const char* message)
+{
+    if (!mapVisible()) return;
+    gTft.fillRect(0, 0, 320, 224, ILI9341_BLACK);
+    printCentered(message, 160, 104, ILI9341_WHITE);
+}
+void CydGraphics::mapStale()
+{
+    if (!mapVisible()) return;
+    gTft.fillRect(0, 0, 320, 16, ILI9341_DARKGREY);
+    printCentered("MAP STALE", 160, 4, ILI9341_YELLOW);
+}
+bool CydGraphics::drawMapBlock(int x, int y, int width, int height, uint16_t* pixels)
+{
+    if (!mapVisible() || !pixels || x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x >= 320 || y >= 224 || width > 320 - x || height > 224 - y) return false;
+    gTft.startWrite();
+    gTft.setAddrWindow(x, y, width, height);
+    gTft.writePixels(pixels, uint32_t(width) * height);
+    gTft.endWrite();
+    return true;
+}
+bool CydGraphics::updatePageText(uint8_t page, const char text[5][24])
+{
+    if (page >= _pageCount) return false;
+    for (unsigned row = 0; row < 5; ++row) {
+        bool ended = false;
+        for (unsigned col = 0; col < 24; ++col) {
+            const uint8_t c = uint8_t(text[row][col]);
+            if (!c) ended = true;
+            else if (ended || c < 32 || c > 126) return false;
+        }
+        if (!ended) return false;
+    }
+    memcpy(_pageText[page], text, sizeof(_pageText[page]));
+    auto& p = _ownedPages[page];
+    p.title = _pageText[page][0]; p.line1 = _pageText[page][1]; p.line2 = _pageText[page][2];
+    p.line3 = _pageText[page][3]; p.line4 = _pageText[page][4];
+    if (_started && !calibrationActive() && page == _activePage && page != 5) drawPage();
+    return true;
 }

@@ -373,6 +373,32 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-10-17 — Original CYD whole-frame navigation port
+
+- Added `peripherals/cyd/lib/cydNavigation/`: shared ES3 protocol wrappers,
+  bounded single-buffer receiver, baseline JPEG MCU rendering, and UART0 controller.
+  The original CYD uses 115200-baud CH340 USB, advertises a 32 KiB image limit and
+  one credit, and declines panning/camera streaming. The user approved whole-map
+  fallback: the Jetson supplies the marker, uncertain-heading dot and attribution.
+- Added the sixth MAP tab with a 320×224 viewport; retained local tabs, calibration,
+  SD, audio and LDR control. Runtime Serial diagnostics are suppressed for binary
+  transport. Hidden/calibrating demand, stale/placeholder display, bounded partial
+  writes, heartbeat expiry and reconnect are handled by the application loop.
+- `lib/libes3display` now accepts the explicit CYD HELLO identity. Added a CYD
+  fallback regression to its full suite. ES3C28P source/protocol/plans unchanged.
+- Build helpers include the new library and pin JPEGDEC 1.8.4. Setup, slower-link
+  timeouts and limitations are documented in `peripherals/cyd/NAVIGATION_IMPLEMENTATION.md`
+  and the CYD README. No deployed config, service or device firmware changed.
+- Validation: Arduino ESP32 3.2.0 compile passed (475042 bytes flash, 79744 bytes
+  static RAM); receiver C++11/C++17 and ASan/UBSan passed; real JPEG decoder and
+  actual controller native tests passed; complete Jetson display-link suite passed
+  (0 failures). Windows/PlatformIO not executed. No physical board validation.
+- Next: flash/bench deliberately, verify CH340 throughput, marker/attribution,
+  transitions/reconnect, six-tab calibration and audio/SD/backlight heap margin.
+  At the 32 KiB cap, payload transmission alone takes about 2.85 s; do not expect
+  ES3C28P panning performance. Work remains uncommitted.
+
+
 ## 2026-10-17 (Jetson): navigation (map) Jetson side reviewed and refactored
 
 User asked for a thorough recheck and refactor of the Jetson navigation code. Multi-agent review: 53 findings (50

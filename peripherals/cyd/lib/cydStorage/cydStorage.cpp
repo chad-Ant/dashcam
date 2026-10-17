@@ -1,3 +1,4 @@
+#include "CydLog.h"
 /** @file cydStorage.cpp */
 
 #include "cydStorage.h"
@@ -55,7 +56,7 @@ bool CydStorage::remount()
     _capacityBytes = SD.cardSize();
     _available = _capacityBytes > 0;
     if (_available) {
-        Serial.printf("[cyd] SD mounted at %lu MHz\n",
+        cydLog("[cyd] SD mounted at %lu MHz\n",
                       static_cast<unsigned long>(_spiFrequencyHz / 1000000U));
     }
     return _available;
@@ -157,7 +158,7 @@ bool CydStorage::openRead(const char* path, File& file)
     if (!file) {
         // The card may have been removed and reinserted after startup. Remount
         // once before reporting a missing file so FAT directory state is fresh.
-        Serial.printf("[cyd] SD retrying after remount: %s\n", path);
+        cydLog("[cyd] SD retrying after remount: %s\n", path);
         if (remount()) {
             file = SD.open(path, FILE_READ);
             if (!file && path[1] != '\0') {
@@ -166,7 +167,7 @@ bool CydStorage::openRead(const char* path, File& file)
         }
     }
     if (!file) {
-        Serial.printf("[cyd] SD cannot open %s; refreshed root contains:\n", path);
+        cydLog("[cyd] SD cannot open %s; refreshed root contains:\n", path);
         logRootDirectory();
         return false;
     }
@@ -180,11 +181,11 @@ void CydStorage::logRootDirectory() const
     }
     File root = SD.open("/");
     if (!root) {
-        Serial.println("[cyd]   <root unavailable>");
+        cydLog("[cyd]   <root unavailable>");
         return;
     }
     for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
-        Serial.printf("[cyd]   %s%s (%lu bytes)\n", entry.name(),
+        cydLog("[cyd]   %s%s (%lu bytes)\n", entry.name(),
                       entry.isDirectory() ? "/" : "",
                       static_cast<unsigned long>(entry.size()));
         entry.close();

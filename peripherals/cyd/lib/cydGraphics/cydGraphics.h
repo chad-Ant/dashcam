@@ -45,7 +45,7 @@ struct CydBrightnessConfig {
 
 class CydGraphics {
 public:
-    static constexpr uint8_t kMaxPages = 5;
+    static constexpr uint8_t kMaxPages = 6;
 
     explicit CydGraphics(CydStorage& storage);
 
@@ -81,6 +81,13 @@ public:
     /** Begins fresh calibration without replacing saved values until SAVE. */
     void requestCalibration();
 
+    bool mapVisible() const { return _started && !_calibrating && !_calibrationTesting && _activePage == 5; }
+    bool calibrationActive() const { return !_started || _calibrating || _calibrationTesting; }
+    void mapPlaceholder(const char* message);
+    void mapStale();
+    bool drawMapBlock(int x, int y, int width, int height, uint16_t* pixels);
+    bool updatePageText(uint8_t page, const char text[5][24]);
+
     bool sdAvailable() const;
     bool calibrationLoaded() const;
     uint8_t activePage() const;
@@ -94,10 +101,8 @@ private:
         uint16_t y;
     };
 
-    static constexpr uint8_t kTabCount = 5;
     static constexpr int kScreenWidth = 320;
     static constexpr int kScreenHeight = 240;
-    static constexpr int kTabWidth = 64;
     static constexpr int kTabHeight = 16;
     static constexpr int kTabTop = kScreenHeight - kTabHeight;
     static constexpr int kCalibrationMargin = 24;
@@ -114,6 +119,8 @@ private:
 
     CydStorage& _storage;
     const CydDashboardPage* _pages;
+    CydDashboardPage _ownedPages[kMaxPages]{};
+    char _pageText[kMaxPages][5][24]{};
     uint8_t _pageCount;
     uint8_t _activePage;
     bool _started;

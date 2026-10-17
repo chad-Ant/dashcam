@@ -12,6 +12,8 @@ src/main.cpp                application-specific page data and lifecycle
 lib/cydStorage/             SD-card initialisation and persistent file I/O
 lib/cydGraphics/            reusable display/touch/tab-dashboard component
 lib/cydAudio/               SD-streaming notification-audio component
+lib/cydNavigation/          USB whole-map receiver and bounded JPEG rendering
+tests/                      native receiver, decoder and link regression tests
 BuildAndUpload.cmd          Windows compile/upload path
 build_and_upload.sh         Linux compile/upload path
 platformio.ini              PlatformIO configuration
@@ -24,14 +26,19 @@ host/ch341_module.sh        Jetson host: CH340 USB-serial driver (build, check)
 `CydStorage` owns the SD SPI bus and all card file access. It currently stores
 and validates `/cyd_touch.cal`, but is the single place for future SD logs,
 settings, assets, and data read/write routines. `CydGraphics` owns the ILI9341
-display, XPT2046 touch overlay, and five-tab renderer; it receives `CydStorage`
+display, XPT2046 touch overlay, and six-tab renderer; it receives `CydStorage`
 by reference solely to load/save calibration. The application injects a fixed
 `CydDashboardPage` array, so later dashcam data/control code can change page
 content without touching display, touch, or storage hardware code.
 
-The current demo has five 64 x 16 px white bottom tabs: Live, Trip, Camera,
-System, and Settings. It displays only placeholder data; no I2C link exists
-yet.
+The dashboard has six bottom tabs: Live, Trip, Camera, System, Settings, and
+MAP. The MAP tab displays 320 × 224 whole-map JPEGs from the Jetson over the
+CH340 USB-to-UART connection at 115200 baud. The Jetson draws position, heading
+(or a dot when heading is unreliable), status and attribution. Camera streaming
+and board-side map panning are not supported on this port. See
+[NAVIGATION_IMPLEMENTATION.md](NAVIGATION_IMPLEMENTATION.md) for setup, protocol,
+throughput limits and validation. Existing dashboard pages also accept text
+updates over the binary link.
 
 ## Ambient-light backlight control
 
@@ -56,7 +63,7 @@ selects only the dim (`minDuty`) or bright (`maxDuty`) target at the actual
 `transitionStep` controls the gradual PWM fade at each `updateIntervalMs`
 interval. GPIO34 is ADC1 and input-only, which suits this sensor.
 
-Every dashboard page shows `L:<raw> B:<duty>` at lower-right. Cover and uncover
+Every dashboard page except MAP shows `L:<raw> B:<duty>` at lower-right. Cover and uncover
 the LDR: after crossing the `L = 20` threshold, `B` fades smoothly between 32 and
 255 rather than jumping. If `L` is outside the default 400--1200 window, use
 the dark and bright displayed values as `darkRaw` and `brightRaw` in
@@ -94,8 +101,8 @@ exactly 320 x 224 px, leaving the 16 px tab strip visible. This is a headerless
 RGB565 image in **big-endian display-wire order**, stored top-to-bottom. It is
 143,360 bytes: 33% smaller than the previous 24-bit BMP and requires no
 per-pixel colour conversion. The loader sets one display window and streams
-the pixels in 320-pixel blocks, then logs its elapsed render time and selected
-SD frequency to Serial.
+the pixels in 320-pixel blocks, without allocating a full framebuffer. Runtime Serial diagnostics are suppressed
+because UART0 carries the binary display protocol.
 
 The ready-to-copy artwork is `assets/splash.rgb565`. Copy that file to the root
 of the CYD SD card so its card path is `/splash.rgb565`. A legacy
@@ -110,7 +117,7 @@ python peripherals\cyd\tools\bmp24_to_rgb565.py input.bmp splash.rgb565
 The converter uses only Python's standard library and rejects incorrect image
 dimensions or BMP variants. `CydStorage` now attempts the CYD SD socket at
 20 MHz, falling back automatically to 10 MHz if the card cannot initialise at
-the faster speed. A successful mount logs the chosen rate; stable operation
+the faster speed. Stable operation
 with the target card is still the final verification for 20 MHz.
 
 ## Touch calibration
@@ -152,7 +159,9 @@ a classic ESP32 with a CH340 serial adapter, not the ESP32-C3 XIAO.
 The `l4t-ml-gpio` image has the toolchain: the esp32 core 3.2.0 (it carries
 the Xtensa compiler a classic ESP32 needs) and Adafruit ILI9341 1.6.4, on top
 of the GFX and BusIO libraries the MKR layer installs. The Windows build used
-core 3.3.11; the app also builds on 3.2.0 without warnings.
+core 3.3.11; the navigation port builds on 3.2.0 without warnings. The build
+helpers install JPEGDEC 1.8.4. Arduino core 3.x is required by the existing DAC
+audio driver; the PlatformIO configuration has not been validated for this port.
 
 ```bash
 # compile only
@@ -161,8 +170,6 @@ docker run --rm -v ~/dashcam:/user/dashcam l4t-ml-gpio:latest \
 # compile and flash the one CH340 under /dev/serial/by-id
 docker run --rm --privileged -v /dev:/dev -v ~/dashcam:/user/dashcam l4t-ml-gpio:latest \
   /user/dashcam/peripherals/cyd/build_and_upload.sh auto
-# serial console at 115200 (Ctrl-A Ctrl-X quits)
-docker run --rm -it --privileged -v /dev:/dev l4t-ml-gpio:latest picocom -b 115200 /dev/ttyUSB0
 ```
 
 **The host needs the CH340 driver once.** The CYD's USB port is a CH340

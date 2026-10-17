@@ -1903,19 +1903,21 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
     switch (done.type) {
     case es3proto::Hello: {
         const size_t idLen = sizeof(kDeviceIdentity) - 1;
-        if (f.length != idLen || std::memcmp(f.payload, kDeviceIdentity, idLen) != 0) {
+        const bool es3 = f.length == idLen && std::memcmp(f.payload, kDeviceIdentity, idLen) == 0;
+        const bool cyd = f.length == 3 && std::memcmp(f.payload, "CYD", 3) == 0;
+        if (!es3 && !cyd) {
             ++w.st.helloRejected;
             std::string got;
             for (size_t i = 0; i < f.length; ++i)
                 got += (f.payload[i] >= 32 && f.payload[i] <= 126) ? char(f.payload[i]) : '.';
             logQuiet(QHello, LogLevel::ERROR,
-                     "ES3 display: %s answered HELLO with \"%s\", not \"%s\" - wrong device? closing",
+                     "ES3 display: %s answered HELLO with \"%s\", not \"%s\" or CYD - wrong device? closing",
                      cfg.device.c_str(), got.c_str(), kDeviceIdentity);
-            closeDevice("not an ES3C28P", false);
+            closeDevice("not an ES3C28P or CYD", false);
             return;
         }
         w.helloOk = true;
-        w.st.identity.assign(reinterpret_cast<const char*>(f.payload), idLen);
+        w.st.identity.assign(reinterpret_cast<const char*>(f.payload), f.length);
         w.quiet[QHello].clear();
         if (!w.connectedOnce) {
             w.connectedOnce = true;

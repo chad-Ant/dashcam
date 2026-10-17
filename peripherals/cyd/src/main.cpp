@@ -9,6 +9,8 @@
 
 #include <Arduino.h>
 #include "cydAudio.h"
+#include "cydNavigation.h"
+#include "CydLog.h"
 #include "cydGraphics.h"
 
 static constexpr CydDashboardPage kDemoPages[] = {
@@ -16,7 +18,8 @@ static constexpr CydDashboardPage kDemoPages[] = {
     {"TRIP", "TRIP SUMMARY", "Distance: --.- km", "Drive:    00:00", "Average:  -- km/h", "Score:    -- / 100", false, false, false},
     {"CAM", "CAMERAS", "Road:    standby", "Cabin:   standby", "Lanes:   waiting", "Storage: -- GB free", false, false, false},
     {"SYS", "SYSTEM HEALTH", "Jetson:  offline", "C3 link: waiting", "CPU temp: -- C", "Battery: --.- V", false, false, false},
-    {"SET", "QUICK CONTROLS", "Recording: start", "Audio alert: on", "Screen:      auto", "Tap SET tab to calibrate", true, false, true},
+    {"SET", "QUICK CONTROLS", "Recording: start", "Audio alert: on", "Screen:      auto", "Tap SET to calibrate", true, false, true},
+    {"MAP", "NAVIGATION", "", "", "", "", false, false, false},
 };
 
 // The ESP32-2432S028's onboard LDR is wired to ADC1 GPIO34. On this board,
@@ -30,31 +33,33 @@ static constexpr CydBrightnessConfig kBrightness = {
 static CydStorage gStorage;
 static CydGraphics gGraphics(gStorage);
 static CydAudio gAudio(gStorage);
+static CydNavigation gNavigation(gGraphics, gAudio);
 
 void setup()
 {
-    Serial.begin(115200);
-    delay(200);
+
 
     const uint8_t pageCount = static_cast<uint8_t>(sizeof(kDemoPages) / sizeof(kDemoPages[0]));
     const bool storageOk = gStorage.begin();
-    Serial.printf("[cyd] storage %s\n", storageOk ? "ready" : "unavailable");
+    cydLog("[cyd] storage %s\n", storageOk ? "ready" : "unavailable");
     if (!gGraphics.setPages(kDemoPages, pageCount) ||
         !gGraphics.setBrightnessConfig(kBrightness) || !gGraphics.begin()) {
-        Serial.println("[cyd] graphics startup failed");
+        cydLog("[cyd] graphics startup failed");
     }
     if (!gAudio.begin()) {
-        Serial.println("[cyd] audio startup failed");
+        cydLog("[cyd] audio startup failed");
     } else if (gStorage.exists("/alert.wav")) {
         // Optional short boot proof. It remains silent when the test asset is
         // not copied to the card; future notifications call playWav directly.
         (void)gAudio.playWav("/alert.wav");
     }
+    (void)gNavigation.begin();
 }
 
 void loop()
 {
     gGraphics.update();
+    gNavigation.update();
     gAudio.update();
-    delay(10);
+    delay(1);
 }

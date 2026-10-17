@@ -13,6 +13,8 @@ FQBN="esp32:esp32:esp32"
 
 command -v arduino-cli >/dev/null || { echo "arduino-cli is not available on PATH"; exit 1; }
 
+arduino-cli lib install --no-deps "JPEGDEC@1.8.4"
+
 port="${1:-}"
 if [ "$port" = "auto" ]; then
     shopt -s nullglob
@@ -24,7 +26,7 @@ if [ "$port" = "auto" ]; then
     port="${ports[0]}"
 fi
 
-args=(compile --warnings all --fqbn "$FQBN" --library "$STORAGE_DIR" --library "$GRAPHICS_DIR" --library "$AUDIO_DIR")
+args=(compile --warnings all --fqbn "$FQBN" --library "$STORAGE_DIR" --library "$GRAPHICS_DIR" --library "$AUDIO_DIR" --library "$SKETCH_DIR/lib/cydNavigation")
 if [ -n "$port" ]; then
     args+=(--upload --port "$port")
 fi
