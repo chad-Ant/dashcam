@@ -91,7 +91,9 @@ LIBPREVIEW_SRCS := lib/libvideopreview/libvideopreview.cpp \
                    lib/libvideopreview/libvideopreview_convert.cpp
 LIBES3_SRCS     := lib/libes3display/libes3display.cpp
 LIBNAV_SRCS     := lib/libnavigation/libnavigation.cpp lib/libnavigation/nav_geo.cpp \
-                   lib/libnavigation/nav_tiles.cpp lib/libnavigation/nav_compose.cpp
+                   lib/libnavigation/nav_tiles.cpp lib/libnavigation/nav_compose.cpp \
+                   lib/libnavigation/nav_pan.cpp lib/libnavigation/nav_fetch.cpp \
+                   lib/libnavigation/nav_render.cpp
 
 # ─── build directory (timestamped so parallel invocations don't collide) ──────
 
@@ -141,8 +143,9 @@ V04_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_CORE_SRCS) $(LIBCAM_EXPO_S
 # timesync_test: NTP-first / GPS-fallback clock decisions + clock-jump detection (no privileges)
 TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests/test_timesync.cpp)
 
-# bridge_overlay_test: ESP32-C3 telemetry -> recording overlay mapping (src/bridge_overlay.h, no hardware)
-BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) src/tests/test_bridge_overlay.cpp)
+# bridge_overlay_test: ESP32-C3 telemetry -> recording overlay and map position mapping (src/bridge_overlay.h,
+# no hardware; nav_geo.cpp for the map's usablePosition rules)
+BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) lib/libnavigation/nav_geo.cpp src/tests/test_bridge_overlay.cpp)
 
 # videopreview_test: libvideopreview MJPEG -> letterboxed preview JPEG (DCT-scaled decode, resize,
 # capped encode) + never-blocking submission, worker and lease pool (synthesized JPEGs, mock sink)
@@ -153,9 +156,10 @@ PREVIEW_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPREVIEW_SRCS) src/tes
 NAV_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPREVIEW_SRCS) $(LIBNAV_SRCS) src/tests/test_libnavigation.cpp)
 
 # es3display_test: libes3display (ES3C28P USB tty owner: handshake, CAPABILITIES/START_VIDEO, credited
-# E3 29 video with control priority + TIOCOUTQ gating, reconnect) against a fake display on a pty
+# E3 29 video with control priority + TIOCOUTQ gating, reconnect, map + board-side panning) against a
+# fake display on a pty; also NavigationService -> link -> fake board end to end (libnavigation)
 ES3_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) \
-                     src/tests/test_libes3display.cpp)
+                     $(LIBNAV_SRCS) src/tests/test_libes3display.cpp)
 
 # exposure_test: frame-rate-priority auto-exposure loop (pure logic, no camera)
 EXPO_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_EXPO_SRCS) src/tests/test_exposure.cpp)
@@ -356,7 +360,7 @@ $(BUILD_DIR)/navigation_test: $(NAV_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG) $(LD_NAV)
 
 $(BUILD_DIR)/es3display_test: $(ES3_TEST_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG) $(LD_NAV)
 
 $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)

@@ -373,6 +373,79 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-10-17 (Jetson): navigation (map) Jetson side reviewed and refactored
+
+User asked for a thorough recheck and refactor of the Jetson navigation code. Multi-agent review: 53 findings (50
+confirmed by two verifiers each), then a review of the fixes (29 more, fixed except two test-only items). Summary and
+the list of what was not done: NAVIGATION_PLAN.md, "Jetson-side review and refactor (2026-10-17)". Nothing committed.
+
+- **Code:** `lib/libnavigation` split into `libnavigation.cpp` (API, bounded stop), `nav_service.h`, `nav_fetch.cpp`,
+  `nav_render.cpp`; fixes in `nav_tiles.cpp`, `nav_compose.cpp`, `nav_pan.cpp`. Map/pan parts of
+  `lib/libes3display/libes3display.cpp` (resend counter, caps re-ask, VISIBILITY page, margin guard, session helper;
+  done on top of the colleague's 2026-10-17 link review, see `lib/libes3display/VIDEO_REVIEW_2026-10-17.md`).
+  `libconfig` validation, `src/bridge_overlay.h` toNavSample, `src/dashcam_v0_4.cpp` wiring, Makefile.
+- **Behaviour changes worth knowing:** a parked whole-frame map refreshes once a second (it used to re-send 4 fps);
+  `<Navigation>` StaleAfterMs is clamped to >= 1500 and PanBackgroundWidth/Height to >= 384/256 (with a WARN);
+  ProviderUrl placeholders other than {z}{x}{y} and an attribution over 52 characters now turn the map off with a
+  clear message; a redirect from the tile server turns downloads off for the run.
+- **Tests (all PASS, plain `make`, 0 warnings, two repeat runs stable):** navigation_test (new [3b], [10] and many
+  checks), es3display_test (new [24], [21] additions), config_test, bridge_overlay_test; firmware `run_tests.sh`;
+  v0.4 SIGINT -> exit 0 with navigation on.
+- **Open:** commit; the bench with the real board; the not-done items in the plan section.
+- **Deploy note:** `kSupervisorStuckMs` (30 s) is longer than `docker stop -t 20`, so the app's own clean-exit backstop
+  can never fire before docker's SIGKILL. navigation.stop() is now bounded (3 s), which removes the known cause, but
+  aligning the two timeouts is still worth doing (not changed here).
+
+
+## 2026-10-17: Jetson video streaming review and refactor
+
+Review scope and severity-ranked findings: `lib/libes3display/VIDEO_REVIEW_2026-10-17.md`.
+The camera tap, preview converter/pools, USB delivery and v0.4 lifecycle were reviewed.
+Pending navigation/panning and firmware changes were preserved; plans and wire headers are unchanged.
+
+- Fixed the producer wake/close race using a dedicated eventfd mutex; descriptor allocation now follows
+  allocating setup. No producer can write to a descriptor that stop has closed and the OS has reused.
+- Fixed artificial 100 ms sleeps after the bounded TX batch. The worker checks RX/timers before resuming
+  immediately when it has yielded for fairness; real write/kernel-queue blocking still waits normally.
+- Credit recovery checks the current camera/map/panning queues. START_MAP/START_PAN negotiation and
+  already-handled timeout states no longer leave obsolete deadlines driving recovery/polling.
+- Duplicate RESULT Ok no longer drops a frame awaiting PRESENTED. A real post-assembly failure still drops it.
+- Split image eligibility, selection, START and continuation into smaller functions. JPEG conversion, pools,
+  credit limits, wire format and page-driven camera/map exclusion remain unchanged.
+- The four targeted fault regressions fail against the pre-review transport. The full preview suite and
+  all 23 display-link scenarios pass with the refactor. `dashcam_v0_4` and test builds pass with
+  `-Wall -Wextra -Werror`. ASan/UBSan preview and final link regressions passed, with leak detection enabled.
+  GCC 11 analyzer: two false-positive possible-null reports inside throwing `std::make_unique`; no other reports.
+- Recorder synthetic Part A tests passed (0 failures), including slow/failing preview consumers, rate
+  independence and EOS/shutdown. Part B was skipped because no USB camera was passed into the containers.
+  No board was flashed and no deployment changed. Real UGREEN→ES3C28P FPS,
+  capture latency, recorder continuity under load and thermal behaviour remain bench/drive checks.
+- Reproduce in `l4t-ml-gpio:latest`: build `videopreview_test`, `es3display_test`, `record_test` and
+  `dashcam_v0_4` with an isolated `BUILD_DIR`; run the three test binaries. The focused transport regressions
+  can be run with `es3display_test --streaming-regressions`. Do not pass camera devices for synthetic-only testing.
+- This review's changes remain uncommitted. Next: physical UGREEN→ES3C28P testing at 10–15 fps while recording,
+  including reconnects and camera/map tab switches; measure latency and thermal behaviour before deployment.
+
+## 2026-10-16: ES3C28P focused video pipeline review
+
+Follow-up to `6fdb0c0`; details in `peripherals/es3c28p/VIDEO_IMPLEMENTATION.md`,
+"Focused streaming review and refactor". No protocol or design-plan changes; no board flash.
+
+- Fixed the view/acquire session race: a token-specific acquisition leaves a replacement session's first
+  image queued instead of taking it and dropping it as Hidden. Covers camera and map/panning consumers.
+- Split DECODING and DRAWING ownership. Validate completion/release handles before touching buffers or
+  credits; reject duplicate completions, stale/reused-slot releases and invalid indices. Do not overwrite
+  a live handle during acquisition. The old implementation fails the new duplicate-credit regression.
+- Scoped mutex guards make worker lock boundaries explicit; decode and SPI operations remain outside locks.
+  Portable pixel helpers validate decoder block output and viewport-sized TFT strip copies, with canary tests.
+- Native C++11/C++17 protocol/state tests, 39 Python tests, receiver/pixel sanitizers and JPEGDEC fixtures passed.
+  All 22 host display-link integration scenarios passed against the current workspace (0 failures), including
+  reconnect/credit handling and navigation panning with the firmware receiver.
+- Both Arduino 3.2.0 builds passed with all warnings enabled and no warnings: HWCDC flash 544,194 bytes,
+  static RAM 54,748 bytes; TinyUSB flash 580,786 bytes, static RAM 73,908 bytes. Static RAM grew by 8 bytes.
+- PSRAM pools, task stack reservations and eight-row SPI budget are unchanged. Hardware soak, throughput,
+  tearing and stack/heap measurements remain outstanding; these changes do not establish a new frame-rate claim.
+
 ## 2026-10-16: ES3C28P code review and refactor
 
 User requested a full review/refactor after the panning work. Detailed findings, ownership map, test commands and

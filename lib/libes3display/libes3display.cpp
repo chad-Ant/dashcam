@@ -6,7 +6,8 @@
  * pending frame and the control queue under handoffMu, the stats snapshot under
  * statsMu); Io holds what only the worker touches (the tty, the parser, the TX
  * record, the control slot, the video session and the frame in transmission).
- * Locks are never held across I/O, a log line or a callback.
+ * Handoff/stats locks are never held across tty I/O, a log line or a callback.
+ * The separate wake mutex protects the nonblocking eventfd write against close.
  */
 
 #include "libes3display.h"
@@ -53,6 +54,18 @@ constexpr size_t   kFrameRing       = 16;    ///< Started frames awaiting RESULT
 constexpr uint32_t kFrameIdLimit    = 0x7fffffffu;  ///< Renegotiate long before frame_id wraps.
 constexpr uint32_t kMinNegotiateBackoffMs = 1000;
 constexpr int64_t  kMaxCaptureLatencyUs   = 60LL * 1000 * 1000;  ///< Older "capture" times are not latencies.
+constexpr uint8_t  kCapsTriesPerOpen      = 2;     ///< MAP/PAN_CAPABILITIES attempts per open before doing without.
+constexpr uint16_t kMinPanMarginPx        = 32;    ///< A panning background must leave this much around the map area.
+constexpr uint32_t kPanResendGapMs        = 2000;  ///< At most one resend request per this after lost pan images.
+
+// navigation::PanPose / Marker are handed to the wire unchanged: they must match the contract.
+static_assert(uint8_t(dashcam::navigation::Marker::None) == es3map::MarkerNone &&
+                  uint8_t(dashcam::navigation::Marker::Dot) == es3map::MarkerDot &&
+                  uint8_t(dashcam::navigation::Marker::Arrow) == es3map::MarkerArrow &&
+                  uint8_t(dashcam::navigation::Marker::LastKnown) == es3map::MarkerLastKnown,
+              "navigation::Marker must keep es3map::PoseMarker's values");
+static_assert(dashcam::navigation::kPoseSubpixels == es3map::kPoseSubpixels,
+              "PanPose coordinates must use the wire's subpixel scale");
 
 int64_t nowUs() {
     using namespace std::chrono;
@@ -93,6 +106,8 @@ const char* commandName(uint8_t type) {
     case es3map::CmdMapCapabilities: return "MAP_CAPABILITIES";
     case es3map::CmdStartMap:        return "START_MAP";
     case es3map::CmdStopMap:         return "STOP_MAP";
+    case es3map::CmdPanCapabilities: return "PAN_CAPABILITIES";
+    case es3map::CmdStartPan:        return "START_PAN";
     default:                     return "?";
     }
 }
@@ -190,6 +205,10 @@ bool validateConfig(const DisplayLinkConfig& c, std::string* why) {
             return fail("mapStaleAfterMs must be 1-10000");
         if (c.mapPlaceholderAfterMs < c.mapStaleAfterMs || c.mapPlaceholderAfterMs > es3video::kMaxTimeoutMs)
             return fail("mapPlaceholderAfterMs must be mapStaleAfterMs-10000");
+        if (c.mapPan && (c.mapPanBackgroundW < 320 || c.mapPanBackgroundW > es3map::kMaxPanBackground))
+            return fail("mapPanBackgroundW must be 320-1024");
+        if (c.mapPan && (c.mapPanBackgroundH < 64 || c.mapPanBackgroundH > es3map::kMaxPanBackground))
+            return fail("mapPanBackgroundH must be 64-1024");
     }
     if (why) why->clear();
     return true;
@@ -299,6 +318,7 @@ struct Es3DisplayLink::Impl {
         uint8_t  txVideoType = 0;
         int64_t  txProgressUs = 0;
         bool     txBlocked = false;        ///< Last write said EAGAIN: wait for POLLOUT.
+        bool     txYielded = false;        ///< Fairness budget used; resume after checking RX/timers.
         bool     waitingOutq = false;      ///< A video record is held for TIOCOUTQ.
         bool     outqCounted = false;      ///< That hold is already in kernelQueueWaits.
         bool     pollOutDrains = true;     ///< POLLOUT implies an empty queue (cdc-acm); false on a pty.
@@ -314,6 +334,7 @@ struct Es3DisplayLink::Impl {
             Queued   app;                  ///< user == true.
             es3video::StartVideoRequest video;  ///< type == StartVideo.
             es3map::StartMapRequest     map;    ///< type == CmdStartMap.
+            es3map::StartPanRequest     pan;    ///< type == CmdStartPan.
             uint32_t                    stopToken = 0;  ///< type == StopVideo / CmdStopMap (a source switch).
         } ctl;
         uint8_t  nextSeq = 0;
@@ -332,6 +353,9 @@ struct Es3DisplayLink::Impl {
         bool     wantMapCaps = false, mapKnown = false, mapSupported = false;
         es3map::MapCapabilities mapCaps;
         uint32_t mapMaxJpeg = 0, mapGeneration = 0;
+        bool     wantPanCaps = false, panKnown = false, panSupported = false;
+        uint8_t  mapCapsTries = 0, panCapsTries = 0;   ///< Asked this open (a timeout re-HELLOs).
+        es3map::PanCapabilities panCaps;
         uint8_t  page = 0xff;              ///< Board's active page from STATUS; 0xff unknown.
         int64_t  nextPollUs = 0;
 
@@ -345,6 +369,10 @@ struct Es3DisplayLink::Impl {
             uint8_t  visibility = es3video::DemandActive;
             int64_t  progressUs = 0;
             bool     creditBlocked = false;
+            bool     pan = false;           ///< A panning map session (extension v2).
+            es3map::PanSession panGeo;     ///< pan == true.
+            uint32_t poseSeq = 0;           ///< Last MAP_POSE seq sent.
+            int64_t  lastPoseUs = 0;
         } s;
         bool     resyncWanted = false;
         int64_t  negotiateNotBeforeUs = 0;
@@ -358,6 +386,7 @@ struct Es3DisplayLink::Impl {
             Phase             phase = Phase::Chunk;
             uint8_t           abortReason = 0;
             int64_t           startWrittenUs = 0;
+            uint8_t           panKind = 0;   ///< es3map::PanImage in a panning session.
         } cur;
 
         // Started frames still owed a RESULT / PRESENTED.
@@ -366,6 +395,7 @@ struct Es3DisplayLink::Impl {
             uint32_t frameId = 0;
             int64_t  startUs = 0;           ///< START fully written (0 = not yet).
             uint64_t captureUs = 0;
+            uint8_t  panKind = 0;           ///< es3map::PanImage of a panning session's frame.
         };
         std::array<Outstanding, kFrameRing> ring{};
 
@@ -383,6 +413,7 @@ struct Es3DisplayLink::Impl {
     dashcam::log::LogCallback log;
     std::thread               worker;
     int                       wakeFd = -1;
+    std::mutex                wakeMu;     ///< Serialises notification with descriptor replacement/close.
     std::atomic<bool>         running{false};
     std::atomic<bool>         stopRequested{false};
     std::unique_ptr<Io>       io;
@@ -404,12 +435,23 @@ struct Es3DisplayLink::Impl {
     uint32_t          acceptMapJpeg = 0;
     uint8_t           acceptPages = kPageCount;   ///< PAGE indexes the board has.
     EncodedFrameLease mapPending;
+    // Panning map (extension v2): one pending background, chrome and pose.
+    dashcam::navigation::PanDemand panDemandNow;   ///< What panDemand() reports.
+    uint32_t          panResend = 0;               ///< PanDemand::resend: bumped when the board needs images again.
+    int64_t           lastLossResendUs = 0;        ///< Rate limit for resends after a lost image...
+    bool              lossResendDue = false;       ///< ... and one deferred by it (bumped by checkTimers()).
+    EncodedFrameLease panBgPending, panChromePending;
+    uint64_t          panBgOrigin = 0;            ///< es3map::packOrigin() of panBgPending.
+    std::atomic<bool> posePending{false};          ///< Written under handoffMu; read lock-free for timers.
+    dashcam::navigation::PanPose pose;
     std::array<Queued, kControlQueueDepth> queue{};
     size_t            qHead = 0, qCount = 0;
 
     // Caller-side counters.
     std::atomic<uint64_t> framesOffered{0}, framesAccepted{0}, framesRefused{0}, framesReplaced{0},
-        controlEnqueued{0}, controlRejected{0}, controlQueueFull{0}, mapOffered{0}, mapAccepted{0};
+        controlEnqueued{0}, controlRejected{0}, controlQueueFull{0}, mapOffered{0}, mapAccepted{0},
+        panBgOffered{0}, panBgAccepted{0}, panChromeOffered{0}, panChromeAccepted{0}, posesOffered{0},
+        posesAccepted{0}, posesReplaced{0};
 
     /// The map surface's IPreviewSink (Es3DisplayLink::mapSink()).
     class MapSink : public dashcam::preview::IPreviewSink {
@@ -423,6 +465,20 @@ struct Es3DisplayLink::Impl {
     };
     MapSink mapSinkObj{*this};
 
+    /// The panning map surface (Es3DisplayLink::panSink()).
+    class PanSink : public dashcam::navigation::IMapPanSink {
+    public:
+        explicit PanSink(Impl& m) : m_(m) {}
+        dashcam::navigation::PanDemand panDemand() const override;
+        bool offerPanBackground(EncodedFrameLease&& jpeg, uint32_t originX, uint32_t originY) override;
+        bool offerPanChrome(EncodedFrameLease&& jpeg) override;
+        bool offerPanPose(const dashcam::navigation::PanPose& pose) override;
+
+    private:
+        Impl& m_;
+    };
+    PanSink panSinkObj{*this};
+
     // Snapshot for stats() (statsMu).
     mutable std::mutex statsMu;
     DisplayLinkStats   published;
@@ -430,10 +486,18 @@ struct Es3DisplayLink::Impl {
 
     // ── helpers used from any thread ─────────────────────────────────────────
     void wake() {
+        std::lock_guard<std::mutex> lk(wakeMu);
         if (wakeFd < 0) return;
         const uint64_t one = 1;
-        const ssize_t  n   = ::write(wakeFd, &one, sizeof(one));
-        (void)n;   // a saturated counter still means "wake up"
+        ssize_t n;
+        do { n = ::write(wakeFd, &one, sizeof(one)); } while (n < 0 && errno == EINTR);
+        // EAGAIN means the counter already contains a wakeup.
+    }
+    void closeWake() {
+        // Called only before worker launch or after join: worker reads are done.
+        std::lock_guard<std::mutex> lk(wakeMu);
+        if (wakeFd >= 0) ::close(wakeFd);
+        wakeFd = -1;
     }
 
     // ── worker ───────────────────────────────────────────────────────────────
@@ -453,10 +517,15 @@ struct Es3DisplayLink::Impl {
     bool buildControl(int64_t now);
     void buildControlFrame(uint8_t type, const uint8_t* payload, size_t length);
     bool buildVideo(int64_t now);
+    bool startImage(int64_t now);
+    bool continueImage(int64_t now);
+    EncodedFrameLease* nextImage();   ///< Requires handoffMu; worker only.
     bool kernelQueueAllows();
     bool needNegotiation(uint16_t& w, uint16_t& h);
     bool buildStartVideo(int64_t now, uint16_t w, uint16_t h);
     bool buildStartMap();
+    bool buildPose(int64_t now);
+    void dropPanPending();
     Io::Kind desiredKind() const;
     bool sourceSwitch();   ///< Builds the STOP for a session the active page no longer wants.
     EncodedFrameLease& pendingFor(Io::Kind k) { return k == Io::Kind::Map ? mapPending : pending; }
@@ -473,11 +542,20 @@ struct Es3DisplayLink::Impl {
     void rehello(const char* why);
     void endSession();
     void abandonCurrent(bool sendAbort, uint8_t reason, bool count = true);
+    void panImageLost(int64_t now);
+    void beginSession(Io::Kind kind, uint32_t token, const es3video::StartVideoRequest& limits, uint32_t grant,
+                      const es3map::PanSession* pan);
+    void onStopDone(const Io::Control& done);
     void negotiationFailed(const std::string& why);
     void resync(int64_t now);
     Io::Outstanding* findFrame(uint32_t frameId);
     void addFrame(uint32_t frameId, uint64_t captureUs);
     bool outstandingWork();
+    bool startingSession() const {
+        const Io::Control& c = io->ctl;
+        return c.busy && (c.type == es3proto::StartVideo || c.type == es3map::CmdStartMap ||
+                          c.type == es3map::CmdStartPan);
+    }
 
     void setState(LinkState s);
     void publishVideo();
@@ -536,9 +614,11 @@ void Es3DisplayLink::Impl::publishVideo() {
     const bool videoTurn = !w.mapSupported || w.page == 0;
     const bool videoActive = base && w.videoSupported && videoTurn &&
                              (w.s.token == 0 ? true : (w.s.kind == Kind::Video && visible));
-    const bool mapActive = base && w.mapSupported && w.page == w.mapCaps.mapPage && w.s.token != 0 &&
-                           w.s.kind == Kind::Map && visible;
-    EncodedFrameLease dropped, droppedMap;
+    const bool mapShown = base && w.mapSupported && w.page == w.mapCaps.mapPage && w.s.token != 0 &&
+                          w.s.kind == Kind::Map && visible;
+    const bool mapActive = mapShown && !w.s.pan;
+    const bool panActive = mapShown && w.s.pan;
+    EncodedFrameLease dropped, droppedMap, droppedBg, droppedChrome;
     {
         std::lock_guard<std::mutex> lk(handoffMu);
         acceptVideo   = videoActive;
@@ -559,15 +639,42 @@ void Es3DisplayLink::Impl::publishVideo() {
                                                         w.mapMaxJpeg)
                                            : 0,
                             std::memory_order_release);
+        dashcam::navigation::PanDemand pd;
+        if (w.s.token != 0 && w.s.pan) {
+            const es3map::PanSession& g = w.s.panGeo;
+            pd.active        = panActive;
+            pd.session       = w.s.token;
+            pd.mapW          = g.mapW;
+            pd.mapH          = g.mapH;
+            pd.backgroundW   = g.request.backgroundW;
+            pd.backgroundH   = g.request.backgroundH;
+            pd.chromeTopH    = g.chromeTopH;
+            pd.chromeBottomH = g.chromeBottomH;
+            pd.maxJpegBytes  = g.request.map.maxJpegBytes;
+            pd.maxPoseHz     = w.panCaps.maxPoseHz;
+        }
+        const bool sameSession = pd.session == panDemandNow.session;
+        // Shown again within the same session: the board dropped its images when
+        // it hid the map, so the producer must send them again (a new session
+        // says so by itself).
+        if (pd.active && !panDemandNow.active && sameSession) ++panResend;
+        pd.resend    = panResend;
+        panDemandNow = pd;
+        if (!panActive || !sameSession) {   // images and poses belong to the session they were made for
+            if (panBgPending) droppedBg = std::move(panBgPending);
+            if (panChromePending) droppedChrome = std::move(panChromePending);
+            posePending = false;
+        }
     }
     if (dropped) {
         ++w.st.framesReleased;
         dropped.release();
     }
-    if (droppedMap) {
-        ++w.st.framesReleased;
-        droppedMap.release();
-    }
+    for (EncodedFrameLease* l : {&droppedMap, &droppedBg, &droppedChrome})
+        if (*l) {
+            ++w.st.framesReleased;
+            l->release();
+        }
 }
 
 void Es3DisplayLink::Impl::publishStats() {
@@ -590,6 +697,11 @@ void Es3DisplayLink::Impl::publishStats() {
     w.st.mapCapabilities  = w.mapCaps;
     w.st.activePage       = w.page;
     w.st.sessionKind      = static_cast<uint8_t>(w.s.token ? w.s.kind : Io::Kind::None);
+    w.st.panSupported     = w.panSupported;
+    w.st.panCapabilities  = w.panCaps;
+    w.st.panSession       = w.s.token != 0 && w.s.pan;
+    w.st.panBackgroundW   = w.st.panSession ? w.s.panGeo.request.backgroundW : 0;
+    w.st.panBackgroundH   = w.st.panSession ? w.s.panGeo.request.backgroundH : 0;
     const es3video::MuxParser::Stats& ps = w.parser.stats();
     w.st.parserGarbageBytes = ps.garbageBytes;
     w.st.parserCrcErrors    = ps.crcErrors;
@@ -618,26 +730,22 @@ bool Es3DisplayLink::start(const DisplayLinkConfig& cfg, dashcam::log::LogCallba
                                 why.c_str());
         return false;
     }
-    const int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (efd < 0) {
-        dashcam::log::logPrintf(log, LogLevel::ERROR, "ES3 display: eventfd failed: %s - display link off",
-                                std::strerror(errno));
-        return false;
-    }
-
     m.cfg    = cfg;
     m.log    = std::move(log);
-    m.wakeFd = efd;
     m.io     = std::make_unique<Impl::Io>();
     m.io->st.device = cfg.device;
     m.io->nextOpenUs = nowUs();
     for (auto* c : {&m.framesOffered, &m.framesAccepted, &m.framesRefused, &m.framesReplaced,
-                    &m.controlEnqueued, &m.controlRejected, &m.controlQueueFull})
+                    &m.controlEnqueued, &m.controlRejected, &m.controlQueueFull, &m.mapOffered, &m.mapAccepted,
+                    &m.panBgOffered, &m.panBgAccepted, &m.panChromeOffered, &m.panChromeAccepted, &m.posesOffered,
+                    &m.posesAccepted, &m.posesReplaced})
         c->store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(m.handoffMu);
         m.acceptVideo = m.acceptControl = false;
         m.qHead = m.qCount = 0;
+        m.panDemandNow = dashcam::navigation::PanDemand{};
+        m.posePending  = false;
     }
     {
         std::lock_guard<std::mutex> lk(m.statsMu);
@@ -648,13 +756,25 @@ bool Es3DisplayLink::start(const DisplayLinkConfig& cfg, dashcam::log::LogCallba
     m.demandWord.store(0);
     m.stateValue.store(static_cast<uint8_t>(LinkState::Disconnected));
     m.stopRequested.store(false);
+    // Allocate the descriptor after potentially throwing setup, so an
+    // allocation failure cannot strand it before the worker exists.
+    const int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) {
+        m.io.reset();
+        dashcam::log::logPrintf(m.log, LogLevel::ERROR, "ES3 display: eventfd failed: %s - display link off",
+                                std::strerror(errno));
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m.wakeMu);
+        m.wakeFd = efd;
+    }
     m.running.store(true, std::memory_order_release);
     try {
         m.worker = std::thread(&Impl::workerLoop, &m);
     } catch (const std::system_error& e) {
         m.running.store(false);
-        ::close(m.wakeFd);
-        m.wakeFd = -1;
+        m.closeWake();
         m.io.reset();
         dashcam::log::logPrintf(m.log, LogLevel::ERROR, "ES3 display: worker thread failed: %s - display link off",
                                 e.what());
@@ -686,8 +806,7 @@ void Es3DisplayLink::stop() {
     m.stopRequested.store(true);
     m.wake();
     m.worker.join();
-    ::close(m.wakeFd);
-    m.wakeFd = -1;
+    m.closeWake();
     m.io.reset();
     m.demandWord.store(0);
     m.stateValue.store(static_cast<uint8_t>(LinkState::Disconnected));
@@ -773,6 +892,72 @@ bool Es3DisplayLink::Impl::MapSink::offerFrame(EncodedFrameLease&& frame) {
     return true;
 }
 
+dashcam::navigation::IMapPanSink& Es3DisplayLink::panSink() { return impl_->panSinkObj; }
+
+dashcam::navigation::PanDemand Es3DisplayLink::Impl::PanSink::panDemand() const {
+    std::lock_guard<std::mutex> lk(m_.handoffMu);
+    return m_.panDemandNow;
+}
+
+bool Es3DisplayLink::Impl::PanSink::offerPanBackground(EncodedFrameLease&& jpeg, uint32_t originX, uint32_t originY) {
+    Impl& m = m_;
+    m.panBgOffered.fetch_add(1, std::memory_order_relaxed);
+    if (!jpeg || jpeg.data() == nullptr || jpeg.size() == 0) return false;
+    EncodedFrameLease replaced;
+    {
+        std::lock_guard<std::mutex> lk(m.handoffMu);
+        const dashcam::navigation::PanDemand& d = m.panDemandNow;
+        if (!m.running.load(std::memory_order_acquire) || !d.active || jpeg.width() != d.backgroundW ||
+            jpeg.height() != d.backgroundH || jpeg.size() > d.maxJpegBytes)
+            return false;   // the caller keeps the lease
+        replaced        = std::move(m.panBgPending);
+        m.panBgPending  = std::move(jpeg);
+        m.panBgOrigin   = es3map::packOrigin(originX, originY);
+    }
+    m.panBgAccepted.fetch_add(1, std::memory_order_relaxed);
+    if (replaced) replaced.release();
+    m.wake();
+    return true;
+}
+
+bool Es3DisplayLink::Impl::PanSink::offerPanChrome(EncodedFrameLease&& jpeg) {
+    Impl& m = m_;
+    m.panChromeOffered.fetch_add(1, std::memory_order_relaxed);
+    if (!jpeg || jpeg.data() == nullptr || jpeg.size() == 0) return false;
+    EncodedFrameLease replaced;
+    {
+        std::lock_guard<std::mutex> lk(m.handoffMu);
+        const dashcam::navigation::PanDemand& d = m.panDemandNow;
+        if (!m.running.load(std::memory_order_acquire) || !d.active || jpeg.width() != d.mapW ||
+            jpeg.height() != d.chromeTopH + d.chromeBottomH || jpeg.size() > d.maxJpegBytes)
+            return false;
+        replaced           = std::move(m.panChromePending);
+        m.panChromePending = std::move(jpeg);
+    }
+    m.panChromeAccepted.fetch_add(1, std::memory_order_relaxed);
+    if (replaced) replaced.release();
+    m.wake();
+    return true;
+}
+
+bool Es3DisplayLink::Impl::PanSink::offerPanPose(const dashcam::navigation::PanPose& pose) {
+    Impl& m = m_;
+    m.posesOffered.fetch_add(1, std::memory_order_relaxed);
+    if (pose.courseCdeg >= 36000 || static_cast<uint8_t>(pose.marker) > es3map::MarkerLastKnown) return false;
+    bool replaced = false;
+    {
+        std::lock_guard<std::mutex> lk(m.handoffMu);
+        if (!m.running.load(std::memory_order_acquire) || !m.panDemandNow.active) return false;
+        replaced      = m.posePending;
+        m.pose        = pose;
+        m.posePending = true;
+    }
+    m.posesAccepted.fetch_add(1, std::memory_order_relaxed);
+    if (replaced) m.posesReplaced.fetch_add(1, std::memory_order_relaxed);
+    m.wake();
+    return true;
+}
+
 bool Es3DisplayLink::enqueueControl(const ControlRequest& request) {
     Impl& m = *impl_;
     if (!request.valid() || !isApplicationCommand(request.command) || request.length > es3proto::kMaxPayload) {
@@ -820,6 +1005,13 @@ DisplayLinkStats Es3DisplayLink::stats() const {
     s.controlQueueFull = m.controlQueueFull.load(std::memory_order_relaxed);
     s.mapFramesOffered  = m.mapOffered.load(std::memory_order_relaxed);
     s.mapFramesAccepted = m.mapAccepted.load(std::memory_order_relaxed);
+    s.panBackgroundsOffered  = m.panBgOffered.load(std::memory_order_relaxed);
+    s.panBackgroundsAccepted = m.panBgAccepted.load(std::memory_order_relaxed);
+    s.panChromeOffered       = m.panChromeOffered.load(std::memory_order_relaxed);
+    s.panChromeAccepted      = m.panChromeAccepted.load(std::memory_order_relaxed);
+    s.posesOffered           = m.posesOffered.load(std::memory_order_relaxed);
+    s.posesAccepted          = m.posesAccepted.load(std::memory_order_relaxed);
+    s.posesReplaced          = m.posesReplaced.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -953,6 +1145,9 @@ bool Es3DisplayLink::Impl::openDevice(int64_t now) {
     w.caps = es3video::Capabilities{};
     w.wantMapCaps = w.mapKnown = w.mapSupported = false;
     w.mapCaps     = es3map::MapCapabilities{};
+    w.wantPanCaps = w.panKnown = w.panSupported = false;
+    w.panCaps     = es3map::PanCapabilities{};
+    w.mapCapsTries = w.panCapsTries = 0;
     w.page        = 0xff;
     w.nextPollUs  = 0;
     w.s    = Io::Session{};
@@ -996,6 +1191,7 @@ void Es3DisplayLink::Impl::closeDevice(const std::string& why, bool unexpected) 
     w.helloOk = w.wantHello = w.wantCaps = false;
     w.capsKnown = w.videoSupported = false;
     w.wantMapCaps = w.mapKnown = w.mapSupported = false;
+    w.wantPanCaps = w.panKnown = w.panSupported = false;
     w.page        = 0xff;
     publishVideo();
     setState(LinkState::Disconnected);
@@ -1083,12 +1279,23 @@ void Es3DisplayLink::Impl::checkTimers(int64_t now) {
     // dropped it (or will); stop spending bytes on it.
     if (w.cur.active && w.cur.startWrittenUs != 0 && w.cur.phase != Io::Phase::Abort &&
         now - w.cur.startWrittenUs > int64_t(cfg.assemblyTimeoutMs) * 1000) {
+        const bool panImage = w.s.pan && w.cur.panKind != es3map::PanImageNone;
         abandonCurrent(true, es3video::ReasonAssemblyTimeout);
+        if (panImage) panImageLost(now);
+    }
+
+    // A lost pan image deferred by the resend rate limit: ask for it now.
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        if (lossResendDue && now - lastLossResendUs >= int64_t(kPanResendGapMs) * 1000) {
+            lossResendDue       = false;
+            lastLossResendUs    = now;
+            panDemandNow.resend = ++panResend;
+        }
     }
 
     // Credit stall: frames outstanding, no grant/RESULT progress.
-    const bool negotiating = w.ctl.busy && w.ctl.type == es3proto::StartVideo;
-    if (w.s.token != 0 && !negotiating && !w.resyncWanted && !w.stopping) {
+    if (w.s.token != 0 && !startingSession() && !w.resyncWanted && !w.stopping) {
         if (!outstandingWork()) {
             w.s.progressUs = now;
         } else if (now - w.s.progressUs > int64_t(stallBoundMs()) * 1000) {
@@ -1106,19 +1313,24 @@ bool Es3DisplayLink::Impl::outstandingWork() {
     if (w.s.started != w.s.results) return true;
     if (w.s.started < w.s.grant) return false;
     std::lock_guard<std::mutex> lk(handoffMu);
-    return bool(pending);
+    return w.s.pan ? bool(panBgPending) || bool(panChromePending) : bool(pendingFor(w.s.kind));
 }
 
 int Es3DisplayLink::Impl::pollTimeoutMs(int64_t now) const {
     const Io& w = *io;
+    if (w.txYielded) return 0;   // yielding for fairness is not waiting for I/O
     int64_t   t = int64_t(kPollSliceMs) * 1000;
     auto      until = [&](int64_t at) { t = std::min(t, at - now); };
     if (w.ctl.busy && w.ctl.written) until(w.ctl.deadlineUs);
     if (!w.ctl.busy && w.helloOk && !w.stopping) until(w.lastRequestUs + int64_t(cfg.heartbeatMs) * 1000);
     if (!w.ctl.busy && w.helloOk && !w.stopping && w.mapSupported) until(w.nextPollUs);
+    if (w.s.pan && w.s.lastPoseUs && w.panCaps.maxPoseHz && posePending.load(std::memory_order_relaxed))
+        until(w.s.lastPoseUs + 1000000 / int64_t(w.panCaps.maxPoseHz));
     if (w.waitingOutq) t = std::min<int64_t>(t, int64_t(w.pollOutDrains ? kOutqSafetyMs : kOutqSliceMs) * 1000);
-    if (w.cur.active && w.cur.startWrittenUs) until(w.cur.startWrittenUs + int64_t(cfg.assemblyTimeoutMs) * 1000);
-    if (w.s.token) until(w.s.progressUs + int64_t(stallBoundMs()) * 1000);
+    if (w.cur.active && w.cur.startWrittenUs && w.cur.phase != Io::Phase::Abort)
+        until(w.cur.startWrittenUs + int64_t(cfg.assemblyTimeoutMs) * 1000);
+    if (w.s.token && !startingSession() && !w.resyncWanted && !w.stopping)
+        until(w.s.progressUs + int64_t(stallBoundMs()) * 1000);
     if (w.negotiateNotBeforeUs > now) until(w.negotiateNotBeforeUs);
     if (w.txOff < w.txLen) until(w.txProgressUs + int64_t(txStallMs()) * 1000);
     if (w.stopping) until(w.stopDeadlineUs);
@@ -1130,6 +1342,7 @@ int Es3DisplayLink::Impl::pollTimeoutMs(int64_t now) const {
 
 void Es3DisplayLink::Impl::pumpTx() {
     Io& w = *io;
+    w.txYielded = false;
     for (int step = 0; step < kMaxTxSteps && w.fd >= 0; ++step) {
         if (w.txOff < w.txLen) {
             const ssize_t n = ::write(w.fd, w.tx + w.txOff, w.txLen - w.txOff);
@@ -1154,6 +1367,7 @@ void Es3DisplayLink::Impl::pumpTx() {
         if (buildVideo(now)) continue;
         return;
     }
+    w.txYielded = w.fd >= 0;
 }
 
 void Es3DisplayLink::Impl::onRecordWritten(int64_t now) {
@@ -1171,6 +1385,8 @@ void Es3DisplayLink::Impl::onRecordWritten(int64_t now) {
             if (Io::Outstanding* e = findFrame(w.cur.frameId)) e->startUs = now;
         } else if (w.txVideoType == es3video::RecordEnd) {
             ++w.st.framesSent;
+        } else if (w.txVideoType == es3video::RecordMapPose) {
+            ++w.st.posesSent;
         }
     }
     w.txLen = w.txOff = 0;
@@ -1227,7 +1443,14 @@ bool Es3DisplayLink::Impl::buildControl(int64_t now) {
     }
     if (w.wantMapCaps) {
         w.wantMapCaps = false;
+        ++w.mapCapsTries;
         buildControlFrame(es3map::CmdMapCapabilities, nullptr, 0);
+        return true;
+    }
+    if (w.wantPanCaps) {
+        w.wantPanCaps = false;
+        ++w.panCapsTries;
+        buildControlFrame(es3map::CmdPanCapabilities, nullptr, 0);
         return true;
     }
 
@@ -1253,7 +1476,9 @@ bool Es3DisplayLink::Impl::buildControl(int64_t now) {
     using Kind = Io::Kind;
     if (sourceSwitch()) return true;
     const Kind want = desiredKind();
-    if (want == Kind::Map && now >= w.negotiateNotBeforeUs &&
+    // A panning board is asked first: START_PAN waits for its PAN_CAPABILITIES answer.
+    const bool panAnswered = !cfg.mapPan || w.panKnown;
+    if (want == Kind::Map && panAnswered && now >= w.negotiateNotBeforeUs &&
         (w.s.token == 0 || (w.s.kind == Kind::Map && w.resyncWanted)) && buildStartMap())
         return true;
     uint16_t vw = 0, vh = 0;
@@ -1345,6 +1570,24 @@ bool Es3DisplayLink::Impl::buildStartMap() {
     r.staleAfterMs       = cfg.mapStaleAfterMs;
     r.placeholderAfterMs = cfg.mapPlaceholderAfterMs;
     r.generation         = ++w.mapGeneration;
+    if (w.panSupported) {
+        es3map::StartPanRequest pr;
+        pr.map = r;
+        pr.map.targetFps = std::min<uint8_t>(cfg.mapTargetFps, 2);   // backgrounds are rare
+        const uint16_t mapH = es3map::panMapHeight(w.mapCaps, w.panCaps);
+        pr.backgroundW = std::clamp<uint16_t>(cfg.mapPanBackgroundW, w.mapCaps.viewportW, w.panCaps.maxBackgroundW);
+        pr.backgroundH = std::clamp<uint16_t>(cfg.mapPanBackgroundH, mapH, w.panCaps.maxBackgroundH);
+        uint8_t pp[es3map::kStartPanRequestBytes];
+        if (es3map::encodeStartPanRequest(pr, w.panCaps, w.mapCaps, w.caps, pp, sizeof(pp)) == 0) {
+            negotiationFailed("the START_PAN request does not fit the board's pan capabilities");
+            return false;
+        }
+        abandonCurrent(false, 0);
+        buildControlFrame(es3map::CmdStartPan, pp, sizeof(pp));
+        w.ctl.pan = pr;
+        setState(LinkState::Negotiated);
+        return true;
+    }
     uint8_t p[es3map::kStartMapRequestBytes];
     if (es3map::encodeStartMapRequest(r, w.mapCaps, w.caps, p, sizeof(p)) == 0) {
         negotiationFailed("the START_MAP request does not fit the board's map capabilities");
@@ -1389,6 +1632,56 @@ bool Es3DisplayLink::Impl::buildStartVideo(int64_t now, uint16_t vw, uint16_t vh
     return true;
 }
 
+/// The pending pose as a MAP_POSE record, at most the board's maxPoseHz.
+bool Es3DisplayLink::Impl::buildPose(int64_t now) {
+    Io& w = *io;
+    if (w.s.visibility != es3video::DemandActive || w.resyncWanted || !w.panCaps.maxPoseHz) return false;
+    if (w.s.lastPoseUs && now - w.s.lastPoseUs < 1000000 / int64_t(w.panCaps.maxPoseHz)) return false;
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        if (!posePending) return false;
+    }
+    if (!kernelQueueAllows()) return false;
+    es3map::MapPose p;
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        if (!posePending) return false;
+        p.xQ4        = pose.xQ4;
+        p.yQ4        = pose.yQ4;
+        p.courseCdeg = pose.courseCdeg;
+        p.marker     = static_cast<uint8_t>(pose.marker);
+        posePending  = false;
+    }
+    p.seq = w.s.poseSeq + 1;
+    const size_t n = es3map::encodeMapPose(w.s.token, p, w.tx, sizeof(w.tx));
+    if (n == 0) return false;   // the sink validated the fields; nothing else can fail
+    w.s.poseSeq    = p.seq;
+    w.s.lastPoseUs = now;
+    w.txLen        = n;
+    w.txOff        = 0;
+    w.txKind       = Io::TxKind::Video;
+    w.txVideoType  = es3video::RecordMapPose;
+    w.txProgressUs = now;
+    return true;
+}
+
+/// Release the panning session's pending images and pose.
+void Es3DisplayLink::Impl::dropPanPending() {
+    Io&               w = *io;
+    EncodedFrameLease bg, chrome;
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        if (panBgPending) bg = std::move(panBgPending);
+        if (panChromePending) chrome = std::move(panChromePending);
+        posePending = false;
+    }
+    for (EncodedFrameLease* l : {&bg, &chrome})
+        if (*l) {
+            ++w.st.framesReleased;
+            l->release();
+        }
+}
+
 /// TIOCOUTQ gate for video records (control frames skip it).
 bool Es3DisplayLink::Impl::kernelQueueAllows() {
     Io& w = *io;
@@ -1413,71 +1706,104 @@ bool Es3DisplayLink::Impl::buildVideo(int64_t now) {
     w.waitingOutq = false;
     if (w.stopping || !w.videoSupported || w.s.token == 0) return false;
     if (w.ctl.busy && (w.ctl.type == es3proto::StartVideo || w.ctl.type == es3map::CmdStartMap ||
-                       w.ctl.type == es3proto::StopVideo || w.ctl.type == es3map::CmdStopMap))
+                       w.ctl.type == es3map::CmdStartPan || w.ctl.type == es3proto::StopVideo ||
+                       w.ctl.type == es3map::CmdStopMap))
         return false;   // (re)negotiating or switching the source
     if (w.mapSupported) {   // a switch is due: nothing more for the outgoing surface
         const Io::Kind want = desiredKind();
         if (want != Io::Kind::None && want != w.s.kind) return false;
     }
+    // A pose goes between any two records: it is tiny, uncredited and the
+    // board moves the map with it (a background in flight takes ~100 ms).
+    if (w.s.pan && buildPose(now)) return true;
 
-    if (!w.cur.active) {
-        if (w.s.visibility != es3video::DemandActive || w.resyncWanted) return false;
-        bool ready = false;
-        {
-            std::lock_guard<std::mutex> lk(handoffMu);
-            EncodedFrameLease& src = pendingFor(w.s.kind);
-            ready = src && src.width() == w.s.req.viewportW && src.height() == w.s.req.viewportH;
-        }
-        if (!ready) return false;
-        const bool credit = w.s.started < w.s.grant && w.s.started - w.s.results < w.window;
-        if (!credit) {
-            if (!w.s.creditBlocked) {
-                w.s.creditBlocked = true;
-                ++w.st.creditStalls;
-            }
-            return false;
-        }
-        if (!kernelQueueAllows()) return false;
-        {
-            std::lock_guard<std::mutex> lk(handoffMu);
-            // Re-check: offerFrame() may have replaced it meanwhile.
-            EncodedFrameLease& src = pendingFor(w.s.kind);
-            if (!src || src.width() != w.s.req.viewportW || src.height() != w.s.req.viewportH) return false;
-            w.cur.lease = std::move(src);
-        }
-        w.s.creditBlocked = false;
-        es3video::StartInfo info;
-        info.width             = w.cur.lease.width();
-        info.height            = w.cur.lease.height();
-        info.jpegBytes         = static_cast<uint32_t>(w.cur.lease.size());
-        info.sourceTimestampUs = w.cur.lease.captureMonotonicUs();
-        const uint32_t frameId = w.s.nextFrameId;
-        const size_t   n = es3video::checkStartForSession(info, w.s.req) == es3video::ReasonOk
-                               ? es3video::encodeStart(w.s.token, frameId, info, w.tx, sizeof(w.tx))
-                               : 0;
-        if (n == 0) {   // offerFrame() checked the limits; only a protocol mismatch gets here
-            ++w.st.framesReleased;
-            w.cur.lease.release();
-            return false;
-        }
-        ++w.s.nextFrameId;
-        ++w.s.started;
-        ++w.st.framesStarted;
-        w.cur.active         = true;
-        w.cur.frameId        = frameId;
-        w.cur.size           = info.jpegBytes;
-        w.cur.offset         = 0;
-        w.cur.crc            = 0;
-        w.cur.phase          = Io::Phase::Chunk;
-        w.cur.startWrittenUs = 0;
-        addFrame(frameId, info.sourceTimestampUs);
-        w.txLen        = n;
-        w.txOff        = 0;
-        w.txKind       = Io::TxKind::Video;
-        w.txVideoType  = es3video::RecordStart;
-        w.txProgressUs = now;
-        return true;
+    return w.cur.active ? continueImage(now) : startImage(now);
+}
+
+/// Select under handoffMu; chrome precedes a background in panning mode.
+EncodedFrameLease* Es3DisplayLink::Impl::nextImage() {
+    const Io& w = *io;
+    if (!w.s.pan) {
+        EncodedFrameLease& src = pendingFor(w.s.kind);
+        return src && src.width() == w.s.req.viewportW && src.height() == w.s.req.viewportH ? &src : nullptr;
     }
+    if (panChromePending) return &panChromePending;
+    return panBgPending ? &panBgPending : nullptr;
+}
+
+/// Spend one credit only after a compatible lease and a valid START are ready.
+bool Es3DisplayLink::Impl::startImage(int64_t now) {
+    Io& w = *io;
+    if (w.s.visibility != es3video::DemandActive || w.resyncWanted) return false;
+    bool ready = false;
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        ready = nextImage() != nullptr;
+    }
+    if (!ready) return false;
+    const bool credit = w.s.started < w.s.grant && w.s.started - w.s.results < w.window;
+    if (!credit) {
+        if (!w.s.creditBlocked) {
+            w.s.creditBlocked = true;
+            ++w.st.creditStalls;
+        }
+        return false;
+    }
+    if (!kernelQueueAllows()) return false;
+    uint64_t origin = 0;
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        // Re-check: an offer may have replaced it meanwhile.
+        EncodedFrameLease* src = nextImage();
+        if (!src) return false;
+        if (src == &panBgPending) origin = panBgOrigin;
+        w.cur.lease = std::move(*src);
+    }
+    w.s.creditBlocked = false;
+    es3video::StartInfo info;
+    info.width             = w.cur.lease.width();
+    info.height            = w.cur.lease.height();
+    info.jpegBytes         = static_cast<uint32_t>(w.cur.lease.size());
+    // A panning session's START carries the background origin instead of a time.
+    info.sourceTimestampUs = w.s.pan ? origin : w.cur.lease.captureMonotonicUs();
+    const uint32_t frameId = w.s.nextFrameId;
+    es3map::PanImage panKind = es3map::PanImageNone;
+    const es3video::Reason fit = w.s.pan ? es3map::checkPanStart(info, w.s.panGeo, panKind)
+                                         : es3video::checkStartForSession(info, w.s.req);
+    const size_t n = fit == es3video::ReasonOk ? es3video::encodeStart(w.s.token, frameId, info, w.tx, sizeof(w.tx))
+                                               : 0;
+    if (n == 0) {   // offerFrame() checked the limits; only a protocol mismatch gets here
+        ++w.st.framesReleased;
+        w.cur.lease.release();
+        return false;
+    }
+    ++w.s.nextFrameId;
+    ++w.s.started;
+    ++w.st.framesStarted;
+    w.cur.active         = true;
+    w.cur.frameId        = frameId;
+    w.cur.size           = info.jpegBytes;
+    w.cur.offset         = 0;
+    w.cur.crc            = 0;
+    w.cur.phase          = Io::Phase::Chunk;
+    w.cur.startWrittenUs = 0;
+    w.cur.panKind        = uint8_t(panKind);
+    addFrame(frameId, w.s.pan ? 0 : info.sourceTimestampUs);
+    if (w.s.pan) {
+        if (Io::Outstanding* e = findFrame(frameId)) e->panKind = panKind;
+        ++(panKind == es3map::PanImageBackground ? w.st.panBackgroundsStarted : w.st.panChromeStarted);
+    }
+    w.txLen        = n;
+    w.txOff        = 0;
+    w.txKind       = Io::TxKind::Video;
+    w.txVideoType  = es3video::RecordStart;
+    w.txProgressUs = now;
+    return true;
+}
+
+/// Continue exactly one record; the caller never interleaves partial records.
+bool Es3DisplayLink::Impl::continueImage(int64_t now) {
+    Io& w = *io;
 
     if (!kernelQueueAllows()) return false;
     size_t n = 0;
@@ -1603,6 +1929,15 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
             setState(LinkState::Capabilities);
         } else {
             setState(w.videoSupported ? LinkState::Negotiated : LinkState::ControlOnly);
+            // A re-HELLO after a lost MAP/PAN_CAPABILITIES reply: ask again (twice
+            // per open at most, then do without, so a broken reply cannot loop).
+            if (w.videoSupported && cfg.map && !w.mapKnown) {
+                if (w.mapCapsTries < kCapsTriesPerOpen) w.wantMapCaps = true;
+                else w.mapKnown = true;   // mapSupported stays false
+            } else if (w.mapSupported && cfg.mapPan && !w.panKnown) {
+                if (w.panCapsTries < kCapsTriesPerOpen) w.wantPanCaps = true;
+                else w.panKnown = true;   // whole map frames
+            }
         }
         publishVideo();
         return;
@@ -1654,10 +1989,55 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
         w.mapCaps      = m;
         w.mapMaxJpeg   = std::min<uint32_t>(cfg.mapMaxJpegBytes, m.maxJpegBytes);
         w.nextPollUs   = 0;   // learn the active page at once
+        if (cfg.mapPan && !w.panKnown) w.wantPanCaps = true;
         logQuiet(QCaps, LogLevel::INFO, "ES3 display: map v%u on page %u of %u, viewport %u,%u %ux%u, JPEG %u B",
                  unsigned(m.mapProtocolVersion), unsigned(m.mapPage), unsigned(m.pageCount), m.viewportX,
                  m.viewportY, m.viewportW, m.viewportH, w.mapMaxJpeg);
         publishVideo();
+        return;
+    }
+    case es3map::CmdPanCapabilities: {
+        es3map::PanCapabilities p;
+        w.panKnown = true;
+        if (!es3map::decodePanCapabilitiesReply(f.payload, f.length, w.mapCaps, w.caps, p)) {
+            w.panSupported = false;
+            logQuiet(QCaps, LogLevel::WARN,
+                     "ES3 display: unusable PAN_CAPABILITIES reply (%u bytes, pan version %u) - whole map frames",
+                     unsigned(f.length), f.length ? unsigned(f.payload[0]) : 0u);
+            return;
+        }
+        // The background the link will ask for must leave the board room to
+        // scroll, or panning would recentre constantly: whole frames instead.
+        const uint16_t mapH = es3map::panMapHeight(w.mapCaps, p);
+        const uint16_t bgW  = std::clamp<uint16_t>(cfg.mapPanBackgroundW, w.mapCaps.viewportW, p.maxBackgroundW);
+        const uint16_t bgH  = std::clamp<uint16_t>(cfg.mapPanBackgroundH, mapH, p.maxBackgroundH);
+        if ((bgW - w.mapCaps.viewportW) / 2 < kMinPanMarginPx || (bgH - mapH) / 2 < kMinPanMarginPx) {
+            w.panSupported = false;
+            logQuiet(QCaps, LogLevel::WARN,
+                     "ES3 display: a %ux%u panning background leaves under %u px to scroll around the %ux%u map "
+                     "area - whole map frames",
+                     bgW, bgH, unsigned(kMinPanMarginPx), w.mapCaps.viewportW, mapH);
+            return;
+        }
+        w.panSupported = true;
+        w.panCaps      = p;
+        logQuiet(QCaps, LogLevel::INFO,
+                 "ES3 display: board-side panning v%u, background up to %ux%u, strips %u+%u, %u poses/s",
+                 unsigned(p.panVersion), p.maxBackgroundW, p.maxBackgroundH, unsigned(p.chromeTopH),
+                 unsigned(p.chromeBottomH), unsigned(p.maxPoseHz));
+        return;
+    }
+    case es3map::CmdStartPan: {
+        es3map::StartPanReply r;
+        if (!es3map::decodeStartPanReply(f.payload, f.length, r)) {
+            negotiationFailed("malformed START_PAN reply");
+            return;
+        }
+        logLine(LogLevel::DEBUG, "ES3 display: panning map session %08x (generation %u), background %ux%u, grant %u",
+                r.sessionToken, done.pan.map.generation, done.pan.backgroundW, done.pan.backgroundH,
+                r.initialGrant);
+        const es3map::PanSession geo = es3map::panSession(done.pan, w.panCaps);
+        beginSession(Io::Kind::Map, r.sessionToken, es3map::sessionLimits(done.pan.map), r.initialGrant, &geo);
         return;
     }
     case es3map::CmdStartMap: {
@@ -1666,22 +2046,9 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
             negotiationFailed("malformed START_MAP reply");
             return;
         }
-        endSession();
-        w.s.kind        = Io::Kind::Map;
-        w.s.token       = r.sessionToken;
-        w.s.req         = es3map::sessionLimits(done.map);
-        w.s.grant       = r.initialGrant;
-        w.s.nextFrameId = 1;
-        w.s.visibility  = es3video::DemandActive;   // the board re-sends VISIBILITY now
-        w.s.progressUs  = nowUs();
-        w.resyncWanted  = false;
-        ++w.st.sessions;
-        ++w.st.mapSessions;
-        w.quiet[QNegotiate].clear();
         logLine(LogLevel::DEBUG, "ES3 display: map session %08x (generation %u), grant %u", r.sessionToken,
                 done.map.generation, r.initialGrant);
-        setState(LinkState::Active);
-        publishVideo();
+        beginSession(Io::Kind::Map, r.sessionToken, es3map::sessionLimits(done.map), r.initialGrant, nullptr);
         return;
     }
     case es3proto::StartVideo: {
@@ -1690,33 +2057,15 @@ void Es3DisplayLink::Impl::onReply(Io::Control& done, const es3proto::Frame& f) 
             negotiationFailed("malformed START_VIDEO reply");
             return;
         }
-        endSession();   // the old token's frames can no longer complete
-        w.s.kind        = Io::Kind::Video;
-        w.s.token       = r.sessionToken;
-        w.s.req         = done.video;
-        w.s.grant       = r.initialGrant;
-        w.s.nextFrameId = 1;
-        w.s.visibility  = es3video::DemandActive;   // the device re-sends VISIBILITY now
-        w.s.progressUs  = nowUs();
-        w.resyncWanted  = false;
-        ++w.st.sessions;
-        w.quiet[QNegotiate].clear();
         logLine(LogLevel::DEBUG, "ES3 display: video session %08x, viewport %u,%u %ux%u, chunk %u, grant %u",
-                r.sessionToken, w.s.req.viewportX, w.s.req.viewportY, w.s.req.viewportW, w.s.req.viewportH,
-                unsigned(w.s.req.chunkBytes), r.initialGrant);
-        setState(LinkState::Active);
-        publishVideo();
+                r.sessionToken, done.video.viewportX, done.video.viewportY, done.video.viewportW,
+                done.video.viewportH, unsigned(done.video.chunkBytes), r.initialGrant);
+        beginSession(Io::Kind::Video, r.sessionToken, done.video, r.initialGrant, nullptr);
         return;
     }
     case es3proto::StopVideo:
     case es3map::CmdStopMap:
-        if (w.stopping) {
-            w.stopDone = true;
-        } else if (done.stopToken && done.stopToken == w.s.token) {   // a source switch
-            endSession();
-            setState(LinkState::Negotiated);
-            publishVideo();
-        }
+        onStopDone(done);
         return;
     case es3proto::Status:
         if (f.length == 9) {
@@ -1781,15 +2130,29 @@ void Es3DisplayLink::Impl::onError(Io::Control& done, uint8_t code) {
     case es3map::CmdStartMap:
         negotiationFailed(std::string("START_MAP refused: ") + errorName(code));
         return;
+    case es3map::CmdPanCapabilities:
+        w.panKnown     = true;
+        w.panSupported = false;
+        logQuiet(QCaps, (code == es3proto::BadCommand || code == es3proto::NotReady) ? LogLevel::INFO : LogLevel::WARN,
+                 "ES3 display: no board-side panning on this firmware (PAN_CAPABILITIES: %s) - whole map frames",
+                 errorName(code));
+        return;
+    case es3map::CmdStartPan:
+        if (code == es3proto::NotReady) {   // a camera session still exists: retry as for START_MAP
+            negotiationFailed(std::string("START_PAN refused: ") + errorName(code));
+            return;
+        }
+        // Advertised but refused: use whole frames on this connection rather than retrying forever.
+        w.panSupported = false;
+        ++w.st.panFallbacks;
+        logQuiet(QNegotiate, LogLevel::WARN, "ES3 display: START_PAN refused (%s) - whole map frames until reconnect",
+                 errorName(code));
+        setState(LinkState::Negotiated);
+        publishVideo();
+        return;
     case es3proto::StopVideo:
     case es3map::CmdStopMap:
-        if (w.stopping) {
-            w.stopDone = true;
-        } else if (done.stopToken && done.stopToken == w.s.token) {   // the board no longer has it either
-            endSession();
-            setState(LinkState::Negotiated);
-            publishVideo();
-        }
+        onStopDone(done);   // the board no longer has it either
         return;
     default:
         break;
@@ -1856,6 +2219,10 @@ void Es3DisplayLink::Impl::onVideo(const es3video::Record& r) {
         // Hidden right after being shown: the user just left that tab, so learn the
         // new page now rather than at the next 1 s poll (a faster camera/map switch).
         if (w.mapSupported && d != es3video::DemandActive) w.nextPollUs = 0;
+        // Active proves which page is shown (the board makes a session active
+        // only on its own tab): no need to wait for the next STATUS poll.
+        if (w.mapSupported && d == es3video::DemandActive)
+            w.page = w.s.kind == Io::Kind::Map ? w.mapCaps.mapPage : uint8_t(0);
         logLine(LogLevel::DEBUG, "ES3 display: %s demand %s", w.s.kind == Io::Kind::Map ? "map" : "video",
                 d == es3video::DemandActive ? "active" : d == es3video::DemandHidden ? "hidden" : "calibrating");
         setState(d == es3video::DemandActive ? LinkState::Active : LinkState::Paused);
@@ -1877,6 +2244,9 @@ void Es3DisplayLink::Impl::onVideo(const es3video::Record& r) {
             ++w.st.unknownFrameRecords;
             return;
         }
+        // Ok acknowledges assembly once. A replay must not turn a frame
+        // awaiting PRESENTED into a drop or keep the stall timer alive.
+        if (e->resulted && reason == es3video::ReasonOk) return;
         w.s.progressUs = now;
         if (!e->resulted) {
             e->resulted = true;
@@ -1887,6 +2257,12 @@ void Es3DisplayLink::Impl::onVideo(const es3video::Record& r) {
             }
         }
         ++w.st.framesDropped;   // a rejection, or the second RESULT after Ok
+        // A background or chrome the board will not show: the producer must
+        // send it again.  Superseded means a newer one of the same kind is
+        // coming; Hidden/Cancelled are covered by the shown-again resend.
+        if (w.s.pan && e->panKind != es3map::PanImageNone && reason != es3video::ReasonSuperseded &&
+            reason != es3video::ReasonHidden && reason != es3video::ReasonCancelled)
+            panImageLost(now);
         e->used = false;
         return;
     }
@@ -1977,6 +2353,60 @@ void Es3DisplayLink::Impl::abandonCurrent(bool sendAbort, uint8_t reason, bool c
     w.cur.active = false;
 }
 
+/// A background or chrome was lost after the producer handed it over: ask it
+/// for both again (at most every kPanResendGapMs, so a board that keeps
+/// rejecting an image is not flooded).
+void Es3DisplayLink::Impl::panImageLost(int64_t now) {
+    std::lock_guard<std::mutex> lk(handoffMu);
+    if (lastLossResendUs && now - lastLossResendUs < int64_t(kPanResendGapMs) * 1000) {
+        lossResendDue = true;   // deferred, never dropped: checkTimers() bumps it when the gap is over
+        return;
+    }
+    lastLossResendUs    = now;
+    lossResendDue       = false;
+    panDemandNow.resend = ++panResend;
+}
+
+/// The common steps after a START_VIDEO / START_MAP / START_PAN reply.
+void Es3DisplayLink::Impl::beginSession(Io::Kind kind, uint32_t token, const es3video::StartVideoRequest& limits,
+                                        uint32_t grant, const es3map::PanSession* pan) {
+    Io& w = *io;
+    endSession();   // the old token's frames can no longer complete
+    {
+        std::lock_guard<std::mutex> lk(handoffMu);
+        lossResendDue    = false;   // a new session needs its images anyway
+        lastLossResendUs = 0;
+    }
+    w.s.kind        = kind;
+    w.s.token       = token;
+    w.s.req         = limits;
+    w.s.pan         = pan != nullptr;
+    if (pan) w.s.panGeo = *pan;
+    w.s.grant       = grant;
+    w.s.nextFrameId = 1;
+    w.s.visibility  = es3video::DemandActive;   // the device re-sends VISIBILITY now
+    w.s.progressUs  = nowUs();
+    w.resyncWanted  = false;
+    ++w.st.sessions;
+    if (kind == Io::Kind::Map) ++w.st.mapSessions;
+    if (pan) ++w.st.panSessions;
+    w.quiet[QNegotiate].clear();
+    setState(LinkState::Active);
+    publishVideo();
+}
+
+/// STOP_VIDEO / STOP_MAP answered (Ok or Error: either way the board has no such session).
+void Es3DisplayLink::Impl::onStopDone(const Io::Control& done) {
+    Io& w = *io;
+    if (w.stopping) {
+        w.stopDone = true;
+    } else if (done.stopToken && done.stopToken == w.s.token) {   // a source switch
+        endSession();
+        setState(LinkState::Negotiated);
+        publishVideo();
+    }
+}
+
 void Es3DisplayLink::Impl::negotiationFailed(const std::string& why) {
     Io& w = *io;
     ++w.st.negotiationFailures;
@@ -1998,6 +2428,7 @@ void Es3DisplayLink::Impl::negotiationFailed(const std::string& why) {
             ++w.st.framesReleased;
             l->release();
         }
+    dropPanPending();
     publishVideo();
 }
 

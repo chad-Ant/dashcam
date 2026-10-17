@@ -987,12 +987,22 @@ static bool test_navigation() {
     out.navigation.zoom        = 17;
     out.navigation.warmFps     = 0;
     out.navigation.cachePath   = std::string("/tmp/navcache.sqlite");
+    out.navigation.panning     = false;
+    out.navigation.poseHz      = 25;
+    out.navigation.panBackgroundWidth  = 448;
+    out.navigation.panBackgroundHeight = 352;
     check(ConfigReader::save(tmpFile, out, log), "save");
     AppConfig in;
     check(ConfigReader::load(tmpFile, in, log) && in.navigation.enabled && in.navigation.zoom == 17 &&
               in.navigation.warmFps == 0 && std::string(in.navigation.cachePath) == "/tmp/navcache.sqlite" &&
               std::string(in.navigation.attribution) == std::string(d.attribution),
           "round trip (incl. the UTF-8 attribution)");
+    check(!in.navigation.panning && in.navigation.poseHz == 25 && in.navigation.panBackgroundWidth == 448 &&
+              in.navigation.panBackgroundHeight == 352 && in.navigation.panJpegQuality == 75,
+          "panning settings round trip");
+    check(d.panning && d.poseHz == 20 && d.panBackgroundWidth == 512 && d.panBackgroundHeight == 384 &&
+              d.panBackgroundWidth.maxValue() <= 1024 && d.poseHz.maxValue() <= 60 && d.panBackgroundWidth.minValue() >= 320,
+          "panning defaults (on, 20 Hz, 512x384) fit map extension v2's ceilings");
     check(validateNavigation(in.navigation, problems), "a localhost http provider validates (test servers)");
 
     check(writeConfigFile(tmpFile, "<Recording><SegmentSec>60</SegmentSec></Recording>"), "write file w/o section");
@@ -1017,6 +1027,47 @@ static bool test_navigation() {
     bad.placeholderAfterMs = 3000;
     check(!validateNavigation(bad, problems) && problems.size() == 5,
           "plain http, missing {x}, empty UserAgent and Attribution, placeholder <= stale: 5 problems");
+    auto only = [&](const NavigationConfig& c, const char* needle) {
+        return !validateNavigation(c, problems) && problems.size() == 1 && problems[0].find(needle) != std::string::npos;
+    };
+    NavigationConfig u = d;
+    u.providerUrl = std::string("https://{s}.tile.example.org/{z}/{x}/{y}.png");
+    check(only(u, "{s}"), "an unsupported placeholder ({s}) is rejected by name");
+    u.providerUrl = std::string("http://localhost.example.com/{z}/{x}/{y}.png");
+    check(only(u, "https"), "http to localhost.example.com is not 'localhost'");
+    u.providerUrl = std::string("http://user@localhost/{z}/{x}/{y}.png");
+    check(only(u, "https"), "http with user info is rejected");
+    u.providerUrl = std::string("http://localhost:8080/{z}/{x}/{y}.png");
+    check(validateNavigation(u, problems), "http://localhost:8080 is a local test server");
+    u.providerUrl = std::string("http://[::1]:9/{z}/{x}/{y}.png");
+    check(validateNavigation(u, problems), "http://[::1] too");
+    u.providerUrl = std::string("http://tiles.example.org/{z}/{x}/{y}.png?key=SECRET123");
+    check(!validateNavigation(u, problems) && problems[0].find("SECRET123") == std::string::npos,
+          "the message never repeats the URL's query (keys)");
+    NavigationConfig at = d;
+    at.attribution = std::string("\xC2\xA9 OpenStreetMap contributors, \xC2\xA9 A Very Long Tile Provider Name Ltd");
+    check(only(at, "Attribution"), "an attribution too long for the strip is rejected");
+    check(d.staleAfterMs.minValue() >= 1500, "StaleAfterMs below the map's refresh (+ margin) is clamped up to 1500");
+    check(d.panBackgroundWidth.minValue() >= 384 && d.panBackgroundHeight.minValue() >= 256,
+          "panning backgrounds at least the map area + 64 (384x256)");
+    {
+        warns.clear();
+        check(writeConfigFile(tmpFile, "<Navigation><StaleAfterMs>1000</StaleAfterMs><PanBackgroundWidth>320"
+                                       "</PanBackgroundWidth><PanBackgroundHeight>192</PanBackgroundHeight></Navigation>"),
+              "write a file with old-range values");
+        AppConfig oldRange;
+        check(ConfigReader::load(tmpFile, oldRange, log) && oldRange.navigation.staleAfterMs == 1500 &&
+                  oldRange.navigation.panBackgroundWidth == 384 && oldRange.navigation.panBackgroundHeight == 256 &&
+                  warns.size() == 3 && validateNavigation(oldRange.navigation, problems),
+              "old-range values are clamped with a WARN each and the map stays valid");
+    }
+    DisplayPreviewConfig dl;
+    check(validateDisplayLink(dl, problems) == !std::string(dl.device).empty(), "the link defaults");
+    dl.device             = std::string("");
+    dl.staleAfterMs       = 3000;
+    dl.placeholderAfterMs = 2000;
+    check(!validateDisplayLink(dl, problems) && problems.size() == 2,
+          "map-only config: an empty Device and placeholder <= stale in <DisplayPreview> are reported");
     fs::remove(tmpFile);
     return g_fails == before;
 }

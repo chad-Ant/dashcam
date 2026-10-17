@@ -18,6 +18,7 @@
  */
 
 #include "HostProtocol.h"
+#include "libnavigation.h"
 #include "librecord.h"
 
 #include <cmath>
@@ -238,6 +239,30 @@ inline void applyBridgeDetail(dashcam::record::OverlayData& od, const hostproto:
 {
     od.detailText        = formatBridgeDetail(t, bridgeFresh);
     od.detailTimestampMs = tickMs;
+}
+
+/**
+ * @brief The map's copy of one bridge sample (libnavigation does not know the
+ *        bridge protocol).  Coordinates are promoted from float, whose step is
+ *        sub-pixel at zoom 16.  The receiver's own flags are passed through
+ *        unchanged; NavState decides what may be shown.
+ * @param receivedUs Steady-clock microseconds when the sample arrived (the
+ *        clock NavigationService ages samples with).
+ */
+inline dashcam::navigation::GpsSample toNavSample(const hostproto::Telemetry& t, uint64_t receivedUs)
+{
+    dashcam::navigation::GpsSample s;
+    s.latitude   = double(t.latitude);
+    s.longitude  = double(t.longitude);
+    s.speedKmh   = t.gpsSpeedKmh;
+    s.courseDeg  = t.heading;   // the MKR's filtered course; NaN while unreliable
+    s.fixType    = t.fixType;
+    s.satellites = t.satellites;
+    s.fixValid   = t.fixValid != 0;
+    s.gpsFix     = (t.flags & hostproto::TLM_FLAG_GPS_FIX) != 0;
+    s.gpsPresent = (t.flags & hostproto::TLM_FLAG_GPS_PRESENT) != 0;
+    s.receivedUs = receivedUs;
+    return s;
 }
 
 } // namespace app

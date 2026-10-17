@@ -622,6 +622,45 @@ marker centred in the background offered before every pose). `navigation_test
 --pan-drive OUTDIR` renders a simulated board at 30 fps over the real OSM drive
 (output kept outside the repo).
 
+## Jetson-side review and refactor (2026-10-17)
+
+A multi-agent review of the Jetson navigation code (7 angles; 53 findings, 50
+confirmed by two independent verifiers, 2 contested, 1 rejected) and a second
+review of the fixes (29 findings, all addressed but two test-only items) led to:
+
+- **Structure:** `libnavigation.cpp` (public API, bounded start/stop),
+  `nav_service.h` (internal state and thread ownership), `nav_fetch.cpp` (tile
+  workers, HTTP, provider health), `nav_render.cpp` (whole frames and panning as
+  named steps); pure helpers stay in `nav_geo`/`nav_tiles`/`nav_compose`/`nav_pan`.
+- **Tile policy:** no fetch once the map is hidden (queued work becomes disk-only
+  at once); provider waits only ever get later and a success that crossed a
+  setback does not cancel it (Retry-After honoured with two workers); unreachable
+  server (DNS/connect) backs off at most 10 s; redirects disable the provider;
+  other 4xx mark the tile, not the server; stale-while-revalidate shown at once;
+  a 304 without Cache-Control keeps the stored lifetime; tiles fetched before the
+  clock is set are not stored; URLs logged without query or credentials.
+- **Cache:** size/count kept incrementally (no full scan per insert), eviction on
+  the worker after a store (never on the render thread), a corrupt file set aside
+  and rebuilt, run-time corruption reported once.
+- **Stop:** bounded. The render thread is always joined; a worker stuck in DNS or
+  disk I/O is left behind after 3 s, silenced, and keeps its own state alive.
+- **Panning:** an incomplete background is completed while parked; the link asks
+  the producer to resend when the map is shown again or an image is lost (deferred,
+  never dropped, by a 2 s limit); poses are sent before any encode; one continuous
+  x frame per session across the antimeridian; small margins cannot churn
+  backgrounds (lead cap, link margin guard of 32 px, config minimum 384x256).
+- **Whole frames:** a repeated GPS sample that changes nothing drawn is not a new
+  frame (parked: 1 fps refresh instead of re-sending 4 fps); the first frame after
+  the map is shown goes out at once; no idle 1 ms wake-ups.
+- **Link/config/app:** MAP/PAN_CAPABILITIES asked again after a re-HELLO;
+  VISIBILITY active sets the page (back to MAP in ~2 ms instead of a STATUS poll);
+  config rejects unknown URL placeholders, non-local plain http, a too-long
+  attribution, and clamps StaleAfterMs to >= 1500; map-only configs validate the
+  `<DisplayPreview>` link fields; `toNavSample()` moved to `src/bridge_overlay.h`.
+
+Not done: an injectable clock for tests, curl multi for an instant stop, a test of
+the detach path (needs a hook to stall a worker), and a pose-ordering test.
+
 ## 10. Sources checked for this plan
 
 1. [OSM API purpose](https://wiki.openstreetmap.org/wiki/API): editing/raw data

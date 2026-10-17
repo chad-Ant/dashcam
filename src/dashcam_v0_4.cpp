@@ -1428,31 +1428,32 @@ static int selfTestSupervision() {
     return failures;
 }
 
+// ─── <Navigation> -> map service settings ─────────────────────────────────────
+
+static dashcam::navigation::NavigationServiceConfig navigationServiceConfig(
+    const dashcam::config::NavigationConfig& nv) {
+    dashcam::navigation::NavigationServiceConfig c;
+    c.providerUrl      = std::string(nv.providerUrl);
+    c.providerId       = std::string(nv.providerId);
+    c.userAgent        = std::string(nv.userAgent);
+    c.attribution      = std::string(nv.attribution);
+    c.cachePath        = std::string(nv.cachePath);
+    c.cacheBudgetBytes = uint64_t((int)nv.cacheBudgetMB) << 20;
+    c.zoom             = (int)nv.zoom;
+    c.maxFps           = (int)nv.maxFps;
+    c.warmFps          = (int)nv.warmFps;
+    c.jpegQuality      = (int)nv.jpegQuality;
+    c.gpsStaleMs       = static_cast<uint32_t>((int)nv.gpsStaleMs);
+    c.poseHz           = (int)nv.poseHz;
+    c.panJpegQuality   = (int)nv.panJpegQuality;
+    return c;
+}
+
 // ─── repeated-message damper ──────────────────────────────────────────────────
 
 // Wraps a log callback: each distinct message is logged once at its own level,
 // repeats at DEBUG.  For chatty retry loops (a missing bridge, an offline NTP
 // server) that would otherwise write the same line every few seconds forever.
-// ─── bridge telemetry -> map position ─────────────────────────────────────────
-
-// The map's copy of one bridge sample (libnavigation does not know libcommlink).
-// Coordinates are promoted from float: the float step is sub-pixel at zoom 16.
-static dashcam::navigation::GpsSample navGpsSample(const dashcam::commlink::Telemetry& t) {
-    dashcam::navigation::GpsSample s;
-    s.latitude   = double(t.latitude);
-    s.longitude  = double(t.longitude);
-    s.speedKmh   = t.gpsSpeedKmh;
-    s.courseDeg  = t.heading;   // the MKR's filtered course; NaN while unreliable
-    s.fixType    = t.fixType;
-    s.satellites = t.satellites;
-    s.fixValid   = t.fixValid != 0;
-    s.gpsFix     = (t.flags & hostproto::TLM_FLAG_GPS_FIX) != 0;
-    s.gpsPresent = (t.flags & hostproto::TLM_FLAG_GPS_PRESENT) != 0;
-    s.receivedUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count());
-    return s;
-}
-
 static dashcam::log::LogCallback quietRepeats(dashcam::log::LogCallback log) {
     auto seen = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
     return [log, seen](LogLevel lvl, const std::string& msg) {
@@ -1726,10 +1727,20 @@ int main(int argc, char* argv[]) {
     }
     if (wantMap) {
         std::vector<std::string> problems;
-        if (!dashcam::config::validateNavigation(nv, problems)) {
+        std::vector<std::string> linkProblems;
+        const bool navOk = dashcam::config::validateNavigation(nv, problems);
+        // The link settings the map needs; with the preview enabled its own
+        // validation has already reported these, so they are not repeated.
+        const bool linkOk = dashcam::config::validateDisplayLink(dp, linkProblems);
+        if (!navOk || !linkOk) {
             for (const auto& p : problems) log(LogLevel::WARN, "navigation: " + p);
-            log(LogLevel::WARN, "navigation: off for this run — fix <Navigation> in dashcam.xml "
-                                "(recording is unaffected)");
+            if (!dp.enabled)
+                for (const auto& p : linkProblems) log(LogLevel::WARN, "navigation: " + p);
+            const char* fix = !navOk && !linkOk ? "<Navigation> and <DisplayPreview>"
+                              : !navOk          ? "<Navigation>"
+                                                : "<DisplayPreview> (the link settings the map uses)";
+            log(LogLevel::WARN, std::string("navigation: off for this run — fix ") + fix +
+                                    " in dashcam.xml (recording is unaffected)");
             wantMap = false;
         }
     }
@@ -1749,6 +1760,9 @@ int main(int argc, char* argv[]) {
         lc.mapTargetFps          = static_cast<uint8_t>((int)nv.maxFps);
         lc.mapStaleAfterMs       = static_cast<uint16_t>((int)nv.staleAfterMs);
         lc.mapPlaceholderAfterMs = static_cast<uint16_t>((int)nv.placeholderAfterMs);
+        lc.mapPan                = (bool)nv.panning;
+        lc.mapPanBackgroundW     = static_cast<uint16_t>((int)nv.panBackgroundWidth);
+        lc.mapPanBackgroundH     = static_cast<uint16_t>((int)nv.panBackgroundHeight);
         auto displayLog = quietRepeats(recLog);
         std::string why;
         if (!dashcam::es3display::validateConfig(lc, &why) || !display.start(lc, displayLog)) {
@@ -1769,19 +1783,8 @@ int main(int argc, char* argv[]) {
                               : std::string("display preview: converter not started (recording is unaffected)"));
             }
             if (wantMap) {
-                dashcam::navigation::NavigationServiceConfig ncfg;
-                ncfg.providerUrl      = std::string(nv.providerUrl);
-                ncfg.providerId       = std::string(nv.providerId);
-                ncfg.userAgent        = std::string(nv.userAgent);
-                ncfg.attribution      = std::string(nv.attribution);
-                ncfg.cachePath        = std::string(nv.cachePath);
-                ncfg.cacheBudgetBytes = uint64_t((int)nv.cacheBudgetMB) << 20;
-                ncfg.zoom             = (int)nv.zoom;
-                ncfg.maxFps           = (int)nv.maxFps;
-                ncfg.warmFps          = (int)nv.warmFps;
-                ncfg.jpegQuality      = (int)nv.jpegQuality;
-                ncfg.gpsStaleMs       = static_cast<uint32_t>((int)nv.gpsStaleMs);
-                navigationOn = navigation.start(ncfg, display.mapSink(), quietRepeats(recLog));
+                navigationOn = navigation.start(navigationServiceConfig(nv), display.mapSink(),
+                                                nv.panning ? &display.panSink() : nullptr, quietRepeats(recLog));
                 if (!navigationOn) log(LogLevel::WARN, "navigation: map service not started (recording is unaffected)");
             }
             if (!previewOn && !navigationOn) display.stop();
@@ -1810,7 +1813,9 @@ int main(int argc, char* argv[]) {
         bridge.setTelemetryCallback([&timeKeeper, &telemetryCsv, &navigation, gpsTime,
                                      navigationOn](const dashcam::commlink::Telemetry& t) {
             telemetryCsv.pushTelemetry(t, epochMs());
-            if (navigationOn) navigation.offerGps(navGpsSample(t));
+            if (navigationOn)
+                navigation.offerGps(dashcam::app::toNavSample(t, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                                     std::chrono::steady_clock::now().time_since_epoch()).count())));
             if (!gpsTime) return;
             dashcam::timesync::UtcFields u;
             u.year = t.year; u.month = t.month; u.day = t.day;
@@ -2073,11 +2078,12 @@ int main(int argc, char* argv[]) {
     heartbeat.beat();
     if (navigationOn) {
         const dashcam::navigation::NavigationStats ns = navigation.stats();
-        navigation.stop();   // bounded: an HTTP transfer in progress aborts
-        char b[200];
-        std::snprintf(b, sizeof(b), "navigation: %llu map frames offered, %llu tile downloads (%llu KiB), "
-                                    "%llu tiles cached",
-                      (unsigned long long)ns.framesOffered, (unsigned long long)ns.http200,
+        navigation.stop();   // bounded: a worker stuck in DNS or disk I/O is left behind after 3 s
+        char b[256];
+        std::snprintf(b, sizeof(b), "navigation: %llu map frames offered, %llu panning backgrounds, %llu poses, "
+                                    "%llu tile downloads (%llu KiB), %llu tiles cached",
+                      (unsigned long long)ns.framesOffered, (unsigned long long)ns.panBackgrounds,
+                      (unsigned long long)ns.posesOffered, (unsigned long long)ns.http200,
                       (unsigned long long)(ns.httpBytes / 1024), (unsigned long long)ns.cacheTiles);
         log(LogLevel::INFO, b);
         heartbeat.beat();

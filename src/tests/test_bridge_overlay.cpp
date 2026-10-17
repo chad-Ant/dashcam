@@ -244,6 +244,32 @@ int main() {
               "status CSV row has one cell per header column");
     }
 
+    std::printf("--- telemetry -> map position (toNavSample) ---\n");
+    {
+        Telemetry t   = driving();
+        t.fixType     = 3;
+        t.satellites  = 11;
+        t.flags      |= hostproto::TLM_FLAG_GPS_PRESENT;
+        const dashcam::navigation::GpsSample s = dashcam::app::toNavSample(t, 123456789ull);
+        check(std::fabs(s.latitude - 10.8231) < 1e-5 && std::fabs(s.longitude - 106.6297) < 1e-5 &&
+                  std::fabs(s.speedKmh - 51.9f) < 1e-5f && std::fabs(s.courseDeg - 271.0f) < 1e-5f,
+              "position, GNSS speed and course copied");
+        check(s.fixType == 3 && s.satellites == 11 && s.fixValid && s.gpsFix && s.gpsPresent &&
+                  s.receivedUs == 123456789ull,
+              "fix type, satellites, the three fix flags and the arrival time");
+        check(dashcam::navigation::usablePosition(s) && dashcam::navigation::usableCourse(s, 5.0f),
+              "a healthy fix is usable for the map, with its course");
+        Telemetry n = blank();
+        const dashcam::navigation::GpsSample z = dashcam::app::toNavSample(n, 1);
+        check(!z.gpsPresent && !z.gpsFix && !z.fixValid && !dashcam::navigation::usablePosition(z),
+              "nothing from the receiver: not usable, receiver absent");
+        Telemetry p = driving();
+        p.flags = hostproto::TLM_FLAG_GPS_PRESENT;   // receiver answering, no fix flag
+        const dashcam::navigation::GpsSample q = dashcam::app::toNavSample(p, 1);
+        check(q.gpsPresent && !q.gpsFix && !dashcam::navigation::usablePosition(q),
+              "receiver present without TLM_FLAG_GPS_FIX: not usable");
+    }
+
     std::printf("\nRESULT: %s (%d failure%s)\n", g_fails ? "FAIL" : "PASS", g_fails,
                 g_fails == 1 ? "" : "s");
     return g_fails ? 1 : 0;

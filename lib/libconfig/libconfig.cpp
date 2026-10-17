@@ -534,6 +534,11 @@ static void parseNavigation(pugi::xml_node node, NavigationConfig& n,
     readVar(node, n.gpsStaleMs,         log);
     readVar(node, n.staleAfterMs,       log);
     readVar(node, n.placeholderAfterMs, log);
+    readVar(node, n.panning,            log);
+    readVar(node, n.poseHz,             log);
+    readVar(node, n.panBackgroundWidth, log);
+    readVar(node, n.panBackgroundHeight, log);
+    readVar(node, n.panJpegQuality,     log);
 }
 
 static void writeNavigation(pugi::xml_node parent, const NavigationConfig& c) {
@@ -552,6 +557,11 @@ static void writeNavigation(pugi::xml_node parent, const NavigationConfig& c) {
     writeVar(n, c.gpsStaleMs);
     writeVar(n, c.staleAfterMs);
     writeVar(n, c.placeholderAfterMs);
+    writeVar(n, c.panning);
+    writeVar(n, c.poseHz);
+    writeVar(n, c.panBackgroundWidth);
+    writeVar(n, c.panBackgroundHeight);
+    writeVar(n, c.panJpegQuality);
 }
 
 static void writeDisplayPreview(pugi::xml_node parent, const DisplayPreviewConfig& p) {
@@ -700,28 +710,94 @@ bool validateDisplayPreview(const DisplayPreviewConfig& cfg,
     return problems.empty();
 }
 
+namespace {
+/// @p url without query, fragment or user:password (keys stay out of logs).
+std::string redactedUrl(const std::string& url) {
+    std::string u = url.substr(0, url.find_first_of("?#"));
+    const size_t scheme = u.find("://");
+    const size_t start  = scheme == std::string::npos ? 0 : scheme + 3;
+    const size_t slash  = u.find('/', start);
+    const size_t at     = u.rfind('@', slash == std::string::npos ? u.size() : slash);
+    if (at != std::string::npos && at >= start) u.erase(start, at + 1 - start);
+    return u;
+}
+/// Plain http only to a test server on this machine: the host must be exactly
+/// localhost / 127.0.0.1 / [::1], with no user info.
+bool localHttpUrl(const std::string& url) {
+    const std::string prefix = "http://";
+    if (url.rfind(prefix, 0) != 0) return false;
+    const size_t end       = url.find_first_of("/?#", prefix.size());
+    const std::string auth = url.substr(prefix.size(), end == std::string::npos ? std::string::npos : end - prefix.size());
+    if (auth.find('@') != std::string::npos) return false;
+    std::string host = auth;
+    if (!host.empty() && host[0] == '[') host = host.substr(0, host.find(']') + 1);
+    else host = host.substr(0, host.find(':'));
+    return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+}
+size_t utf8CodePoints(const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s)
+        if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+constexpr size_t kMaxAttributionChars = 52;   ///< 5x7 font, 6 px a glyph, in the 320 px strip with margins.
+constexpr int    kMinMapStaleAfterMs  = 1500; ///< Whole maps refresh at least every 1 s, plus transport margin.
+} // namespace
+
 bool validateNavigation(const NavigationConfig& cfg, std::vector<std::string>& problems) {
     problems.clear();
-    const std::string& url = cfg.providerUrl;
+    const std::string& url  = cfg.providerUrl;
+    const std::string  safe = redactedUrl(url);
     const bool https = url.rfind("https://", 0) == 0;
-    const bool localHttp = url.rfind("http://127.0.0.1", 0) == 0 || url.rfind("http://localhost", 0) == 0;
-    if (!https && !localHttp)
-        problems.push_back("Navigation ProviderUrl '" + url + "' must be https:// (http only for 127.0.0.1/localhost)");
+    if (!https && !localHttpUrl(url))
+        problems.push_back("Navigation ProviderUrl '" + safe + "' must be https:// (http only for 127.0.0.1/localhost)");
     for (const char* key : {"{z}", "{x}", "{y}"})
         if (url.find(key) == std::string::npos)
             problems.push_back(std::string("Navigation ProviderUrl lacks ") + key);
+    // Only {z} {x} {y} are substituted; {s}, {r}, {apikey}... would reach the server as is.
+    for (size_t p = url.find('{'); p != std::string::npos; p = url.find('{', p + 1)) {
+        const std::string t = url.substr(p, 3);
+        if (t != "{z}" && t != "{x}" && t != "{y}") {
+            const size_t close = url.find('}', p);
+            problems.push_back("Navigation ProviderUrl has an unsupported placeholder '" +
+                               url.substr(p, close == std::string::npos ? 4 : close - p + 1) +
+                               "' (only {z} {x} {y}; write the subdomain or key out)");
+            break;
+        }
+    }
     const std::string& ua = cfg.userAgent;
     if (ua.empty()) problems.push_back("Navigation UserAgent is empty (the tile server must be able to identify the app)");
     const std::string& attr = cfg.attribution;
     if (attr.empty()) problems.push_back("Navigation Attribution is empty (the map licence requires visible credit)");
+    else if (utf8CodePoints(attr) > kMaxAttributionChars)
+        problems.push_back("Navigation Attribution is " + std::to_string(utf8CodePoints(attr)) +
+                           " characters; at most " + std::to_string(kMaxAttributionChars) +
+                           " fit the map's bottom strip legibly (the licence requires the credit to be readable)");
     const std::string& id = cfg.providerId;
     if (id.empty()) problems.push_back("Navigation ProviderId is empty");
     const std::string& cache = cfg.cachePath;
     if (cache.empty()) problems.push_back("Navigation CachePath is empty");
+    if (cfg.staleAfterMs < kMinMapStaleAfterMs)
+        problems.push_back("Navigation StaleAfterMs " + std::to_string(static_cast<int>(cfg.staleAfterMs)) +
+                           " is shorter than the map's own refresh (at least " +
+                           std::to_string(kMinMapStaleAfterMs) + " ms, or a healthy map is marked stale)");
     if (cfg.placeholderAfterMs <= cfg.staleAfterMs)
         problems.push_back("Navigation PlaceholderAfterMs " +
                            std::to_string(static_cast<int>(cfg.placeholderAfterMs)) + " must exceed StaleAfterMs " +
                            std::to_string(static_cast<int>(cfg.staleAfterMs)));
+    return problems.empty();
+}
+
+bool validateDisplayLink(const DisplayPreviewConfig& cfg, std::vector<std::string>& problems) {
+    problems.clear();
+    const std::string& device = cfg.device;
+    if (device.empty())
+        problems.push_back("DisplayPreview Device is empty (the map uses the display link set up there; "
+                           "set the display's udev alias or by-id path)");
+    if (cfg.placeholderAfterMs <= cfg.staleAfterMs)
+        problems.push_back("DisplayPreview PlaceholderAfterMs " +
+                           std::to_string(static_cast<int>(cfg.placeholderAfterMs)) + " must exceed StaleAfterMs " +
+                           std::to_string(static_cast<int>(cfg.staleAfterMs)) + " (the link settings the map uses)");
     return problems.empty();
 }
 

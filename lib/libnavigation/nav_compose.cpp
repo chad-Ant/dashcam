@@ -190,13 +190,27 @@ void drawNorth(Canvas& c, int mapY0) {
     c.haloText(int(x) - 2, int(y) + 8, "N", 1, kBlack, kWhite);
 }
 
-void drawScale(Canvas& c, double lat, int zoom, int mapBottom) {
+/// The longest round distance whose bar fits @p maxPx, its length and label.
+struct ScaleBar {
+    int  px = 1;
+    char label[16] = {};
+};
+ScaleBar pickScale(double lat, int zoom, double maxPx) {
     static const int kNice[] = {5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
     const double mpp = metersPerPixel(lat, zoom);
     int meters = kNice[0];
     for (int m : kNice)
-        if (m / mpp <= 90.0) meters = m;
-    const int px = std::max(1, int(std::lround(meters / mpp)));
+        if (m / mpp <= maxPx) meters = m;
+    ScaleBar b;
+    b.px = std::max(1, int(std::lround(meters / mpp)));
+    if (meters >= 1000) std::snprintf(b.label, sizeof(b.label), "%d km", meters / 1000);
+    else std::snprintf(b.label, sizeof(b.label), "%d m", meters);
+    return b;
+}
+
+void drawScale(Canvas& c, double lat, int zoom, int mapBottom) {
+    const ScaleBar sb = pickScale(lat, zoom, 90.0);
+    const int px = sb.px;
     const int x = 6, y = mapBottom - 8;
     c.fill(x - 1, y - 1, px + 2, 5, kWhite);
     c.fill(x, y, px, 3, kBlack);
@@ -204,10 +218,43 @@ void drawScale(Canvas& c, double lat, int zoom, int mapBottom) {
     c.fill(x, y - 4, 1, 7, kBlack);
     c.fill(x + px - 2, y - 5, 3, 9, kWhite);
     c.fill(x + px - 1, y - 4, 1, 7, kBlack);
-    char label[24];
-    if (meters >= 1000) std::snprintf(label, sizeof(label), "%d km", meters / 1000);
-    else std::snprintf(label, sizeof(label), "%d m", meters);
-    c.haloText(x + 3, y - 13, label, 1, kBlack, kWhite);
+    c.haloText(x + 3, y - 13, sb.label, 1, kBlack, kWhite);
+}
+
+/// A tile that is not in RAM: light fill with a diagonal hatch (missing, not blank land).
+void drawMissingTile(Canvas& c, int x, int y) {
+    c.fill(x, y, kTileSize, kTileSize, kMissingBg);
+    for (int d = 0; d < kTileSize * 2; d += 16)
+        for (int i = 0; i < kTileSize; ++i)
+            if (d - i >= 0 && d - i < kTileSize) c.put(x + i, y + d - i, kGridLine);
+}
+
+/// The tiles of a @p w x @p h view centred on @p centre, drawn at canvas row @p y0.
+ComposeResult drawTiles(Canvas& c, const WorldPoint& centre, int zoom, int w, int h, int y0, const TileLookup& lookup) {
+    ComposeResult res;
+    const auto tiles = tilesForView(centre, zoom, w, h);
+    res.tilesNeeded  = int(tiles.size());
+    for (const TilePlacement& t : tiles) {
+        const uint8_t* px = lookup ? lookup(t.key) : nullptr;
+        if (px) {
+            c.blitTile(px, t.dstX, y0 + t.dstY);
+            ++res.tilesDrawn;
+        } else {
+            drawMissingTile(c, t.dstX, y0 + t.dstY);
+        }
+    }
+    res.mapComplete = res.tilesDrawn == res.tilesNeeded;
+    return res;
+}
+
+/// No position: the grid with the reason in the middle.
+void drawNoPosition(Canvas& c, int y0, int w, int h, PositionState state) {
+    drawGrid(c, y0, h);
+    const char* why = state == PositionState::NoReceiver ? "GPS receiver not found"
+                      : state == PositionState::Acquiring ? "Waiting for GPS fix"
+                                                          : "Waiting for GPS";
+    const int tw = Canvas::textWidth(why, 2);
+    c.haloText((w - tw) / 2, y0 + h / 2 - 7, why, 2, kBlack, kWhite);
 }
 
 std::string statusText(const NavView& v) {
@@ -223,11 +270,52 @@ std::string statusText(const NavView& v) {
     char speed[16];
     if (std::isfinite(v.speedKmh)) std::snprintf(speed, sizeof(speed), "%.0fkm/h", double(std::max(0.0f, v.speedKmh)));
     else std::snprintf(speed, sizeof(speed), "--km/h");
-    if (v.marker == Marker::Arrow)
-        std::snprintf(b, sizeof(b), "%s %s %03.0f\xC2\xB0", fix, speed, double(v.courseDeg));
+    if (v.marker == Marker::Arrow)   // round, then wrap: 359.6 shows as 000, never 360
+        std::snprintf(b, sizeof(b), "%s %s %03d\xC2\xB0", fix, speed, int(std::lround(v.courseDeg)) % 360);
     else
         std::snprintf(b, sizeof(b), "%s %s Dir --", fix, speed);
     return b;
+}
+
+void drawStatusStrip(Canvas& c, int y0, int h, const NavView& v, NetState net, bool loading) {
+    c.fill(0, y0, c.w(), h, kStatusBg);
+    c.text(3, y0 + (h - 14) / 2, statusText(v), 2, v.state == PositionState::Live ? kStatusFg : kAmber);
+    const char* netLabel = net == NetState::Denied    ? "DENIED"
+                           : net == NetState::Offline ? "OFFLINE"
+                           : loading                  ? "LOADING"
+                           : net == NetState::Online  ? "NET"
+                                                      : "";
+    if (*netLabel) {
+        const int tw = Canvas::textWidth(netLabel, 1);
+        c.text(c.w() - tw - 3, y0 + (h - 7) / 2, netLabel, 1, net == NetState::Online && !loading ? kStatusFg : kAmber);
+    }
+}
+
+/// Right-aligned credit; returns the x where it starts.
+int drawAttribution(Canvas& c, int y0, int h, const std::string& attribution) {
+    c.fill(0, y0, c.w(), h, kAttrBg);
+    const int x = std::max(2, c.w() - Canvas::textWidth(attribution, 1) - 3);
+    c.text(x, y0 + (h - 7) / 2, attribution, 1, kAttrFg);
+    return x;
+}
+
+/// Scale bar and north mark inside the bottom strip (panning chrome), left of
+/// the attribution; the bar is at most @p maxPx long.
+void drawStripScale(Canvas& c, int y0, int h, double lat, int zoom, int maxPx, int limitX) {
+    const ScaleBar sb = pickScale(lat, zoom, maxPx);
+    const int   px    = sb.px;
+    const char* label = sb.label;
+    const int   x = 4, mid = y0 + h / 2;
+    const int end = x + px + 4 + Canvas::textWidth(label, 1) + 14;
+    if (end > limitX) return;   // no room next to the attribution: leave it out
+    c.fill(x, mid, px, 2, kAttrFg);
+    c.fill(x, mid - 3, 1, 5, kAttrFg);
+    c.fill(x + px - 1, mid - 3, 1, 5, kAttrFg);
+    const int lx = x + px + 4;
+    c.text(lx, mid - 3, label, 1, kAttrFg);
+    const double nx = lx + Canvas::textWidth(label, 1) + 9, ny = mid;   // north mark: a small up-arrow
+    const double tri[3][2] = {{nx, ny - 6}, {nx - 4, ny + 3}, {nx + 4, ny + 3}};
+    c.triangle(tri, kAttrFg);
 }
 
 } // namespace
@@ -245,30 +333,10 @@ ComposeResult composeMap(const NavView& v, int zoom, const MapLayout& L, const T
     c.clip(0, mapY0, L.width, mapY1);
     const bool havePos = v.marker != Marker::None;
     if (!havePos) {
-        drawGrid(c, mapY0, mapH);
-        const char* why = v.state == PositionState::NoReceiver ? "GPS receiver not found"
-                          : v.state == PositionState::Acquiring ? "Waiting for GPS fix"
-                                                                : "Waiting for GPS";
-        const int tw = Canvas::textWidth(why, 2);
-        c.haloText((L.width - tw) / 2, mapY0 + mapH / 2 - 7, why, 2, kBlack, kWhite);
+        drawNoPosition(c, mapY0, L.width, mapH, v.state);
     } else {
-        const WorldPoint centre = project(v.latitude, v.longitude, zoom);
         drawGrid(c, mapY0, mapH);
-        const auto tiles = tilesForView(centre, zoom, L.width, mapH);
-        res.tilesNeeded  = int(tiles.size());
-        for (const TilePlacement& t : tiles) {
-            const uint8_t* px = lookup ? lookup(t.key) : nullptr;
-            if (px) {
-                c.blitTile(px, t.dstX, mapY0 + t.dstY);
-                ++res.tilesDrawn;
-            } else {
-                c.fill(t.dstX, mapY0 + t.dstY, kTileSize, kTileSize, kMissingBg);
-                for (int d = 0; d < kTileSize * 2; d += 16)   // hatch: missing, not blank land
-                    for (int i = 0; i < kTileSize; ++i)
-                        if (d - i >= 0 && d - i < kTileSize) c.put(t.dstX + i, mapY0 + t.dstY + d - i, kGridLine);
-            }
-        }
-        res.mapComplete = res.tilesDrawn == res.tilesNeeded;
+        res = drawTiles(c, project(v.latitude, v.longitude, zoom), zoom, L.width, mapH, mapY0, lookup);
         drawMarker(c, v, L.width / 2.0, mapY0 + mapH / 2.0);
         drawNorth(c, mapY0);
         drawScale(c, v.latitude, zoom, mapY1);
@@ -287,20 +355,46 @@ ComposeResult composeMap(const NavView& v, int zoom, const MapLayout& L, const T
     c.unclip();
 
     // ── status strip ──
-    c.fill(0, 0, L.width, L.statusH, kStatusBg);
-    c.text(3, (L.statusH - 14) / 2, statusText(v), 2, v.state == PositionState::Live ? kStatusFg : kAmber);
-    const char* netLabel = net == NetState::Online ? "NET" : net == NetState::Offline ? "OFFLINE"
-                           : net == NetState::Denied ? "DENIED" : "";
-    if (*netLabel) {
-        const int tw = Canvas::textWidth(netLabel, 1);
-        c.text(L.width - tw - 3, (L.statusH - 7) / 2, netLabel, 1, net == NetState::Online ? kStatusFg : kAmber);
-    }
+    drawStatusStrip(c, 0, L.statusH, v, net, false);
 
     // ── attribution strip: whenever imagery may be visible ──
-    c.fill(0, mapY1, L.width, L.attributionH, kAttrBg);
-    const int aw = Canvas::textWidth(attribution, 1);
-    c.text(std::max(2, L.width - aw - 3), mapY1 + (L.attributionH - 7) / 2, attribution, 1, kAttrFg);
+    drawAttribution(c, mapY1, L.attributionH, attribution);
     return res;
+}
+
+ComposeResult composePanBackground(const NavView& v, bool havePosition, int zoom, int64_t ox, int64_t oy, int w,
+                                   int h, const TileLookup& lookup, std::vector<uint8_t>& rgb) {
+    rgb.assign(size_t(w) * h * 3, 0);
+    Canvas c(rgb, w, h);
+    if (!havePosition) {
+        drawNoPosition(c, 0, w, h, v.state);
+        return ComposeResult{};
+    }
+    drawGrid(c, 0, h);
+    return drawTiles(c, WorldPoint{double(ox) + w / 2.0, double(oy) + h / 2.0}, zoom, w, h, 0, lookup);
+}
+
+void composePanChrome(const NavView& v, int zoom, int w, int topH, int bottomH, NetState net, bool mapComplete,
+                      const std::string& attribution, std::vector<uint8_t>& rgb) {
+    rgb.assign(size_t(w) * (topH + bottomH) * 3, 0);
+    Canvas c(rgb, w, topH + bottomH);
+    // Each strip draws only inside itself (a board may have one strip, or thin ones).
+    constexpr int kMinTextStripH = 9;   // the 5x7 font plus a pixel above and below
+    if (topH > 0) {
+        c.clip(0, 0, w, topH);
+        if (topH >= kMinTextStripH) drawStatusStrip(c, 0, topH, v, net, !mapComplete && v.marker != Marker::None);
+        else c.fill(0, 0, w, topH, kStatusBg);
+    }
+    if (bottomH > 0) {
+        c.clip(0, topH, w, topH + bottomH);
+        if (bottomH >= kMinTextStripH) {
+            const int attrX = drawAttribution(c, topH, bottomH, attribution);
+            if (v.marker != Marker::None) drawStripScale(c, topH, bottomH, v.latitude, zoom, 60, attrX - 4);
+        } else {
+            c.fill(0, topH, w, bottomH, kAttrBg);
+        }
+    }
+    c.unclip();
 }
 
 // ─── JPEG ─────────────────────────────────────────────────────────────────────
@@ -335,7 +429,8 @@ void jpegErrorExit(j_common_ptr c) { std::longjmp(reinterpret_cast<JpegError*>(c
 void jpegSilent(j_common_ptr) {}
 } // namespace
 
-bool encodeMapJpeg(const uint8_t* rgb, int w, int h, int quality, uint8_t* out, size_t capacity, size_t& outSize) {
+bool encodeMapJpeg(const uint8_t* rgb, int w, int h, int quality, uint8_t* out, size_t capacity, size_t& outSize,
+                   bool chroma420) {
     outSize = 0;
     if (!rgb || !out || w <= 0 || h <= 0 || capacity == 0) return false;
     jpeg_compress_struct c;
@@ -362,9 +457,11 @@ bool encodeMapJpeg(const uint8_t* rgb, int w, int h, int quality, uint8_t* out, 
     c.in_color_space             = JCS_RGB;
     jpeg_set_defaults(&c);
     jpeg_set_quality(&c, std::clamp(quality, 1, 100), TRUE);
-    for (int i = 0; i < 3; ++i) {   // 4:4:4: small map text stays legible
-        c.comp_info[i].h_samp_factor = 1;
-        c.comp_info[i].v_samp_factor = 1;
+    if (!chroma420) {   // 4:4:4: small map text stays legible (jpeg_set_defaults is 4:2:0)
+        for (int i = 0; i < 3; ++i) {
+            c.comp_info[i].h_samp_factor = 1;
+            c.comp_info[i].v_samp_factor = 1;
+        }
     }
     c.optimize_coding = TRUE;   // smaller, still baseline sequential Huffman
     jpeg_start_compress(&c, TRUE);

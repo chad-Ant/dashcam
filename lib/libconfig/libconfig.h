@@ -556,19 +556,34 @@ struct NavigationConfig {
     ConfigVar<int>         zoom              {"Zoom",              16,   12,  18,   1,  "Map zoom level (16: about 2.4 m per pixel at the equator)"};
     ConfigVar<int>         maxFps            {"MaxFps",            4,    1,   10,   1,  "Map frame-rate ceiling while the MAP tab is shown; also the START_MAP target fps"};
     ConfigVar<int>         warmFps           {"WarmFps",           1,    0,   4,    1,  "Re-render rate while the MAP tab is hidden (from the disk cache only, nothing sent), so switching to the map shows a fresh frame at once; 0 = no warm rendering"};
-    ConfigVar<int>         jpegQuality       {"JpegQuality",       80,   40,  95,   1,  "Map JPEG quality (4:4:4 for legible text); retried at 70 then 60 if a frame exceeds the display's JPEG limit"};
+    ConfigVar<int>         jpegQuality       {"JpegQuality",       80,   40,  95,   1,  "Map JPEG quality (4:4:4 for legible text), whole frames and the panning strips; a frame over the display's JPEG limit is retried 10 lower, twice"};
     ConfigVar<int>         gpsStaleMs        {"GpsStaleMs",        1500, 500, 10000, 100, "A bridge telemetry sample older than this (ms) shows the position as 'Last known' (grey marker)"};
-    ConfigVar<int>         staleAfterMs      {"StaleAfterMs",      2000, 100, 9900, 100, "Display side: time without a new map frame (ms) before the board marks the map stale"};
+    ConfigVar<int>         staleAfterMs      {"StaleAfterMs",      2000, 1500, 9900, 100, "Display side: time without a new map frame or position (ms) before the board marks the map stale; at least 1500 (a shown whole-frame map refreshes every second)"};
     ConfigVar<int>         placeholderAfterMs{"PlaceholderAfterMs",5000, 200, 10000, 100, "Display side: time without a new map frame (ms) before the board shows 'Map unavailable'; must exceed StaleAfterMs"};
+    ConfigVar<bool>        panning           {"Panning",           true, "Board-side panning (map extension v2) when the display firmware has it: the board scrolls a larger map itself and draws the marker from 20 Hz positions interpolated between GPS fixes (smooth movement, a few KB/s over USB). Firmware without it gets whole map frames at MaxFps as before"};
+    ConfigVar<int>         poseHz            {"PoseHz",            20,   5,   30,   1,  "Panning: position updates sent to the board per second (the board's own maximum caps it)"};
+    ConfigVar<int>         panBackgroundWidth{"PanBackgroundWidth",512,  384, 640,  32, "Panning: width of the map image the board scrolls (px); larger = rarer, bigger images. At least the map area + 64 so there is room to scroll; clamped to the board's maximum (whole frames if that leaves under 32 px a side)"};
+    ConfigVar<int>         panBackgroundHeight{"PanBackgroundHeight",384, 256, 480, 32, "Panning: height of the map image the board scrolls (px); at least the map area + 64. Clamped to the board's maximum"};
+    ConfigVar<int>         panJpegQuality    {"PanJpegQuality",    75,   30,  95,   1,  "Panning: quality of the scrolled map image (4:2:0 to fit the display's 64 KB JPEG limit); retried 10 lower up to three times if too large"};
 };
 
 /**
  * @brief Check the NavigationConfig rules clamping cannot express: ProviderUrl has
- *        {z} {x} {y} and is https (http only to 127.0.0.1/localhost); UserAgent,
- *        Attribution, ProviderId and CachePath are non-empty; PlaceholderAfterMs >
- *        StaleAfterMs.  Pure; same use as validateDisplayPreview().
+ *        {z} {x} {y} and no other placeholder, and is https (plain http only to
+ *        exactly localhost / 127.0.0.1 / [::1]); UserAgent, Attribution,
+ *        ProviderId and CachePath are non-empty; Attribution fits the strip
+ *        (52 characters); StaleAfterMs >= 1500 and PlaceholderAfterMs >
+ *        StaleAfterMs.  Messages never repeat a URL's query (keys).  Pure; same
+ *        use as validateDisplayPreview().
  */
 bool validateNavigation(const NavigationConfig& cfg, std::vector<std::string>& problems);
+
+/**
+ * @brief The part of \<DisplayPreview\> the map needs even while the camera
+ *        preview is disabled (it owns the display link): Device non-empty and
+ *        PlaceholderAfterMs > StaleAfterMs.  Pure.
+ */
+bool validateDisplayLink(const DisplayPreviewConfig& cfg, std::vector<std::string>& problems);
 
 /**
  * @brief Aggregated application configuration.

@@ -74,8 +74,9 @@
  * @endcode
  *
  * Thread safety: every public method may be called from any thread.
- * demand() and offerFrame() never block on I/O (offerFrame() takes one short
- * internal mutex).  Control completion callbacks and log lines run on the I/O
+ * demand() is lock-free. offerFrame() takes short handoff/wake mutexes and
+ * never waits for tty I/O; its eventfd write is nonblocking and serialised
+ * with close. Control completion callbacks and log lines run on the I/O
  * thread: keep them short, and never call stop() from one.  start()/stop() are
  * serialised against each other; the destructor stop()s.
  */
@@ -86,6 +87,7 @@
 #include "Es3MapProtocol.h"
 #include "Es3VideoProtocol.h"
 #include "liblog.h"
+#include "libnavigation.h"
 #include "libvideopreview.h"
 
 #include <array>
@@ -146,6 +148,12 @@ struct DisplayLinkConfig {
     uint32_t mapMaxJpegBytes       = 65536;  ///< 1024-65536; the board's limit can lower it.
     uint16_t mapStaleAfterMs       = 2000;   ///< 1-10000.
     uint16_t mapPlaceholderAfterMs = 5000;   ///< mapStaleAfterMs-10000.
+    /// Board-side panning (map extension v2): ask PAN_CAPABILITIES and, when the
+    /// board has it, open the map as a panning session (START_PAN) fed through
+    /// panSink(); otherwise (or false) whole frames through mapSink() as before.
+    bool     mapPan                = true;
+    uint16_t mapPanBackgroundW     = 512;    ///< 320-1024; clamped to the board's map area and maximum.
+    uint16_t mapPanBackgroundH     = 384;    ///< 64-1024; likewise.
     /// Hold video records while TIOCOUTQ reports at least this many bytes.
     /// 0 = one full CHUNK record (chunk + 20 B): about one record queued at a time.
     uint32_t txQueueLimitBytes  = 0;
@@ -319,6 +327,18 @@ struct DisplayLinkStats {
     uint8_t                 sessionKind  = 0;       ///< 0 none, 1 video, 2 map.
     uint64_t mapSessions = 0, sourceSwitches = 0, pagePolls = 0;
     uint64_t mapFramesOffered = 0, mapFramesAccepted = 0;
+
+    // Board-side panning (map extension v2).
+    bool                    panSupported = false;   ///< PAN_CAPABILITIES answered with a valid set.
+    es3map::PanCapabilities panCapabilities;
+    bool                    panSession   = false;   ///< The current map session is a panning one.
+    uint16_t                panBackgroundW = 0, panBackgroundH = 0;   ///< Negotiated (0 = none).
+    uint64_t panSessions = 0, panFallbacks = 0;     ///< Fallbacks: START_PAN refused -> whole frames.
+    uint64_t panBackgroundsOffered = 0, panBackgroundsAccepted = 0;
+    uint64_t panChromeOffered = 0, panChromeAccepted = 0;
+    uint64_t panBackgroundsStarted = 0, panChromeStarted = 0;
+    uint64_t posesOffered = 0, posesAccepted = 0, posesSent = 0;
+    uint64_t posesReplaced = 0;                     ///< Overwritten by a newer pose before sending.
     bool           haveStatus = false;
     DeviceStatus   lastStatus;       ///< Last STATUS reply.
 };
@@ -387,6 +407,20 @@ public:
      * does no work (the recorder tap's frames are refused before any copy).
      */
     dashcam::preview::IPreviewSink& mapSink();
+
+    /**
+     * @brief The panning map surface (map extension v2), for libnavigation.
+     *
+     * panDemand() is active only while a panning session exists and the board
+     * shows the MAP tab; its session value changes with every new session (the
+     * board then has no background or chrome yet).  The link prefers a panning
+     * session whenever the board answers PAN_CAPABILITIES (cfg.mapPan); while
+     * one exists, mapSink()'s demand stays inactive, and vice versa.
+     * Backgrounds and chrome each keep one pending image (newest wins), sent
+     * as credited E3 29 frames, chrome first; poses keep one pending value and
+     * go out as MAP_POSE records between any two records, at most maxPoseHz.
+     */
+    dashcam::navigation::IMapPanSink& panSink();
 
     /**
      * @brief Queue an application request (page / alert / stop audio / status

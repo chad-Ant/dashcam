@@ -36,10 +36,15 @@
 //
 // [19] repeats the core cases against es3_firmware_fake.h: the colleague's
 // firmware VideoState.h and parser, with es3UsbLink's service rules mirrored.
+// [20] the map surface (extension v1), [21] board-side panning (extension v2:
+// PAN_CAPABILITIES, START_PAN, background/chrome images, MAP_POSE rate and
+// interleaving, fallback), [22] NavigationService -> link -> fake board.
 //
 // Usage: es3display_test            (ES3_TEST_VERBOSE=1 prints the link's log)
 //        es3display_test --fake-board PATH   (that firmware-logic fake behind the
 //                                             symlink PATH, for running the real app)
+//        es3display_test --fake-map-board PATH [pan]   (the contract fake with the
+//                                             map extension [and panning], tabs cycling)
 
 #include "libes3display.h"
 #include "libvideopreview.h"
@@ -54,6 +59,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <csetjmp>
@@ -123,7 +129,19 @@ void arm(uint64_t rdev) {
 void resetMax() { maxQueued = queued(); }
 } // namespace outq
 
+namespace wakeRace {
+thread_local bool intercept = false;
+std::atomic<bool> entered{false}, resume{false};
+std::atomic<int> fd{-1};
+}
+
 extern "C" ssize_t write(int fd, const void* buf, size_t n) {
+    if (wakeRace::intercept && n == sizeof(uint64_t)) {
+        wakeRace::intercept = false;
+        wakeRace::fd = fd;
+        wakeRace::entered = true;
+        while (!wakeRace::resume.load()) std::this_thread::yield();
+    }
     const ssize_t r = static_cast<ssize_t>(::syscall(SYS_write, fd, buf, n));
     if (r > 0 && outq::armed(fd)) {
         outq::written += r;
@@ -294,6 +312,7 @@ static bool decodeJpeg(const uint8_t* d, size_t n, std::vector<uint8_t>& row, in
 
 struct FakeFrame {
     bool     map = false;   ///< Assembled under a map session.
+    uint8_t  panKind = 0;   ///< es3map::PanImage in a panning session.
     uint32_t token = 0, frameId = 0, bytes = 0;
     uint16_t w = 0, h = 0;
     uint64_t ts = 0;
@@ -310,6 +329,11 @@ struct FakeCounters {
         rejectedStarts = 0, startDuringAssembly = 0, withheldCredits = 0, startsWhileHidden = 0;
     int64_t  bytesWhileHidden = 0, videoBytes = 0;
     int mapCaps = 0, startMap = 0, startMapRejected = 0, stopMap = 0, busyRefusals = 0;
+    int panCaps = 0, startPan = 0, startPanRefused = 0, poses = 0, poseSeqErrors = 0, poseBadFields = 0,
+        posesWhileHidden = 0, posesOutsideSession = 0;
+    es3map::MapPose lastPose;
+    int64_t         firstPoseMs = 0, lastPoseMs = 0;
+    int64_t         minPoseGapMs = 1 << 30;
     int      maxInFlight = 0;
     size_t   maxChunk = 0;
     uint64_t lastStartTs = 0;
@@ -324,6 +348,7 @@ public:
     std::atomic<int>     devMaxJpeg{65536};
     std::atomic<int>     devMaxCredits{1};
     std::atomic<int>     initialGrant{1};
+    std::atomic<bool>    duplicateOk{false}; ///< Replay assembly success before presentation.
     std::atomic<bool>    neverCredit{false}; ///< Withhold every CREDIT.
     std::atomic<int>     dropReplyTo{0};     ///< One-shot: swallow the next reply to this command.
     std::atomic<int>     resultDelayMs{0};   ///< END -> RESULT Ok.
@@ -332,6 +357,10 @@ public:
     std::atomic<int64_t> stallUntilMs{0};    ///< Reads nothing before this time.
     std::atomic<int>     sessionTimeoutMs{5000};
     std::atomic<int>     mapMode{0};         ///< 0 firmware without the map (BadCommand), 1 map extension.
+    std::atomic<int>     panMode{0};         ///< 0 no v2 (BadCommand to 0D), 1 panning, 2 advertised but START_PAN refused.
+    std::atomic<int>     panMaxW{640}, panMaxH{480};   ///< PAN_CAPABILITIES background maximum.
+    std::atomic<bool>    rejectNextPan{false};          ///< One-shot: the next pan image fails to decode.
+    std::atomic<int>     initialPage{0};                ///< The tab shown when plugged in (the board's default).
 
     /// The user taps another tab (map firmware): the bound surface's VISIBILITY follows.
     void setPage(int page) {
@@ -377,7 +406,7 @@ public:
             session_ = false;
             endVideoLocked();
             visibility_ = es3video::DemandActive;
-            page_       = 0;
+            page_       = initialPage.load();
         }
         outq::arm(uint64_t(sb.st_rdev));
         master_ = fd;
@@ -501,6 +530,11 @@ private:
     int                         page_ = 0;
     bool                        mapSession_ = false;   ///< token_ belongs to a map session.
     es3map::MapCapabilities     mapCaps_;
+    bool                        panSession_ = false;   ///< ... a panning one (extension v2).
+    es3map::PanCapabilities     panCaps_;
+    es3map::PanSession          panGeo_;
+    uint32_t                    poseSeq_ = 0;
+    uint8_t                     asmPanKind_ = 0;
 
     /// Demand of the bound surface: the visibility knob, and with the map
     /// extension also the page (camera on LIVE, map on page 5), as the firmware does.
@@ -552,6 +586,8 @@ private:
     void sendResult(uint32_t frameId, uint8_t reason) {
         uint8_t b[64];
         send(b, es3video::encodeResult(token_, frameId, static_cast<es3video::Reason>(reason), b, sizeof(b)));
+        if (reason == es3video::ReasonOk && duplicateOk.load())
+            send(b, es3video::encodeResult(token_, frameId, es3video::ReasonOk, b, sizeof(b)));
     }
     void creditBack() {
         if (neverCredit.load()) {
@@ -570,6 +606,8 @@ private:
     }
     void endVideoLocked() {
         mapSession_ = false;
+        panSession_ = false;
+        poseSeq_    = 0;
         token_ = grant_ = credited_ = firstResults_ = lastFrameId_ = 0;
         assembling_ = false;
         events_.clear();
@@ -790,6 +828,47 @@ private:
             sendVisibility(token_, effectiveDemand());
             return;
         }
+        case es3map::CmdPanCapabilities: {
+            ++c_.panCaps;
+            if (mapMode.load() == 0 || panMode.load() == 0) { error(f, es3proto::BadCommand); return; }
+            panCaps_.maxBackgroundW = uint16_t(panMaxW.load());
+            panCaps_.maxBackgroundH = uint16_t(panMaxH.load());
+            panCaps_.chromeTopH     = 16;
+            panCaps_.chromeBottomH  = 16;
+            panCaps_.maxPoseHz      = 30;
+            uint8_t p[es3map::kPanCapabilitiesReplyBytes];
+            reply(f, p, es3map::encodePanCapabilitiesReply(panCaps_, mapCaps_, caps_, p, sizeof(p)));
+            return;
+        }
+        case es3map::CmdStartPan: {
+            ++c_.startPan;
+            if (mapMode.load() == 0 || panMode.load() == 0) { error(f, es3proto::BadCommand); return; }
+            if (!mapSession_ && token_) {
+                ++c_.busyRefusals;
+                error(f, es3proto::NotReady);
+                return;
+            }
+            es3map::StartPanRequest r;
+            if (panMode.load() == 2 || !es3map::decodeStartPanRequest(f.payload, f.length, panCaps_, mapCaps_, caps_, r)) {
+                ++c_.startPanRefused;
+                error(f, es3proto::BadPayload);
+                return;
+            }
+            endVideoLocked();
+            mapSession_ = true;
+            panSession_ = true;
+            panGeo_     = es3map::panSession(r, panCaps_);
+            token_      = ++tokenCounter_;
+            req_        = es3map::sessionLimits(r.map);
+            grant_      = uint32_t(std::min(initialGrant.load(), devMaxCredits.load()));
+            es3map::StartPanReply rep;
+            rep.sessionToken = token_;
+            rep.initialGrant = grant_;
+            uint8_t p[es3map::kStartMapReplyBytes];
+            reply(f, p, es3map::encodeStartPanReply(rep, p, sizeof(p)));
+            sendVisibility(token_, effectiveDemand());
+            return;
+        }
         case es3map::CmdStopMap: {
             ++c_.stopMap;
             if (mapMode.load() == 0) { error(f, es3proto::BadCommand); return; }
@@ -826,6 +905,20 @@ private:
             if (r.type == es3video::RecordStart) ++c_.startsWhileHidden;
         }
         switch (r.type) {
+        case es3video::RecordMapPose: {
+            es3map::MapPose pose;
+            if (!panSession_) { ++c_.posesOutsideSession; return; }
+            if (es3map::decodeMapPose(r, pose) != es3video::ReasonOk) { ++c_.poseBadFields; return; }
+            if (pose.seq <= poseSeq_) { ++c_.poseSeqErrors; return; }
+            poseSeq_ = pose.seq;
+            if (effectiveDemand() != es3video::DemandActive && now - hiddenSinceMs_ > 100) ++c_.posesWhileHidden;
+            if (c_.poses) c_.minPoseGapMs = std::min(c_.minPoseGapMs, now - c_.lastPoseMs);
+            else c_.firstPoseMs = now;
+            ++c_.poses;
+            c_.lastPose   = pose;
+            c_.lastPoseMs = now;
+            return;
+        }
         case es3video::RecordStart: {
             es3video::StartInfo si;
             es3video::Reason    why = es3video::decodeStart(r, si);
@@ -842,7 +935,10 @@ private:
                 assembling_ = false;
                 rejectFrame(asmId_, es3video::ReasonSuperseded);
             }
-            if (why == es3video::ReasonOk) why = es3video::checkStartForSession(si, req_);
+            es3map::PanImage kind = es3map::PanImageNone;
+            if (why == es3video::ReasonOk)
+                why = panSession_ ? es3map::checkPanStart(si, panGeo_, kind) : es3video::checkStartForSession(si, req_);
+            asmPanKind_ = uint8_t(kind);
             if (why == es3video::ReasonOk && r.frameId <= lastFrameId_) why = es3video::ReasonBadFrameId;
             if (why == es3video::ReasonOk && effectiveDemand() != es3video::DemandActive) why = es3video::ReasonHidden;
             lastFrameId_ = std::max(lastFrameId_, r.frameId);
@@ -891,6 +987,7 @@ private:
             }
             FakeFrame fr;
             fr.map = mapSession_;
+            fr.panKind = asmPanKind_;
             fr.token   = token_;
             fr.frameId = asmId_;
             fr.bytes   = asmGot_;
@@ -914,7 +1011,8 @@ private:
             done.frameId  = asmId_;
             done.credit   = true;
             done.decodeUs = decodeUs;
-            if (!fr.decodeOk) {
+            const bool forcedFail = fr.panKind && rejectNextPan.exchange(false);
+            if (!fr.decodeOk || forcedFail) {
                 ++c_.decodeFails;
                 done.type   = es3video::RecordResult;
                 done.reason = es3video::ReasonDecodeFailed;
@@ -1440,6 +1538,80 @@ static void testFramesFlow() {
     check(p.pool->freeSlots() == p.pool->slotCount(), "every lease back in the pool");
     r.link.stop();
     check(r.fake.counters().stopVideo == 1, "stop() ends the session with STOP_VIDEO");
+}
+
+static void testStreamingRegressions() {
+    std::printf("\n[23] TX fairness, duplicate acknowledgements, wake/close race\n");
+    {
+        Rig r;
+        DisplayLinkConfig c = r.cfg();
+        c.chunkDataBytes = 64;
+        c.txQueueLimitBytes = 8192; // Let a batch exhaust its work budget before TIOCOUTQ gates it.
+        c.assemblyTimeoutMs = 500;
+        r.fake.duplicateOk = true;
+        check(r.up(c), "small-chunk link negotiated");
+        const Jpeg j = bigFrame(77);
+        auto pool = EncodedFramePool::create(1, 65536);
+        check(j.bytes.size() > 30000 && offerJpeg(r.link, *pool, j, nowUs()) == 1,
+              "one large JPEG queued with no producer wakeups afterward");
+        check(waitFor([&] { return r.link.stats().framesPresented == 1; }, 2000),
+              "TX fairness yields to RX/timers without sleeping through assembly deadline");
+        const auto s = r.link.stats();
+        check(s.framesCompleted == 1 && s.framesDropped == 0 && s.unknownFrameRecords == 0,
+              "duplicate RESULT Ok keeps the frame awaiting PRESENTED, counted once");
+        check(r.fake.counters().assemblyTimeouts == 0 && pool->freeSlots() == 1,
+              "no assembly timeout and the output lease returned");
+    }
+    {
+        Rig r;
+        r.fake.duplicateOk = true;
+        check(r.up(r.cfg()), "duplicate-result link negotiated");
+        const Jpeg j = smallFrames().front();
+        auto pool = EncodedFramePool::create(1, 65536);
+        check(offerJpeg(r.link, *pool, j, nowUs()) == 1, "frame queued");
+        check(waitFor([&] { return r.fake.counters().presented == 1; }, 1000) &&
+                  waitFor([&] { return r.link.stats().framesPresented == 1; }, 500),
+              "replayed RESULT Ok does not discard the later PRESENTED");
+        check(r.link.stats().framesCompleted == 1 && r.link.stats().framesDropped == 0,
+              "one completion, no false drop");
+    }
+    {
+        Rig r;
+        check(r.up(r.cfg()), "wake-race link negotiated");
+        wakeRace::entered = wakeRace::resume = false;
+        std::atomic<bool> stopped{false}, accepted{false};
+        std::thread producer([&] {
+            wakeRace::intercept = true;
+            accepted = r.link.enqueueControl(ControlRequest::status());
+        });
+        const bool intercepted = waitFor([] { return wakeRace::entered.load(); }, 1000);
+        check(intercepted, "producer paused immediately before its eventfd syscall");
+        std::thread stopper([&] { r.link.stop(); stopped = true; });
+        // Old code closes the captured descriptor while this producer is paused.
+        const bool premature = waitFor([&] { return stopped.load(); }, 600);
+        check(intercepted && !premature && ::fcntl(wakeRace::fd.load(), F_GETFD) >= 0,
+              "stop cannot close/reuse the descriptor underneath an in-flight wake");
+        wakeRace::resume = true;
+        producer.join();
+        stopper.join();
+        check(accepted && stopped, "producer and stop finish after wake completes");
+    }
+    {
+        Rig r;
+        r.fake.mapMode = 1;
+        r.fake.neverCredit = true;
+        auto c = r.cfg();
+        c.creditStallMs = 400;
+        c.map = true;
+        check(r.up(c), "map credit-regression link negotiated");
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.mapSink().demand().active; }, 2000), "map active");
+        Producer p(r.link.mapSink(), {makeJpeg(320, 224, gradient(9), 65)}, 20);
+        p.start();
+        check(waitFor([&] { return r.link.stats().resyncs >= 1; }, 2000),
+              "pending map with returned RESULT but missing CREDIT triggers resync");
+        p.stop();
+    }
 }
 
 static void testReplacement() {
@@ -2004,6 +2176,337 @@ static void testMapSurface() {
     }
 }
 
+/// Offers @p j through a panning sink as a background (origin) or chrome.
+static int offerPan(dashcam::navigation::IMapPanSink& sink, EncodedFramePool& pool, const Jpeg& j, bool background,
+                    uint32_t ox = 0, uint32_t oy = 0) {
+    EncodedFrameLease l = pool.tryAcquire();
+    if (!l) return -1;
+    std::memcpy(l.writableData(), j.bytes.data(), j.bytes.size());
+    l.setFrame(j.bytes.size(), j.w, j.h, 0, 0, 80);
+    const bool ok = background ? sink.offerPanBackground(std::move(l), ox, oy) : sink.offerPanChrome(std::move(l));
+    if (!ok && !l.valid()) return -2;
+    return ok ? 1 : 0;
+}
+
+static Pattern noise(uint32_t seed) {
+    return [seed](uint32_t x, uint32_t y, uint8_t rgb[3]) {
+        uint32_t v = (x * 73856093u) ^ (y * 19349663u) ^ (seed * 83492791u);
+        v ^= v >> 13;
+        v *= 0x5bd1e995u;
+        rgb[0] = uint8_t(v), rgb[1] = uint8_t(v >> 8), rgb[2] = uint8_t(v >> 16);
+    };
+}
+
+static void testPanSurface() {
+    std::printf("\n[21] board-side panning: PAN_CAPABILITIES, START_PAN, background/chrome images, MAP_POSE\n");
+    using dashcam::navigation::Marker;
+    using dashcam::navigation::PanPose;
+    {
+        Rig r;
+        r.fake.mapMode      = 1;
+        r.fake.panMode      = 1;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated (panning firmware)");
+        check(waitFor([&] { return r.link.stats().panSupported && r.link.stats().activePage == 0; }, 1500),
+              "pan v1 found after MAP_CAPABILITIES");
+        DisplayLinkStats s = r.link.stats();
+        check(s.panCapabilities.maxBackgroundW == 640 && s.panCapabilities.chromeTopH == 16 &&
+                  s.panCapabilities.maxPoseHz == 30 && r.fake.counters().panCaps == 1,
+              "PAN_CAPABILITIES asked once: 640x480, strips 16+16, 30 poses/s");
+        check(!r.link.panSink().panDemand().active && r.link.panSink().panDemand().session == 0,
+              "on LIVE: no panning session yet");
+        PanPose early;
+        early.marker = Marker::Dot;
+        check(!r.link.panSink().offerPanPose(early), "a pose without a shown panning session is refused");
+
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.panSink().panDemand().active; }, 1500), "MAP: panning session, demand active");
+        const auto pd = r.link.panSink().panDemand();
+        check(pd.backgroundW == 512 && pd.backgroundH == 384 && pd.mapW == 320 && pd.mapH == 192 &&
+                  pd.chromeTopH == 16 && pd.chromeBottomH == 16 && pd.maxJpegBytes == 65536 && pd.maxPoseHz == 30 &&
+                  pd.session != 0,
+              "pan demand: background 512x384, map area 320x192, chrome 320x32, 30 poses/s");
+        check(r.fake.counters().startPan == 1 && r.fake.counters().startMap == 0 && !r.link.mapSink().demand().active &&
+                  r.link.stats().panSession,
+              "START_PAN (not START_MAP); the whole-frame map sink stays inactive");
+
+        auto pool = EncodedFramePool::create(4, es3video::kMaxJpegBytes);
+        const Jpeg bg     = makeJpeg(512, 384, gradient(4), 80);
+        const Jpeg chrome = makeJpeg(320, 32, gradient(5), 80);
+        check(offerPan(r.link.panSink(), *pool, bg, true, 1000, 2000) == 1, "background accepted");
+        check(offerPan(r.link.panSink(), *pool, chrome, false) == 1, "chrome accepted");
+        check(offerPan(r.link.panSink(), *pool, makeJpeg(320, 224, gradient(6), 80), true) == 0 &&
+                  offerPan(r.link.panSink(), *pool, makeJpeg(320, 16, gradient(6), 80), false) == 0,
+              "wrong-size background / chrome refused (the caller keeps them)");
+        check(offerJpeg(r.link.mapSink(), *pool, makeJpeg(320, 224, gradient(7), 80), nowUs()) == 0,
+              "a whole map frame is refused during a panning session");
+        check(waitFor([&] {
+                  int bgs = 0, chromes = 0;
+                  for (const FakeFrame& f : r.fake.frames()) {
+                      bgs += f.panKind == es3map::PanImageBackground;
+                      chromes += f.panKind == es3map::PanImageChrome;
+                  }
+                  return bgs == 1 && chromes == 1;
+              }, 2000),
+              "one background and one chrome assembled");
+        bool imagesOk = true;
+        for (const FakeFrame& f : r.fake.frames()) {
+            if (f.panKind == es3map::PanImageBackground)
+                imagesOk = imagesOk && f.decodeOk && f.decW == 512 && f.decH == 384 &&
+                           f.ts == es3map::packOrigin(1000, 2000);
+            if (f.panKind == es3map::PanImageChrome) imagesOk = imagesOk && f.decodeOk && f.decW == 320 && f.decH == 32;
+        }
+        check(imagesOk, "decoded at 512x384 / 320x32; the background START carries its origin");
+
+        // Poses offered at ~100 Hz: the link sends the newest at most 30 times a second.
+        PanPose pose;
+        pose.marker = Marker::Arrow;
+        const int64_t t0 = nowMs();
+        int offered = 0;
+        while (nowMs() - t0 < 1000) {
+            pose.xQ4 = (1000 + 256) * 16 + uint32_t(offered);
+            pose.yQ4 = (2000 + 192) * 16;
+            pose.courseCdeg = uint16_t((offered * 100) % 36000);
+            if (r.link.panSink().offerPanPose(pose)) ++offered;
+            sleepMs(10);
+        }
+        sleepMs(150);
+        FakeCounters fc = r.fake.counters();
+        s = r.link.stats();
+        check(offered >= 80, std::to_string(offered) + " poses offered");
+        check(fc.poses >= 20 && fc.poses <= 33, std::to_string(fc.poses) + " MAP_POSE records in ~1 s (cap 30/s)");
+        check(fc.poseSeqErrors == 0 && fc.poseBadFields == 0 && fc.posesOutsideSession == 0,
+              "seq increasing, fields valid");
+        check(fc.lastPose.xQ4 == pose.xQ4 && fc.lastPose.courseCdeg == pose.courseCdeg &&
+                  fc.lastPose.marker == es3map::MarkerArrow,
+              "the newest pose arrived last");
+        check(s.posesReplaced > 0 && s.posesSent == uint64_t(fc.poses), "older poses replaced, not queued");
+
+        // A large background over a slow reader: poses keep coming while it streams.
+        r.fake.readRate = 120000;
+        Jpeg big;
+        for (int q = 60; q >= 10; q -= 5) {   // the largest noisy background that still fits
+            big = makeJpeg(512, 384, noise(3), q);
+            if (big.bytes.size() <= 60000) break;
+        }
+        check(big.bytes.size() > 40000 && big.bytes.size() <= 65536,
+              "noisy background " + std::to_string(big.bytes.size()) + " B");
+        const int posesBefore = r.fake.counters().poses;
+        check(offerPan(r.link.panSink(), *pool, big, true, 1100, 2000) == 1, "large background accepted");
+        const int64_t t1 = nowMs();
+        while (nowMs() - t1 < 500) {
+            pose.xQ4 += 16;
+            r.link.panSink().offerPanPose(pose);
+            sleepMs(20);
+        }
+        check(waitFor([&] {
+                  int bgs = 0;
+                  for (const FakeFrame& f : r.fake.frames()) bgs += f.panKind == es3map::PanImageBackground;
+                  return bgs == 2;
+              }, 3000),
+              "large background assembled");
+        check(r.fake.counters().poses - posesBefore >= 8,
+              std::to_string(r.fake.counters().poses - posesBefore) + " poses interleaved with the background");
+        r.fake.readRate = 0;
+
+        // TRIP: paused; no poses or images go out; demand inactive, same session.
+        const uint32_t session = r.link.panSink().panDemand().session;
+        r.fake.setPage(1);
+        check(waitFor([&] { return !r.link.panSink().panDemand().active; }, 1000), "TRIP: pan demand inactive");
+        check(!r.link.panSink().offerPanPose(pose) && offerPan(r.link.panSink(), *pool, bg, true) == 0,
+              "poses and images refused while hidden");
+        sleepMs(300);
+        check(r.fake.counters().posesWhileHidden == 0 && r.fake.counters().bytesWhileHidden == 0, "nothing sent while hidden");
+        const uint32_t resendBefore = r.link.panSink().panDemand().resend;
+        const int64_t  shownAt      = nowMs();
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.panSink().panDemand().active; }, 1000) &&
+                  r.link.panSink().panDemand().session == session && r.fake.counters().startPan == 1,
+              "MAP again: the same session resumes");
+        const int64_t backMs = nowMs() - shownAt;
+        check(backMs < 150, "active again " + std::to_string(backMs) +
+                                " ms after the tab (VISIBILITY tells the page; no STATUS poll wait)");
+        check(r.link.panSink().panDemand().resend != resendBefore,
+              "and the producer is asked to resend (the board dropped its images when hidden)");
+        // A pan image the board fails to decode: resend asked for too.
+        const uint32_t r1 = r.link.panSink().panDemand().resend;
+        r.fake.rejectNextPan = true;
+        check(offerPan(r.link.panSink(), *pool, chrome, false) == 1, "chrome offered");
+        check(waitFor([&] { return r.link.panSink().panDemand().resend != r1; }, 1500),
+              "an image the board rejected: the producer is asked to resend");
+
+        // LIVE: the camera takes the receiver back.
+        Producer cam(r.link, smallFrames(), 30);
+        cam.start();
+        r.fake.setPage(0);
+        check(waitFor([&] {
+                  for (const FakeFrame& f : r.fake.frames())
+                      if (!f.map) return true;
+                  return false;
+              }, 2000),
+              "LIVE: STOP_MAP, START_VIDEO, camera frames");
+        cam.stop();
+        check(!r.link.panSink().panDemand().active && r.link.panSink().panDemand().session == 0 &&
+                  r.fake.counters().busyRefusals == 0,
+              "pan demand gone with the session");
+    }
+    {   // Advertised but refused: whole frames on this connection.
+        Rig r;
+        r.fake.mapMode      = 1;
+        r.fake.panMode      = 2;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated (START_PAN refused)");
+        check(waitFor([&] { return r.link.stats().panSupported; }, 1500), "pan advertised");
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.mapSink().demand().active; }, 2500),
+              "START_PAN refused -> START_MAP, whole-frame demand active");
+        const DisplayLinkStats s = r.link.stats();
+        check(s.panFallbacks == 1 && r.fake.counters().startPanRefused == 1 && r.fake.counters().startMap == 1 &&
+                  !s.panSession && !r.link.panSink().panDemand().active,
+              "one fallback, no panning session");
+    }
+    {   // mapPan off: never asks.
+        Rig r;
+        r.fake.mapMode      = 1;
+        r.fake.panMode      = 1;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        c.mapPan            = false;
+        check(r.up(c), "negotiated (mapPan off)");
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.mapSink().demand().active; }, 2000), "whole-frame map session");
+        check(r.fake.counters().panCaps == 0 && r.fake.counters().startPan == 0, "PAN_CAPABILITIES never asked");
+    }
+}
+
+static void testPanEndToEnd() {
+    std::printf("\n[22] end to end: NavigationService -> Es3DisplayLink -> fake panning board, over the pty\n");
+    Rig r;
+    r.fake.mapMode      = 1;
+    r.fake.panMode      = 1;
+    DisplayLinkConfig c = r.cfg();
+    c.map               = true;
+    check(r.up(c), "negotiated (panning firmware)");
+    check(waitFor([&] { return r.link.stats().panSupported; }, 1500), "pan capabilities known");
+    r.fake.setPage(5);
+    check(waitFor([&] { return r.link.panSink().panDemand().active; }, 1500), "MAP tab: panning session");
+
+    dashcam::navigation::NavigationService nav;
+    dashcam::navigation::NavigationServiceConfig nc;
+    nc.providerUrl = "http://127.0.0.1:9/{z}/{x}/{y}.png";   // refused: tiles stay missing (hatched), no network
+    nc.poseHz      = 20;
+    check(nav.start(nc, r.link.mapSink(), &r.link.panSink()), "navigation starts on the link's sinks");
+    std::atomic<bool> run{true};
+    std::thread feed([&] {   // 10 Hz telemetry carrying 4 Hz fixes, east at 100 km/h
+        const double lat = 48.8584, lon0 = 2.2945;
+        const int64_t t0 = nowMs();
+        int64_t fixMs = 0;
+        double lon = lon0;
+        while (run) {
+            const int64_t now = nowMs();
+            if (now - fixMs >= 250) {
+                fixMs = now;
+                lon = lon0 + 100.0 / 3.6 * double(now - t0) / 1000.0 / (111320.0 * std::cos(lat * M_PI / 180.0));
+            }
+            dashcam::navigation::GpsSample s;
+            s.latitude = lat, s.longitude = lon, s.speedKmh = 100.0f, s.courseDeg = 90.0f;
+            s.fixType = 3, s.satellites = 9, s.fixValid = s.gpsFix = s.gpsPresent = true;
+            s.receivedUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count());
+            nav.offerGps(s);
+            sleepMs(100);
+        }
+    });
+    sleepMs(3000);
+    const FakeCounters fc = r.fake.counters();
+    int bgs = 0, chromes = 0;
+    uint64_t origin = 0;
+    bool decoded = true;
+    for (const FakeFrame& f : r.fake.frames()) {
+        if (f.panKind == es3map::PanImageBackground) {
+            ++bgs;
+            origin = f.ts;
+            decoded = decoded && f.decodeOk && f.decW == 512 && f.decH == 384;
+        }
+        if (f.panKind == es3map::PanImageChrome) {
+            ++chromes;
+            decoded = decoded && f.decodeOk && f.decW == 320 && f.decH == 32;
+        }
+    }
+    check(bgs >= 1 && chromes >= 1 && decoded,
+          std::to_string(bgs) + " background(s), " + std::to_string(chromes) + " chrome image(s) decoded on the board");
+    check(fc.poses >= 45 && fc.poses <= 64 && fc.poseSeqErrors == 0 && fc.poseBadFields == 0,
+          std::to_string(fc.poses) + " MAP_POSE records in ~3 s at 20 Hz, seq increasing");
+    const es3map::PanView pv = es3map::computePanView(origin, 512, 384, 320, 192, fc.lastPose);
+    char why[200];
+    std::snprintf(why, sizeof(why), "the newest pose: an east arrow inside the map area of the background the board "
+                  "has (marker %u, course %u, origin %u,%u, pose %.1f,%.1f, marker at %d,%d)",
+                  unsigned(fc.lastPose.marker), unsigned(fc.lastPose.courseCdeg), es3map::originX(origin),
+                  es3map::originY(origin), fc.lastPose.xQ4 / 16.0, fc.lastPose.yQ4 / 16.0, pv.markerXQ4 / 16,
+                  pv.markerYQ4 / 16);
+    check(fc.lastPose.marker == es3map::MarkerArrow && fc.lastPose.courseCdeg == 9000 && pv.markerVisible, why);
+    run = false;
+    feed.join();
+    const auto ns = nav.stats();
+    nav.stop();
+    check(ns.panning && ns.panBackgrounds >= 1 && ns.posesRefused == 0, "navigation: panning, no pose refused");
+    check(r.fake.counters().busyRefusals == 0 && r.fake.counters().startMap == 0, "no START_MAP, no busy refusal");
+}
+
+static void testPanReconnect() {
+    std::printf("\n[24] panning across a lost reply, a re-HELLO and a USB replug on the MAP tab\n");
+    {   // PAN_CAPABILITIES reply lost once: re-HELLO, asked again, panning works.
+        Rig r;
+        r.fake.mapMode      = 1;
+        r.fake.panMode      = 1;
+        r.fake.dropReplyTo  = es3map::CmdPanCapabilities;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated");
+        check(waitFor([&] { return r.link.stats().panSupported; }, 4000),
+              "PAN_CAPABILITIES asked again after the re-HELLO (" + std::to_string(r.fake.counters().panCaps) + " asks)");
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.panSink().panDemand().active; }, 1500), "and the panning session opens");
+    }
+    {   // Replugged while the board shows MAP: everything is negotiated again and the producer resends.
+        Rig r;
+        r.fake.mapMode      = 1;
+        r.fake.panMode      = 1;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated");
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.panSink().panDemand().active; }, 1500), "panning session");
+        const uint32_t first = r.link.panSink().panDemand().session;
+        r.fake.unplug();
+        check(waitFor([&] { return !r.link.panSink().panDemand().active; }, 1500), "unplugged: demand inactive");
+        r.fake.initialPage = 5;
+        check(r.fake.plug(r.dev), "replugged, showing MAP");
+        check(waitFor([&] { return r.link.panSink().panDemand().active; }, 4000),
+              "the link learns the page and opens a new panning session");
+        const auto pd = r.link.panSink().panDemand();
+        check(pd.session != first && r.fake.counters().panCaps == 1 && r.fake.counters().startPan == 1 &&
+                  r.fake.counters().startMap == 0,
+              "a new session (fresh 0D and 0E on the new connection)");
+    }
+    {   // A board whose largest background leaves no room to scroll: whole frames instead.
+        Rig r;
+        r.fake.mapMode      = 1;
+        r.fake.panMode      = 1;
+        r.fake.panMaxW      = 352;
+        r.fake.panMaxH      = 224;
+        DisplayLinkConfig c = r.cfg();
+        c.map               = true;
+        check(r.up(c), "negotiated");
+        r.fake.setPage(5);
+        check(waitFor([&] { return r.link.mapSink().demand().active; }, 2000),
+              "352x224 maximum (16 px margin): START_MAP and whole frames");
+        check(!r.link.stats().panSupported && r.fake.counters().startPan == 0, "no panning session");
+    }
+}
+
 static std::atomic<bool> g_fakeRun{true};
 static void onFakeSignal(int) { g_fakeRun = false; }
 
@@ -2037,19 +2540,22 @@ static int runFakeBoard(const std::string& path) {
     return 0;
 }
 
-/// es3display_test --fake-map-board PATH: the contract fake WITH the map
-/// extension (no firmware implements it yet), cycling the tabs LIVE, MAP, TRIP,
-/// MAP every 4 s, for an end-to-end run of the app with preview + navigation.
-static int runFakeMapBoard(const std::string& path) {
+/// es3display_test --fake-map-board PATH [pan]: the contract fake WITH the map
+/// extension (and with "pan" board-side panning, extension v2), cycling the tabs
+/// LIVE, MAP, TRIP, MAP every 4 s, for an end-to-end run of the app with
+/// preview + navigation.
+static int runFakeMapBoard(const std::string& path, bool pan) {
     std::signal(SIGINT, onFakeSignal);
     std::signal(SIGTERM, onFakeSignal);
     FakeDisplay fd;
     fd.mapMode = 1;
+    fd.panMode = pan ? 1 : 0;
     if (!fd.plug(path)) {
         std::fprintf(stderr, "cannot create the pty / symlink %s\n", path.c_str());
         return 1;
     }
-    std::printf("fake ES3C28P with the map extension at %s (tabs cycle every 4 s)\n", path.c_str());
+    std::printf("fake ES3C28P with the map extension%s at %s (tabs cycle every 4 s)\n",
+                pan ? " and board-side panning" : "", path.c_str());
     std::fflush(stdout);
     static const int kCycle[] = {0, 5, 1, 5};
     int     step = 0;
@@ -2058,16 +2564,18 @@ static int runFakeMapBoard(const std::string& path) {
         sleepMs(50);
         if (nowMs() < next) continue;
         next += 4000;
-        int cam = 0, map = 0, bad = 0;
+        int cam = 0, map = 0, bad = 0, bgs = 0, chromes = 0;
         for (const FakeFrame& f : fd.frames()) {
             (f.map ? map : cam)++;
-            if (!f.decodeOk || (f.map && (f.decW != 320 || f.decH != 224))) ++bad;
+            bgs += f.panKind == es3map::PanImageBackground;
+            chromes += f.panKind == es3map::PanImageChrome;
+            if (!f.decodeOk || (f.map && !f.panKind && (f.decW != 320 || f.decH != 224))) ++bad;
         }
         const FakeCounters c = fd.counters();
-        std::printf("page %d | camera frames %d, map frames %d, bad %d | startVideo %d stopVideo %d startMap %d "
-                    "stopMap %d busy %d | status polls %d\n",
-                    fd.page(), cam, map, bad, c.startVideo, c.stopVideo, c.startMap, c.stopMap, c.busyRefusals,
-                    c.status);
+        std::printf("page %d | camera frames %d, map frames %d (backgrounds %d, chrome %d), bad %d | startVideo %d "
+                    "stopVideo %d startMap %d startPan %d stopMap %d busy %d | poses %d | status polls %d\n",
+                    fd.page(), cam, map, bgs, chromes, bad, c.startVideo, c.stopVideo, c.startMap, c.startPan,
+                    c.stopMap, c.busyRefusals, c.poses, c.status);
         std::fflush(stdout);
         step = (step + 1) % 4;
         fd.setPage(kCycle[step]);
@@ -2078,8 +2586,13 @@ static int runFakeMapBoard(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--streaming-regressions") == 0) {
+        testStreamingRegressions();
+        return g_fails ? 1 : 0;
+    }
     if (argc == 3 && std::string(argv[1]) == "--fake-board") return runFakeBoard(argv[2]);
-    if (argc == 3 && std::string(argv[1]) == "--fake-map-board") return runFakeMapBoard(argv[2]);
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--fake-map-board")
+        return runFakeMapBoard(argv[2], argc == 4 && std::string(argv[3]) == "pan");
     std::printf("es3display_test: Es3DisplayLink vs a fake ES3C28P on a pty\n");
     const uint8_t chk[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
     check(refCrc32(chk, 9) == 0xCBF43926u && es3video::crc32(chk, 9) == 0xCBF43926u,
@@ -2089,6 +2602,7 @@ int main(int argc, char** argv) {
     testNegotiation();
     testControlOnly();
     testFramesFlow();
+    testStreamingRegressions();
     testReplacement();
     testCredits();
     testCreditStall();
@@ -2106,6 +2620,9 @@ int main(int argc, char** argv) {
     testRequests();
     testFirmwareCompatibility();
     testMapSurface();
+    testPanSurface();
+    testPanEndToEnd();
+    testPanReconnect();
     std::printf("\n%s (%d failure%s, %.1f s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails, g_fails == 1 ? "" : "s",
                 double(nowMs() - t0) / 1000.0);
     return g_fails ? 1 : 0;
