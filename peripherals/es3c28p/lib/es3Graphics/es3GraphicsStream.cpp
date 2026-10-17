@@ -1,4 +1,5 @@
 #include "GraphicsInternal.h"
+#include "PixelCopy.h"
 
 bool Es3Graphics::videoCoversTabs() const
 {
@@ -59,14 +60,19 @@ void Es3Graphics::updateVideo()
         _navigation = false;
         panel.fillRect(0, kTabTop, kScreenWidth, kTabHeight, ILI9341_BLACK);
     }
-    if (_videoImage.slot < 0 && _video->acquire(_videoImage)) {
+    if (_videoToken && _videoImage.slot < 0 && _video->acquire(_videoImage, _videoToken)) {
         if (_videoImage.token != _videoToken) { _video->release(_videoImage, false, 0); return; }
         _videoRow = 0; _blitStarted = micros();
     }
     if (_videoImage.slot >= 0) {
         const int width = config.viewportW;
-        const int rows = min<int>(8, config.viewportH - _videoRow);
-        memcpy(_videoStrip, _videoImage.pixels + _videoRow * width, width * rows * 2);
+        const unsigned rows = es3video::copyFrameStrip(_videoStrip,
+            sizeof(_videoStrip) / sizeof(_videoStrip[0]), _videoImage.pixels,
+            _videoImage.width, _videoImage.height, config.viewportW, config.viewportH, _videoRow);
+        if (!rows) {
+            _video->release(_videoImage, false, 0);
+            return; // Invalid geometry must never read pixels or claim PRESENTED.
+        }
         // One bounded SPI transaction; touch and controls run between strips.
         panel.drawRGBBitmap(config.viewportX, config.viewportY + _videoRow, _videoStrip, width, rows);
         _videoRow += rows;
@@ -129,7 +135,7 @@ void Es3Graphics::updatePan(const es3map::PanSnapshot& pan, uint32_t now)
         // pointer remains leased while the graphics task reads its pixels.
         for (int n = 0; n < 4; ++n) {
             es3video::VideoState::Image next;
-            if (!_video->acquire(next)) break;
+            if (!_video->acquire(next, _videoToken)) break;
             if (next.token != _videoToken || next.kind == es3map::PanImageNone) {
                 _video->release(next, false, 0); continue;
             }

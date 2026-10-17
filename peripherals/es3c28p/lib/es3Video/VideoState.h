@@ -7,7 +7,7 @@
 namespace es3video {
 class VideoState {
 public:
-    enum State { Free, Receiving, Ready, Working };
+    enum State { Free, Receiving, Ready, Decoding, Drawing };
     struct Slot {
         State state = Free;
         uint32_t token = 0, frame = 0, bytes = 0, received = 0, crc = 0;
@@ -18,6 +18,8 @@ public:
         bool presented = false;
     };
     struct Event { uint8_t bytes[24]; size_t size = 0; };
+    // Handles identify a specific token/frame and slot. Return them once; stale
+    // copies are ignored after return/reuse. The owner must not overwrite a live handle.
     struct Job {
         int jpeg = -1, image = -1;
         uint32_t token = 0, frame = 0, bytes = 0;
@@ -56,10 +58,10 @@ public:
         _head = _count = 0; _fault = false;
         // Leased buffers cannot be reclaimed until their owners return them.
         for (int i = 0; i < 2; ++i) {
-            if (inputs[i].state != Working) inputs[i].state = Free;
+            if (inputs[i].state != Decoding) inputs[i].state = Free;
         }
         for (int i = 0; i < 4; ++i)
-            if (images[i].state != Working) images[i].state = Free;
+            if (images[i].state != Decoding && images[i].state != Drawing) images[i].state = Free;
     }
     void start(uint32_t session, const StartVideoRequest& request) {
         reset(); config = request; token = session; grant = 1;
@@ -151,8 +153,9 @@ public:
             reject(slot, parsed == ReasonOk ? reason : parsed);
         }
     }
+    // JPEG input and output are exclusively leased to the decoder together.
     bool takeJob(Job& job) {
-        if (!token || demand != DemandActive) return false;
+        if (!token || demand != DemandActive || ownsJob(job)) return false;
         int source = -1, destination = -1;
         for (int i = 0; i < 2; ++i) {
             if (inputs[i].state == Ready) source = i;
@@ -173,7 +176,7 @@ public:
             if (!panning) reject(source, ReasonBusy);
             return false;
         }
-        inputs[source].state = Working;
+        inputs[source].state = Decoding;
         images[destination] = inputs[source];
         job.jpeg = source; job.image = destination; job.token = token;
         job.frame = inputs[source].frame; job.bytes = inputs[source].bytes;
@@ -182,6 +185,7 @@ public:
         return true;
     }
     void finishJob(const Job& job, bool ok, uint32_t duration) {
+        if (!ownsJob(job)) return; // duplicate/stale completion cannot free a reused slot
         inputs[job.jpeg].state = Free;
         Slot& image = images[job.image];
         image.state = Free;
@@ -197,10 +201,12 @@ public:
         image.state = Ready; image.decodeUs = duration;
         ++stats.decoded; stats.decodeUs = duration;
     }
-    bool acquire(Image& image) {
+    bool acquire(Image& image, uint32_t expectedToken = 0) {
+        if (expectedToken && token != expectedToken) return false;
+        if (image.slot >= 0) return false; // never overwrite an outstanding lease
         if (!token || demand != DemandActive) return false;
         for (int i = 0; i < 4; ++i) if (images[i].state == Ready) {
-            Slot& s = images[i]; s.state = Working;
+            Slot& s = images[i]; s.state = Drawing;
             image.slot = i; image.token = s.token; image.frame = s.frame;
             image.decodeUs = s.decodeUs; image.pixels = pixels[i];
             image.width = s.width; image.height = s.height; image.origin = s.origin; image.kind = s.kind;
@@ -211,7 +217,7 @@ public:
     // Panning holds its displayed images across many poses. Acknowledge once,
     // separately from releasing the lease, so they cannot be decoded over.
     void present(const Image& image, uint32_t blitUs) {
-        if (image.slot < 0 || image.slot >= 4 || !token || image.token != token) return;
+        if (!ownsImage(image) || !token || image.token != token || demand != DemandActive) return;
         Slot& slot = images[image.slot];
         if (slot.presented) return;
         slot.presented = true;
@@ -220,11 +226,12 @@ public:
         ++stats.presented; stats.blitUs = blitUs;
     }
     void release(Image& image, bool presented, uint32_t blitUs) {
-        if (image.slot < 0) return;
-        if (presented) present(image, blitUs);
-        else if (token && token == image.token && !images[image.slot].presented)
-            result(image.frame, ReasonHidden);
-        images[image.slot].state = Free;
+        if (ownsImage(image)) {
+            if (presented && demand == DemandActive) present(image, blitUs);
+            else if (token && token == image.token && !images[image.slot].presented)
+                result(image.frame, ReasonHidden);
+            images[image.slot].state = Free;
+        }
         image = Image();
     }
 
@@ -233,6 +240,20 @@ private:
     uint32_t _visibilityEpoch = 0;
     Event _events[32]; unsigned _head = 0, _count = 0;
     bool _fault = false;
+    bool ownsJob(const Job& job) const {
+        if (job.jpeg < 0 || job.jpeg >= 2 || job.image < 0 || job.image >= 4) return false;
+        const Slot& input = inputs[job.jpeg];
+        const Slot& output = images[job.image];
+        return input.state == Decoding && output.state == Decoding &&
+            input.token == job.token && output.token == job.token &&
+            input.frame == job.frame && output.frame == job.frame;
+    }
+    bool ownsImage(const Image& image) const {
+        if (image.slot < 0 || image.slot >= 4) return false;
+        const Slot& slot = images[image.slot];
+        return slot.state == Drawing && slot.token == image.token &&
+            slot.frame == image.frame && pixels[image.slot] == image.pixels;
+    }
     void emit(const Event& e) {
         if (!e.size || _count == 32) { _fault = true; return; }
         _events[(_head + _count) % 32] = e; ++_count;

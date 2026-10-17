@@ -1,5 +1,6 @@
 #pragma once
 #include <JPEGDEC.h>
+#include "PixelCopy.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -12,7 +13,8 @@ public:
             height < 1 || height > 384 || uint32_t(width * height) > capacityPixels || data[0] != 0xff || data[1] != 0xd8 ||
             data[bytes - 2] != 0xff || data[bytes - 1] != 0xd9) return false;
         if (!baselineHeader(data, bytes, width, height)) return false;
-        _output = output; _width = width; _height = height; _written = 0; _badBlock = false;
+        if (!_pixels.begin(output, unsigned(width), unsigned(height), capacityPixels)) return false;
+        _badBlock = false;
         if (!_decoder.openRAM(data, bytes, draw)) return false;
         bool ok = _decoder.getWidth() == width && _decoder.getHeight() == height &&
                   _decoder.getJPEGType() == JPEG_MODE_BASELINE;
@@ -20,7 +22,7 @@ public:
             _decoder.setUserPointer(this);
             _decoder.setPixelType(RGB565_LITTLE_ENDIAN);
             ok = _decoder.decode(0, 0, 0) != 0 && !_badBlock &&
-                 _written == uint32_t(width * height);
+                 _pixels.complete();
         }
         _decoder.close();
         return ok;
@@ -56,26 +58,20 @@ private:
         return false;
     }
     JPEGDEC _decoder;
-    uint16_t* _output = nullptr;
-    int _width = 0, _height = 0;
-    uint32_t _written = 0;
+    es3video::DecodedPixels _pixels;
     bool _badBlock = false;
     static int draw(JPEGDRAW* block);
 };
 
 inline int Es3JpegDecoder::draw(JPEGDRAW* block)
 {
+    if (!block) return 0;
     auto* self = static_cast<Es3JpegDecoder*>(block->pUser);
-    if (!self || !block->pPixels || block->x < 0 || block->y < 0 ||
-        block->iWidthUsed <= 0 || block->iWidthUsed > block->iWidth || block->iHeight <= 0 ||
-        block->x + block->iWidthUsed > self->_width || block->y >= self->_height) {
-        if (self) self->_badBlock = true;
+    if (!self) return 0;
+    if (!self->_pixels.copy(block->x, block->y, block->iWidthUsed, block->iWidth,
+                            block->iHeight, static_cast<const uint16_t*>(block->pPixels))) {
+        self->_badBlock = true;
         return 0;
     }
-    const int rows = (block->iHeight < self->_height - block->y ? block->iHeight : self->_height - block->y);
-    for (int row = 0; row < rows; ++row)
-        memcpy(self->_output + (block->y + row) * self->_width + block->x,
-               block->pPixels + row * block->iWidth, block->iWidthUsed * 2);
-    self->_written += rows * block->iWidthUsed;
     return 1;
 }

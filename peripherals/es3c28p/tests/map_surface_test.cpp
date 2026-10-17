@@ -98,7 +98,7 @@ int main() {
     // present or issue a credit in the camera session.
     const int held = image.slot;
     state.stopSurface(Surface::Map, 1);
-    assert(state.token == 0 && state.images[held].state == VideoState::Working);
+    assert(state.token == 0 && state.images[held].state == VideoState::Drawing);
     assert(state.startCamera(3, cameraRequest(), c)); visibility(DemandHidden, 3);
     state.release(image, true, 100); assert(!state.pop(e));
     assert(state.stats.presented == 0 && state.grant == 1);
@@ -111,7 +111,7 @@ int main() {
     state.stopSurface(Surface::Camera, 3);
     state.view(5, false);
     assert(state.startMap(5, request, c)); visibility(DemandActive, 5);
-    assert(state.inputs[job.jpeg].state == VideoState::Working);
+    assert(state.inputs[job.jpeg].state == VideoState::Decoding);
     state.finishJob(job, true, 100); assert(!state.pop(e) && !state.acquire(image));
     assert(state.grant == 1);
 

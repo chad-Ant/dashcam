@@ -113,8 +113,8 @@ int main() {
     job=decode(5,true); state.finishJob(job,true,10); drain();
     job=decode(6,true); state.finishJob(job,true,10);
     assert(events(RecordResult,5,ReasonSuperseded) == 1);
-    assert(state.images[background.slot].state == VideoState::Working);
-    assert(state.images[strips.slot].state == VideoState::Working);
+    assert(state.images[background.slot].state == VideoState::Drawing);
+    assert(state.images[strips.slot].state == VideoState::Drawing);
 
     // Hiding a map suppresses poses. A source replacement cannot reclaim a
     // retained image or a decoder lease, nor publish old work into the new token.

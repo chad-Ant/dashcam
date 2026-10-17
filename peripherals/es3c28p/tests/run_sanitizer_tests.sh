@@ -4,7 +4,7 @@ set -euo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_BUILD="$(mktemp -d)"
 trap 'rm -rf "$TEST_BUILD"' EXIT
-for test in calibration video_state map_surface pan_state resource media_header; do
+for test in calibration video_state map_surface pan_state resource media_header pixel_copy; do
     c++ -std=c++17 -Wall -Wextra -Werror -g \
         -fsanitize=address,undefined -fno-sanitize-recover=all \
         -I"$TEST_DIR/../lib/es3Graphics" -I"$TEST_DIR/../lib/es3UsbLink" -I"$TEST_DIR/../lib/es3Video" \

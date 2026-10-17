@@ -29,8 +29,8 @@ The Jetson application and camera capture changes are outside this firmware work
 `VideoState.h` contains portable assembly and ownership logic. `Es3Video`
 serializes its state transitions with a mutex; copying one bounded USB chunk
 and its CRC update happen under the lock, while JPEG decode and SPI writes do
-not. JPEG slots follow FREE/RECEIVING/READY/WORKING; output slots follow
-FREE/WORKING/READY/WORKING (decode then draw). A reconnect never frees a buffer
+not. JPEG slots follow FREE/RECEIVING/READY/DECODING; output slots follow
+FREE/DECODING/READY/DRAWING. Decode and display ownership are distinct. A reconnect never frees a buffer
 still leased by a decoder or the TFT owner. Returning an old lease frees its
 slot without granting credits or emitting notifications into the new session.
 
@@ -84,6 +84,73 @@ the indicator marks the image stale; after the placeholder interval (normally
 these deadlines. The next successfully decoded image replaces the placeholder.
 For a viewport with no top bar, the stale notice temporarily overlays stopped
 footage and is replaced by the next frame.
+
+## Focused streaming review and refactor (2026-10-16)
+
+Reviewed the USB receiver/credit flow, JPEG worker, retained map images and
+whole-frame display path after commit `6fdb0c0`. The design plans and shared
+wire headers remain unchanged. Jetson service changes remain outside this work.
+
+Findings and changes:
+
+- **P2 — session replacement between view and acquire could discard a new
+  image.** Graphics previously acquired whichever session was current, then
+  released a token mismatch as Hidden. If USB replaced the session between
+  those calls, the new session's first decoded image was consumed. Acquisition
+  now accepts the expected view token and checks it under the same mutex as
+  the slot transition. A mismatch leaves the ready image queued; graphics
+  does not acquire while its view token is zero. A regression simulates a
+  snapshot from session 6 followed by a ready image in session 7.
+- **P2 — lease return APIs trusted indices and identity.** A duplicate
+  `finishJob()` could return a second credit and reclaim a buffer that had
+  already moved to drawing. A stale copied image handle could free a reused
+  slot; an out-of-range release could index outside the pool. The decoder and
+  display now have distinct DECODING/DRAWING states. Returns validate indices,
+  token/frame identity, expected state, and (for images) buffer address before
+  mutating anything. The duplicate-completion regression was compiled against
+  the previous implementation and failed at the credit-count assertion.
+  These are internal API robustness cases, not evidence that normal USB input
+  made the existing single worker call completion twice.
+- Acquisition refuses to overwrite a live image handle, and job acquisition
+  refuses to overwrite a live decoder handle. Presentation is acknowledged
+  once, only for an owned image in the current active session. Hidden release
+  reports Hidden for an image not previously presented. Old-session valid
+  leases can still be returned safely without notifications to the new session.
+- Mutex lifetime is expressed with a noncopyable scoped guard. Worker take and
+  finish each have their own explicit scope; decoding and yielding remain
+  outside the lock. No additional task, lock, queue or per-frame allocation.
+- `PixelCopy.h` isolates decoder block bounds/accounting and whole-frame strip
+  copying from hardware APIs. It rejects invalid coordinates/strides and an
+  exhausted output budget before writes, clips padded bottom MCU rows, and
+  requires the image and negotiated viewport to match before copying a TFT
+  strip. A failed strip copy releases the image without claiming PRESENTED.
+  Real JPEGDEC fixture tests continue to verify odd dimensions and RGB565 colors.
+
+Validation includes the native C++11/C++17 suite, 39 Python tests, ASan/UBSan
+receiver/map/raster/resource/pixel checks, and the pinned JPEGDEC fixtures.
+New cases cover replayed completions, reused slots, malformed handles,
+acquisition into a live handle while another image is ready, hidden
+presentation, replacement-session acquisition, pixel canaries, extreme callback
+coordinates, padded rows, viewport mismatch and insufficient strip capacity.
+The pixel count is a completion budget, not a proof of spatial coverage for
+arbitrary synthetic overlapping callbacks; JPEGDEC remains responsible for
+its block traversal and entropy parsing.
+
+Image PSRAM remains 958,464 bytes with panning (startup peak 1,265,664 bytes),
+or 438,272 bytes in whole-frame fallback. The 5,120-byte TFT staging buffer,
+8 KiB worker/USB stack reservations, and eight-row draw budget are unchanged.
+Both Arduino 3.2.0 builds passed with all warnings enabled and no warnings:
+
+| USB mode | Flash bytes | Static RAM bytes |
+| --- | ---: | ---: |
+| HWCDC | 544,194 | 54,748 |
+| TinyUSB | 580,786 | 73,908 |
+
+Static RAM increased by 8 bytes from `6fdb0c0`. All 22 host display-link
+integration scenarios passed against the current workspace, including the
+firmware receiver, reconnect/credit handling and navigation panning (0 failures).
+Hardware throughput, tearing, display timing and stack high-water marks still
+require bench measurement. No board was flashed.
 
 ## Validation and measurements
 

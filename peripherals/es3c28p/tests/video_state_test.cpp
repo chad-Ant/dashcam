@@ -65,13 +65,13 @@ int main() {
     complete(8);assert(state.takeJob(job));
     const int input=job.jpeg, output=job.image;
     const auto config=state.config; state.start(8,config);
-    assert(state.inputs[input].state==VideoState::Working);
-    assert(state.images[output].state==VideoState::Working);
+    assert(state.inputs[input].state==VideoState::Decoding);
+    assert(state.images[output].state==VideoState::Decoding);
     drain();state.finishJob(job,true,100);assert(state.grant==1);
     VideoState::Event e; assert(!state.pop(e));assert(!state.acquire(image));
     setup();complete(1);assert(state.takeJob(job));state.finishJob(job,true,10);
     assert(state.acquire(image));state.start(8,config);
-    assert(state.images[image.slot].state==VideoState::Working);
+    assert(state.images[image.slot].state==VideoState::Drawing);
     drain();state.release(image,true,100);assert(!state.pop(e));
     // Newest ready frame replaces waiting output, never a drawing lease.
     setup();complete(1);assert(state.takeJob(job));state.finishJob(job,true,1);drain();
@@ -99,6 +99,49 @@ int main() {
     start(5); const uint8_t okReason = ReasonOk;
     state.accept(makeRecord(RecordAbort,7,5,&okReason,1),0);
     assert(event(RecordResult,5,ReasonMalformed));assert(state.grant==6);
+    // A view/acquire race must not consume the replacement session's image.
+    setup(); const auto replacementConfig = state.config;
+    state.start(6,replacementConfig); const uint32_t oldViewToken = state.token;
+    state.start(7,replacementConfig); // USB replaces the session after the view snapshot
+    complete(1); assert(state.takeJob(job)); state.finishJob(job,true,1); drain();
+    assert(!state.acquire(image,oldViewToken));
+    assert(state.acquire(image,7) && image.frame==1);
+    state.release(image,true,1); drain();
+    // Lease returns are idempotent and cannot act on a reused slot.
+    setup(); complete(1); assert(state.takeJob(job));
+    const auto oldJob = job;
+    VideoState::Image decoderBuffer;
+    decoderBuffer.slot=job.image; decoderBuffer.token=job.token; decoderBuffer.frame=job.frame;
+    decoderBuffer.pixels=state.pixels[job.image]; drain();
+    state.present(decoderBuffer,1); state.release(decoderBuffer,true,1);
+    assert(state.images[job.image].state==VideoState::Decoding && !state.pop(e));
+    assert(!state.takeJob(job)); // do not overwrite a live decoder handle
+    state.finishJob(job,true,1); drain();
+    state.finishJob(oldJob,true,1); assert(state.grant==2 && !state.pop(e));
+    assert(state.acquire(image)); const auto held = image;
+    assert(!state.acquire(image) && image.slot==held.slot && image.frame==held.frame);
+    auto badImage = image; badImage.slot=4; state.release(badImage,true,1);
+    assert(badImage.slot==-1 && state.images[image.slot].state==VideoState::Drawing);
+    VideoState::Job badJob; badJob.jpeg=2; badJob.image=4;
+    state.finishJob(badJob,true,1); assert(state.grant==2 && !state.pop(e));
+    state.present(image,1); drain();
+    state.present(image,1); assert(!state.pop(e));
+    auto staleImage = image;
+    state.release(image,true,1); assert(!state.pop(e));
+    complete(2); assert(state.takeJob(job)); drain();
+    state.finishJob(oldJob,true,1); // old handle while the same input/output decode a new frame
+    assert(state.inputs[job.jpeg].state==VideoState::Decoding && state.grant==2);
+    state.finishJob(job,true,1); drain(); assert(state.acquire(image));
+    state.present(staleImage,1); state.release(staleImage,false,0);
+    assert(state.images[image.slot].state==VideoState::Drawing && !state.pop(e));
+    complete(3); assert(state.takeJob(job)); state.finishJob(job,true,1); drain();
+    const auto beforeAcquire = image;
+    assert(!state.acquire(image) && image.frame==beforeAcquire.frame && image.slot==beforeAcquire.slot);
+    VideoState::Image waiting; assert(state.acquire(waiting) && waiting.frame==3);
+    state.release(waiting,false,0); drain();
+    state.setDemand(DemandHidden); drain();
+    state.present(image,1); assert(!state.pop(e));
+    state.release(image,true,1); assert(event(RecordResult,2,ReasonHidden));
     // Millis rollover must preserve the exact assembly timeout boundary.
     setup(); StartInfo rollover; rollover.width=320; rollover.height=180;
     rollover.jpegBytes=sizeof(sample);

@@ -38,7 +38,7 @@ for std in c++11 c++17; do
 done
 # Resource failures and SD media parsers use the same portable production code.
 for std in c++11 c++17; do
-    for test in resource media_header; do
+    for test in resource media_header pixel_copy; do
         c++ -std=$std -Wall -Wextra -Werror -I"$TEST_DIR/../lib/es3Graphics" -I"$TEST_DIR/../lib/es3UsbLink" \
             "$TEST_DIR/${test}_test.cpp" -o "$TEST_BUILD/${test}_$std"
         "$TEST_BUILD/${test}_$std"

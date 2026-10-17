@@ -27,7 +27,8 @@ public:
     uint32_t snapshot(es3video::StartVideoRequest& config);
     uint32_t view(uint8_t page, bool blocked, es3video::StartVideoRequest& config,
                   es3map::Binding& binding, es3map::PanSnapshot* pan = nullptr);
-    bool acquire(es3video::VideoState::Image& image);
+    // Pass the token from view() to leave replacement-session images queued.
+    bool acquire(es3video::VideoState::Image& image, uint32_t expectedToken = 0);
     void present(const es3video::VideoState::Image& image, uint32_t duration);
     void release(es3video::VideoState::Image& image, bool presented, uint32_t duration);
     es3video::VideoState::Stats stats();
@@ -41,6 +42,15 @@ private:
     Es3JpegDecoder _decoder;
     static void task(void* context);
     void decodeLoop();
-    void lock() { xSemaphoreTake(_mutex, portMAX_DELAY); }
-    void unlock() { xSemaphoreGive(_mutex); }
+    class StateLock {
+    public:
+        explicit StateLock(SemaphoreHandle_t mutex) : _mutex(mutex) {
+            xSemaphoreTake(_mutex, portMAX_DELAY);
+        }
+        ~StateLock() { xSemaphoreGive(_mutex); }
+        StateLock(const StateLock&) = delete;
+        StateLock& operator=(const StateLock&) = delete;
+    private:
+        SemaphoreHandle_t _mutex;
+    };
 };
