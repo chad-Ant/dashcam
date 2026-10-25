@@ -159,6 +159,24 @@ RUN for i in 1 2 3; do \
     && arduino-cli lib list | grep -q "^Adafruit ILI9341 *1.6.4 " \
     && arduino-cli lib list | grep -q "^JPEGDEC *1.8.4 "
 
+# Lane test suite tooling (tools/lane_eval): report plots and the UFLD v2
+# reference decoder's config loader.
+#   - matplotlib for the post-drive report figures; addict for UFLD's
+#     utils/config.py (the demo.py oracle).  numpy is pinned to the base
+#     image's 1.26.4 in the same install so pip cannot upgrade it: the base's
+#     cv2 and torch are built against numpy 1.x.  Public PyPI, as for esptool.
+#   - psmisc for fuser: the preflight device-holder check.
+# The final import check fails the build if any of them broke cv2 or torch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        psmisc \
+    && rm -rf /var/lib/apt/lists/* \
+    && PIP_INDEX_URL=https://pypi.org/simple pip3 install --no-cache-dir \
+        "numpy==1.26.4" "matplotlib==3.9.4" "addict==2.4.0" \
+    && python3 -c "import numpy, matplotlib, addict, cv2, torch; \
+assert numpy.__version__ == '1.26.4', numpy.__version__; \
+print('lane_eval deps ok: numpy', numpy.__version__, 'matplotlib', matplotlib.__version__, 'cv2', cv2.__version__, 'torch', torch.__version__)" \
+    && command -v fuser
+
 WORKDIR /home/app
 
 CMD ["/bin/bash"]
