@@ -78,7 +78,9 @@ LIBSPI_SRCS    := lib/libspi/libspi.cpp
 LIBUART_SRCS   := lib/libuart/libuart.cpp
 LIBLOG_SRCS    := lib/liblog/liblog.cpp
 LIBCFG_SRCS      := lib/libconfig/libconfig.cpp
-LIBLANE_SRCS     := lib/liblanedetector/liblanedetector.cpp
+LIBLANE_SRCS     := lib/liblanedetector/liblanedetector.cpp \
+                    lib/liblanedetector/lane_geometry.cpp \
+                    lib/liblanedetector/ufld_decode.cpp
 LIBLANE_CU_SRCS  := lib/liblanedetector/liblanedetector_preprocess.cu
 LIBDSTATE_SRCS    := lib/libdriverstate/libdriverstate.cpp
 LIBDSTATE_CU_SRCS := lib/libdriverstate/libdriverstate_preprocess.cu
@@ -210,10 +212,16 @@ CSI_RTP_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
 GPIO_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBGPIO_SRCS) $(LIBUART_SRCS) \
                  $(LIBI2C_SRCS) $(LIBSPI_SRCS) src/tests/gpio_test.cpp)
 
-# lane_test: live-camera lane detection smoke test (10 s run)
+# lane_test: lane detection smoke test (10 s live, --video) and --replay (R1 golden)
 LANE_TEST_OBJS := $(call make_objs,    $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
-                                        $(LIBLANE_SRCS) src/tests/test_lanedetector.cpp) \
+                                        $(LIBLANE_SRCS) src/tests/test_lanedetector.cpp \
+                                        src/tests/lane_test_unit.cpp src/tests/lane_test_gpu.cpp) \
                   $(call make_cu_objs,  $(LIBLANE_CU_SRCS))
+
+# lane_drive: in-car / bench harness of the lane test suite (one camera per process)
+LANE_DRIVE_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCAM_FOCUS_SRCS) \
+                                        $(LIBCFG_SRCS) $(LIBLANE_SRCS) src/tests/test_lanedetector_drive.cpp) \
+                   $(call make_cu_objs, $(LIBLANE_CU_SRCS))
 
 # driverstate_test: live-UVC drowsiness classification smoke test (2 fps branch)
 DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
@@ -222,7 +230,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
 
 ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(FOCUS_TEST_OBJS) $(CAMGST_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
-                   $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
+                   $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(LANE_DRIVE_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS) \
                    $(PREVIEW_TEST_OBJS) $(ES3_TEST_OBJS) $(NAV_TEST_OBJS))
 
@@ -255,6 +263,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/midi_test \
            $(BUILD_DIR)/liblog_test \
            $(BUILD_DIR)/lane_test \
+           $(BUILD_DIR)/lane_drive \
            $(BUILD_DIR)/driverstate_test
 
 .PHONY: all clean dashcam_v0_3 dashcam_v0_4 commlink_test
@@ -393,6 +402,9 @@ $(BUILD_DIR)/liblog_test: $(LIBLOG_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/lane_test: $(LANE_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)
+
+$(BUILD_DIR)/lane_drive: $(LANE_DRIVE_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT)
 
 $(BUILD_DIR)/driverstate_test: $(DSTATE_TEST_OBJS)

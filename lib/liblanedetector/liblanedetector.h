@@ -14,8 +14,14 @@
  * @code
  *   /usr/src/tensorrt/bin/trtexec --onnx=ufldv2_culane_res18_320x1600.onnx \
  *       --saveEngine=models/culane_res18_fp16.engine --fp16 \
- *       --memPoolSize=workspace:512M --builderOptimizationLevel=2
+ *       --memPoolSize=workspace:512M --builderOptimizationLevel=2 \
+ *       --profilingVerbosity=detailed
  * @endcode
+ * Build it on the Jetson that runs it: a plan built elsewhere loads with a
+ * "different models of devices" warning.  Expect ~413 MB with the FC head in
+ * FP16.  The 803 MB engine used until 2026-10-25 had an FP32 head and took
+ * ~14 ms/frame against ~9.4 ms.  --profilingVerbosity=detailed only lets
+ * tools/lane_eval/engine_check.sh show per-layer precision.
  * The engine's IO signature is validated against LaneDetectorConfig at load:
  * input (1,3,H,W) float32 and the four UFLD v2 outputs loc_row / loc_col /
  * exist_row / exist_col.
@@ -43,10 +49,18 @@
  * @endcode
  *
  * @note A Camera_GST stop()/start() cycle clears all branches.  Call
- *       createBin() again and re-register before each subsequent cam.start().
- * @note poll() is thread-safe; all other methods are not.
- * @note The leaky branch queue limits the lane detector to the rate it can
- *       sustain (~15–30 fps on Orin Nano).  No explicit throttle is needed.
+ *       createBin() again — with the detector stopped (it is refused while
+ *       the inference thread runs) — and re-register before each subsequent
+ *       cam.start().  Each start() begins a clean run: poll(), hasFreshResult()
+ *       and processedFrameCount() forget the previous run.
+ * @note poll(), stats() and processedFrameCount() are thread-safe; the other
+ *       methods are not.
+ * @note Two limits set the inference rate: branchMaxFps (a videorate at the
+ *       branch inlet) and targetHz (a gate in the inference thread), with the
+ *       leaky queue / appsink dropping whatever inference cannot keep up
+ *       with.  With rateGate = kLegacy (the default) the wall-clock gate
+ *       aliases against a branch running at targetHz and delivers ~13 Hz for
+ *       20; RateGate::kPts does not (see LaneDetectorConfig::rateGate).
  */
 
 #ifndef LIBLANEDETECTOR_H
@@ -54,14 +68,36 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 #include <gst/gst.h>
 #include "liblog.h"
+#include "ufld_decode.h"
 
 namespace dashcam::lane {
 
 // ─── output types ─────────────────────────────────────────────────────────────
+
+/**
+ * @brief When a result's frame was taken and how long each stage took.
+ *
+ * Mono times are CLOCK_MONOTONIC ns (std::chrono::steady_clock).  Stage
+ * times are filled only with LaneDetectorConfig::collectTimings (−1 otherwise).
+ */
+struct LaneTiming {
+    int64_t ptsNs         = -1;  ///< buffer PTS as delivered (stream time, not converted to
+                                 ///< running time) / processFrame's ptsNs
+    int64_t captureMonoNs = -1;  ///< PTS on CLOCK_MONOTONIC via the pipeline's system clock; −1 unknown
+    int64_t pullMonoNs    = -1;  ///< appsink pull returned (processFrame: call entry)
+    int64_t doneMonoNs    = -1;  ///< decode finished
+    float   h2dUs = -1;          ///< host→device copy of the frame
+    float   preUs = -1;          ///< preprocess kernel
+    float   trtUs = -1;          ///< TensorRT enqueueV3
+    float   d2hUs = -1;          ///< output copies
+    float   decUs = -1;          ///< CPU decode (decodeUfldV2 + egoFromSlots)
+};
 
 /**
  * @brief Permitted travel direction for a single lane.
@@ -112,6 +148,31 @@ struct LaneResult {
         LaneDirection::Straight,
         LaneDirection::Straight,
         LaneDirection::Straight};
+
+    /// The four boundary slots as decoded (native domains, ufld_decode.h):
+    /// what numLanes / currentLaneIndex / lateralOffset were derived from.
+    std::array<LaneSlot, 4> slots{};
+
+    /// NaN/Inf values found in this frame's output tensors.
+    int32_t nonFinite = 0;
+
+    LaneTiming timing;
+};
+
+/// Monotonic counters since construction (all paths, thread and processFrame).
+struct LaneStats {
+    uint64_t pulled       = 0;   ///< samples pulled from the appsink
+    uint64_t gated        = 0;   ///< pulled frames dropped by the targetHz gate
+    uint64_t mapFail      = 0;   ///< gst_buffer_map failures
+    uint64_t sizeMismatch = 0;   ///< frames whose size != branch size (skipped)
+    uint64_t h2dFail      = 0;
+    uint64_t preFail      = 0;
+    uint64_t trtFail      = 0;
+    uint64_t d2hFail      = 0;
+    uint64_t syncFail     = 0;
+    uint64_t nonFinite    = 0;   ///< frames with any NaN/Inf output value
+    uint64_t processed    = 0;   ///< valid results since construction
+    int64_t  lastErrorMonoNs = -1;
 };
 
 // ─── configuration ────────────────────────────────────────────────────────────
@@ -162,6 +223,8 @@ struct LaneDetectorConfig {
     /// band — e.g. 0.5 top + 0.2059 bottom on the 1088-row IMX296 keeps rows
     /// [544, 864): a 320-row band that matches the model input height, so the
     /// preprocess does no vertical resampling at all.
+    /// NOTE: this default (0) differs from libconfig's <Detection>
+    /// LaneInputCropBottom (0.2059); set both crops explicitly.
     float inputCropBottom = 0.0f;
 
     /// Frame-rate cap applied at the branch inlet (videorate drop-only), so
@@ -173,13 +236,27 @@ struct LaneDetectorConfig {
     /// linspace(rowAnchorStart, 1.0, numRowAnchors) like the UFLD v2 demo.
     float rowAnchorStart = 0.42f;
 
-    /// Source-image y-position (fraction of height) where boundary x-coords
-    /// are sampled to determine lane widths and vehicle position.
+    /// Where boundary x-coords are sampled to determine lane widths and
+    /// vehicle position, as a fraction of the model's IMPLIED frame — not of
+    /// the source frame: with the IMX296 defaults 0.90 is source row 810.7 of
+    /// 1088 (LaneGeometry::refRowSrc has the source row for any config).
     float laneReferenceY = 0.90f;
 
     /// Inference rate cap in Hz.  0 = run as fast as the pipeline allows.
     /// Recommended: 20 for urban driving, 10 for highway-only.
     uint32_t targetHz = 20;
+
+    /// How targetHz is enforced.
+    ///  kLegacy  wall-clock time since the last inference (the original
+    ///           gate).  When the branch already runs at ~targetHz it drops
+    ///           every frame that arrives a hair early: ~13 Hz for 20 on the
+    ///           IMX296 (plan bug B3).  Kept as the default until the higher
+    ///           GPU load of a true 20 Hz is signed off for v0.2/v0.3.
+    ///  kPts     decimates on buffer timestamps with half a frame interval of
+    ///           slack: exactly targetHz from any source rate >= targetHz.
+    ///           Frames without a PTS fall back to the wall-clock gate.
+    enum class RateGate : uint8_t { kLegacy = 0, kPts = 1 };
+    RateGate rateGate = RateGate::kLegacy;
 
     // ── normalisation (must match training) ───────────────────────────────────
 
@@ -194,10 +271,19 @@ struct LaneDetectorConfig {
 
     /// Optional override of the auto-built conversion chain (advanced).  When
     /// non-empty it is used verbatim and MUST deliver BGR frames of exactly
-    /// width × (height − (inputCropTop+inputCropBottom)·height) — the appsink
-    /// caps pin that size, and rate limiting/cropping become the override's
-    /// responsibility.
+    /// width × LaneGeometry::branchH, i.e. height − cropTopPx − cropBottomPx
+    /// with each crop rounded to an EVEN row count (not height·(1 − top −
+    /// bottom)) — the appsink caps pin that size, and size pinning, rate
+    /// limiting and cropping become the override's responsibility.
     std::string gstConversion;
+
+    /// Measure per-stage times into LaneResult::timing (CUDA events around
+    /// each GPU stage, read after the existing stream sync).  Off in
+    /// production; the frame timestamps and LaneStats are always on.
+    bool collectTimings = false;
+
+    /// Name of the inference thread (pthread_setname_np, ≤ 15 chars kept).
+    std::string threadName = "lane_infer";
 
     /// Log sink, wired like the other dashcam libraries.  Defaults to the
     /// process-wide liblog callback so construction-time errors are visible;
@@ -205,9 +291,49 @@ struct LaneDetectorConfig {
     dashcam::log::LogCallback log = dashcam::log::getCallback();
 };
 
+// ─── geometry ─────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Where the model looks, for one source size and config.
+ *
+ * Rows are continuous edge coordinates in the FULL source frame (row r spans
+ * [r, r+1)).  The decode works in the model's "implied frame": UFLD v2 was
+ * trained on the bottom cropRatio of a frame resized to
+ * modelInputH / cropRatio rows, so fraction f of that implied frame (row
+ * anchors, laneReferenceY) lands on source row impliedTopSrc + f·impliedH.
+ */
+struct LaneGeometry {
+    uint32_t srcW = 0, srcH = 0;          ///< full tee frame
+    uint32_t cropTopPx = 0;               ///< rows removed by the branch, top
+    uint32_t cropBottomPx = 0;            ///< rows removed by the branch, bottom
+    uint32_t branchW = 0, branchH = 0;    ///< appsink frame (bytes = W·H·3)
+    float    keptFrac = 0;                ///< branchH / srcH
+    float    effRatio = 0;                ///< min(1, cropRatio / keptFrac)
+    int      resizedH = 0;                ///< preprocess resize target rows
+    int      cropTopRows = 0;             ///< resizedH − modelInputH
+    float    preYScale = 0;               ///< branch rows per model row
+    float    preYOff = 0;                 ///< branch row of model row 0's top edge
+
+    double impliedH = 0;                  ///< implied frame height, source rows
+    double impliedTopSrc = 0;             ///< implied frame top, source row
+    double refRowSrc = 0;                 ///< laneReferenceY in source rows
+    double anchorRowSrcFirst = 0;         ///< first row anchor, source row
+    double anchorRowSrcLast = 0;          ///< last row anchor, source row
+
+    double impliedToSourceRow(double f) const { return impliedTopSrc + f * impliedH; }
+    double sourceRowToImplied(double r) const { return (r - impliedTopSrc) / impliedH; }
+};
+
+/// Copies of the tensors one processFrame() call used (parity / debugging).
+struct LaneDebugTensors {
+    std::vector<float> input;                  ///< 1×3×H×W, CHW RGB, normalised
+    std::array<std::vector<float>, 4> outputs; ///< loc_row, loc_col, exist_row, exist_col
+};
+
 // ─── detector ─────────────────────────────────────────────────────────────────
 
 class LaneDetectorImpl;
+struct LaneDetectorTestHook;
 
 /**
  * @brief TensorRT lane detector driven by the GStreamer pipeline.
@@ -239,7 +365,10 @@ public:
      *
      * The returned bin contains the conversion chain and an appsink.
      * Ownership transfers to the camera pipeline via addBranch().
-     * Call before cam.start().
+     * Call before cam.start(), with the detector stopped: while the
+     * inference thread runs it is refused (nullptr + ERROR log).
+     * The bin pins the full srcWidth × srcHeight first, so a tee of any other
+     * size fails caps negotiation instead of being cropped silently.
      *
      * @return Floating GstElement* (GstBin with a sink ghost pad),
      *         or nullptr if GStreamer element construction fails.
@@ -260,7 +389,8 @@ public:
     /** @brief Return the most recent lane result (thread-safe). */
     LaneResult poll() const;
 
-    /** @brief Number of frames successfully processed by CUDA/TRT. */
+    /** @brief Frames successfully processed by CUDA/TRT since the last start()
+     *         (lifetime total: stats().processed). */
     uint64_t processedFrameCount() const;
 
     /**
@@ -271,11 +401,79 @@ public:
      */
     bool hasFreshResult(uint32_t maxAgeMs) const;
 
-    /** @brief Replace the log sink (same pattern as the other libraries). */
-    void setLogCallback(dashcam::log::LogCallback cb);
+    /**
+     * @brief Replace the log sink (same pattern as the other libraries).
+     * @return false (and the old sink logs an ERROR) while the inference
+     *         thread runs — the thread reads the sink.
+     */
+    bool setLogCallback(dashcam::log::LogCallback cb);
+
+    /**
+     * @brief Run one branch-sized BGR frame synchronously (replay / tests).
+     *
+     * Same CUDA → TRT → decode path as the inference thread, and the same
+     * bookkeeping (sequence, poll(), hasFreshResult()).  Refused (returns
+     * false, logs an ERROR) while the inference thread runs.
+     *
+     * @param bgr    geometry().branchW × branchH × 3 bytes, the frame the
+     *               appsink would deliver (already branch-cropped).
+     * @param bytes  size of bgr; must equal branchW·branchH·3.
+     * @param ptsNs  frame timestamp, carried for the caller (−1 if unknown).
+     * @param out    the result (valid=false on failure).
+     * @param dbg    optional: receives copies of the input/output tensors.
+     * @return true when a valid result was produced.
+     */
+    bool processFrame(const uint8_t* bgr, size_t bytes, int64_t ptsNs,
+                      LaneResult& out, LaneDebugTensors* dbg = nullptr);
+
+    /** @brief Crop / preprocess / implied-frame geometry in use. */
+    const LaneGeometry& geometry() const;
+
+    /** @brief Counters since construction (thread-safe). */
+    LaneStats stats() const;
+
+    /**
+     * @brief Receive every valid result as it is produced.
+     *
+     * Called on the inference thread (and from processFrame()) right after
+     * the result becomes poll()'s — keep the handler short (enqueue only).
+     * Only allowed before start(); returns false (and logs) otherwise.
+     */
+    bool setResultSink(std::function<void(const LaneResult&)> sink);
 
 private:
+    friend struct LaneDetectorTestHook;
     std::unique_ptr<LaneDetectorImpl> impl_;
+};
+
+/**
+ * @brief Test-only access to LaneDetector internals (lane_test).  Inert
+ * unless called: production code never touches it.
+ */
+struct LaneDetectorTestHook {
+    enum class Fault : uint8_t {
+        H2D,          ///< host→device copy fails
+        Preprocess,   ///< preprocess launch fails
+        Enqueue,      ///< enqueueV3 fails
+        D2H,          ///< an output copy fails
+        NaNOutputs,   ///< loc_row / loc_col come back all-NaN (decode still runs)
+    };
+
+    /// Make the next `count` frames hit `fault` (thread or processFrame path).
+    static void injectFault(LaneDetector& det, Fault fault, int count);
+
+    /// Run a frame that is ALREADY model-sized (modelInputW × modelInputH
+    /// BGR, e.g. the training-geometry /var/tmp/ufld_calib frames) with an
+    /// identity preprocess.  The detector must have been built with a
+    /// modelInputW × modelInputH branch; returns false otherwise.
+    static bool runModelSized(LaneDetector& det, const uint8_t* bgr, size_t bytes,
+                              LaneResult& out, LaneDebugTensors* dbg = nullptr);
+
+    /// Receive the raw mapped bytes of every frame the inference thread maps:
+    /// what the appsink delivered, after the targetHz gate and before the size
+    /// check.  Called on the inference thread.  Set before start() only;
+    /// returns false while the thread runs.  nullptr clears it.
+    static bool onFrame(LaneDetector& det, std::function<void(const uint8_t*, size_t)> cb);
 };
 
 } // namespace dashcam::lane

@@ -363,7 +363,7 @@ struct DetectionConfig {
     ConfigVar<int>   laneBranchMaxFps  {"LaneBranchMaxFps",  20,    0,    120,  1,     "Lane branch inlet frame-rate cap (fps, videorate drop-only) so conversion runs below the sensor rate; 0 = uncapped"};
     ConfigVar<float> laneInputCropTop  {"LaneInputCropTop",  0.50f,   0.0f, 0.9f, 0.01f,   "Fraction of frame height cropped off the top inside the lane branch (0.5 = keep lower half)"};
     ConfigVar<float> laneInputCropBottom {"LaneInputCropBottom", 0.2059f, 0.0f, 0.9f, 0.0001f, "Fraction of frame height additionally cropped off the bottom of the lane branch (0.2059 = 224 rows on the 1088-row IMX296, leaving a 320-row mid band)"};
-    ConfigVar<float> laneReferenceY    {"LaneReferenceY",    0.90f, 0.5f, 1.0f, 0.01f, "Row (fraction of height) where lane x-positions are sampled"};
+    ConfigVar<float> laneReferenceY    {"LaneReferenceY",    0.90f, 0.5f, 1.0f, 0.01f, "Row where lane x-positions are sampled, as a fraction of the model's implied frame (0.90 = IMX296 source row ~811 at the default crops)"};
     ConfigVar<int>   signTargetHz      {"SignTargetHz",      5,     0,    30,   1,     "Sign inference rate cap (Hz)"};
     ConfigVar<float> signConfThreshold {"SignConfThreshold", 0.50f, 0.0f, 1.0f, 0.01f, "Sign detection confidence threshold"};
     ConfigVar<float> signNmsThreshold  {"SignNmsThreshold",  0.45f, 0.0f, 1.0f, 0.01f, "Sign NMS IoU threshold"};
