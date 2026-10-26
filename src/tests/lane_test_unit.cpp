@@ -4,6 +4,8 @@
 //   G1–G8  computeLaneGeometry: crops, preprocess ROI, implied-frame mapping
 //   D1–D12 decodeUfldV2 / egoFromSlots on hand-built UFLD v2 tensors
 //   U6     the output-path guard (data must never land in the public repo)
+//   A1–A5  lane_drive's camera-free parts (lane_drive_aux.h): clip ring,
+//          clip budget, clip planner, mount monitor, tensor ring
 //
 // Hand-built tensors: an anchor is made "present" with exist logits (0, 1)
 // and its location logits are −10 everywhere except +10 at the chosen cell,
@@ -12,6 +14,7 @@
 //   row head (slots 1,2): x = (g + 0.5) / (numCellRow − 1) · W,  y = anchor k
 //   col head (slots 0,3): x = k / (numColAnchors − 1) · W,  y = (g + 0.5) / (numCellCol − 1)
 
+#include "lane_drive_aux.h"
 #include "lane_test_common.h"
 #include "lane_geometry.h"
 #include "liblanedetector.h"
@@ -19,6 +22,7 @@
 
 #include <cmath>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -436,6 +440,180 @@ void testU6OutputGuard(const TestEnv&) {
     fs::current_path(cwd, ec);
 }
 
+// ─── lane_drive aux (clip ring, budget, planner, mount monitor) ──────────────
+
+using namespace lanedrive;
+constexpr int64_t kS = 1'000'000'000LL;
+
+void testA1JpegRing(const TestEnv&) {
+    JpegRing ring(1000);
+    std::vector<uint8_t> b(300, 7);
+    for (int i = 0; i < 5; ++i) ring.push(100 + i * 10, i * kS, b.data(), b.size());
+    check(ring.bytes() == 900 && ring.pushed() == 5, "A1 cap 1000 B: 3 of 5 frames of 300 B kept (" +
+          std::to_string(ring.bytes()) + " B)");
+    JFrame f;
+    int64_t d = 0;
+    check(ring.find(140, f, d, false) && d == 0 && f.mono == 4 * kS, "A1 exact PTS found");
+    check(!ring.find(110, f, d, false), "A1 an evicted PTS is not found exactly");
+    check(ring.find(133, f, d, true) && f.pts == 130 && d == -3, "A1 nearest PTS with its dpts");
+    check(ring.rangeMono(2 * kS, 4 * kS).size() == 2, "A1 range (2 s, 4 s] holds 2 frames");
+    check(ring.newestMono() == 4 * kS && std::fabs(ring.spanS() - 2.0) < 1e-9, "A1 newest mono and span");
+    ring.setEnabled(false);
+    ring.push(200, 5 * kS, b.data(), b.size());
+    check(ring.bytes() == 0 && ring.pushed() == 5, "A1 disabled: cleared and nothing pushed");
+}
+
+void testA2ClipBudget(const TestEnv&) {
+    ClipBudget b(3.6, 100, 1.0);          // 1 MB/s, capacity 100 MB, full
+    check(b.admit(kRest, 20e6, 0), "A2 rest admitted while the bucket is full");
+    check(!b.admit(kRest, 20e6, 0), "A2 rest refused below its 75 % reserve");
+    check(b.admit(kStopGo, 20e6, 0), "A2 stop->go still admitted (50 % reserve)");
+    check(b.admit(kLaneChange, 20e6, 0) && !b.admit(kLaneChange, 20e6, 0), "A2 LC admitted down to its 25 % reserve");
+    check(b.admit(kFault, 20e6, 0) && b.admit(kFault, 20e6, 0) && !b.admit(kFault, 20e6, 0),
+          "A2 faults take the last tokens (no reserve), then are refused");
+    check(std::fabs(b.tokens(10) - 10e6) < 1, "A2 refill 1 MB/s");
+    b.adjust(-5e6);
+    check(std::fabs(b.tokens(10) - 15e6) < 1, "A2 settling a smaller-than-estimated clip returns tokens");
+}
+
+void testA3ClipPlanner(const TestEnv&) {
+    ClipPlanner::Params p;
+    p.pendingCap = 1000;
+    ClipPlanner pl(p);
+    ClipBudget big(1000, 600, 1.0);
+    JpegRing ring(1u << 20);
+    std::vector<uint8_t> b(100, 1);
+    const int id = pl.trigger("stall", kFault, 100 * kS, 1e3, big);
+    check(id == 1 && pl.openJobs() == 1, "A3 first trigger opens job 1");
+    check(pl.trigger("mark", kRest, 105 * kS, 1e3, big) == 1, "A3 a trigger inside the window joins it");
+    check(pl.trigger("late", kRest, 140 * kS, 1e3, big) == 2, "A3 a trigger after the window opens job 2");
+    check(pl.trigger("x", kRest, 0, 1e3, big, false) == -1, "A3 disabled: -1");
+    for (int t = 85; t <= 125; ++t) ring.push(t, t * kS, b.data(), b.size());
+    pl.collect(ring);
+    auto done = pl.finished(ring.newestMono(), 125 * kS);
+    check(done.size() == 1 && done[0].id == 1, "A3 job 1 finished once a frame past 115 s arrived");
+    if (!done.empty()) {
+        check(done[0].frames.size() == 10 && done[0].overflow, "A3 job 1 window 90..115 s: the 1000 B pending cap keeps "
+              "the first 10 frames and flags the overflow (" + std::to_string(done[0].frames.size()) + " collected)");
+        check(done[0].triggers == "stall;mark" && done[0].priority == kFault, "A3 merged triggers and priority kept");
+    }
+    check(pl.overflowFrames() > 0, "A3 frames beyond the pending cap are counted (" +
+          std::to_string(pl.overflowFrames()) + ")");
+    auto late = pl.finished(ring.newestMono(), 156 * kS);
+    check(late.size() == 1 && late[0].id == 2, "A3 job 2 times out 5 s past its window with no frames");
+    ClipBudget tiny(0.0036, 1, 1.0);       // 1 kB/s, capacity 1 kB
+    check(pl.trigger("rest", kRest, 300 * kS, 1e6, tiny) == 0 && pl.refused() == 1, "A3 the budget refuses");
+}
+
+// A smooth textured scene (Gaussian blobs + two hard edges), rendered with a
+// sub-pixel shift and a rotation about the centre.
+Gray scene(int w, int h, double dx, double dy, double rotDeg, unsigned seed, double noise) {
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<double> U(0, 1);
+    struct Blob { double x, y, s, a; };
+    std::vector<Blob> blobs;
+    for (int i = 0; i < 160; ++i) blobs.push_back({ U(rng) * w, U(rng) * h, 1.5 + 4 * U(rng), (U(rng) - 0.5) * 140 });
+    std::mt19937 nrng(seed);
+    std::normal_distribution<double> N(0, noise > 0 ? noise : 1);
+    const double c = std::cos(-rotDeg * M_PI / 180), s = std::sin(-rotDeg * M_PI / 180);
+    const double cx = w / 2.0, cy = h / 2.0;
+    Gray g;
+    g.w = w; g.h = h; g.px.resize(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const double ux = x - dx - cx, uy = y - dy - cy;
+            const double X = c * ux - s * uy + cx, Y = s * ux + c * uy + cy;
+            double v = 110 + (Y > 0.8 * h ? 40 : 0) + (X > 0.3 * w && Y > 0.9 * h ? -30 : 0);
+            for (const auto& b : blobs) {
+                const double ex = X - b.x, ey = Y - b.y;
+                if (std::fabs(ex) < 4 * b.s && std::fabs(ey) < 4 * b.s) v += b.a * std::exp(-(ex * ex + ey * ey) / (2 * b.s * b.s));
+            }
+            if (noise > 0) v += N(nrng);
+            g.px[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(std::max(0.0, std::min(255.0, v)));
+        }
+    return g;
+}
+
+void testA4MountMonitor(const TestEnv&) {
+    const int W = 364, H = 272;
+    const float scale = 4.0f;            // CSI 1456 / 364
+    MountRoi roi;
+    roi.y0 = 0.55f;
+    MountMonitor m;
+    check(m.setReference(scene(W, H, 0, 0, 0, 1, 2), roi, scale), "A4 reference accepted");
+    const MountSample same = m.measure(scene(W, H, 0, 0, 0, 2, 2));
+    check(same.ok && std::fabs(same.dx) < 0.5 && std::fabs(same.dy) < 0.5 && std::fabs(same.rollDeg) < 0.15 &&
+          same.conf > 0.8, "A4 same view (new noise): dx " + f(same.dx, 2) + " dy " + f(same.dy, 2) + " src px, roll " +
+          f(same.rollDeg, 2) + " deg, conf " + f(same.conf, 2));
+    const MountSample sh = m.measure(scene(W, H, 1.5, -2.25, 0, 3, 2));
+    check(sh.ok && std::fabs(sh.dx - 6.0) < 1.2 && std::fabs(sh.dy + 9.0) < 1.2,
+          "A4 shift (+1.5, -2.25) tap px = (+6, -9) src px measured (" + f(sh.dx, 2) + ", " + f(sh.dy, 2) + ")");
+    const MountSample ro = m.measure(scene(W, H, 0, 0, 1.0, 4, 2));
+    check(ro.ok && std::fabs(ro.rollDeg - 1.0) < 0.3, "A4 roll 1.0 deg measured " + f(ro.rollDeg, 2) + " deg");
+    const MountSample far = m.measure(scene(W, H, 40, 30, 0, 6, 2));
+    check(!far.ok && far.lost && far.featureRatio > 0.7f, "A4 view moved beyond the search (40, 30) tap px: lost "
+          "(conf " + f(far.conf, 2) + ", features " + f(far.featureRatio, 2) + " of the reference)");
+    Gray flat;
+    flat.w = W; flat.h = H; flat.px.assign(static_cast<size_t>(W) * H, 30);
+    MountMonitor dark;
+    dark.setReference(flat, roi, scale);
+    check(!dark.measure(flat).ok, "A4 featureless (dark) reference: no measurement");
+    Gray darkFrame = flat;
+    const MountSample dk = m.measure(darkFrame);
+    check(!dk.ok && !dk.lost, "A4 a dark frame against a good reference: neither measured nor lost");
+
+    // Verdict: 5 s median over the threshold, sustained 5 s → shifted (latched).
+    MountMonitor v;
+    MountSample s8;
+    s8.ok = true; s8.dy = 8; s8.conf = 0.9f;
+    MountSample s0 = s8;
+    s0.dy = 0.5f;
+    int onAt = -1, offAt = -1;
+    for (int t = 0; t < 30; ++t) {
+        const auto r = v.feed(t * kS, t < 15 ? s8 : s0);
+        if (r.onEdge) onAt = t;
+        if (r.offEdge) offAt = t;
+    }
+    // The median exceeds from the first sample (t = 0); sustained 5 s → t = 5.
+    // Back: the median drops at t = 17 (3 of 5 small), clear 5 s → t = 22.
+    check(onAt == 5, "A4 FAIL edge 5 s after the 5 s median first exceeds 6 px (t = " + std::to_string(onAt) + ")");
+    check(offAt == 22 && v.feed(31 * kS, s0).shifted, "A4 view back: off edge at t = " + std::to_string(offAt) +
+          ", shifted stays latched");
+    // Lost view: FAIL 5 s after the first lost sample; dark samples hold the state.
+    MountMonitor lv;
+    MountSample good = s0, lost, darkS;
+    lost.lost = true;
+    int lostOn = -1;
+    for (int t = 0; t < 20; ++t) {
+        const auto r = lv.feed(t * kS, t < 5 ? good : (t == 7 || t == 8) ? darkS : lost);
+        if (r.onEdge) lostOn = t;
+    }
+    check(lostOn == 10, "A4 lost view from t = 5 (dark samples at 7, 8 neither reset nor count): FAIL at t = " +
+          std::to_string(lostOn));
+    MountMonitor q;
+    std::mt19937 rng(7);
+    std::normal_distribution<double> N(0, 2.0);
+    bool any = false;
+    for (int t = 0; t < 600; ++t) {
+        MountSample n = s0;
+        n.dx = static_cast<float>(N(rng)); n.dy = static_cast<float>(N(rng)); n.rollDeg = static_cast<float>(N(rng) * 0.08);
+        any = any || q.feed(t * kS, n).shifted;
+    }
+    check(!any, "A4 10 min of 2 px / 0.16 deg sigma jitter: no FAIL");
+}
+
+void testA5TensorRing(const TestEnv&) {
+    TensorRing r(3);
+    float a[2] = { 1, 2 }, b[1] = { 3 }, c[1] = { 4 }, d[1] = { 5 };
+    const float* outs[4] = { a, b, c, d };
+    const size_t n[4] = { 2, 1, 1, 1 };
+    for (uint64_t s = 1; s <= 5; ++s) { a[0] = static_cast<float>(s); r.put(s, static_cast<int64_t>(s * 10), -1, outs, n); }
+    const auto snap = r.snapshot();
+    check(snap.size() == 3 && snap[0].seq == 3 && snap[2].seq == 5 && snap[2].data.size() == 5 &&
+          snap[2].data[0] == 5.0f && snap[2].data[4] == 5.0f && snap[0].counts[0] == 2,
+          "A5 ring of 3 keeps seq 3..5 in order, outputs back to back");
+}
+
 } // namespace
 
 namespace lanetest {
@@ -465,6 +643,11 @@ std::vector<TestCase> unitTests() {
         { "D12 fit rms",               5, testD12Rms },
         { "U6 output-path guard",      5, testU6OutputGuard },
         { "S1 live smoke criterion",   5, testS1LiveSmokeCriterion },
+        { "A1 clip ring",              5, testA1JpegRing },
+        { "A2 clip budget",            5, testA2ClipBudget },
+        { "A3 clip planner",           5, testA3ClipPlanner },
+        { "A4 mount monitor",         20, testA4MountMonitor },
+        { "A5 tensor ring",            5, testA5TensorRing },
     };
 }
 

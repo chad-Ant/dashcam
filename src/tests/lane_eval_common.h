@@ -49,10 +49,13 @@ public:
     CsvWriter(const CsvWriter&) = delete;
     CsvWriter& operator=(const CsvWriter&) = delete;
 
-    bool open(const std::string& path, const std::string& header) {
-        f_ = std::fopen(path.c_str(), "w");
+    /// @p append: keep an existing file's rows (a restarted instance of the
+    /// same run); the header goes only into a new or empty file.
+    bool open(const std::string& path, const std::string& header, bool append = false) {
+        f_ = std::fopen(path.c_str(), append ? "a" : "w");
         if (!f_) return false;
-        std::fprintf(f_, "%s\n", header.c_str());
+        if (append) std::fseek(f_, 0, SEEK_END);
+        if (!append || std::ftell(f_) == 0) std::fprintf(f_, "%s\n", header.c_str());
         run_ = true;
         th_ = std::thread(&CsvWriter::loop, this);
         return true;

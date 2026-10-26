@@ -10,8 +10,11 @@ lane_drive / logger containers that lane_run.sh starts.  Writes:
   sysmon.csv  mono_ns, realtime_ns, mem_avail_kb, swap_used_kb, cpu_pct (all
               cores, 100 = one core), gpu_load_pct, gpu_mhz, vic_mhz, nvjpg_mhz,
               nvjpg1_mhz, nvdec_mhz, then one column per thermal zone
-              (t_<type>_c) and per INA3221 rail (p_<label>_mw), disk_free_gb,
-              run_gb, run_gbph_5min (trailing 5 min rate of RUN_DIR growth)
+              (t_<type>_c) and per INA3221 rail (p_<label>_mw), vdd_in_mv,
+              oc1..oc3_events (soctherm over-current / under-voltage event
+              counters since boot; a rise = a throttling power event),
+              disk_free_gb, run_gb, run_gbph_5min (trailing 5 min rate of
+              RUN_DIR growth)
   proc.csv    mono_ns, name, pids, cpu_pct (100 = one core), rss_kb, threads —
               one row per component per sample: each container's whole process
               tree (host PIDs via docker inspect, re-resolved every 10 s) and
@@ -92,6 +95,15 @@ def rails():
     return out
 
 
+def soctherm_oc():
+    """[(column, path)] of the soctherm OC event counters."""
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read(hw + "/name") == "soctherm_oc":
+            return [("oc%d_events" % i, hw + "/oc%d_event_cnt" % i) for i in (1, 2, 3)
+                    if os.path.exists(hw + "/oc%d_event_cnt" % i)]
+    return []
+
+
 def all_procs():
     """pid -> (ppid, utime+stime ticks, rss_kb, threads, comm)."""
     procs = {}
@@ -158,10 +170,11 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    zones, rl = thermal_zones(), rails()
+    zones, rl, oc = thermal_zones(), rails(), soctherm_oc()
+    vin = [r for r in rl if r[0] == "p_vdd_in_mw"]
     cols = (["mono_ns", "realtime_ns", "mem_avail_kb", "swap_used_kb", "cpu_pct", "gpu_load_pct"] +
-            list(DEVFREQ) + [z[0] for z in zones] + [r[0] for r in rl] +
-            ["disk_free_gb", "run_gb", "run_gbph_5min"])
+            list(DEVFREQ) + [z[0] for z in zones] + [r[0] for r in rl] + (["vdd_in_mv"] if vin else []) +
+            [o[0] for o in oc] + ["disk_free_gb", "run_gb", "run_gbph_5min"])
     sysf = open(os.path.join(a.out, "sysmon.csv"), "w")
     sysf.write(",".join(cols) + "\n")
     procf = open(os.path.join(a.out, "proc.csv"), "w")
@@ -209,6 +222,10 @@ def main():
         for _, vp, cp in rl:
             v, c = read(vp), read(cp)
             row.append(int(v) * int(c) // 1000 if v and c else "")
+        if vin:
+            row.append(read(vin[0][1]) or "")
+        for _, p in oc:
+            row.append(read(p) or "")
         disk = shutil.disk_usage(a.run_dir or a.out)
         if a.run_dir and now - last_walk >= 10:
             last_walk = now

@@ -474,6 +474,22 @@ struct LaneDetectorTestHook {
     /// check.  Called on the inference thread.  Set before start() only;
     /// returns false while the thread runs.  nullptr clears it.
     static bool onFrame(LaneDetector& det, std::function<void(const uint8_t*, size_t)> cb);
+
+    /// What one valid inference used and produced, for onInference().  Every
+    /// pointer is valid only during the callback (the frame is still mapped,
+    /// the outputs are the detector's pinned host buffers).
+    struct InferenceView {
+        const uint8_t* frame = nullptr;      ///< branch-sized BGR frame (branchW × branchH × 3)
+        size_t         frameBytes = 0;
+        const LaneResult* result = nullptr;  ///< as published (sequence and timing filled)
+        const float*   outputs[4] = {};      ///< loc_row, loc_col, exist_row, exist_col
+        size_t         outputFloats[4] = {};
+    };
+    /// Receive every VALID inference right after its result was published
+    /// (thread and processFrame paths), on the calling/inference thread —
+    /// copy what you need and return.  Set before start() only; returns
+    /// false while the thread runs.  nullptr clears it.
+    static bool onInference(LaneDetector& det, std::function<void(const InferenceView&)> cb);
 };
 
 } // namespace dashcam::lane

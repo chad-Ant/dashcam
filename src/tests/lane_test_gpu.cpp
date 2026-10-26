@@ -928,6 +928,44 @@ void testPF3ResultSink(const TestEnv& env) {
     note(std::string("PF3 setResultSink after stop(): ") + (afterStop ? "accepted" : "refused"));
 }
 
+// onInference (lane_drive's tensor dumps): the view carries the frame, the
+// published result and the very output tensors processFrame's dbg copy got.
+void testPF4InferenceHook(const TestEnv& env) {
+    LogSink sink;
+    auto det = makeDetector(1456, 1088, engineCfg(env.engine, sink), "PF4");
+    if (!det) return;
+    struct Seen {
+        const uint8_t* frame; size_t bytes; uint64_t seq; int64_t pts;
+        std::array<std::vector<float>, 4> outs;
+    };
+    std::vector<Seen> seen;
+    check(LaneDetectorTestHook::onInference(*det, [&seen](const LaneDetectorTestHook::InferenceView& v) {
+              Seen s{ v.frame, v.frameBytes, v.result ? v.result->sequence : 0,
+                      v.result ? v.result->timing.ptsNs : -2, {} };
+              for (int i = 0; i < 4; ++i) s.outs[i].assign(v.outputs[i], v.outputs[i] + v.outputFloats[i]);
+              seen.push_back(std::move(s));
+          }), "PF4 onInference accepted before start()");
+    const std::vector<uint8_t> a = branchFrame(*det, 43u);
+    LaneResult r;
+    LaneDebugTensors dbg;
+    const bool ok = det->processFrame(a.data(), a.size(), 777, r, &dbg);
+    bool same = ok && seen.size() == 1 && seen[0].frame == a.data() && seen[0].bytes == a.size() &&
+                seen[0].seq == r.sequence && seen[0].pts == 777;
+    for (int i = 0; same && i < 4; ++i) same = sameBits(seen[0].outs[i], dbg.outputs[i]);
+    check(same, "PF4 the view has the frame, the published result and the dbg-identical output tensors");
+
+    LaneDetectorTestHook::injectFault(*det, LaneDetectorTestHook::Fault::Enqueue, 1);
+    LaneResult bad;
+    check(!det->processFrame(a.data(), a.size(), 0, bad) && seen.size() == 1,
+          "PF4 a failed frame (injected enqueue fault) is not reported");
+    det->start();
+    check(!LaneDetectorTestHook::onInference(*det, nullptr), "PF4 onInference refused while the thread runs");
+    det->stop();
+    check(LaneDetectorTestHook::onInference(*det, nullptr), "PF4 onInference cleared after stop()");
+    det->processFrame(a.data(), a.size(), 0, r);
+    check(seen.size() == 1, "PF4 a cleared hook is not called");
+}
+
 // ─── tiny engine ─────────────────────────────────────────────────────────────
 
 // lane_test_unit.cpp's fourLanes() fixture, which make_tiny_engine.py bakes
@@ -1823,6 +1861,7 @@ std::vector<TestCase> gpuTests() {
         { "PF1 determinism + timings",    60, testPF1Determinism },
         { "PF2 refused while running",    60, testPF2RefusedWhileRunning },
         { "PF3 result sink",              60, testPF3ResultSink },
+        { "PF4 inference hook",           60, testPF4InferenceHook },
         { "T1 tiny engine decode",        30, testT1TinyDecode },
         { "T2 runModelSized",             30, testT2RunModelSized },
         { "L1 createBin while running",   30, testL1CreateBinWhileRunning },

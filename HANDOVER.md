@@ -12,14 +12,14 @@ This file has three parts:
 
 | Item | State |
 |---|---|
-| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | **The UGREEN and the CYD only.** The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CYD is `/dev/ttyUSB0` since the out-of-tree `ch341.ko` was installed and brltty-udev masked (2026-10-12 log section). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. **Update 2026-10-25 (bench):** the IMX296 (`/dev/video0`, Argus id 0), the UGREEN (`/dev/video1`), the MKR (`/dev/ttyACM0`, its console reports GNSS and IMU up) and the C3 (`/dev/ttyACM1`) were all attached and worked for the lane test suite; `dashcam-v04` was inactive throughout. |
+| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | **The UGREEN and the CYD only.** The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CYD is `/dev/ttyUSB0` since the out-of-tree `ch341.ko` was installed and brltty-udev masked (2026-10-12 log section). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. **Update 2026-10-25 (bench):** the IMX296 (`/dev/video0`, Argus id 0), the UGREEN (`/dev/video1`), the MKR (`/dev/ttyACM0`, its console reports GNSS and IMU up) and the C3 (`/dev/ttyACM1`) were all attached and worked for the lane test suite; `dashcam-v04` was inactive throughout. **Update 2026-10-26 (bench):** same devices plus the CYD (`/dev/ttyUSB0`); the IMX296 now **intermittently stops with an Argus sensor timeout** (see CSI camera row). |
 | Platform | L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra, UEFI 36.5.2 (upgraded 2026-10-01). The 65 NVIDIA packages are held. |
-| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
+| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **Since 2026-10-26 07:52 it intermittently dies** with Argus `waitCsiFrameStart Timeout … Sensor GUID 0 is in error state`, 39 s – 11 min into a run, sooner the longer it has been running (also yesterday's build, also a bare `nvarguscamerasrc → fakesink` under load; the 2026-10-25 81-min soak was clean); only a fresh process recovers. Suspect thermal / the flex connector: reseat the flex, `sudo systemctl restart nvargus-daemon`, then test `sudo jetson_clocks` (2026-10-26 log section). **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
 | UGREEN | `/dev/video1` next to the CSI camera (`/dev/video0` without it), pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. `usb_test`, `record_test` Part B and `scan_cameras` pass on it with the 2026-10-11 build (2026-10-12). It has **no** `exposure_dynamic_framerate` control. |
 | v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). **The newest build is now `bin/build_20261011_003045`**, which holds the uncommitted 2026-10-11 library changes (behaviour-neutral, all tests pass); the service runs it at its next start. `bin/build_20261011_002908` is a test build of the old float code; delete it through the container if wanted. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on, logs at 16 MB × 8, and since 2026-10-10 no obsolete settings (backup `dashcam.xml.bak-20261010-before-obsolete-cleanup`). Its wrong "autofocus stuck at 512" comment was corrected on 2026-10-12 (comment only; backup `dashcam.xml.bak-20261012-before-focus-comment`). |
 | MKR Zero | Production raw-CAN build (`3a702a8`). It boots into DISCOVER: listen-only, accept-all, raw `F`/`FS` lines on native USB, no decode. Its millis() clock is **not** held to the crystal (+1300 → −140 ppm within a drive; 2026-10-11 log section). |
 | ESP32-C3 | Bridge firmware 1.0; `HostProtocol` and `CommProtocol` are at 0x07. |
-| Lane engine and image (2026-10-25) | `models/culane_res18_fp16.engine` is now a **native FP16 build made on this Jetson** (413 MB, sha256 `d048fbde…`, 9.4 ms GPU vs 14.0 ms); the old 803 MB engine (FP32 head, built on another device) is kept beside it as `.prev803_bak`. It is also v0.2/v0.3's engine. `models/` is gitignored: the build command is in `liblanedetector.h`. `l4t-ml-gpio:latest` was rebuilt with matplotlib, addict and psmisc (`24110f6`); the previous image is tagged `build_20261025_143839`. The newest build is `bin/build_20261025_195258` (all targets, including `lane_drive`). Run data: `/media/jetson/backup/lane_tests/`, replay packs `/media/jetson/backup/lane_replay/`, goldens and tiny engines in `~/drive_logs/lane_golden`, `~/drive_logs/lane_engines`. |
+| Lane engine and image (2026-10-25) | `models/culane_res18_fp16.engine` is now a **native FP16 build made on this Jetson** (413 MB, sha256 `d048fbde…`, 9.4 ms GPU vs 14.0 ms); the old 803 MB engine (FP32 head, built on another device) is kept beside it as `.prev803_bak`. It is also v0.2/v0.3's engine. `models/` is gitignored: the build command is in `liblanedetector.h`. `l4t-ml-gpio:latest` was rebuilt with matplotlib, addict and psmisc (`24110f6`); the previous image is tagged `build_20261025_143839`. The newest build is `bin/build_20261026_053024` (all targets, including `lane_drive` and `lane_status`; `bin/build_20261025_195258` is the P5a build). Run data: `/media/jetson/backup/lane_tests/`, replay packs `/media/jetson/backup/lane_replay/`, goldens and tiny engines in `~/drive_logs/lane_golden`, `~/drive_logs/lane_engines`. |
 | Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. Since 2026-10-10: `drive_watch.sh` watches the raw-CAN files, tegrastats runs every 1 s, and `drive_session.sh stop` refuses while the car is moving (`--force` overrides). |
 | Storage | `/media/jetson/backup` sits on the root NVMe: 428 GB free. |
 | Uncommitted | `peripherals/mkr_zero/tools/canstream/` (logger hung-disk bound, tests, README); `peripherals/mkr_zero/libraries/EncoderPan/` (standalone servo/encoder prototype); `lib/libcan/libcan.cpp`, `lib/libgpio/libgpio.cpp`, `lib/libcamera/libcamera.{h,cpp}`, `lib/libconfig/libconfig.{h,cpp}`, `src/tests/test_libconfig.cpp`; since 2026-10-12: `tools/isp_tuning/chart/v2/` (capture helper, tests, docs), `peripherals/cyd/` (the dashboard app the user copied in from a colleague's uncommitted work, with my fixes; bring-up sketch fixes; CH340 driver script; README), `docker_dev/Dockerfile`, `build.sh` and `install_samd_aarch64.py`; this file. Since 2026-10-13/14: `peripherals/es3c28p/` (colleague's board port + firmware video side; my protocol headers, vectors, tests, Python playback), `lib/libvideopreview/`, `lib/libes3display/`, the preview tap in `lib/librecord/`, `<DisplayPreview>` in `lib/libconfig/`, `src/dashcam_v0_4.cpp`, the Makefile, their tests, and the Dockerfile JPEGDEC pin (image rebuilt). |
@@ -40,7 +40,7 @@ This file has three parts:
 | ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
 | ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
-| Lane detection test suite | `24110f6`, `650701a` | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. 81-min dual-camera soak passes every gate. Never run in the car. | Crop check in the parked car, then the first lane drive (day, then night). |
+| Lane detection test suite | `24110f6`, `650701a`, P5b in the commit after this file's 2026-10-26 update | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. **P5b done on the bench (2026-10-26 log section):** clip rings, tensor dumps, mount monitor, live CAN triggers, supervisor (restarts, degrade ladder, status), status display program, calibration, bench tools; B0 / B3m / 60-min soak pass (UGREEN), the 10-03 CSI slip is detected. Never run in the car. | Fix the CSI sensor fault (hardware); `lane_run.sh calibrate` in the parked car; then the first lane drive (day, then night). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
 ## Open work, in priority order
@@ -53,9 +53,13 @@ This file has three parts:
      spanned about 20°, and single jumps reached 250 px. Level it within 2°, keep the dashboard to at most 30% of the frame, and take reference frames
      before and after the drive;
    - decide whether to re-arm the drive crontab. The session's stop guard now refuses a stop while the car moves;
-   - **for a lane test drive** (`tools/lane_eval/DRIVE_PROCEDURE.md`): parked on a marked road, check that the lane band
-     shows road on both cameras (CSI default rows 544–864 of 1088 were mostly dashboard on 2026-10-03; pass
-     `--csi-crop T,B` / `--usb-crop T,B` to `lane_run.sh start`). `lane_run.sh` refuses to start while `dashcam-v04` runs.
+   - **for a lane test drive** (`tools/lane_eval/DRIVE_PROCEDURE.md`): first fix the IMX296 sensor timeouts of
+     2026-10-26 (reseat the flex, restart `nvargus-daemon`, test `jetson_clocks`; a 10-min CSI run must stay clean).
+     Then, parked on a marked road, `tools/lane_eval/lane_run.sh calibrate`: it proposes crops (CSI default rows
+     544–864 of 1088 were mostly dashboard on 2026-10-03) and writes the mount template; start with
+     `--csi-crop T,B --usb-crop T,B --mount-ref CAL_NNN/mount`. `lane_run.sh` refuses to start while `dashcam-v04`
+     runs. The CYD shows the status pages only with its navigation firmware (the 2026-10-13 dashboard firmware does
+     not answer the ES3 link); otherwise use the ES3C28P or `lane_run.sh status` over ssh.
 2. **In-car raw-CAN loss test:** parked, engine on, about 10 min, against the CANRawLog baseline (≥ 0.4%).
 3. **CSI night quality** (needs the user's sudo; procedure in
    `~/drive_logs/tools/imx296_driver/staging_20261010/README.md`):
@@ -262,8 +266,12 @@ $B/lane_test --gpu --strict --engine models/culane_res18_fp16.engine --tiny /use
                                                      # GPU tier (~90 s, no camera; mount ~/drive_logs/lane_engines)
 $B/lane_test --replay --pack DIR --engine E --out DIR --golden DIR   # R1 replay vs a golden (packs/goldens outside the repo)
 $B/lane_test models/culane_res18_fp16.engine         # live IMX296 smoke (10 s); `--video FILE W H [s [stride]]` for clips
-tools/lane_eval/lane_run.sh start|status|stop        # host: lane test run (both cameras + MKR logger + sysmon), see DRIVE_PROCEDURE.md
+tools/lane_eval/lane_run.sh start|status|mark|stop|calibrate   # host: lane test run (cameras, MKR logger, can_live,
+                                                     #   supervisor, status display, sysmon), see DRIVE_PROCEDURE.md
 python3 tools/lane_eval/check_run.py RUN_DIR [--bench]   # host: the plan's health/resource gates on a run
+python3 tools/lane_eval/phase_table.py RUN_DIR           # host: B0 resource deltas per phase
+python3 tools/lane_eval/sync_check.py RUN_DIR            # host: B5 cross-camera offset (torch / hand passes)
+$B/lane_drive --mount-replay --out DIR --files A.mkv,... --ref-file A.mkv --ref-at S   # B9 mount monitor on footage
 make -C lib/libdeadreckoning check                   # dead-reckoning library (55 checks); `sanitize` for ASan/UBSan
 make -C lib/liblidartracking test                    # GRF-250 parser/FSM + Orin association library (container for camera tests)
 make -C lib/libstereoprototype test                  # stereo feasibility prototype (container)
@@ -387,6 +395,48 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-10-26 (Jetson, bench): lane detection test suite P5b (drive harness extras)
+
+The user asked to start P5b (plan section 14: clip rings, dumps, mount monitor, status display and alerts, degrade
+ladder, `.ass` banner, ROI calibration, bench tests B0/B3/B3m/B5/B9). Full numbers: `~/drive_logs/lane_p0/P0_REPORT.md`
+(P5b section); runs in `/media/jetson/backup/lane_tests/run_003…009`.
+
+- **Library:** `LaneDetectorTestHook::onInference` hands the frame, the published result and the four output tensors
+  to a test harness (thread and `processFrame` paths; GPU test PF4). Replay still bit-identical (250/250).
+- **`lane_drive`:** CSI encode branch at 30 fps NVJPG feeding the review (decimated by a PTS probe) and a byte-capped
+  RAM clip ring; UGREEN ring of every MJPEG frame. Event clips (t − 10 … t + 10 s, merged, ≤ 60 s) on stall, camera
+  error, latency spike, error counter, mount shift, CAN stalk episodes, stop→go, operator marks, flicker bursts and a
+  random sample, rationed by a 1.5 GB/h-per-camera token bucket (faults first). Tensor dumps (`LTD1` .bin + input
+  band + the camera frame with the same PTS) every 5 s and on events. `image_stats.csv`, `mount.csv`, `.ass` lane
+  banner per review part, `status.json`, `RUN/ctl/degrade`, `--lanes-schedule` (B0), `--stills` (calibration),
+  `--instance K` (restart into the same run), `--mount-replay` (B9). On `cam_lost` it finalises and exits 3. The
+  camera-free parts are in `src/tests/lane_drive_aux.h` with unit tests A1–A5.
+- **Mount monitor:** gradient cross-correlation of a car-fixed region against a parked reference (1 Hz, 5 s median,
+  FAIL when > 6 px or > 0.5° for 5 s, latched). A view that moved beyond the ±48 px search (the 10-03 slip was
+  ~230 px, ~9°) counts as a shift when edges are still visible. Its verdict raises alerts **only for a car-fixed
+  region** (`roi_calib.py` found the hood edge, or `--mount-roi`): the UGREEN's view is all road and would
+  false-alarm once the car moves. Replay of the 10-03 night: the CSI slip is flagged 5 s after 22:20:13.
+- **Host tools:** `can_live.py` (follows `can_raw.log` through the unmodified `can_decode`, writes
+  `can/live_state.json` and clip triggers), `lane_supervisor.py` (container restarts up to 10, ≥ 20 s apart; CAN
+  logger restart into `can/partN`; degrade ladder; GPU-saturation step; `status.json` with display lines),
+  `lane_status` (own binary: PAGE text and ALERT beeps through `libes3display`), `roi_calib.py`, `balloon.py`,
+  `sync_check.py`, `phase_table.py`; `lane_run.sh calibrate|mark`, `--mount-ref`, `--display`, `--expect-can`,
+  `--plan night`, `--idle-lead`, `--csi-args/--usb-args`; `sysmon.py` logs VDD_IN and the soctherm OC counters;
+  `check_run.py` adds ring, losses, clip/review ffprobe, dump pairing, mount and supervisor gates.
+- **Bench results:** B0 — idle 5.4 W; cameras + recording 7.9 W, 136 % CPU (of one core); both lanes 13.7 W, 183 %,
+  GPU 56 % at 715 MHz, ≈ 145 mJ per inference. B3m — degrade steps 1–5 in order at MemAvailable ≈ 0.9 GB, step 6 at
+  0.55 GB stopped the run, exit 0, no OOM kill (OOM-victim test not done). 60-min dual soak — the UGREEN passes every
+  gate (20.0 Hz, p99 52 ms, 0 errors/drops, RSS flat, 21 clean clips, 100 % exact-PTS dumps, ≤ 8.7 GB/h, tj 58 °C).
+  `can_live` on a real CAN recording replayed live: 124 394 frames decoded, stalk and stop→go episodes found. Kill
+  tests: logger → part1, camera container → instance 1, both recovered.
+- **Pitfalls found:** libjpeg in `lane_drive`'s process (OpenCV, `libvideopreview`) breaks `nvjpegenc` ("JPEG
+  parameter struct mismatch") → no OpenCV/libjpeg in `lane_drive`, band JPEGs via GStreamer `jpegenc`, the status
+  display a separate binary. A `videorate max-rate=5` after a tee negotiated the upstream 30 fps `videorate` down to
+  ~5 fps → PTS probe decimators.
+- **Open:** the IMX296 sensor timeouts (CSI camera row above); the CYD needs its navigation firmware for the status
+  pages; the single-camera TensorRT p99 gate (25 ms) fails at the governor's low GPU clock (29.6 ms); not done: B5
+  (needs a person with a torch), a dark-room soak, B1b, GNSS logger, a lane-based mount check.
 
 ## 2026-10-25 (Jetson, bench): lane detection test suite P0–P5a (committed `24110f6`, `650701a`)
 

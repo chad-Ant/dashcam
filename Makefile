@@ -218,10 +218,15 @@ LANE_TEST_OBJS := $(call make_objs,    $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SR
                                         src/tests/lane_test_unit.cpp src/tests/lane_test_gpu.cpp) \
                   $(call make_cu_objs,  $(LIBLANE_CU_SRCS))
 
-# lane_drive: in-car / bench harness of the lane test suite (one camera per process)
+# lane_drive: in-car / bench harness of the lane test suite (one camera per process).
+# No libjpeg / OpenCV in it: a libjpeg in the global symbol scope breaks nvjpegenc.
 LANE_DRIVE_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCAM_EXPO_SRCS) $(LIBCAM_FOCUS_SRCS) \
                                         $(LIBCFG_SRCS) $(LIBLANE_SRCS) src/tests/test_lanedetector_drive.cpp) \
                    $(call make_cu_objs, $(LIBLANE_CU_SRCS))
+
+# lane_status: the lane test's status pages + alerts on the CYD / ES3C28P (libes3display)
+LANE_STATUS_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) \
+                                       $(LIBNAV_SRCS) src/tests/lane_status_display.cpp)
 
 # driverstate_test: live-UVC drowsiness classification smoke test (2 fps branch)
 DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_SRCS) \
@@ -230,7 +235,7 @@ DSTATE_TEST_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCFG_S
 
 ALL_OBJS := $(sort $(CSI_OBJS) $(USB_OBJS) $(REC_OBJS) $(V02_OBJS) $(V03_OBJS) $(V04_OBJS) $(EXPO_TEST_OBJS) $(FOCUS_TEST_OBJS) $(CAMGST_TEST_OBJS) $(TIMESYNC_TEST_OBJS) $(BRIDGE_OVL_OBJS) $(SCAN_OBJS) \
                    $(CFG_OBJS) $(CAN_OBJS) $(GPIO_OBJS) $(MIDI_OBJS) $(LIBLOG_TEST_OBJS) \
-                   $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(LANE_DRIVE_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
+                   $(WRITECFG_OBJS) $(LANE_TEST_OBJS) $(LANE_DRIVE_OBJS) $(LANE_STATUS_OBJS) $(DSTATE_TEST_OBJS) $(NET_TEST_OBJS) \
                    $(CSI_RTP_OBJS) $(COMMLINK_OBJS) $(COMMLINK_SIM_OBJS) \
                    $(PREVIEW_TEST_OBJS) $(ES3_TEST_OBJS) $(NAV_TEST_OBJS))
 
@@ -264,6 +269,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/liblog_test \
            $(BUILD_DIR)/lane_test \
            $(BUILD_DIR)/lane_drive \
+           $(BUILD_DIR)/lane_status \
            $(BUILD_DIR)/driverstate_test
 
 .PHONY: all clean dashcam_v0_3 dashcam_v0_4 commlink_test
@@ -406,6 +412,9 @@ $(BUILD_DIR)/lane_test: $(LANE_TEST_OBJS)
 
 $(BUILD_DIR)/lane_drive: $(LANE_DRIVE_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT)
+
+$(BUILD_DIR)/lane_status: $(LANE_STATUS_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG) $(LD_NAV)
 
 $(BUILD_DIR)/driverstate_test: $(DSTATE_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_TRT) $(LD_CV)

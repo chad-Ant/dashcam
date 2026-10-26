@@ -219,6 +219,21 @@ public:
 
     // LaneDetectorTestHook::onFrame: raw mapped frames (tests only; set before start()).
     std::function<void(const uint8_t*, size_t)> testFrameCb_;
+    // LaneDetectorTestHook::onInference: every valid inference (tests only; set before start()).
+    std::function<void(const LaneDetectorTestHook::InferenceView&)> testInferCb_;
+
+    void notifyInference(const uint8_t* frame, const LaneResult& r) {
+        if (!testInferCb_) return;
+        LaneDetectorTestHook::InferenceView v;
+        v.frame = frame;
+        v.frameBytes = srcBytes_;
+        v.result = &r;
+        for (int i = 0; i < kNumOuts; ++i) {
+            v.outputs[i] = hOut_[i];
+            v.outputFloats[i] = outBytes_[i] / sizeof(float);
+        }
+        testInferCb_(v);
+    }
 
     // LaneDetectorTestHook fault injection: frames left to fail, per point.
     std::atomic<int> faultLeft_[5] = {};
@@ -654,10 +669,12 @@ public:
                 }
             }
 
+            if (sizeOk && result.valid) {
+                publish(result);
+                notifyInference(frame, result);   // frame still mapped
+            }
             gst_buffer_unmap(buf, &map);
             gst_sample_unref(sample);
-
-            if (sizeOk && result.valid) publish(result);
         }
     }
 
@@ -721,6 +738,7 @@ public:
 
         if (!result.valid) return false;
         publish(result);
+        notifyInference(bgr, result);
         out = result;
         return true;
     }
@@ -973,6 +991,13 @@ bool LaneDetectorTestHook::onFrame(LaneDetector& det,
                                    std::function<void(const uint8_t*, size_t)> cb) {
     if (det.impl_->inferThread_.joinable()) return false;
     det.impl_->testFrameCb_ = std::move(cb);
+    return true;
+}
+
+bool LaneDetectorTestHook::onInference(LaneDetector& det,
+                                       std::function<void(const InferenceView&)> cb) {
+    if (det.impl_->inferThread_.joinable()) return false;
+    det.impl_->testInferCb_ = std::move(cb);
     return true;
 }
 
