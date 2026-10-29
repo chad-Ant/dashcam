@@ -255,6 +255,7 @@ TARGETS := $(BUILD_DIR)/csi_test \
            $(BUILD_DIR)/camera_gst_test \
            $(BUILD_DIR)/timesync_test \
            $(BUILD_DIR)/bridge_overlay_test \
+           $(BUILD_DIR)/monitoring_test \
            $(BUILD_DIR)/videopreview_test \
            $(BUILD_DIR)/navigation_test \
            $(BUILD_DIR)/es3display_test \
