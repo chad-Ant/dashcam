@@ -416,6 +416,8 @@ struct DriverScoreConfig {
  * time service.  libnetwork itself does not depend on libconfig.
  */
 struct NetworkConfig {
+    ConfigVar<bool> monitoringEnabled {"MonitoringEnabled", false, "Publish read-only v0.4 snapshots to the local Android connector agent (no LAN listener in the recorder)"};
+    ConfigVar<std::string> monitoringSocket {"MonitoringSocket", "/run/dashcam-monitor/telemetry.sock", "Unix datagram socket owned by the host monitoring agent; share its parent into the recording container"};
     // WiFi bring-up at startup: ask NetworkManager to connect to the SSID; if it
     // cannot be fulfilled the app runs in offline mode (no time-sync, no streaming).
     ConfigVar<bool>        wifiConnectEnabled  {"WifiConnectEnabled",  true, "Ask the OS (NetworkManager) to connect to the WiFi SSID at startup; on failure, run offline"};

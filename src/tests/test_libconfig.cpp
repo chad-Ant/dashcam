@@ -178,6 +178,8 @@ static bool test_roundtrip() {
     src.network.rtpPort             = 5602;
     src.network.rtpBitrateKbps      = 6000;
     src.network.controlEnabled      = true;
+    src.network.monitoringEnabled = true;
+    src.network.monitoringSocket = "/run/example-monitor.sock";
     src.network.controlPort         = 8123;
     src.network.controlMaxClients   = 5;
     src.network.controlBindAddress  = "127.0.0.1";
@@ -329,6 +331,9 @@ static bool test_roundtrip() {
     check(dst.network.rtpPort == 5602,                   "network.rtpPort round-trip");
     check(dst.network.rtpBitrateKbps == 6000,            "network.rtpBitrateKbps round-trip");
     check(dst.network.controlEnabled == true,            "network.controlEnabled round-trip");
+    check(dst.network.monitoringEnabled == true, "network.monitoringEnabled round-trip");
+    check(static_cast<const std::string&>(dst.network.monitoringSocket) == "/run/example-monitor.sock",
+          "network.monitoringSocket round-trip");
     check(dst.network.controlPort == 8123,               "network.controlPort round-trip");
     check(dst.network.controlMaxClients == 5,            "network.controlMaxClients round-trip");
     check(dst.network.controlBindAddress == "127.0.0.1", "network.controlBindAddress round-trip");

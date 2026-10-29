@@ -148,6 +148,7 @@ TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests
 # bridge_overlay_test: ESP32-C3 telemetry -> recording overlay and map position mapping (src/bridge_overlay.h,
 # no hardware; nav_geo.cpp for the map's usablePosition rules)
 BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) lib/libnavigation/nav_geo.cpp src/tests/test_bridge_overlay.cpp)
+MONITOR_OBJS := $(call make_objs, src/tests/test_monitoring.cpp)
 
 # videopreview_test: libvideopreview MJPEG -> letterboxed preview JPEG (DCT-scaled decode, resize,
 # capped encode) + never-blocking submission, worker and lease pool (synthesized JPEGs, mock sink)
@@ -290,6 +291,9 @@ commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
 
 # Same for the library suites the display preview work touches.
 .PHONY: record_test config_test
+.PHONY: monitoring_test
+monitoring_test: $(BUILD_DIR)/monitoring_test | $(BUILD_DIR)/logs
+	@echo "Built monitoring_test in $(BUILD_DIR)/"
 record_test: $(BUILD_DIR)/record_test | $(BUILD_DIR)/logs
 	@echo "Built record_test in $(BUILD_DIR)/"
 config_test: $(BUILD_DIR)/config_test | $(BUILD_DIR)/logs
@@ -381,6 +385,9 @@ $(BUILD_DIR)/scan_cameras: $(SCAN_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/config_test: $(CFG_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+
+$(BUILD_DIR)/monitoring_test: $(MONITOR_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/can_test: $(CAN_OBJS)

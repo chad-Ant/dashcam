@@ -276,6 +276,8 @@ static void warnObsolete(pugi::xml_node root, const dashcam::log::LogCallback& l
 
 static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
                          const dashcam::log::LogCallback& log) {
+    readVar(node, n.monitoringEnabled, log);
+    readVar(node, n.monitoringSocket, log);
     readVar(node, n.wifiConnectEnabled,  log);
     readVar(node, n.wifiSsid,            log);
     readVar(node, n.wifiTimeoutSec,      log);
@@ -469,6 +471,8 @@ static void writeDetection(pugi::xml_node parent, const DetectionConfig& d) {
 
 static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     pugi::xml_node node = parent.append_child("Network");
+    writeVar(node, n.monitoringEnabled);
+    writeVar(node, n.monitoringSocket);
     writeVar(node, n.wifiConnectEnabled);
     writeVar(node, n.wifiSsid);
     writeVar(node, n.wifiTimeoutSec);

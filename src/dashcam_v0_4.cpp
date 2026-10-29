@@ -4,7 +4,8 @@
 // start: one USB UVC camera's own compressed stream (MJPEG/H.264) is copied
 // into gapless MKV segments (no decode, no encode) with an .ass sidecar
 // showing the live clock (speed/heading/position as "--": no GPS yet).
-// No lane detection, no driver monitoring, no network.
+// No lane detection or driver monitoring. Optional read-only monitoring uses
+// local IPC; the separate host agent owns the LAN service.
 //
 // Loop overwrite: when this program's own segments exceed <MaxFootageGB>, or
 // free space drops below <MinFreeGB>, the oldest segments (lowest SEQ — never
@@ -71,6 +72,7 @@
 #include "libtimesync.h"
 #include "libvideopreview.h"
 #include "telemetry_log.h"
+#include "monitoring.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1997,6 +1999,15 @@ int main(int argc, char* argv[]) {
             clean ? 0 : 3);
     });
 
+    // Optional local monitor: nonblocking datagrams; a missing/stalled agent
+    // drops only dashboard updates. Vehicle telemetry publishes even with no camera.
+    dashcam::monitor::Publisher monitor;
+    if ((bool)net.monitoringEnabled && !monitor.open((std::string)net.monitoringSocket))
+        log(LogLevel::WARN, "monitoring: cannot create local publisher — recording continues");
+    uint64_t monitorSeq = 0, monitorFrames = 0;
+    auto monitorSampleAt = std::chrono::steady_clock::now();
+    double monitorFps = -1;
+
     // ── supervisor loop ──────────────────────────────────────────────────────
     while (g_run) {
         heartbeat.beat();
@@ -2067,6 +2078,23 @@ int main(int argc, char* argv[]) {
                     nextAttempt = now;
                 }
             }
+        }
+        if (monitor.enabled()) {
+            const bool active = recorder.isRecording();
+            const uint64_t frames = recorder.framesReceived();
+            const double span = std::chrono::duration<double>(now - monitorSampleAt).count();
+            if (!active || frames < monitorFrames) {
+                monitorFps = -1;
+                monitorFrames = frames;
+                monitorSampleAt = now;
+            } else if (span >= 1.0) {
+                monitorFps = static_cast<double>(frames - monitorFrames) / span;
+                monitorFrames = frames;
+                monitorSampleAt = now;
+            }
+            const auto sample = bridge.telemetry();
+            monitor.offer(dashcam::monitor::snapshot(sample, !bridge.isStale(kBridgeFreshnessMs),
+                          bridge.telemetryAgeMs(), active, frames, monitorFps, ++monitorSeq));
         }
         std::this_thread::sleep_for(kTick);
     }
