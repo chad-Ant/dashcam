@@ -278,6 +278,23 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
                          const dashcam::log::LogCallback& log) {
     readVar(node, n.monitoringEnabled, log);
     readVar(node, n.monitoringSocket, log);
+    readVar(node, n.monitoringVideoEnabled, log);
+    readVar(node, n.monitoringVideoSocket, log);
+    readVar(node, n.monitoringVideoDemand, log);
+    // Out of range falls back to the default (not clamped): 0 or 60 is a typo,
+    // not a request for the nearest bound.
+    if (pugi::xml_node fpsNode = node.child(n.monitoringVideoFps.name().c_str())) {
+        const int fps = fpsNode.text().as_int(n.monitoringVideoFps.defaultValue());
+        if (fps < n.monitoringVideoFps.minValue() || fps > n.monitoringVideoFps.maxValue()) {
+            doLog(log, dashcam::log::LogLevel::WARN,
+                  "config '%s': %d out of range %d..%d, using %d", n.monitoringVideoFps.name().c_str(), fps,
+                  n.monitoringVideoFps.minValue(), n.monitoringVideoFps.maxValue(),
+                  n.monitoringVideoFps.defaultValue());
+            n.monitoringVideoFps.set(n.monitoringVideoFps.defaultValue());
+        } else {
+            n.monitoringVideoFps.set(fps);
+        }
+    }
     readVar(node, n.wifiConnectEnabled,  log);
     readVar(node, n.wifiSsid,            log);
     readVar(node, n.wifiTimeoutSec,      log);
@@ -473,6 +490,10 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     pugi::xml_node node = parent.append_child("Network");
     writeVar(node, n.monitoringEnabled);
     writeVar(node, n.monitoringSocket);
+    writeVar(node, n.monitoringVideoEnabled);
+    writeVar(node, n.monitoringVideoSocket);
+    writeVar(node, n.monitoringVideoDemand);
+    writeVar(node, n.monitoringVideoFps);
     writeVar(node, n.wifiConnectEnabled);
     writeVar(node, n.wifiSsid);
     writeVar(node, n.wifiTimeoutSec);

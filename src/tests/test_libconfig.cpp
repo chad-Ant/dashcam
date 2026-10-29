@@ -180,6 +180,10 @@ static bool test_roundtrip() {
     src.network.controlEnabled      = true;
     src.network.monitoringEnabled = true;
     src.network.monitoringSocket = "/run/example-monitor.sock";
+    src.network.monitoringVideoEnabled = true;
+    src.network.monitoringVideoSocket = "/run/example-video.sock";
+    src.network.monitoringVideoDemand = "/run/example-video-demand";
+    src.network.monitoringVideoFps = 7;
     src.network.controlPort         = 8123;
     src.network.controlMaxClients   = 5;
     src.network.controlBindAddress  = "127.0.0.1";
@@ -334,6 +338,12 @@ static bool test_roundtrip() {
     check(dst.network.monitoringEnabled == true, "network.monitoringEnabled round-trip");
     check(static_cast<const std::string&>(dst.network.monitoringSocket) == "/run/example-monitor.sock",
           "network.monitoringSocket round-trip");
+    check(dst.network.monitoringVideoEnabled == true, "network.monitoringVideoEnabled round-trip");
+    check(static_cast<const std::string&>(dst.network.monitoringVideoSocket) == "/run/example-video.sock",
+          "network.monitoringVideoSocket round-trip");
+    check(static_cast<const std::string&>(dst.network.monitoringVideoDemand) == "/run/example-video-demand",
+          "network.monitoringVideoDemand round-trip");
+    check(dst.network.monitoringVideoFps == 7, "network.monitoringVideoFps round-trip");
     check(dst.network.controlPort == 8123,               "network.controlPort round-trip");
     check(dst.network.controlMaxClients == 5,            "network.controlMaxClients round-trip");
     check(dst.network.controlBindAddress == "127.0.0.1", "network.controlBindAddress round-trip");
@@ -1077,6 +1087,41 @@ static bool test_navigation() {
     return g_fails == before;
 }
 
+// ── test 16: monitoring video settings (defaults, out-of-range fps -> 10) ────
+
+static bool test_monitoring_video() {
+    std::cout << "\n--- Test 16: monitoring video settings ---\n";
+    const int before = g_fails;
+    NetworkConfig def;
+    check(!def.monitoringVideoEnabled && def.monitoringVideoFps == 10 &&
+              static_cast<const std::string&>(def.monitoringVideoSocket) == "/run/dashcam-monitor/video.sock" &&
+              static_cast<const std::string&>(def.monitoringVideoDemand) == "/run/dashcam-monitor/video-demand",
+          "monitoring video defaults: off, 10 fps, sockets under /run/dashcam-monitor");
+
+    const std::string tmpFile = "/tmp/libconfig_monitor_video_test.xml";
+    std::vector<std::string> warns;
+    dashcam::log::LogCallback log = [&](dashcam::log::LogLevel lvl, const std::string& m) {
+        if (lvl == dashcam::log::LogLevel::WARN) warns.push_back(m);
+    };
+    const struct { const char* text; int expect; size_t warnings; } cases[] = {
+        {"15", 15, 0}, {"1", 1, 0}, {"0", 10, 1}, {"16", 10, 1}, {"-3", 10, 1}, {"60", 10, 1},
+    };
+    for (const auto& c : cases) {
+        warns.clear();
+        const std::string xml = std::string("<Network><MonitoringVideoEnabled>true</MonitoringVideoEnabled>"
+                                            "<MonitoringVideoFps>") + c.text + "</MonitoringVideoFps></Network>";
+        check(writeConfigFile(tmpFile, xml), "write a monitoring video file");
+        AppConfig cfg;
+        const bool ok = ConfigReader::load(tmpFile, cfg, log);
+        const std::string label = std::string("MonitoringVideoFps ") + c.text + " -> " + std::to_string(c.expect) +
+                                  (c.warnings ? " with a WARN" : " without a WARN");
+        check(ok && cfg.network.monitoringVideoEnabled && cfg.network.monitoringVideoFps == c.expect &&
+                  warns.size() == c.warnings, label.c_str());
+    }
+    fs::remove(tmpFile);
+    return g_fails == before;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -1095,6 +1140,7 @@ int main() {
     bool t13 = test_display_preview_clamping();
     bool t14 = test_display_preview_validation();
     bool t15 = test_navigation();
+    bool t16 = test_monitoring_video();
 
     std::cout << "\n=== Results ===\n";
     std::cout << "Test 1 (load real file):    " << (t1 ? "PASS" : "FAIL") << "\n";
@@ -1112,7 +1158,8 @@ int main() {
     std::cout << "Test 13 (preview clamping): " << (t13 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 14 (preview validate): " << (t14 ? "PASS" : "FAIL") << "\n";
     std::cout << "Test 15 (navigation):       " << (t15 ? "PASS" : "FAIL") << "\n";
+    std::cout << "Test 16 (monitoring video): " << (t16 ? "PASS" : "FAIL") << "\n";
 
     return (t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 &&
-            t11 && t12 && t13 && t14 && t15) ? 0 : 1;
+            t11 && t12 && t13 && t14 && t15 && t16) ? 0 : 1;
 }

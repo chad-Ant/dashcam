@@ -73,6 +73,7 @@
 #include "libvideopreview.h"
 #include "telemetry_log.h"
 #include "monitoring.h"
+#include "monitoring_video.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1793,6 +1794,35 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ── monitoring agent: camera preview (optional) ──────────────────────────
+    // <Network><MonitoringVideoEnabled> (with MonitoringEnabled): a second
+    // converter makes 640x360 JPEGs of the recording camera, but only while the
+    // agent's demand file is fresh (someone watches the Live tab); each goes to
+    // the agent as one nonblocking datagram.  Like the display preview it never
+    // gates recording: any failure leaves the agent without video.
+    dashcam::monitor::MonitorVideoSink monitorVideo;
+    dashcam::preview::VideoPreview     monitorPreview;
+    bool monitorPreviewOn = false, monitorDemand = false;
+    const uint32_t monitorVideoFps = static_cast<uint32_t>((int)net.monitoringVideoFps);
+    if ((bool)net.monitoringVideoEnabled && !(bool)net.monitoringEnabled) {
+        log(LogLevel::WARN, "monitor preview: off — MonitoringVideoEnabled needs MonitoringEnabled");
+    } else if ((bool)net.monitoringVideoEnabled) {
+        if (!monitorVideo.open((std::string)net.monitoringVideoSocket, (std::string)net.monitoringVideoDemand)) {
+            log(LogLevel::WARN, "monitor preview: cannot create the local sender (recording is unaffected)");
+        } else {
+            dashcam::preview::PreviewConfig pc;
+            pc.targetFps          = monitorVideoFps;
+            pc.jpegQuality        = 65;
+            pc.minimumJpegQuality = 45;
+            pc.maxJpegBytes       = dashcam::monitor::kVideoMaxJpegBytes;
+            monitorPreviewOn = monitorPreview.start(pc, monitorVideo, quietRepeats(recLog));
+            log(monitorPreviewOn ? LogLevel::INFO : LogLevel::WARN,
+                monitorPreviewOn ? "monitor preview: on, " + std::to_string(monitorVideoFps) + " fps to " +
+                                       (std::string)net.monitoringVideoSocket + " while a viewer watches"
+                                 : std::string("monitor preview: converter not started (recording is unaffected)"));
+        }
+    }
+
     // The ESP32-C3 bridge (MKR Zero: CAN, GNSS, IMU) feeds the overlay's vehicle
     // fields — speed, acceleration, position, heading — and, when enabled, GPS
     // time. Optional: without the bridge the link retries quietly in its own
@@ -1892,6 +1922,7 @@ int main(int argc, char* argv[]) {
                                               : std::chrono::seconds((int)r.retryIntervalSec));
     };
 
+    bool monitorCabinPaused = false;   // last tryStart withheld the cabin camera from the monitor preview
     auto tryStart = [&]() -> bool {
         std::string why;
         // Never under a running cleanup pass (see pickStartDir).
@@ -1930,14 +1961,39 @@ int main(int argc, char* argv[]) {
 
         const bool mjpeg = f.pixelFormat == V4L2_PIX_FMT_MJPEG;
         recorder.setLumaTap(frameRateExposure && mjpeg);
-        if (previewOn) {
+        if (previewOn || monitorPreviewOn) {
             // Possibly another camera or format: drop the waiting frame and the
             // cached geometry before this session's first frame.  The recorder
-            // keeps the callable for every later session; preview outlives them.
-            preview.invalidateSource();
-            recorder.setPreviewTap([&preview](const rec::PreviewFrame& pf) {
-                preview.submitJpeg(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs);
-            }, static_cast<uint32_t>((int)dp.targetFps));
+            // keeps the callable for every later session; both previews outlive
+            // them.  One tap feeds both: at their common rate, or at the
+            // camera's when they differ (each converter rate-limits itself).
+            if (previewOn) preview.invalidateSource();
+            if (monitorPreviewOn) monitorPreview.invalidateSource();
+            // The network viewers get the road camera only: when the cabin
+            // (driver) camera is the fallback recording, the monitor preview
+            // gets nothing this session (the in-car display still does).
+            const bool toMonitorOn = monitorPreviewOn && !rc.cabinFallback;
+            if (monitorPreviewOn && rc.cabinFallback != monitorCabinPaused)
+                log(LogLevel::INFO, rc.cabinFallback ? "monitor preview: paused, recording the cabin camera"
+                                                     : "monitor preview: resumed, recording the road camera");
+            monitorCabinPaused = monitorPreviewOn && rc.cabinFallback;
+            const uint32_t displayFps = static_cast<uint32_t>((int)dp.targetFps);
+            uint32_t tapFps = previewOn ? displayFps : monitorVideoFps;
+            if (previewOn && toMonitorOn && displayFps != monitorVideoFps)
+                tapFps = std::max({displayFps, monitorVideoFps,
+                                   static_cast<uint32_t>(std::max(1.0, std::ceil((double)f.frameRate)))});
+            dashcam::preview::VideoPreview* toDisplay = previewOn ? &preview : nullptr;
+            dashcam::preview::VideoPreview* toMonitor = toMonitorOn ? &monitorPreview : nullptr;
+            // Always (re)installed: the recorder keeps the last callable, so an
+            // earlier session's monitor target must be replaced; an empty
+            // callable turns the tap off for this session.
+            if (toDisplay || toMonitor)
+                recorder.setPreviewTap([toDisplay, toMonitor](const rec::PreviewFrame& pf) {
+                    if (toDisplay) toDisplay->submitJpeg(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs);
+                    if (toMonitor) toMonitor->submitJpeg(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs);
+                }, tapFps);
+            else
+                recorder.setPreviewTap(rec::PreviewFrameCallback{}, 0);
         }
         if (!recorder.start(rc.cam->address, fmt, opts)) {
             scheduleRetry(rc.cam->address + ": " + recorder.lastError());
@@ -2079,6 +2135,11 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+        if (monitorPreviewOn && monitorVideo.pollDemand() != monitorDemand) {
+            monitorDemand = !monitorDemand;
+            log(LogLevel::INFO, monitorDemand ? "monitor preview: a viewer is watching — converting"
+                                              : "monitor preview: no viewer — idle");
+        }
         if (monitor.enabled()) {
             const bool active = recorder.isRecording();
             const uint64_t frames = recorder.framesReceived();
@@ -2133,6 +2194,22 @@ int main(int argc, char* argv[]) {
         heartbeat.beat();
     }
     display.stop();   // after both producers; a no-op when it never started
+    if (monitorPreviewOn) {
+        // After the recorder, like the display preview: no tap callback runs now.
+        const dashcam::preview::PreviewStats ps = monitorPreview.stats();
+        monitorPreview.stop();
+        const dashcam::monitor::MonitorVideoStats vs = monitorVideo.stats();
+        char b[256];
+        std::snprintf(b, sizeof(b), "monitor preview: %llu frames converted, %llu sent, %llu dropped "
+                                    "(%llu agent busy, %llu no agent, %llu refused, %llu other); "
+                                    "conversion p95 %.0f ms",
+                      (unsigned long long)ps.processed, (unsigned long long)vs.sent,
+                      (unsigned long long)vs.dropped(), (unsigned long long)vs.dropBusy,
+                      (unsigned long long)vs.dropMissing, (unsigned long long)vs.dropRefused,
+                      (unsigned long long)vs.dropOther, ps.total.p95Ms);
+        log(LogLevel::INFO, b);
+        heartbeat.beat();
+    }
     timeRun.store(false);
     bridge.close();
     telemetryCsv.close();

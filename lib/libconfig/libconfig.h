@@ -418,6 +418,10 @@ struct DriverScoreConfig {
 struct NetworkConfig {
     ConfigVar<bool> monitoringEnabled {"MonitoringEnabled", false, "Publish read-only v0.4 snapshots to the local Android connector agent (no LAN listener in the recorder)"};
     ConfigVar<std::string> monitoringSocket {"MonitoringSocket", "/run/dashcam-monitor/telemetry.sock", "Unix datagram socket owned by the host monitoring agent; share its parent into the recording container"};
+    ConfigVar<bool> monitoringVideoEnabled {"MonitoringVideoEnabled", false, "Also publish a 640x360 preview of the recording camera to the monitoring agent while a viewer watches (needs MonitoringEnabled)"};
+    ConfigVar<std::string> monitoringVideoSocket {"MonitoringVideoSocket", "/run/dashcam-monitor/video.sock", "Unix datagram socket the monitoring agent receives preview frames on"};
+    ConfigVar<std::string> monitoringVideoDemand {"MonitoringVideoDemand", "/run/dashcam-monitor/video-demand", "File the monitoring agent touches while a viewer watches; preview frames are converted only while it is fresh (< 3 s old)"};
+    ConfigVar<int> monitoringVideoFps {"MonitoringVideoFps", 10, 1, 15, 1, "Monitoring preview frame-rate ceiling (fps); out of range = 10"};
     // WiFi bring-up at startup: ask NetworkManager to connect to the SSID; if it
     // cannot be fulfilled the app runs in offline mode (no time-sync, no streaming).
     ConfigVar<bool>        wifiConnectEnabled  {"WifiConnectEnabled",  true, "Ask the OS (NetworkManager) to connect to the WiFi SSID at startup; on failure, run offline"};

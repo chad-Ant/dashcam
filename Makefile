@@ -148,7 +148,9 @@ TIMESYNC_TEST_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBTIME_SRCS) src/tests
 # bridge_overlay_test: ESP32-C3 telemetry -> recording overlay and map position mapping (src/bridge_overlay.h,
 # no hardware; nav_geo.cpp for the map's usablePosition rules)
 BRIDGE_OVL_OBJS := $(call make_objs, $(LIBLOG_SRCS) lib/libnavigation/nav_geo.cpp src/tests/test_bridge_overlay.cpp)
-MONITOR_OBJS := $(call make_objs, src/tests/test_monitoring.cpp)
+# monitoring_test: v0.4 monitoring snapshot/publisher and the camera preview sink (src/monitoring*.h;
+# libvideopreview for the frame leases, libjpeg through it) — local sockets in /tmp, no hardware
+MONITOR_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBPREVIEW_SRCS) src/tests/test_monitoring.cpp)
 
 # videopreview_test: libvideopreview MJPEG -> letterboxed preview JPEG (DCT-scaled decode, resize,
 # capped encode) + never-blocking submission, worker and lease pool (synthesized JPEGs, mock sink)
@@ -389,7 +391,7 @@ $(BUILD_DIR)/config_test: $(CFG_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
 
 $(BUILD_DIR)/monitoring_test: $(MONITOR_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE) $(LD_JPEG)
 
 $(BUILD_DIR)/can_test: $(CAN_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LD_BASE)
