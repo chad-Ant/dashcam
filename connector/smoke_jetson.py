@@ -17,7 +17,8 @@ from service import initialize, load_identity
 
 async def smoke():
     root = Path(__file__).resolve().parent.parent
-    build = sorted((root / 'bin').glob('build_*/dashcam_v0_4'))[-1]
+    # Newest timestamped build (bin/build_<YYYYMMDD>_<HHMMSS>); ad-hoc names such as build_kz3_* sort after them.
+    build = sorted((root / 'bin').glob('build_[0-9]*_[0-9]*/dashcam_v0_4'))[-1]
     with tempfile.TemporaryDirectory(prefix='connector-smoke-', dir=root) as directory:
         test = Path(directory)
         state = test / 'identity'

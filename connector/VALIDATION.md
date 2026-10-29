@@ -36,9 +36,31 @@ checkout. Build and smoke-test containers had no host camera/serial devices
 exposed. No production config, service, recording binary or camera state was
 changed. Test processes were stopped after validation.
 
+## Browser client (local CA) — 2026-10-29, on the Jetson
+
+- `test_service.py`: 30 tests pass (Python 3.10, aiohttp 3.14.3, cryptography 46.0.3): the original 10 plus the
+  CA/leaf profile, chain verification with the `ssl` module (CA file, hostname check by IP SAN), SAN validation and
+  the fixed name constraints, `cert` / `ca` / `pair`, atomic writes, static whitelist and security headers, the
+  session cookie (creation, attributes, tampered/expired/other-token rejection, sign-out), Host/Origin checks
+  (cross-site WebSocket refused) and the unchanged Android bearer path.
+- OpenSSL 3: the chain verifies by IP and DNS SAN and fails for another IP; a leaf for `www.google.com` / `8.8.8.8`
+  forged with the real CA key fails with "permitted subtree violation". Leaf validity is exactly 825 days.
+- Headless Firefox 157 (Marionette) against `serve --simulate` over TLS, 19/19 checks: pairing from the browser link
+  strips the token from the address bar, the cookie is HttpOnly and nothing is stored in Web Storage; live data on
+  Live/Vehicle/System/Connection at 1280x800 and 412x915; the session survives a reload and an agent restart; a
+  WebSocket and a credentialed fetch from another origin (same host, other port) get no data; the page blanks when
+  the agent stops and 2.15 s after it freezes with the socket held open (SIGSTOP), then recovers; sign-out returns
+  to the not-paired state; pasting the Android link also pairs. Firefox accepted the certificate through
+  `acceptInsecureCerts` (no NSS tools here to install the CA in a test profile), so browser-side CA trust was checked
+  with OpenSSL and the `ssl` module instead.
+- `smoke_jetson.py` passes again against build `bin/build_20261029_092154` (it now picks the newest timestamped
+  build; ad-hoc `build_kz3_*` directories had sorted after the dated ones and selected a pre-monitoring binary).
+- Not yet done: installing the CA and pairing a browser on the real phone/tablet/laptop (Chrome, Samsung Internet,
+  Safari).
+
 ## Remaining physical acceptance
 
-- Installation and pairing on the actual Samsung S25 Ultra and Tab S10 FE.
+- Installation and pairing on the actual Samsung S25 Ultra and Tab S10 FE (app and browser, after installing the CA).
 - mDNS discovery on the actual router, including client-isolation behavior.
 - CAN/GNSS source-loss transitions, reconnect after router/Jetson reboot and
   accurate storage-path configuration on the deployed system.

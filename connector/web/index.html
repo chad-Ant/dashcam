@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Dashcam Connect</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <nav class="nav" aria-label="Pages">
+    <span class="brand" aria-hidden="true">DC</span>
+    <button type="button" class="tab" data-page="live" aria-current="page"><span class="mark" aria-hidden="true">◉</span><span>Live</span></button>
+    <button type="button" class="tab" data-page="vehicle"><span class="mark" aria-hidden="true">↗</span><span>Vehicle</span></button>
+    <button type="button" class="tab" data-page="system"><span class="mark" aria-hidden="true">▥</span><span>System</span></button>
+    <button type="button" class="tab" data-page="connection"><span class="mark" aria-hidden="true">⌁</span><span>Connection</span></button>
+  </nav>
+  <main class="main">
+    <header class="top">
+      <p class="eyebrow">DASHCAM CONNECT</p>
+      <h1 id="title">Live</h1>
+      <p id="subtitle" class="muted">Your Jetson, at a glance</p>
+    </header>
+    <div class="banner-wrap">
+      <div id="banner" class="banner">
+        <p id="status" class="status" role="status" aria-live="polite">Starting</p>
+        <p id="detail" class="detail"></p>
+      </div>
+    </div>
+    <section id="page-live" class="page" aria-labelledby="title"></section>
+    <section id="page-vehicle" class="page" aria-labelledby="title" hidden></section>
+    <section id="page-system" class="page" aria-labelledby="title" hidden></section>
+    <section id="page-connection" class="page" aria-labelledby="title" hidden></section>
+    <noscript><p class="card">Dashcam Connect needs JavaScript enabled.</p></noscript>
+  </main>
+</div>
+</body>
+</html>
