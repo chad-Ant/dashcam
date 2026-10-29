@@ -39,7 +39,7 @@ This file has three parts:
 | CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
 | ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
 | ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
-| Android connector (Dashcam Connect) | `9fac0c2` | Read-only phone/tablet dashboard for v0.4 (2026-10-29 log section): v0.4 publishes a JSON snapshot each supervisor tick (~5 Hz) to a nonblocking Unix datagram socket (`src/monitoring.h`, `<MonitoringEnabled>` / `<MonitoringSocket>` under `<Network>`, off by default); a host Python agent (`connector/service.py`, systemd unit `connector/dashcam-monitor.service`) adds 1 Hz host health and serves up to four Android clients over a certificate-pinned, bearer-authenticated TLS WebSocket on TCP 8443, with optional mDNS. Android app in `android/` (Kotlin/Compose, minSdk 28, target 37; pages Live / Vehicle / System / Connection; Keystore-encrypted pairings). No commands, preview, map or ADAS. Software-validated (`connector/VALIDATION.md`): Android unit/lint/emulator, 10 agent tests, `monitoring_test`, `config_test`, an end-to-end v0.4 → agent → TLS smoke test on this Jetson. **Not deployed** on the rig: no agent service, state dir or launcher socket mount. | Install the agent, add the socket mount and XML keys, pair the Samsung S25 Ultra and Tab S10 FE; then the physical acceptance in `connector/VALIDATION.md`. |
+| Android connector (Dashcam Connect) | `9fac0c2` | Read-only phone/tablet dashboard for v0.4 (2026-10-29 log section): v0.4 publishes a JSON snapshot each supervisor tick (~5 Hz) to a nonblocking Unix datagram socket (`src/monitoring.h`, `<MonitoringEnabled>` / `<MonitoringSocket>` under `<Network>`, off by default); a host Python agent (`connector/service.py`, systemd unit `connector/dashcam-monitor.service`) adds 1 Hz host health and serves up to four Android clients over a certificate-pinned, bearer-authenticated TLS WebSocket on TCP 8443, with optional mDNS. **Browser client** (2026-10-29, uncommitted): the agent also serves a web dashboard (`connector/web/`) signed by its own name-constrained local CA, which the user installs on browser devices; browsers pair with a link and get a 30-day HttpOnly session cookie; same-origin checks block cross-site WebSockets. Android app in `android/` (Kotlin/Compose, minSdk 28, target 37; pages Live / Vehicle / System / Connection; Keystore-encrypted pairings). No commands, preview, map or ADAS. Software-validated (`connector/VALIDATION.md`): Android unit/lint/emulator, 10 agent tests, `monitoring_test`, `config_test`, an end-to-end v0.4 → agent → TLS smoke test on this Jetson. **Not deployed** on the rig: no agent service, state dir or launcher socket mount. | Install the agent, add the socket mount and XML keys, pair the Samsung S25 Ultra and Tab S10 FE; then the physical acceptance in `connector/VALIDATION.md`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | Lane detection test suite | `24110f6`, `650701a`, P5b in the commit after this file's 2026-10-26 update | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. **P5b done on the bench (2026-10-26 log section):** clip rings, tensor dumps, mount monitor, live CAN triggers, supervisor (restarts, degrade ladder, status), status display program, calibration, bench tools; B0 / B3m / 60-min soak pass (UGREEN), the 10-03 CSI slip is detected. Never run in the car. | The IMX296 module still resets in bright sun even with the gain floor (2026-10-27 log section): replace or fix the module before relying on CSI lanes, or accept CSI gaps; `lane_run.sh calibrate` in the parked car; then the first lane drive (day, then night). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
@@ -99,7 +99,9 @@ This file has three parts:
     `dashcam-monitor.service` (sudo), add `--volume /run/dashcam-monitor:/run/dashcam-monitor` to the v0.4 launcher and
     `<MonitoringEnabled>true</MonitoringEnabled>` to the deployed config, pair the phone and tablet. Then the physical
     checks: speed against the bridge, C3 unplug, v0.4 and agent restarts, Wi-Fi loss, rotation, LAN-permission
-    deny/regrant, mDNS on the real router (client isolation), and recording FPS/CPU/memory with two viewers.
+    deny/regrant, mDNS on the real router (client isolation), and recording FPS/CPU/memory with two viewers. For
+    browsers: `service.py cert --san 192.168.0.15` (or `init --san`), `ca --out dashcam-ca.crt`, install the CA on
+    each browser device (README "Browser access"), open the browser link from `pair`.
 12. **Smaller items:**
    - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
    - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
@@ -405,6 +407,33 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-10-29 (Jetson): connector browser client with a local CA
+
+The user asked whether the connector could serve a browser as well as the Android app, then chose certificate
+option B (a local CA installed on each browser device). Built by a workflow (backend, web page and README in
+parallel; five reviews with two skeptics per finding; seven confirmed findings fixed), then hardened and verified
+here. Details: `connector/README.md` ("Browser access"), results: `connector/VALIDATION.md`.
+
+- **Certificates** (`service.py`): `init` now also makes a local CA (EC P-256, 10 years, `ca-key.pem` 0600) with
+  critical name constraints fixed to private/link-local/loopback IPs and names under `local`, `lan`, `home.arpa`,
+  `localhost`; `--san` never widens them (changed from the first design after review: a DNS SAN given at CA
+  creation used to be added, so a name like `com` would have let a stolen CA key sign public names). The leaf
+  (EC P-256, serverAuth, IP/DNS SANs, exactly 825 days for Apple) is signed by it; `cert.pem` = leaf + CA, so the
+  Android pin (SHA-256 of the leaf) is unchanged in meaning. New commands: `cert --san …` (re-issue the leaf,
+  atomic; Android devices must pair again), `ca --out FILE` (export the CA with its colon-hex fingerprint);
+  `pair` also prints the browser link `https://HOST:8443/#pair=TOKEN`.
+- **Browser auth:** the page exchanges the token once (`POST /v1/session`, bearer + same-origin) for a stateless
+  HMAC cookie `__Host-dcsession` (Secure, HttpOnly, SameSite=Strict, 30 days, key derived from the device token,
+  so a new identity revokes it); cookie requests must come from an allowed Host (the leaf SANs) and, for the stream,
+  a same-origin Origin. `DELETE /v1/session` signs out. The Android bearer path is unchanged. Strict CSP and other
+  security headers on every response; static files from an exact whitelist.
+- **Web page** (`connector/web/`, no build step, no external resources): Live / Vehicle / System / Connection like
+  the app, phone and desktop layouts, the same 2 s blanking and protocol checks, a 15 s silent-stream reconnect.
+- **Verified:** 30 agent tests; OpenSSL chain and name-constraint checks (a forged public leaf is rejected);
+  headless Firefox 19/19 end-to-end checks over TLS (with certificate errors accepted, as the CA could not be
+  installed in a test profile); `smoke_jetson.py` passes again after a fix to its build selection.
+- **Not done:** the CA on real devices and browser pairing there; deployment (open-work item 11).
 
 ## 2026-10-29 (user, committed `9fac0c2`): Android dashboard and read-only Jetson monitoring connector
 
