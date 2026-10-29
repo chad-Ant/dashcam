@@ -127,9 +127,10 @@ the Jetson after each drive (`review/` too if space allows).
 
 - UGREEN lanes use software JPEG decode; `--usb-decode hw` (nvv4l2decoder) is broken (13 Hz, growing lag).
 - CSI gain / exposure are not logged (not readable via V4L2 under Argus).
-- The IMX296 intermittently stops with an Argus sensor timeout (2026-10-26, 39 s – 11 min into runs, also with a
-  bare nvarguscamerasrc under load); the restart path recovers it in ~30 s. Check the CSI flex and restart
-  nvargus-daemon before a drive.
+- The IMX296 resets itself at low analogue gain (Argus sensor timeout in bright light; 2026-10-27 HANDOVER log).
+  Builds from 2026-10-27 floor the CSI gain at `gainrange="4 12.5"` in `Camera_CSI`, which lowers but does not
+  remove it: a midday bench soak still reset about every 5 min. The restart path recovers each reset in ~25 s, so
+  expect CSI gaps on a sunny drive.
 - The CYD's current firmware does not answer the display link (no HELLO): flash the navigation firmware
   (`peripherals/cyd`) or use the ES3C28P for the status display; the run carries on without it.
 - No GNSS logger, VP-based mount check, or B1b neutrality test yet.

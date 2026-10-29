@@ -12,9 +12,9 @@ This file has three parts:
 
 | Item | State |
 |---|---|
-| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | **The UGREEN and the CYD only.** The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CYD is `/dev/ttyUSB0` since the out-of-tree `ch341.ko` was installed and brltty-udev masked (2026-10-12 log section). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. **Update 2026-10-25 (bench):** the IMX296 (`/dev/video0`, Argus id 0), the UGREEN (`/dev/video1`), the MKR (`/dev/ttyACM0`, its console reports GNSS and IMU up) and the C3 (`/dev/ttyACM1`) were all attached and worked for the lane test suite; `dashcam-v04` was inactive throughout. **Update 2026-10-26 (bench):** same devices plus the CYD (`/dev/ttyUSB0`). Rebooted 21:08 (stock imx296 driver, default clocks); since 21:59 a **degradation hunt** (`~/drive_logs/lane_p0/driver_ab/degrade_hunt.sh`, up to 30 h) owns the cameras: keep `dashcam-v04` stopped and do not reboot or reload the driver until it ends (2026-10-26 evening log section). |
+| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | **The UGREEN and the CYD only.** The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CYD is `/dev/ttyUSB0` since the out-of-tree `ch341.ko` was installed and brltty-udev masked (2026-10-12 log section). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. **Update 2026-10-25 (bench):** the IMX296 (`/dev/video0`, Argus id 0), the UGREEN (`/dev/video1`), the MKR (`/dev/ttyACM0`, its console reports GNSS and IMU up) and the C3 (`/dev/ttyACM1`) were all attached and worked for the lane test suite; `dashcam-v04` was inactive throughout. **Update 2026-10-26 (bench):** same devices plus the CYD (`/dev/ttyUSB0`). **Update 2026-10-27 (bench):** the degradation hunt ended at the first fault (06:02); the IMX296 tests that followed (2026-10-27 log section) left driver candidate C loaded: reload the stock driver (`sudo docker_dev/csi_driver.sh reload`) or reboot before using the CSI camera. `dashcam-v04` stayed stopped. |
 | Platform | L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra, UEFI 36.5.2 (upgraded 2026-10-01). The 65 NVIDIA packages are held. |
-| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **On 2026-10-26 it died again and again** with Argus `waitCsiFrameStart Timeout … Sensor GUID 0 is in error state` while AE wrote gain under GPU load, after the module had been loaded ~30 h through many sessions. **Not hardware:** a module reload (`sudo docker_dev/csi_driver.sh reload`) or a reboot clears it (a daemon restart or `jetson_clocks` does not), and the stock driver then passes the same workloads. **Reboot or reload the driver before a drive.** What degrades it is being hunted (2026-10-26 evening log section). A driver candidate without the group hold and gain delay was tried and rejected (not the fix; worse AE transitions). **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
+| CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **At low analogue gain the sensor resets itself** mid-stream: it drops off I2C for ~170 ms and comes back with its power-on defaults, and Argus reports `waitCsiFrameStart Timeout … Sensor GUID 0 is in error state`. The hazard rises steeply as the gain falls: GAIN register 16 (Argus 1.0, the DT floor) resets within seconds to a minute; in the dark none was seen at 64 and above, but in midday sun the module also reset at 64 and on stream-on. Heat is the main factor: cooled to a ~34 °C die it ran gain 16 clean (2026-10-29). Bright scenes hit it because AE drives the gain to the floor. Light, exposure, register traffic, GPU load, frame rate, module age and the driver build are ruled out; the cause is on the module (power or bias margin, unit or design; not testable without hardware). **Mitigation, not a fix, in `Camera_CSI` since 2026-10-27:** every CSI pipeline sets `gainrange="4 12.5"` (register 64–200); a `gainrange` attribute replaces it. It passed a 30-min daylight `trtexec` soak that otherwise faulted within 1–3 min, but a midday two-camera `lane_drive` soak (run_018, camera in the sun) still reset 6 times at gain 64 plus 3 times at stream start; the harness kept CSI lanes at a mean 19.75 Hz through 9 container restarts. Expect CSI gaps on a sunny drive until the module is replaced or fixed. The 2026-10-26 "degraded driver state, reboot before a drive" diagnosis was wrong (2026-10-27 log section). Driver candidate C (no group hold, no gain delay) is not a fix; do not install it. **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
 | UGREEN | `/dev/video1` next to the CSI camera (`/dev/video0` without it), pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. `usb_test`, `record_test` Part B and `scan_cameras` pass on it with the 2026-10-11 build (2026-10-12). It has **no** `exposure_dynamic_framerate` control. |
 | v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). **The newest build is now `bin/build_20261011_003045`**, which holds the uncommitted 2026-10-11 library changes (behaviour-neutral, all tests pass); the service runs it at its next start. `bin/build_20261011_002908` is a test build of the old float code; delete it through the container if wanted. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on, logs at 16 MB × 8, and since 2026-10-10 no obsolete settings (backup `dashcam.xml.bak-20261010-before-obsolete-cleanup`). Its wrong "autofocus stuck at 512" comment was corrected on 2026-10-12 (comment only; backup `dashcam.xml.bak-20261012-before-focus-comment`). |
 | MKR Zero | Production raw-CAN build (`3a702a8`). It boots into DISCOVER: listen-only, accept-all, raw `F`/`FS` lines on native USB, no decode. Its millis() clock is **not** held to the crystal (+1300 → −140 ppm within a drive; 2026-10-11 log section). |
@@ -40,7 +40,7 @@ This file has three parts:
 | ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
 | ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
-| Lane detection test suite | `24110f6`, `650701a`, P5b in the commit after this file's 2026-10-26 update | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. **P5b done on the bench (2026-10-26 log section):** clip rings, tensor dumps, mount monitor, live CAN triggers, supervisor (restarts, degrade ladder, status), status display program, calibration, bench tools; B0 / B3m / 60-min soak pass (UGREEN), the 10-03 CSI slip is detected. Never run in the car. | Finish the IMX296 degradation hunt; reboot before driving; `lane_run.sh calibrate` in the parked car; then the first lane drive (day, then night). |
+| Lane detection test suite | `24110f6`, `650701a`, P5b in the commit after this file's 2026-10-26 update | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. **P5b done on the bench (2026-10-26 log section):** clip rings, tensor dumps, mount monitor, live CAN triggers, supervisor (restarts, degrade ladder, status), status display program, calibration, bench tools; B0 / B3m / 60-min soak pass (UGREEN), the 10-03 CSI slip is detected. Never run in the car. | The IMX296 module still resets in bright sun even with the gain floor (2026-10-27 log section): replace or fix the module before relying on CSI lanes, or accept CSI gaps; `lane_run.sh calibrate` in the parked car; then the first lane drive (day, then night). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
 ## Open work, in priority order
@@ -53,9 +53,9 @@ This file has three parts:
      spanned about 20°, and single jumps reached 250 px. Level it within 2°, keep the dashboard to at most 30% of the frame, and take reference frames
      before and after the drive;
    - decide whether to re-arm the drive crontab. The session's stop guard now refuses a stop while the car moves;
-   - **for a lane test drive** (`tools/lane_eval/DRIVE_PROCEDURE.md`): reboot the Jetson (or
-     `sudo docker_dev/csi_driver.sh reload`) shortly before: after ~a day with the driver loaded the IMX296 faults
-     under AE + GPU load (2026-10-26 evening log section). Then, parked on a marked road, `tools/lane_eval/lane_run.sh calibrate`: it proposes crops (CSI default rows
+   - **for a lane test drive** (`tools/lane_eval/DRIVE_PROCEDURE.md`): use a build from 2026-10-27 or later, whose
+     CSI pipeline floors the IMX296 gain (below it the sensor resets itself in bright light; 2026-10-27 log section),
+     with the stock driver loaded; in sun it still resets about every 5 min (the harness recovers in ~25 s). Then, parked on a marked road, `tools/lane_eval/lane_run.sh calibrate`: it proposes crops (CSI default rows
      544–864 of 1088 were mostly dashboard on 2026-10-03) and writes the mount template; start with
      `--csi-crop T,B --usb-crop T,B --mount-ref CAL_NNN/mount`. `lane_run.sh` refuses to start while `dashcam-v04`
      runs. The CYD shows the status pages only with its navigation firmware (the 2026-10-13 dashboard firmware does
@@ -396,7 +396,66 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-10-27 (Jetson, bench): the IMX296 resets itself at low analogue gain; gain floor in Camera_CSI
+
+The user: check the degradation hunt; then reload the stock driver and test in daylight, then candidate C; lens
+capped; the module is an InnoMaker IMX296 colour board, bare PCB, stuck circuitry-down on the bench; no hardware to
+swap the module or feed it from a bench supply; then "go with the gain range limit" and correct HANDOVER. Data and
+tools outside the repo: `~/drive_logs/lane_p0/P0_REPORT.md` (sections from "Degradation hunt result"),
+`~/drive_logs/lane_p0/driver_ab/` (`fault_test.sh … trt|usb|none`, `AE_EXPRANGE` / `AE_SRCPROPS` / `AE_FPS`,
+`shs_poll.py`, `fps_test.sh`), captures in `/media/jetson/backup/lane_tests/flicker/`.
+
+- **The hunt** (stock driver, fresh boot): 15 probes 22:05–05:24 clean (night, gain median ~120), then three at dawn
+  05:51–06:02 all faulted (gain median ~60, min 16). It tracked the light, not uptime (8.8 h) or sessions (198).
+- **Module age is ruled out:** a freshly reloaded stock driver, camera at the window, faulted 3/3 (51–111 s). Every
+  2026-10-26 "stock passes after a reload" test had run at night. Candidate C faulted 4/4 in daylight too.
+- **The sensor resets itself.** `shs_poll.py` reads SHS1 / VMAX / GAIN on i2c-9 0x1a every 5 ms (read-only,
+  `I2C_RDWR`; the jetson user is in group `i2c`). At every fault the sensor NACKs I2C for 166–173 ms, exactly when
+  frames stop, and then reads back its power-on defaults (SHS1 14, VMAX 1130, GAIN 0); the driver's `power_off` comes
+  only with the Argus teardown 3.4 s later.
+- **The trigger is the gain.** Faults with no GPU load, with exposure pinned (85 or 999 lines), with one register
+  write in the whole run, and with the lens capped (dark sensor; the board's parts face the bench). Lens covered,
+  exposure pinned, no load: GAIN register 16 faults in seconds to a minute; 24 / 32 / 40 clean and 48 faulted once in
+  5 min; 64 clean for 20 min, 128 and 200 clean. AE in the dark settles at 200 and runs clean. Light only matters
+  because bright scenes drive AE to the floor (register 16 = Argus 1.0, the DT minimum).
+- **Frame rate:** 8 pairs at gain 16: 60 fps 3.3 resets/min, 30 fps 4.3/min (ratio 1.32, 95 % CI 0.50–3.52). A
+  per-readout current spike (ratio 0.5) is disfavoured, not excluded; two 30 fps runs reset before the first frame.
+  Times to reset lengthened as the module cooled after a sunlit soak, which suggests temperature raises the hazard.
+- **Driver vs mainline** (a workflow plus skeptic checks): the vendor init sequence is the mainline / Raspberry Pi
+  one (41-entry init table byte-identical, the same gain table); no register difference links to gain or a reset.
+  Leading explanation: a power or bias margin on the InnoMaker module (no DT regulators; FPC pin 11 = CAM1_PWDN is
+  its power enable, 3.3 V on pin 15, 1.2 / 1.8 V made on the board), in this unit or in the design. Swap tests (the
+  module on a Pi, a second module, a bench 3.3 V feed, bulk decoupling at pin 15) would separate them.
+- **Workaround:** `Camera_CSI::buildPipelineString()` now sets `gainrange="4 12.5"` (register 64–200) on every CSI
+  pipeline; a `gainrange` attribute still replaces it. The same range passed a 30-min daylight soak with `trtexec`
+  load and AE stepping (gain on the floor most of the time) that faulted within 1–3 min without it. Cost: a little
+  more noise in bright scenes (AE shortens the exposure instead; exposure ran 63–1000 lines). `camera_gst_test`'s
+  exact pipeline string is updated.
+- **Side findings, not changed:** `set_exposure` clamps the exposure only from above (SHS1 can exceed VMAX − 2 for an
+  exposure under 2 lines; not reached with DT limits); SHS1 is not recomputed when only VMAX changes (at 30 fps the
+  999-line request ran at 2124 lines); `fault_test.sh` missed one Argus wording ("Skipping requests on sensor GUID 0"),
+  now matched.
+- **Soak with the floor** (stock driver reloaded, build `build_20261027_040632`, camera at the window in midday sun,
+  `lane_run.sh start --minutes 30 --display none --no-can`, run_018): the floor held (gain exactly 64 for 96 % of
+  the streaming time, never lower), yet the sensor reset 6 times at 64 (mean ~5 min apart) and 3 more times
+  16–20 ms after stream-on at gain 192, each ~23 s after a reset. So the floor lowers the hazard but does not remove
+  it; the module also resets on the stream-on current step when stressed (sun, heat; Jetson tj 54–58 °C, VDD_IN
+  4.89 V at the 14 W reset moments). The harness recovered every time: CSI 31 640 results over 29.7 min, mean
+  19.75 Hz, 12 in-process and 9 container restarts; the UGREEN ran clean. **Open:** two CSI instances ended with
+  exit 134 (abort) instead of 3 after a reset at start; their logs were overwritten (`sys/lane_csi.log` keeps only
+  the last instance).
+- **State:** the stock driver is loaded again; `dashcam-v04` stopped.
+- **Addendum 2026-10-29: heat is the main factor.** The user detached the module and put it under an AC airflow
+  (20 °C); fresh boot, stock driver. The IMX296's die temperature is readable over I2C (write 0x301d = 1, read
+  0x301e, 10 bits, T = 246.312 − 0.304 × TMDOUT, write 0x301d = 0; works in standby). Gain register 16, exposure
+  pinned, no load: 3 × 5 min clean with the die at 26.5–34.7 °C, where the warm module had reset 18 times out of 18
+  within ~70 s. No die temperature was logged during any faulting run; a warm-up test to find the reset temperature
+  is running. Cooling the module (shade, airflow, a heatsink) is likely the real fix; the gain floor adds margin.
+
 ## 2026-10-26 evening (Jetson, bench): the IMX296 fault is a degraded driver/sensor state, not hardware
+
+> **Corrected 2026-10-27:** wrong. The fault is a sensor self-reset at low analogue gain; every "stock driver
+> passes after a reload" test below ran at night, when AE kept the gain high (2026-10-27 log section).
 
 The user, after P5b: restart nvargus-daemon and test the CSI again; "the rig is physically unchanged from yesterday
 so could be a software issue"; then find the root cause. Data: `~/drive_logs/lane_p0/P0_REPORT.md` (P5b section,
@@ -465,7 +524,8 @@ ladder, `.ass` banner, ROI calibration, bench tests B0/B3/B3m/B5/B9). Full numbe
   parameter struct mismatch") → no OpenCV/libjpeg in `lane_drive`, band JPEGs via GStreamer `jpegenc`, the status
   display a separate binary. A `videorate max-rate=5` after a tee negotiated the upstream 30 fps `videorate` down to
   ~5 fps → PTS probe decimators.
-- **Open:** the IMX296 sensor timeouts (found the same evening to be a degraded state: section above); the CYD needs its navigation firmware for the status
+- **Open:** the IMX296 sensor timeouts (found the same evening to be a degraded state: section above; corrected
+  2026-10-27, a low-gain sensor reset); the CYD needs its navigation firmware for the status
   pages; the single-camera TensorRT p99 gate (25 ms) fails at the governor's low GPU clock (29.6 ms); not done: B5
   (needs a person with a torch), a dark-room soak, B1b, GNSS logger, a lane-based mount check.
 

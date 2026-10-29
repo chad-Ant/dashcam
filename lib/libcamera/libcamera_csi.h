@@ -44,7 +44,7 @@ namespace dashcam::camera {
  *
  * Supplies the Camera_GST hooks to build an nvarguscamerasrc pipeline:
  * @verbatim
- *   nvarguscamerasrc name=camerasrc sensor-id=N
+ *   nvarguscamerasrc name=camerasrc sensor-id=N gainrange="4 12.5"
  *     ! video/x-raw(memory:NVMM), NV12, WxH, fps
  *     [! nvvidconv ! scaled NV12] [! videorate ! capped fps]   ← setOutputResolution()
  *     ! tee name=srctee
@@ -58,6 +58,11 @@ namespace dashcam::camera {
  * capture.  Pre-start attributes are queued and applied in start() before the
  * pipeline transitions to PLAYING, so the first captured frame already uses
  * the requested settings.
+ *
+ * The analogue gain range defaults to "4 12.5" (GAIN register 64-200): the
+ * rig's IMX296 resets itself mid-stream at lower gains (see libcamera_csi.cpp);
+ * this lowers, but does not remove, the resets.
+ * A "gainrange" attribute replaces that range.
  */
 class Camera_CSI : public Camera_GST {
 protected:

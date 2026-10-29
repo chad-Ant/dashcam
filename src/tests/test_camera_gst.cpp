@@ -1615,7 +1615,8 @@ static void testPipelineStrings() {
     CsiProbe cp(csi);
     cp.setOutputResolution(1280, 720, 20.0f);
     const std::string c = cp.pipeline({1920, 1080, 60.0f, V4L2_PIX_FMT_NV12, "NV12"});
-    check(c == "nvarguscamerasrc name=camerasrc sensor-id=1 ! video/x-raw(memory:NVMM), width=1920,"
+    check(c == "nvarguscamerasrc name=camerasrc sensor-id=1 gainrange=\"4 12.5\" !"
+               " video/x-raw(memory:NVMM), width=1920,"
                " height=1080, format=(string)NV12, framerate=60/1 ! nvvidconv !"
                " video/x-raw(memory:NVMM), width=1280, height=720, format=(string)NV12 ! videorate !"
                " video/x-raw(memory:NVMM), width=1280, height=720, format=(string)NV12,"
