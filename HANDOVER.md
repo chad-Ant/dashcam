@@ -16,10 +16,10 @@ This file has three parts:
 | Platform | L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra, UEFI 36.5.2 (upgraded 2026-10-01). The 65 NVIDIA packages are held. |
 | CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **At low analogue gain the sensor resets itself** mid-stream: it drops off I2C for ~170 ms and comes back with its power-on defaults, and Argus reports `waitCsiFrameStart Timeout … Sensor GUID 0 is in error state`. The hazard rises steeply as the gain falls: GAIN register 16 (Argus 1.0, the DT floor) resets within seconds to a minute; in the dark none was seen at 64 and above, but in midday sun the module also reset at 64 and on stream-on. Heat is the main factor: cooled to a ~34 °C die it ran gain 16 clean (2026-10-29). Bright scenes hit it because AE drives the gain to the floor. Light, exposure, register traffic, GPU load, frame rate, module age and the driver build are ruled out; the cause is on the module (power or bias margin, unit or design; not testable without hardware). **Mitigation, not a fix, in `Camera_CSI` since 2026-10-27:** every CSI pipeline sets `gainrange="4 12.5"` (register 64–200); a `gainrange` attribute replaces it. It passed a 30-min daylight `trtexec` soak that otherwise faulted within 1–3 min, but a midday two-camera `lane_drive` soak (run_018, camera in the sun) still reset 6 times at gain 64 plus 3 times at stream start; the harness kept CSI lanes at a mean 19.75 Hz through 9 container restarts. Expect CSI gaps on a sunny drive until the module is replaced or fixed. The 2026-10-26 "degraded driver state, reboot before a drive" diagnosis was wrong (2026-10-27 log section). Driver candidate C (no group hold, no gain delay) is not a fix; do not install it. **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
 | UGREEN | `/dev/video1` next to the CSI camera (`/dev/video0` without it), pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. `usb_test`, `record_test` Part B and `scan_cameras` pass on it with the 2026-10-11 build (2026-10-12). It has **no** `exposure_dynamic_framerate` control. |
-| v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). **The newest build is now `bin/build_20261011_003045`**, which holds the uncommitted 2026-10-11 library changes (behaviour-neutral, all tests pass); the service runs it at its next start. `bin/build_20261011_002908` is a test build of the old float code; delete it through the container if wanted. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on, logs at 16 MB × 8, and since 2026-10-10 no obsolete settings (backup `dashcam.xml.bak-20261010-before-obsolete-cleanup`). Its wrong "autofocus stuck at 512" comment was corrected on 2026-10-12 (comment only; backup `dashcam.xml.bak-20261012-before-focus-comment`). |
+| v0.4 | `dashcam-v04.service` is **enabled but inactive**. Its last run (2026-10-09 16:01–17:33) found neither the UGREEN nor the C3, retried every 3 s, and was stopped cleanly at 17:33:36 (`log_20261009_160103.txt`). **The newest build is now `bin/build_20261011_003045`**, which holds the uncommitted 2026-10-11 library changes (behaviour-neutral, all tests pass); the service runs it at its next start. `bin/build_20261011_002908` is a test build of the old float code; delete it through the container if wanted. The deployed `/user/output/configs/dashcam.xml` has `TelemetryCsv` on, logs at 16 MB × 8, and since 2026-10-10 no obsolete settings (backup `dashcam.xml.bak-20261010-before-obsolete-cleanup`). Its wrong "autofocus stuck at 512" comment was corrected on 2026-10-12 (comment only; backup `dashcam.xml.bak-20261012-before-focus-comment`). **2026-10-29:** `9fac0c2` adds an optional read-only monitoring publisher (`<MonitoringEnabled>`, default off); the deployed launcher and config do not enable it yet. |
 | MKR Zero | Production raw-CAN build (`3a702a8`). It boots into DISCOVER: listen-only, accept-all, raw `F`/`FS` lines on native USB, no decode. Its millis() clock is **not** held to the crystal (+1300 → −140 ppm within a drive; 2026-10-11 log section). |
 | ESP32-C3 | Bridge firmware 1.0; `HostProtocol` and `CommProtocol` are at 0x07. |
-| Lane engine and image (2026-10-25) | `models/culane_res18_fp16.engine` is now a **native FP16 build made on this Jetson** (413 MB, sha256 `d048fbde…`, 9.4 ms GPU vs 14.0 ms); the old 803 MB engine (FP32 head, built on another device) is kept beside it as `.prev803_bak`. It is also v0.2/v0.3's engine. `models/` is gitignored: the build command is in `liblanedetector.h`. `l4t-ml-gpio:latest` was rebuilt with matplotlib, addict and psmisc (`24110f6`); the previous image is tagged `build_20261025_143839`. The newest build is `bin/build_20261026_053024` (all targets, including `lane_drive` and `lane_status`; `bin/build_20261025_195258` is the P5a build). Run data: `/media/jetson/backup/lane_tests/`, replay packs `/media/jetson/backup/lane_replay/`, goldens and tiny engines in `~/drive_logs/lane_golden`, `~/drive_logs/lane_engines`. |
+| Lane engine and image (2026-10-25) | `models/culane_res18_fp16.engine` is now a **native FP16 build made on this Jetson** (413 MB, sha256 `d048fbde…`, 9.4 ms GPU vs 14.0 ms); the old 803 MB engine (FP32 head, built on another device) is kept beside it as `.prev803_bak`. It is also v0.2/v0.3's engine. `models/` is gitignored: the build command is in `liblanedetector.h`. `l4t-ml-gpio:latest` was rebuilt with matplotlib, addict and psmisc (`24110f6`); the previous image is tagged `build_20261025_143839`. The newest build is `bin/build_20261029_092154` (all targets at `9fac0c2` plus the `monitoring_test` Makefile fix; `bin/build_20261027_045254` has the gain floor, `bin/build_20261026_053024` is P5b, `bin/build_20261025_195258` P5a). Run data: `/media/jetson/backup/lane_tests/`, replay packs `/media/jetson/backup/lane_replay/`, goldens and tiny engines in `~/drive_logs/lane_golden`, `~/drive_logs/lane_engines`. |
 | Drive logging | `~/drive_logs/tools/drive_session/` (outside the repo). The `@reboot` crontab line is **disarmed**. Since 2026-10-10: `drive_watch.sh` watches the raw-CAN files, tegrastats runs every 1 s, and `drive_session.sh stop` refuses while the car is moving (`--force` overrides). |
 | Storage | `/media/jetson/backup` sits on the root NVMe: 428 GB free. |
 | Uncommitted | `peripherals/mkr_zero/tools/canstream/` (logger hung-disk bound, tests, README); `peripherals/mkr_zero/libraries/EncoderPan/` (standalone servo/encoder prototype); `lib/libcan/libcan.cpp`, `lib/libgpio/libgpio.cpp`, `lib/libcamera/libcamera.{h,cpp}`, `lib/libconfig/libconfig.{h,cpp}`, `src/tests/test_libconfig.cpp`; since 2026-10-12: `tools/isp_tuning/chart/v2/` (capture helper, tests, docs), `peripherals/cyd/` (the dashboard app the user copied in from a colleague's uncommitted work, with my fixes; bring-up sketch fixes; CH340 driver script; README), `docker_dev/Dockerfile`, `build.sh` and `install_samd_aarch64.py`; this file. Since 2026-10-13/14: `peripherals/es3c28p/` (colleague's board port + firmware video side; my protocol headers, vectors, tests, Python playback), `lib/libvideopreview/`, `lib/libes3display/`, the preview tap in `lib/librecord/`, `<DisplayPreview>` in `lib/libconfig/`, `src/dashcam_v0_4.cpp`, the Makefile, their tests, and the Dockerfile JPEGDEC pin (image rebuilt). |
@@ -39,6 +39,7 @@ This file has three parts:
 | CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
 | ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). No board here yet. | Flash the board, add its udev alias, enable `<DisplayPreview>`, soak at 10 and 15 fps. |
 | ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
+| Android connector (Dashcam Connect) | `9fac0c2` | Read-only phone/tablet dashboard for v0.4 (2026-10-29 log section): v0.4 publishes a JSON snapshot each supervisor tick (~5 Hz) to a nonblocking Unix datagram socket (`src/monitoring.h`, `<MonitoringEnabled>` / `<MonitoringSocket>` under `<Network>`, off by default); a host Python agent (`connector/service.py`, systemd unit `connector/dashcam-monitor.service`) adds 1 Hz host health and serves up to four Android clients over a certificate-pinned, bearer-authenticated TLS WebSocket on TCP 8443, with optional mDNS. Android app in `android/` (Kotlin/Compose, minSdk 28, target 37; pages Live / Vehicle / System / Connection; Keystore-encrypted pairings). No commands, preview, map or ADAS. Software-validated (`connector/VALIDATION.md`): Android unit/lint/emulator, 10 agent tests, `monitoring_test`, `config_test`, an end-to-end v0.4 → agent → TLS smoke test on this Jetson. **Not deployed** on the rig: no agent service, state dir or launcher socket mount. | Install the agent, add the socket mount and XML keys, pair the Samsung S25 Ultra and Tab S10 FE; then the physical acceptance in `connector/VALIDATION.md`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | Lane detection test suite | `24110f6`, `650701a`, P5b in the commit after this file's 2026-10-26 update | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. **P5b done on the bench (2026-10-26 log section):** clip rings, tensor dumps, mount monitor, live CAN triggers, supervisor (restarts, degrade ladder, status), status display program, calibration, bench tools; B0 / B3m / 60-min soak pass (UGREEN), the 10-03 CSI slip is detected. Never run in the car. | The IMX296 module still resets in bright sun even with the gain floor (2026-10-27 log section): replace or fix the module before relying on CSI lanes, or accept CSI gaps; `lane_run.sh calibrate` in the parked car; then the first lane drive (day, then night). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
@@ -93,13 +94,19 @@ This file has three parts:
    (the section is absent there, so the preview stays off until added) and soak at 10 fps, then 15 fps.
 10. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
    boot alert, tap-test touch, cover/uncover the LDR (it read ~980 in the room and held the backlight at 32/255).
-11. **Smaller items:**
+11. **Android connector** (`connector/README.md`, `connector/VALIDATION.md`; 2026-10-29 log section): install the host
+    agent (venv, `service.py init`, `service.env` with `LAN_ADDRESS` and the host footage path), enable
+    `dashcam-monitor.service` (sudo), add `--volume /run/dashcam-monitor:/run/dashcam-monitor` to the v0.4 launcher and
+    `<MonitoringEnabled>true</MonitoringEnabled>` to the deployed config, pair the phone and tablet. Then the physical
+    checks: speed against the bridge, C3 unplug, v0.4 and agent restarts, Wi-Fi loss, rotation, LAN-permission
+    deny/regrant, mDNS on the real router (client isolation), and recording FPS/CPU/memory with two viewers.
+12. **Smaller items:**
    - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
    - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
    - a night plate test on an unlit road, and autofocus while driving;
    - whether a link loss minutes after a recovered link-up should stay DEBUG-only (the 00:06 MKR reboot was);
    - item U with a replug, and the optional item O step (both need sudo).
-12. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
+13. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
     warnings and the float control ranges. Left: the `const_cast` in `getCameraStatus()`.
 
 # Reference
@@ -259,6 +266,9 @@ $B/commlink_test "" 30                               # auto-discover with the tt
 $B/record_test                                       # Part A needs GStreamer base/good/bad/ugly plugins; Part B a camera
 $B/usb_test                                          # a USB camera (stop dashcam-v04 first); puts its controls back
 $B/scan_cameras                                      # lists the cameras, their controls and formats
+$B/monitoring_test                                   # v0.4 monitoring JSON + nonblocking socket (no agent needed)
+python3 -m unittest discover -s connector -p test_service.py   # Android connector agent, 10 tests (needs aiohttp,
+                                                     #   cryptography, zeroconf: connector/requirements.txt)
 make -C peripherals/mkr_zero/tools/canstream check   # raw-CAN logger, converter, decoder, contract, turning + fusion (~2 min; container)
 $B/lane_test --unit --strict --allow-xfail B5,B6,B8  # liblanedetector CPU tier (<1 s); B5/B6/B8 are known, deferred bugs
 $B/lane_test --gpu --strict --engine models/culane_res18_fp16.engine --tiny /user/lane_engines/tiny.engine \
@@ -396,6 +406,46 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-10-29 (user, committed `9fac0c2`): Android dashboard and read-only Jetson monitoring connector
+
+Added by the user (commit `9fac0c2`, "Add Android dashboard and read-only Jetson monitoring connector"); this entry
+summarises it. Design and setup: `connector/README.md`; checks done and still to do: `connector/VALIDATION.md`.
+
+- **Data path:** `dashcam_v0_4 → nonblocking Unix datagram → host Python agent → TLS WebSocket → Android`. v0.4 builds
+  one JSON snapshot per supervisor tick (~5 Hz; `src/monitoring.h`): recording state, frames, measured fps, bridge
+  freshness and age, vehicle values (speed with its source CAN → GNSS → OBD, acceleration, position, heading,
+  satellites, rpm, OBD coolant/fuel/throttle/load) through the same `applyBridgeTelemetry` rules as the overlay;
+  invalid or non-finite values become `null`, and `adas.lane_available` / `driver_available` are always false. The
+  send is `MSG_DONTWAIT` and capped at 16 KiB, so a missing or stalled agent costs only dashboard updates; it runs in
+  the supervisor loop, not in camera or bridge callbacks, and publishes even with no recording camera.
+- **Config:** `<Network><MonitoringEnabled>` (default false) and `<MonitoringSocket>` (default
+  `/run/dashcam-monitor/telemetry.sock`) in libconfig, with a `config_test` round trip. The recording container needs
+  the socket's **directory** mounted, and must run as the agent's UID or as root.
+- **Host agent** (`connector/service.py`; aiohttp, cryptography, zeroconf pinned in `requirements.txt`): `init` makes
+  a device identity and TLS certificate, `pair` prints a private pairing link (credential + certificate SHA-256 pin),
+  `serve` listens on TCP 8443 with routes `/v1/identity`, `/v1/snapshot` and the `/v1/stream` WebSocket (5 Hz, at most
+  four viewers), samples host health at 1 Hz (CPU, GPU, RAM, swap, storage of the footage path, uptime, thermal
+  zones), and expires runtime data 2 s after the sender's monotonic stamp; `--simulate` serves labelled fake data.
+  `connector/dashcam-monitor.service` runs it hardened (user jetson, `ProtectSystem=strict`). Optional mDNS
+  `_dashcam._tcp` advertises only the device ID and schema; discovery never grants trust.
+- **Android app** (`android/`, `com.dashcam.connector` 0.1.0, Kotlin/Compose, minSdk 28, compile/target 37, Gradle
+  wrapper checked in): one adaptive layout for phone portrait and tablet landscape; pages Live, Vehicle, System and
+  Connection; pins the certificate before sending the credential, checks the device ID on every snapshot, blanks the
+  display 2 s after the last message (monotonic clock), stores pairings encrypted with an Android Keystore key, app
+  backup off; needs only the local-network permission. Debug-signed personal build; no signing key in the repo.
+- **Validated (software, `connector/VALIDATION.md`):** Android unit tests, lint and an Android 17 emulator against the
+  simulator (live TLS stream, wrong-pin rejection, both orientations); the 10 agent tests on Windows and on this
+  Jetson; native ARM64 `dashcam_v0_4`, `monitoring_test` and `config_test` in `l4t-ml-gpio`; an end-to-end smoke
+  test (v0.4 without cameras → agent → pinned TLS) from an isolated copy in `~/.cache/dashcam-connector-validation`.
+  Re-run here on 2026-10-29 from the committed tree: `monitoring_test` and `config_test` (15 suites) pass, and the
+  10 agent tests pass with the validation copy's dependencies (`PYTHONPATH=~/.cache/dashcam-connector-validation/.python`;
+  the host Python has none of them installed).
+- **Not done:** deployment on the rig (agent service, state directory, launcher mount and config keys are all
+  absent), pairing the real Samsung S25 Ultra and Tab S10 FE, mDNS on the real router, live vehicle telemetry,
+  and the recording-throughput check with two viewers (open-work item 11).
+- **Follow-up the same day:** `monitoring_test` was missing from the Makefile's `TARGETS`; added, so plain `make` builds
+  it (`bin/build_20261029_092154`, all targets; it passes).
+
 ## 2026-10-27 (Jetson, bench): the IMX296 resets itself at low analogue gain; gain floor in Camera_CSI
 
 The user: check the degradation hunt; then reload the stock driver and test in daylight, then candidate C; lens
@@ -449,8 +499,16 @@ tools outside the repo: `~/drive_logs/lane_p0/P0_REPORT.md` (sections from "Degr
   (20 °C); fresh boot, stock driver. The IMX296's die temperature is readable over I2C (write 0x301d = 1, read
   0x301e, 10 bits, T = 246.312 − 0.304 × TMDOUT, write 0x301d = 0; works in standby). Gain register 16, exposure
   pinned, no load: 3 × 5 min clean with the die at 26.5–34.7 °C, where the warm module had reset 18 times out of 18
-  within ~70 s. No die temperature was logged during any faulting run; a warm-up test to find the reset temperature
-  is running. Cooling the module (shade, airflow, a heatsink) is likely the real fix; the gain floor adds margin.
+  within ~70 s. No die temperature was logged during any faulting run. A warm-up test (11 more runs, 55 min at gain
+  16) stayed clean with the die at 30–39 °C: the module never got warmer, so the reset temperature is only known to
+  be above 39 °C. The user stopped the investigation there (no means to heat or measure the module now). Cooling
+  the module (shade, airflow, a heatsink) is likely the real fix; the gain floor adds margin.
+- **Open (CSI):** the reset die temperature (warm the module while `~/drive_logs/lane_p0/driver_ab/ramp_test.sh
+  NAME 24` runs; it stops at the first reset and logs the die temperature); how hot the module gets behind the
+  windshield; logging the die temperature in `lane_drive` (the register read above, e.g. once per 5 s next to the
+  1 Hz counters) so in-car resets carry it; the two exit-134 aborts after a reset at stream start (run_018), whose
+  logs were lost because `sys/lane_csi.log` keeps only the last instance. Raw `.gray` probe captures were deleted on
+  2026-10-29; the CSVs and logs stay in `/media/jetson/backup/lane_tests/flicker/`.
 
 ## 2026-10-26 evening (Jetson, bench): the IMX296 fault is a degraded driver/sensor state, not hardware
 
