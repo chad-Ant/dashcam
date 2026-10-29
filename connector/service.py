@@ -17,6 +17,7 @@ import secrets
 import socket
 import ssl
 import stat
+import struct
 import time
 import uuid
 from urllib.parse import quote, urlencode
@@ -31,6 +32,16 @@ from health import Health
 
 MAX_PACKET = 16384
 STALE_SECONDS = 2.0
+MAX_VIEWERS = 4  # per channel: /v1/stream and /v1/video each
+# Camera preview, little-endian: magic, header length, then v0.4 datagram = capture CLOCK_MONOTONIC us,
+# source sequence; client message = agent frame sequence, age ms at send time; then width, height, JPEG.
+VIDEO_MAGIC = b'DCV1'
+VIDEO_HEADER = struct.Struct('<4sIQIHH')
+MAX_VIDEO_JPEG = 262144
+VIDEO_NEW_PRODUCER_SECONDS = 5.0  # capture time going back this far = another v0.4 run
+VIDEO_SEND_MAX_AGE = 1.0
+VIDEO_MIN_INTERVAL = .09  # <= 10 fps per viewer
+DEMAND_INTERVAL = .5  # v0.4 converts while the demand file is < 3 s old
 CA_NETWORKS = [ipaddress.ip_network(n) for n in (
     '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '169.254.0.0/16',
     '::1/128', 'fd00::/8', 'fe80::/10')]
@@ -40,7 +51,7 @@ LABEL = re.compile(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?')
 COOKIE = '__Host-dcsession'
 COOKIE_VALUE = re.compile(r'v1\.([0-9]{1,12})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})')
 SECURITY_HEADERS = {
-    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY',
     'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Resource-Policy': 'same-origin',
@@ -271,8 +282,25 @@ def load_identity(directory):
     return identity
 
 
+def jpeg_size(data):
+    """(width, height) from the first SOF0/1/2 segment, or None."""
+    i = 2 if data[:2] == b'\xff\xd8' else len(data)
+    while i + 9 <= len(data) and data[i] == 0xFF:
+        if data[i + 1] in (0xC0, 0xC1, 0xC2):
+            height, width = struct.unpack_from('>HH', data, i + 5)
+            return (width, height) if width and height else None
+        i += 2 + int.from_bytes(data[i + 2:i + 4], 'big')
+    return None
+
+
+def video_message(frame, age_s):
+    age_ms = min(max(0, int(age_s * 1000)), 0xFFFFFFFF)
+    return VIDEO_HEADER.pack(VIDEO_MAGIC, VIDEO_HEADER.size, frame['seq'], age_ms,
+                             frame['width'], frame['height']) + frame['jpeg']
+
+
 class State:
-    def __init__(self, identity, storage):
+    def __init__(self, identity, storage, video_demand=None):
         self.identity = identity
         self.source = None
         self.health = {}
@@ -282,6 +310,12 @@ class State:
         self.session = str(uuid.uuid4())
         self.invalid_packets = 0
         self.tasks = []
+        self.video = None  # latest frame only
+        self.video_seq = 0
+        self.invalid_video = 0
+        self.video_clients = set()
+        self.video_demand = Path(video_demand) if video_demand else None
+        self.demand_failed = False
 
     def accept(self, data):
         try:
@@ -300,6 +334,50 @@ class State:
             self.source = source
         except (ValueError, KeyError, TypeError, UnicodeError, RecursionError):
             self.invalid_packets += 1
+
+    def accept_video(self, data):
+        try:
+            if not VIDEO_HEADER.size <= len(data) <= VIDEO_HEADER.size + MAX_VIDEO_JPEG:
+                raise ValueError('size')
+            magic, header, capture_us, sequence, width, height = VIDEO_HEADER.unpack_from(data)
+            capture = capture_us / 1e6
+            jpeg = bytes(data[header:])
+            if (magic != VIDEO_MAGIC or not VIDEO_HEADER.size <= header <= len(data) - 4 or
+                    jpeg[:2] != b'\xff\xd8' or jpeg[-2:] != b'\xff\xd9' or
+                    not 1 <= width <= 4096 or not 1 <= height <= 4096 or
+                    not math.isfinite(capture) or not 0 <= time.monotonic() - capture <= STALE_SECONDS):
+                raise ValueError('invalid frame')
+        except (ValueError, TypeError, struct.error):
+            self.invalid_video += 1
+            return
+        current = self.video
+        if (current and sequence <= current['source_seq'] and
+                capture >= current['capture_mono_s'] - VIDEO_NEW_PRODUCER_SECONDS and
+                time.monotonic() - current['capture_mono_s'] <= STALE_SECONDS):
+            return  # queued or reordered datagram of the same producer; an expired frame binds nothing
+        self.video_seq += 1
+        self.video = {'jpeg': jpeg, 'seq': self.video_seq, 'source_seq': sequence,
+                      'capture_mono_s': capture, 'width': width, 'height': height}
+
+    def touch_demand(self):
+        """Tell v0.4 someone is watching; it stops converting once the mtime is 3 s old."""
+        if self.video_demand is None:
+            return
+        try:
+            fd = os.open(self.video_demand, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK |
+                         os.O_CLOEXEC, 0o600)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError('not a regular file')
+                os.utime(fd)
+            finally:
+                os.close(fd)
+        except OSError as error:
+            if not self.demand_failed:
+                print(f'WARNING: cannot update the video demand file {self.video_demand}: {error}', flush=True)
+            self.demand_failed = True
+        else:
+            self.demand_failed = False
 
     def snapshot(self):
         age = None if self.source is None else max(0, int((time.monotonic() - self.source['source_mono_s']) * 1000))
@@ -320,6 +398,28 @@ class Receiver(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, _addr):
         self.state.accept(data)
+
+
+class VideoReceiver(asyncio.DatagramProtocol):
+    def __init__(self, state):
+        self.state = state
+
+    def datagram_received(self, data, _addr):
+        self.state.accept_video(data)
+
+
+async def refuse_messages(ws):
+    async for msg in ws:
+        if msg.type in (WSMsgType.TEXT, WSMsgType.BINARY):
+            await ws.close(code=1008, message=b'Read-only channel')
+            break
+
+
+async def touch_demand_while_watched(state):
+    while True:
+        if state.video_clients:
+            state.touch_demand()
+        await asyncio.sleep(DEMAND_INTERVAL)
 
 
 def browser_hosts(sans, port):
@@ -388,7 +488,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
             return await handler(request)  # those check for themselves; bearer = Android, unchanged
         if valid_cookie(request.cookies.get(COOKIE)):
             # Browser session: only for our own origin, and never a cross-site WebSocket.
-            needs_origin = 'Origin' in request.headers or request.match_info.handler is stream
+            needs_origin = 'Origin' in request.headers or request.match_info.handler in (stream, video)
             if not browser_host(request) or (needs_origin and not same_origin(request)):
                 raise web.HTTPForbidden(text='Same-origin browser request required')
             return await handler(request)
@@ -402,14 +502,14 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
 
     async def identity(_request):
         return web.json_response({'schema': 1, 'id': state.identity['id'], 'name': state.identity['name'],
-                                  'capabilities': {'vehicle': True, 'system': True, 'lane': False,
+                                  'capabilities': {'vehicle': True, 'system': True, 'video': True, 'lane': False,
                                                    'driver': False, 'controls': False}}, dumps=encode)
 
     async def snapshot(_request):
         return web.json_response(state.snapshot(), dumps=encode)
 
     async def stream(request):
-        if len(state.clients) >= 4:
+        if len(state.clients) >= MAX_VIEWERS:
             raise web.HTTPServiceUnavailable(text='Maximum viewers reached')
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=4096, compress=False)
         # Reserve a slot before the upgrade awaits, so concurrent handshakes
@@ -417,12 +517,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
         state.clients.add(ws)
         try:
             await ws.prepare(request)
-            async def receive():
-                async for msg in ws:
-                    if msg.type in (WSMsgType.TEXT, WSMsgType.BINARY):
-                        await ws.close(code=1008, message=b'Read-only channel')
-                        break
-            reader = asyncio.create_task(receive())
+            reader = asyncio.create_task(refuse_messages(ws))
             try:
                 while not ws.closed and not reader.done():
                     await asyncio.wait_for(ws.send_str(encode(state.snapshot())), timeout=2)
@@ -438,8 +533,47 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
                 await ws.close()
         return ws
 
+    async def video(request):
+        if len(state.video_clients) >= MAX_VIEWERS:
+            raise web.HTTPServiceUnavailable(text='Maximum video viewers reached')
+        ws = web.WebSocketResponse(heartbeat=10, max_msg_size=4096, compress=False)
+        state.video_clients.add(ws)  # reserved before the upgrade awaits, as for /v1/stream
+        try:
+            await ws.prepare(request)
+            state.touch_demand()  # start the conversion now, not at the next demand tick
+            reader = asyncio.create_task(refuse_messages(ws))
+            try:
+                shown, sent_at = 0, -math.inf
+                while not ws.closed and not reader.done():
+                    frame, now = state.video, time.monotonic()
+                    # Only the newest frame, never queued: a slow viewer skips frames.
+                    if frame and frame['seq'] != shown and now - sent_at >= VIDEO_MIN_INTERVAL:
+                        shown = frame['seq']
+                        age = now - frame['capture_mono_s']
+                        if age <= VIDEO_SEND_MAX_AGE:
+                            sent_at = now
+                            await asyncio.wait_for(ws.send_bytes(video_message(frame, age)), timeout=2)
+                    await asyncio.sleep(.05)
+            finally:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+        except (ConnectionError, asyncio.TimeoutError):
+            pass
+        finally:
+            state.video_clients.discard(ws)
+            if ws.prepared:
+                await ws.close()
+        return ws
+
     async def shutdown(_app):
-        await asyncio.gather(*(ws.close(code=1001) for ws in tuple(state.clients)), return_exceptions=True)
+        await asyncio.gather(*(ws.close(code=1001) for ws in tuple(state.clients | state.video_clients)),
+                             return_exceptions=True)
+
+    async def demand(_app):
+        task = asyncio.create_task(touch_demand_while_watched(state))
+        yield
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     for path in STATIC:
         app.router.add_get(path, static)
@@ -448,7 +582,10 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     app.router.add_get('/v1/identity', identity)
     app.router.add_get('/v1/snapshot', snapshot)
     app.router.add_get('/v1/stream', stream)
+    app.router.add_get('/v1/video', video)
     app.on_shutdown.append(shutdown)
+    if state.video_demand:
+        app.cleanup_ctx.append(demand)
     return app
 
 
@@ -473,31 +610,56 @@ async def simulate(state):
         await asyncio.sleep(.2)
 
 
+async def simulate_video(state, card):
+    size = jpeg_size(card)
+    if size is None:
+        print('Simulator: testcard.jpg has no readable frame size; no video', flush=True)
+        return
+    seq = 0
+    while True:
+        seq = (seq + 1) & 0xFFFFFFFF
+        state.accept_video(VIDEO_HEADER.pack(VIDEO_MAGIC, VIDEO_HEADER.size, int(time.monotonic() * 1e6), seq,
+                                             *size) + card)
+        await asyncio.sleep(.1)
+
+
+async def bind_datagram(path, protocol):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # A stale socket can be left by SIGKILL. Never unlink another type
+    # of file or an active receiver.
+    if path.exists():
+        if not stat.S_ISSOCK(path.lstat().st_mode):
+            raise ValueError(f'IPC path {path} exists and is not a socket')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
+            try:
+                probe.connect(str(path))
+            except ConnectionRefusedError:
+                path.unlink()
+            else:
+                raise ValueError(f'A monitoring agent already owns {path}')
+    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+        lambda: protocol, local_addr=str(path), family=socket.AF_UNIX)
+    path.chmod(0o600)
+    return transport
+
+
 async def run(args, identity):
-    state = State(identity, args.storage)
-    transport, socket_path, advertisement = None, None, None
+    state = State(identity, args.storage, video_demand=None if args.simulate else args.video_demand)
+    endpoints, advertisement = [], None
     try:
         if args.simulate:
             identity['name'] += ' [SIMULATOR]'
             state.tasks.append(asyncio.create_task(simulate(state)))
+            try:
+                card = (Path(__file__).parent / 'testcard.jpg').read_bytes()  # read once
+            except OSError:
+                print('Simulator: no testcard.jpg; no video', flush=True)
+            else:
+                state.tasks.append(asyncio.create_task(simulate_video(state, card)))
         else:
-            socket_path = Path(args.socket)
-            socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # A stale socket can be left by SIGKILL. Never unlink another type
-            # of file or an active receiver.
-            if socket_path.exists():
-                if not stat.S_ISSOCK(socket_path.lstat().st_mode):
-                    raise ValueError('IPC path exists and is not a socket')
-                with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
-                    try:
-                        probe.connect(str(socket_path))
-                    except ConnectionRefusedError:
-                        socket_path.unlink()
-                    else:
-                        raise ValueError('A monitoring agent already owns this socket')
-            transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
-                lambda: Receiver(state), local_addr=str(socket_path), family=socket.AF_UNIX)
-            socket_path.chmod(0o600)
+            for path, protocol in [(Path(args.socket), Receiver(state)),
+                                   (Path(args.video_socket), VideoReceiver(state))]:
+                endpoints.append((await bind_datagram(path, protocol), path))
         state.tasks.append(asyncio.create_task(collect_health(state)))
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -527,9 +689,9 @@ async def run(args, identity):
         for task in state.tasks:
             task.cancel()
         await asyncio.gather(*state.tasks, return_exceptions=True)
-        if transport:
+        for transport, path in endpoints:
             transport.close()
-            socket_path.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
         if advertisement:
             zc, info = advertisement
             await zc.async_unregister_service(info)
@@ -567,12 +729,18 @@ def main():
     p.add_argument('--bind', default='0.0.0.0')
     p.add_argument('--port', type=int, default=8443)
     p.add_argument('--socket', default='/run/dashcam-monitor/telemetry.sock')
+    p.add_argument('--video-socket', type=Path,
+                   help='camera preview datagram socket (default: video.sock next to --socket)')
+    p.add_argument('--video-demand', type=Path,
+                   help='file touched while video viewers watch (default: video-demand next to --socket)')
     p.add_argument('--storage', default='/user/output/footage')
     p.add_argument('--web-dir', type=Path, default=Path(__file__).parent / 'web')
     p.add_argument('--browser-session-days', type=int, default=30)
     p.add_argument('--advertise-address', help='Host LAN IPv4 for mDNS; omit for manual pairing only')
     p.add_argument('--simulate', action='store_true')
     args = p.parse_args()
+    args.video_socket = args.video_socket or Path(args.socket).parent / 'video.sock'
+    args.video_demand = args.video_demand or Path(args.socket).parent / 'video-demand'
     if not 1 <= args.port <= 65535:
         p.error('port must be 1..65535')
     if not 1 <= args.browser_session_days <= 365:

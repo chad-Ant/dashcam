@@ -1,8 +1,11 @@
 package com.dashcam.connector
 
+import androidx.compose.ui.graphics.ImageBitmap
 import org.json.JSONObject
 import java.net.URI
 import java.net.URLDecoder
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 
 data class DeviceProfile(
@@ -63,4 +66,38 @@ data class MonitorState(
 ) {
     val transportFresh get() = active && lastReceiveMs > 0 && nowMs - lastReceiveMs <= 2000
     val runtimeFresh get() = transportFresh && snapshot?.runtimeFresh == true
+}
+
+// /v1/video binary message header (24 bytes, little-endian): "DCV1", uint32
+// header length (>= 24, JPEG starts there), uint64 agent sequence, uint32 age
+// in ms at send time, uint16 width, uint16 height. Same checks as the web client.
+data class VideoHeader(val headerLength: Int, val sequence: Long, val ageMs: Long, val width: Int, val height: Int) {
+    companion object {
+        const val MIN_LENGTH = 24
+        fun parse(data: ByteArray): VideoHeader? {
+            if (data.size < MIN_LENGTH) return null
+            if (data[0] != 'D'.code.toByte() || data[1] != 'C'.code.toByte() ||
+                data[2] != 'V'.code.toByte() || data[3] != '1'.code.toByte()) return null
+            val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+            val headerLength = buffer.getInt(4).toLong() and 0xFFFFFFFFL
+            if (headerLength < MIN_LENGTH || headerLength > data.size) return null
+            val width = buffer.getShort(20).toInt() and 0xFFFF
+            val height = buffer.getShort(22).toInt() and 0xFFFF
+            if (width !in 1..4096 || height !in 1..4096) return null
+            return VideoHeader(headerLength.toInt(), buffer.getLong(8),
+                buffer.getInt(16).toLong() and 0xFFFFFFFFL, width, height)
+        }
+    }
+}
+
+// Not a data class: every decoded frame is a distinct value for StateFlow.
+class VideoFrame(val image: ImageBitmap, val width: Int, val height: Int, val ageMs: Long,
+                 val receivedAtMs: Long, val fps: Double?)
+
+// connected: the /v1/video socket of this state is open; a closed or retrying
+// connection never carries a frame, so it shows "No video".
+data class VideoState(val status: String = "Video paused", val frame: VideoFrame? = null, val nowMs: Long = 0,
+                      val connected: Boolean = false) {
+    // Receipt time on the elapsed-realtime clock; an old picture is never shown.
+    val stale get() = frame?.let { nowMs - it.receivedAtMs > 2000 } == true
 }

@@ -8,6 +8,9 @@ User=jetson
 Group=jetson
 RuntimeDirectory=dashcam-monitor
 RuntimeDirectoryMode=0700
+# Keep /run/dashcam-monitor across agent restarts: the recorder container's bind mount
+# would otherwise keep pointing at the deleted directory (telemetry and video go silent).
+RuntimeDirectoryPreserve=yes
 UMask=0077
 WorkingDirectory=/home/jetson/dashcam/connector
 EnvironmentFile=/home/jetson/.config/dashcam-monitor/service.env

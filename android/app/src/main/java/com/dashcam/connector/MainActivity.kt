@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -18,7 +19,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -71,9 +74,16 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     val state by model.repository.state.collectAsStateWithLifecycle()
     val profiles by model.profiles.collectAsStateWithLifecycle()
     val selected by model.selected.collectAsStateWithLifecycle()
+    val video by model.repository.video.collectAsStateWithLifecycle()
     var page by remember { mutableIntStateOf(if (profiles.isEmpty()) 3 else 0) }
     var awake by remember { mutableStateOf(false) }
     LaunchedEffect(awake, state.active) { onKeepAwake(awake && state.active) }
+    // Camera frames stream only while Live is shown; foreground and device
+    // selection are gated by the repository (setActive from onStart/onStop).
+    DisposableEffect(page) {
+        model.repository.setVideoWanted(page == 0)
+        onDispose { model.repository.setVideoWanted(false) }
+    }
     BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding()) {
         val wide = maxWidth >= 840.dp
         Scaffold(containerColor = MaterialTheme.colorScheme.background,
@@ -115,6 +125,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                         val system = state.snapshot?.system?.takeIf { state.transportFresh }
                         when (page) {
                             0 -> {
+                                item { CameraCard(video) }
                                 item { SpeedCard(vehicle, runtime) }
                                 item { AdaptivePair(wide, {
                                     SurfaceCard("Recording") {
@@ -208,6 +219,25 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
         Metric("Acceleration", vehicle.finite("acceleration_ms2"), "m/s²", 2)
     }
 }
+@Composable private fun CameraCard(video: VideoState) { SurfaceCard("Camera") {
+    val frame = video.frame?.takeUnless { video.stale }
+    Box(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).fillMaxWidth().aspectRatio(16f / 9f)
+        .clip(RoundedCornerShape(14.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
+        if (frame != null) Image(bitmap = frame.image, contentDescription = "Dashcam camera",
+            modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+        else Text(if (video.frame != null) "Video stale" else "No video",
+            color = Color(0xFFFFCA80), fontWeight = FontWeight.SemiBold)
+    }
+    val lastFrame = video.frame
+    Hint(if (frame == null) {
+        // Stale on an open socket: say so rather than repeating "Live".
+        if (lastFrame != null) "No camera frames for ${(video.nowMs - lastFrame.receivedAtMs) / 1000} s" else video.status
+    } else buildString {
+        append("${frame.width}×${frame.height}")
+        frame.fps?.let { append(String.format(Locale.US, " · %.1f fps", it)) }
+        append(" · ${frame.ageMs} ms old")
+    })
+} }
 @Composable private fun PositionCard(vehicle: JSONObject?) { SurfaceCard("GNSS position") {
     Metric("Latitude", vehicle.finite("latitude"), "°", 6)
     Metric("Longitude", vehicle.finite("longitude"), "°", 6)

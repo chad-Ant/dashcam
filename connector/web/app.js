@@ -14,8 +14,13 @@
   let ws = null, snap = null, lastMs = 0, openedMs = 0, lastSession = '', lastSeq = -1;
   let status = 'Starting', attempt = 0, retryTimer = 0, epoch = 0;
   let wakeWanted = false, wakeLock = null, wakeBusy = false;
-  let message = null, wakeNote = null;
+  let message = null, wakeNote = null, page = 'live', signingOut = false;
   const binds = [];
+  // Camera video (/v1/video): open only while paired, on Live and visible.
+  const VIDEO_STALE_MS = 2000, VIDEO_MAGIC = [0x44, 0x43, 0x56, 0x31];   // "DCV1"
+  let vws = null, vAttempt = 0, vTimer = 0, vOpenedMs = 0, vMsgMs = 0, vLastSeq = 0;
+  let vImg = null, vUrl = null, vLoadingUrl = null, vLoading = null, vPending = null;
+  let vMeta = null, vShownMs = 0, vTimes = [];
 
   // ---- helpers -------------------------------------------------------------
   function h(tag, cls, text) {
@@ -81,6 +86,37 @@
   function setStatus(text) { status = text; render(); }
 
   // ---- cards (labels, units and decimals match the Android app) -----------
+  function cameraCard() {
+    const box = h('div', 'video-box'), note = h('p', 'video-note', 'No video');
+    vImg = h('img');
+    vImg.alt = 'Dashcam camera';
+    vImg.hidden = true;
+    vImg.addEventListener('load', () => frameDone(true));
+    vImg.addEventListener('error', () => frameDone(false));
+    box.append(vImg, note);
+    const caption = h('p', 'hint video-caption', '—');
+    binds.push(v => {
+      const open = vws !== null && vws.readyState === WebSocket.OPEN;
+      const showing = open && vUrl !== null && vMeta !== null && v.now - vShownMs <= VIDEO_STALE_MS;
+      if (vImg.hidden === showing) vImg.hidden = !showing;   // never keep showing a stale picture
+      note.hidden = showing;
+      setText(note, open && vShownMs > 0 ? 'Video stale' : 'No video');
+      setText(caption, videoCaption(v.now, open, showing));
+    });
+    return card('Camera', box, caption);
+  }
+  function videoCaption(now, open, showing) {
+    if (showing) {
+      const span = vTimes.length > 1 ? vTimes[vTimes.length - 1] - vTimes[0] : 0;
+      const fps = span > 0 ? fmt((vTimes.length - 1) * 1000 / span, 1, 'fps') : '— fps';
+      return vMeta.width + '×' + vMeta.height + ' · ' + fps + ' · ' + vMeta.ageMs + ' ms old';
+    }
+    if (!identity) return 'Pair this browser to see the recording camera';
+    if (identity.capabilities.video !== true) return 'This Jetson does not offer camera video';
+    if (!open) return vAttempt > 0 ? 'Video connection lost · retrying' : 'Connecting to the camera';
+    if (vShownMs > 0) return 'Last frame ' + (Math.max(0, now - vShownMs) / 1000).toFixed(1) + ' s ago';
+    return 'Waiting for frames · the Jetson must have MonitoringVideoEnabled set';
+  }
   function speedCard() {
     const row = h('div', 'speed');
     row.append(bind(h('span', 'num', '—'), v => fmt(v.vehicle?.speed_kmh, 1, '')), h('span', 'unit', 'km/h'));
@@ -242,14 +278,17 @@
   }
   async function signOut() {
     stop('Signing out');
+    signingOut = true; syncVideo();
     let ok = false;
     try {
       const r = await fetch('/v1/session', { method: 'DELETE', credentials: 'same-origin', cache: 'no-store',
         signal: deadline() });
       ok = r.ok;
     } catch (_) { /* reported below */ }
+    signingOut = false;
     if (!ok) { say('Could not reach the Jetson to sign out. Try again.', true); return start(); }
     identity = null; unpaired = true;
+    syncVideo();
     say('Signed out. Open a new browser link to pair again.', false);
     setStatus('Not paired');
     showPage('connection');
@@ -278,6 +317,7 @@
     if (!ws) setStatus(identity ? 'Connecting' : 'Checking pairing');
     const result = await checkIdentity();
     if (e !== epoch) return;
+    syncVideo();
     if (result === 'ok') openSocket();
     else if (result === 'unpaired') { closeSocket(); setStatus('Not paired'); showPage('connection'); }
     else { closeSocket(); retryLater(e, 'Jetson unreachable · retrying'); }
@@ -336,10 +376,114 @@
   // Browsers never ping, so a dead peer (Jetson power cycle, silent Wi-Fi drop) leaves the
   // socket OPEN; a silent socket is closed and retried like a lost connection.
   function tick() {
-    if (ws && performance.now() - (lastMs || openedMs) > LIVENESS_MS) {
+    const now = performance.now();
+    if (ws && now - (lastMs || openedMs) > LIVENESS_MS) {
       closeSocket();
       retryLater(epoch, 'Connection lost · retrying');
     }
+    // A silent video socket is normal while video is disabled on the Jetson; it only counts as
+    // a dead peer when the telemetry stream is not fresh either.
+    const telemetryFresh = ws !== null && lastMs > 0 && now - lastMs <= 2000;
+    if (vws && !telemetryFresh && now - (vMsgMs || vOpenedMs) > LIVENESS_MS) {
+      closeVideo();
+      retryVideo();
+    }
+    syncVideo();
+    render();
+  }
+
+  // ---- camera video --------------------------------------------------------
+  // Binary message: "DCV1", u32 header length (>= 24), u64 sequence, u32 age_ms,
+  // u16 width, u16 height (all little-endian), then the JPEG.
+  function videoWanted() {
+    return identity !== null && identity.capabilities.video === true && page === 'live' &&
+      !document.hidden && !signingOut;
+  }
+  function syncVideo() {
+    if (!videoWanted()) {
+      clearTimeout(vTimer); vTimer = 0; vAttempt = 0;
+      if (vws) closeVideo();
+      return;
+    }
+    if (!vws && !vTimer) openVideo();
+  }
+  function retryVideo() {
+    clearTimeout(vTimer); vTimer = 0;
+    if (!videoWanted()) return;
+    const delay = DELAYS[Math.min(vAttempt, DELAYS.length - 1)];
+    vAttempt += 1;
+    vTimer = setTimeout(() => { vTimer = 0; syncVideo(); }, delay * 1000);
+  }
+  function closeVideo() {
+    const sock = vws;
+    vws = null;
+    resetVideoFrames();
+    if (sock) sock.close(1000);
+  }
+  function resetVideoFrames() {
+    vPending = null; vLoading = null; vMeta = null; vShownMs = 0; vTimes = []; vLastSeq = 0;
+    if (vImg) { vImg.hidden = true; vImg.removeAttribute('src'); }   // no load/error event follows
+    if (vLoadingUrl) { URL.revokeObjectURL(vLoadingUrl); vLoadingUrl = null; }
+    if (vUrl) { URL.revokeObjectURL(vUrl); vUrl = null; }
+  }
+  function parseFrame(data) {
+    if (!(data instanceof ArrayBuffer) || data.byteLength < 24) return null;
+    const d = new DataView(data);
+    for (let i = 0; i < 4; i += 1) if (d.getUint8(i) !== VIDEO_MAGIC[i]) return null;
+    const headerLength = d.getUint32(4, true);
+    if (headerLength < 24 || headerLength >= data.byteLength) return null;
+    const seq = d.getUint32(12, true) * 4294967296 + d.getUint32(8, true);
+    const width = d.getUint16(20, true), height = d.getUint16(22, true);
+    if (!Number.isSafeInteger(seq) || width < 1 || width > 4096 || height < 1 || height > 4096) return null;
+    const blob = new Blob([new Uint8Array(data, headerLength)], { type: 'image/jpeg' });
+    return { seq, width, height, ageMs: d.getUint32(16, true), blob, recvMs: performance.now() };
+  }
+  function openVideo() {
+    let sock;
+    try {
+      sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v1/video');
+    } catch (_) { return retryVideo(); }
+    sock.binaryType = 'arraybuffer';
+    vws = sock; vOpenedMs = performance.now(); vMsgMs = 0;
+    resetVideoFrames();
+    sock.addEventListener('message', ev => {
+      if (vws !== sock) return;
+      const frame = parseFrame(ev.data);
+      if (!frame) { closeVideo(); return retryVideo(); }
+      if (frame.seq <= vLastSeq) return;            // replayed or out of order
+      vLastSeq = frame.seq; vMsgMs = frame.recvMs; vAttempt = 0;
+      if (vLoadingUrl) vPending = frame;            // still decoding: keep only the newest
+      else loadFrame(frame);
+    });
+    sock.addEventListener('close', () => {
+      if (vws !== sock) return;
+      vws = null;
+      resetVideoFrames();
+      retryVideo();
+      render();
+    });
+  }
+  function loadFrame(frame) {
+    vLoading = frame;
+    vLoadingUrl = URL.createObjectURL(frame.blob);
+    vImg.src = vLoadingUrl;
+  }
+  function frameDone(ok) {
+    if (!vLoadingUrl) return;
+    const url = vLoadingUrl, frame = vLoading;
+    vLoadingUrl = null; vLoading = null;
+    if (vUrl) URL.revokeObjectURL(vUrl);           // the previous picture is no longer displayed
+    if (ok) {
+      vUrl = url; vMeta = frame; vShownMs = frame.recvMs;
+      vTimes.push(frame.recvMs);
+      while (vTimes.length > 32 || (vTimes.length > 1 && frame.recvMs - vTimes[0] > 3000)) vTimes.shift();
+    } else {
+      URL.revokeObjectURL(url);                    // undecodable frame: nothing to show until the next
+      vUrl = null;
+    }
+    const next = vPending;
+    vPending = null;
+    if (next) loadFrame(next);
     render();
   }
 
@@ -368,8 +512,11 @@
       if (tab.dataset.page === name) tab.setAttribute('aria-current', 'page');
       else tab.removeAttribute('aria-current');
     }
-    for (const page of Object.keys(PAGES)) $('page-' + page).hidden = page !== name;
+    for (const p of Object.keys(PAGES)) $('page-' + p).hidden = p !== name;
     $('title').textContent = PAGES[name];
+    page = name;
+    syncVideo();
+    render();
   }
   function pairFromHash() {
     if (!location.hash.startsWith('#pair=')) return false;
@@ -379,7 +526,7 @@
     return true;
   }
   function init() {
-    $('page-live').append(speedCard(), duo(recordingCard(), adasCard()), duo(positionCard(), healthCard()));
+    $('page-live').append(cameraCard(), speedCard(), duo(recordingCard(), adasCard()), duo(positionCard(), healthCard()));
     $('page-vehicle').append(speedCard(), duo(powertrainCard(), positionCard()), linkCard());
     $('page-system').append(duo(healthCard(), memoryCard()), temperaturesCard(), adasCard());
     $('page-connection').append(...connectionPage());
@@ -397,6 +544,7 @@
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) stop('Disconnected');
       else { attempt = 0; start(); }
+      syncVideo();
       syncWake();
     });
     window.addEventListener('hashchange', pairFromHash);

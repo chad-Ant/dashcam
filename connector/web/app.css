@@ -4,6 +4,7 @@
   --accent: #0a7564; --on-accent: #ffffff; --sel: #d2eee8;
   --ok-bg: rgba(10, 117, 100, .10); --warn: #8a4f00; --warn-bg: rgba(170, 100, 0, .12);
   --danger: #b3261e; --danger-bg: rgba(179, 38, 30, .10);
+  --video-bg: #05090d; --video-text: #c9d4de;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -84,6 +85,17 @@ h1 { font-size: 2rem; font-weight: 600; line-height: 1.2; }
   align-self: flex-start; color: var(--danger); background: var(--danger-bg);
   border: 1px solid currentColor; border-radius: 8px; padding: 4px 10px; font-weight: 700;
 }
+/* Camera: 16:9 letterbox, the same dark frame in both themes. */
+.video-box {
+  position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden;
+  border-radius: 14px; background: var(--video-bg);
+}
+.video-box img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: contain; }
+.video-note {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--video-text); font-weight: 600;
+}
+.video-caption { font-variant-numeric: tabular-nums; }
 .temps { display: flex; flex-direction: column; gap: 10px; }
 .temps:empty { display: none; }
 .steps { margin: 0; padding-left: 1.25rem; display: flex; flex-direction: column; gap: 6px; }

@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import socket
 import ssl
+import stat
+import struct
 import tempfile
 import time
 import unittest
@@ -25,8 +27,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.x509.oid import ExtendedKeyUsageOID
 import service
-from service import (SECURITY_HEADERS, State, create_app, encode, export_ca, initialize, issue_certificate,
-                     load_identity, pair)
+from service import (SECURITY_HEADERS, State, VideoReceiver, bind_datagram, create_app, encode, export_ca,
+                     initialize, issue_certificate, jpeg_size, load_identity, pair, simulate_video, video_message)
 from health import Health
 
 
@@ -102,11 +104,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
 
     async def test_all_routes_require_authentication(self):
-        for path in ['/v1/identity', '/v1/snapshot', '/v1/stream']:
+        for path in ['/v1/identity', '/v1/snapshot', '/v1/stream', '/v1/video']:
             response = await self.client.get(path)
             self.assertEqual(response.status, 401)
-        with self.assertRaises(WSServerHandshakeError):
-            await self.client.ws_connect('/v1/stream', headers={'Authorization': 'Bearer wrong'})
+        for path in ['/v1/stream', '/v1/video']:
+            for headers in [{}, {'Authorization': 'Bearer wrong'}]:
+                with self.assertRaises(WSServerHandshakeError) as failure:
+                    await self.client.ws_connect(path, headers=headers)
+                self.assertEqual(failure.exception.status, 401)
 
     async def test_non_utf8_authorization_is_401_not_500(self):
         host, port = self.client.server.host, self.client.server.port
@@ -573,6 +578,10 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         ws = await self.client.ws_connect('/v1/stream', headers=self.cookie(value), origin=self.origin)
         self.assertEqual((await ws.receive_json(timeout=2))['type'], 'snapshot')
         await ws.close()
+        self.state.accept_video(video_frame())
+        ws = await self.client.ws_connect('/v1/video', headers=self.cookie(value), origin=self.origin)
+        self.assertEqual((await ws.receive_bytes(timeout=2))[24:], JPEG)
+        await ws.close()
 
     async def test_cookie_rejected_on_foreign_origin_or_host(self):
         value = await self.login()
@@ -584,15 +593,17 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.client.get(path, headers=self.cookie(value, **headers))
                 self.assertEqual(response.status, 403, (path, headers))
                 self.assertSecure(response)
-        for kwargs in [{}, {'origin': 'https://evil.test'}, {'origin': 'http://' + self.host}]:
+        for path in ['/v1/stream', '/v1/video']:
+            for kwargs in [{}, {'origin': 'https://evil.test'}, {'origin': 'http://' + self.host}]:
+                with self.assertRaises(WSServerHandshakeError) as failure:
+                    await self.client.ws_connect(path, headers=self.cookie(value), **kwargs)
+                self.assertEqual(failure.exception.status, 403, (path, kwargs))
             with self.assertRaises(WSServerHandshakeError) as failure:
-                await self.client.ws_connect('/v1/stream', headers=self.cookie(value), **kwargs)
-            self.assertEqual(failure.exception.status, 403, kwargs)
-        with self.assertRaises(WSServerHandshakeError) as failure:
-            await self.client.ws_connect('/v1/stream', headers=self.cookie(value, Host='evil.test:' + port),
-                                         origin='https://evil.test:' + port)
-        self.assertEqual(failure.exception.status, 403)
+                await self.client.ws_connect(path, headers=self.cookie(value, Host='evil.test:' + port),
+                                             origin='https://evil.test:' + port)
+            self.assertEqual(failure.exception.status, 403, path)
         self.assertEqual(self.state.clients, set())
+        self.assertEqual(self.state.video_clients, set())
 
     async def test_bad_cookies_rejected(self):
         value = await self.login()
@@ -607,9 +618,10 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             for path in ['/v1/identity', '/v1/snapshot']:
                 response = await self.client.get(path, headers=self.cookie(cookie, Origin=self.origin))
                 self.assertEqual(response.status, 401, cookie)
-            with self.assertRaises(WSServerHandshakeError) as failure:
-                await self.client.ws_connect('/v1/stream', headers=self.cookie(cookie), origin=self.origin)
-            self.assertEqual(failure.exception.status, 401)
+            for path in ['/v1/stream', '/v1/video']:
+                with self.assertRaises(WSServerHandshakeError) as failure:
+                    await self.client.ws_connect(path, headers=self.cookie(cookie), origin=self.origin)
+                self.assertEqual(failure.exception.status, 401)
         response = await self.client.get('/v1/identity', headers=self.cookie(forge(TOKEN, time.time() + 60)))
         self.assertEqual(response.status, 200)
 
@@ -633,6 +645,10 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             ws = await self.client.ws_connect('/v1/stream', headers=headers)
             self.assertEqual((await ws.receive_json(timeout=2))['device_id'], 'test')
             await ws.close()
+            self.state.accept_video(video_frame(seq=self.state.video_seq + 1))
+            ws = await self.client.ws_connect('/v1/video', headers=headers)
+            self.assertEqual((await ws.receive_bytes(timeout=2))[24:], JPEG)
+            await ws.close()
 
     async def test_viewer_limit_is_shared(self):
         value = await self.login()
@@ -651,6 +667,329 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         replacement = await self.client.ws_connect('/v1/stream', headers=self.cookie(value), origin=self.origin)
         for ws in viewers + [replacement]:
             await ws.close()
+
+
+JPEG = b'\xff\xd8' + bytes(range(256)) * 3 + b'\xff\xd9'
+
+
+def video_frame(seq=1, capture=None, width=640, height=360, jpeg=JPEG, header=24, magic=b'DCV1'):
+    """A v0.4 datagram: header (+ padding when the header grows) + JPEG."""
+    capture = time.monotonic() if capture is None else capture
+    return (struct.pack('<4sIQIHH', magic, header, int(capture * 1e6), seq, width, height) +
+            b'\0' * (header - 24) + jpeg)
+
+
+def sof_jpeg(width, height):
+    return (b'\xff\xd8\xff\xe0\x00\x04JF\xff\xc0\x00\x11\x08' + struct.pack('>HH', height, width) +
+            b'\x03' + b'\x01\x22\x00' * 3 + b'\xff\xd9')
+
+
+async def wait_for(condition, seconds=2.0):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError('condition not reached')
+        await asyncio.sleep(.02)
+
+
+class VideoStateTests(unittest.TestCase):
+    def setUp(self):
+        self.state = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.')
+
+    def test_header_layouts_are_byte_exact(self):
+        datagram = service.VIDEO_HEADER.pack(b'DCV1', 24, 0x0102030405060708, 0x0A0B0C0D, 0x0280, 0x0168) + JPEG
+        self.assertEqual(datagram[:24], b'DCV1' + b'\x18\0\0\0' + bytes.fromhex('0807060504030201') +
+                         bytes.fromhex('0D0C0B0A') + b'\x80\x02' + b'\x68\x01')
+        self.assertEqual(service.VIDEO_HEADER.size, 24)
+        frame = {'jpeg': JPEG, 'seq': 0x1122334455667788, 'width': 640, 'height': 360}
+        message = video_message(frame, .1234)
+        self.assertEqual(message[:24], b'DCV1' + b'\x18\0\0\0' + bytes.fromhex('8877665544332211') +
+                         (123).to_bytes(4, 'little') + b'\x80\x02\x68\x01')
+        self.assertEqual(message[24:], JPEG)
+        self.assertEqual(video_message(frame, -1)[16:20], b'\0\0\0\0')
+
+    def test_valid_frames_keep_only_the_latest(self):
+        self.state.accept_video(video_frame(seq=1))
+        second = b'\xff\xd8second\xff\xd9'
+        self.state.accept_video(video_frame(seq=2, width=320, height=180, jpeg=second))
+        self.assertEqual(self.state.invalid_video, 0)
+        frame = self.state.video
+        self.assertEqual((frame['jpeg'], frame['seq'], frame['source_seq'], frame['width'], frame['height']),
+                         (second, 2, 2, 320, 180))
+        self.assertAlmostEqual(frame['capture_mono_s'], time.monotonic(), delta=.5)
+        self.assertEqual(set(frame), {'jpeg', 'seq', 'source_seq', 'capture_mono_s', 'width', 'height'})
+        # A longer header is allowed: the JPEG starts at the stated offset.
+        self.state.accept_video(video_frame(seq=3, header=32))
+        self.assertEqual((self.state.video['jpeg'], self.state.video['seq']), (JPEG, 3))
+        # Largest allowed datagram, and 1..4096 dimensions.
+        biggest = b'\xff\xd8' + b'\0' * (service.MAX_VIDEO_JPEG - 4) + b'\xff\xd9'
+        for seq, data in enumerate([video_frame(seq=4, jpeg=biggest), video_frame(seq=5, width=1, height=1),
+                                    video_frame(seq=6, width=4096, height=4096)], 4):
+            self.state.accept_video(data)
+            self.assertEqual(self.state.video['source_seq'], seq)
+        self.assertEqual(self.state.invalid_video, 0)
+
+    def test_each_validation_rule(self):
+        now = time.monotonic()
+        too_big = b'\xff\xd8' + b'\0' * (service.MAX_VIDEO_JPEG - 3) + b'\xff\xd9'
+        bad = {'short': video_frame()[:23], 'empty': b'', 'header only': video_frame()[:24],
+               'magic': video_frame(magic=b'DCV2'), 'header 23': video_frame(header=23),
+               'header past end': video_frame()[:4] + struct.pack('<I', 24 + len(JPEG) - 3) + video_frame()[8:],
+               'header huge': video_frame()[:4] + b'\xff\xff\xff\xff' + video_frame()[8:],
+               'oversize': video_frame(jpeg=too_big),
+               'no SOI': video_frame(jpeg=b'\0\xd8' + JPEG[2:]), 'no EOI': video_frame(jpeg=JPEG[:-1] + b'\0'),
+               'not jpeg': video_frame(jpeg=b'hello world'),
+               'width 0': video_frame(width=0), 'width 4097': video_frame(width=4097),
+               'height 0': video_frame(height=0), 'height 4097': video_frame(height=4097),
+               'old': video_frame(capture=now - 2.5), 'future': video_frame(capture=now + .5),
+               'far future': video_frame()[:8] + b'\xff' * 8 + video_frame()[16:]}
+        for name, data in bad.items():
+            before = self.state.invalid_video
+            self.state.accept_video(data)
+            self.assertEqual(self.state.invalid_video, before + 1, name)
+        self.state.accept_video(memoryview(video_frame()))
+        self.assertIsNotNone(self.state.video)
+        self.assertEqual(self.state.invalid_video, len(bad))
+
+    def test_sequence_and_new_producer(self):
+        self.state.accept_video(video_frame(seq=10))
+        for seq in (9, 10):  # reordered or repeated datagram of the same run: kept, not counted invalid
+            self.state.accept_video(video_frame(seq=seq, jpeg=b'\xff\xd8old\xff\xd9'))
+        self.assertEqual((self.state.video['source_seq'], self.state.video['seq'], self.state.video['jpeg']),
+                         (10, 1, JPEG))
+        self.assertEqual(self.state.invalid_video, 0)
+        self.state.accept_video(video_frame(seq=11))
+        self.assertEqual((self.state.video['source_seq'], self.state.video['seq']), (11, 2))
+        # Capture time more than 5 s behind the current frame: another producer, accepted.
+        self.state.video['capture_mono_s'] += 6
+        self.state.accept_video(video_frame(seq=1))
+        self.assertEqual((self.state.video['source_seq'], self.state.video['seq']), (1, 3))
+        # Not 5 s behind: still the same producer.
+        self.state.video['capture_mono_s'] += 4
+        self.state.accept_video(video_frame(seq=1))
+        self.assertEqual(self.state.video['seq'], 3)
+        # A restarted v0.4 (sequence from 0, later capture time) once the old frame has expired.
+        self.state.accept_video(video_frame(seq=500, capture=time.monotonic() - .1))
+        self.state.accept_video(video_frame(seq=2))
+        self.assertEqual(self.state.video['source_seq'], 500)
+        self.state.video['capture_mono_s'] -= 2.5
+        self.state.accept_video(video_frame(seq=0))
+        self.assertEqual((self.state.video['source_seq'], self.state.video['seq']), (0, 5))
+        self.assertEqual(self.state.invalid_video, 0)
+
+    def test_demand_file_is_private_and_errors_are_logged_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'video-demand'
+            self.assertIsNone(State({'id': 't'}, '.').video_demand)
+            State({'id': 't'}, '.').touch_demand()  # no path: nothing to do
+            state = State({'id': 't'}, '.', video_demand=path)
+            state.touch_demand()
+            info = path.stat()
+            self.assertTrue(stat.S_ISREG(info.st_mode))
+            self.assertEqual(info.st_mode & 0o777, 0o600)
+            self.assertAlmostEqual(info.st_mtime, time.time(), delta=2)
+            os.utime(path, (1, 1))
+            state.touch_demand()
+            self.assertAlmostEqual(path.stat().st_mtime, time.time(), delta=2)
+            self.assertEqual(path.read_bytes(), b'')
+            for bad in [Path(directory) / 'missing' / 'video-demand', Path(directory) / 'dir',
+                        Path(directory) / 'link', Path(directory) / 'fifo']:
+                (Path(directory) / 'dir').mkdir(exist_ok=True)
+                if not os.path.lexists(Path(directory) / 'link'):
+                    os.symlink(path, Path(directory) / 'link')
+                    os.mkfifo(Path(directory) / 'fifo')
+                state = State({'id': 't'}, '.', video_demand=bad)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    state.touch_demand()  # never raises, never blocks (FIFO)
+                    state.touch_demand()
+                self.assertEqual(out.getvalue().count('WARNING'), 1, bad)
+            self.assertTrue(stat.S_ISFIFO(os.lstat(Path(directory) / 'fifo').st_mode))
+
+    def test_jpeg_size(self):
+        self.assertEqual(jpeg_size(sof_jpeg(640, 360)), (640, 360))
+        for data in [b'', b'\xff\xd8', JPEG, b'not a jpeg', sof_jpeg(0, 360)]:
+            self.assertIsNone(jpeg_size(data))
+        card = Path(service.__file__).parent / 'testcard.jpg'
+        if card.exists():
+            self.assertEqual(jpeg_size(card.read_bytes()), (640, 360))
+
+
+class VideoIpcTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receiver_binds_privately_and_replaces_only_stale_sockets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run' / 'video.sock'
+            state = State({'id': 't'}, '.')
+            transport = await bind_datagram(path, VideoReceiver(state))
+            try:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                with self.assertRaisesRegex(ValueError, 'already owns'):
+                    await bind_datagram(path, VideoReceiver(state))
+                with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+                    sender.sendto(video_frame(seq=7), str(path))
+                await wait_for(lambda: state.video is not None)
+                self.assertEqual((state.video['source_seq'], state.video['jpeg']), (7, JPEG))
+            finally:
+                transport.close()
+                await asyncio.sleep(0)  # the transport closes its socket on the next loop iteration
+            # Left behind by SIGKILL: replaced.
+            self.assertTrue(path.exists())
+            transport = await bind_datagram(path, VideoReceiver(state))
+            transport.close()
+            await asyncio.sleep(0)
+            path.unlink()
+            path.write_bytes(b'not a socket')
+            with self.assertRaisesRegex(ValueError, 'not a socket'):
+                await bind_datagram(path, VideoReceiver(state))
+            self.assertEqual(path.read_bytes(), b'not a socket')
+
+    async def test_simulator_sends_the_test_card(self):
+        state = State({'id': 't'}, '.')
+        card = sof_jpeg(640, 360)
+        task = asyncio.create_task(simulate_video(state, card))
+        try:
+            await wait_for(lambda: state.video_seq >= 3)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((state.video['jpeg'], state.video['width'], state.video['height']), (card, 640, 360))
+        self.assertEqual(state.video['source_seq'], state.video_seq)
+        self.assertLess(time.monotonic() - state.video['capture_mono_s'], .5)
+        self.assertEqual(state.invalid_video, 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            await asyncio.wait_for(simulate_video(state, b'\xff\xd8\xff\xd9'), 1)  # no size: no video
+        self.assertIn('no video', out.getvalue())
+
+
+class VideoApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.demand = Path(self.temp.name) / 'video-demand'
+        self.state = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.', video_demand=self.demand)
+        self.client = TestClient(TestServer(create_app(self.state)))
+        await self.client.start_server()
+        self.headers = {'Authorization': 'Bearer ' + TOKEN}
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp.cleanup()
+
+    def feed(self, **kwargs):
+        self.state.accept_video(video_frame(seq=self.state.video_seq + 1, **kwargs))
+
+    async def test_binary_message_is_byte_exact(self):
+        self.feed(width=1280, height=720)
+        ws = await self.client.ws_connect('/v1/video', headers=self.headers)
+        message = await ws.receive(timeout=2)
+        self.assertEqual(message.type.name, 'BINARY')
+        data = message.data
+        magic, header, seq, age_ms, width, height = struct.unpack('<4sIQIHH', data[:24])
+        self.assertEqual((magic, header, seq, width, height), (b'DCV1', 24, 1, 1280, 720))
+        self.assertLess(age_ms, 1000)
+        self.assertEqual(data[24:], JPEG)
+        # The same frame is never sent twice; the next one carries the next agent sequence.
+        with self.assertRaises(asyncio.TimeoutError):
+            await ws.receive(timeout=.3)
+        self.state.accept_video(video_frame(seq=99))
+        self.assertEqual(struct.unpack_from('<Q', await ws.receive_bytes(timeout=2), 8)[0], 2)
+        await ws.close()
+
+    async def test_rate_is_capped_at_10_fps_and_only_the_newest_frame_is_sent(self):
+        async def producer():
+            while True:
+                self.feed()
+                await asyncio.sleep(.005)
+        task = asyncio.create_task(producer())
+        try:
+            ws = await self.client.ws_connect('/v1/video', headers=self.headers)
+            arrivals, sequences = [], []
+            start = time.monotonic()
+            while time.monotonic() - start < 1.0:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    data = await ws.receive_bytes(timeout=.2)
+                    arrivals.append(time.monotonic())
+                    sequences.append(struct.unpack_from('<Q', data, 8)[0])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await ws.close()
+        self.assertLessEqual(len(arrivals), 12)
+        self.assertGreaterEqual(len(arrivals), 5)
+        self.assertGreaterEqual((arrivals[-1] - arrivals[0]) / (len(arrivals) - 1), .085)
+        self.assertEqual(sequences, sorted(set(sequences)))
+        self.assertGreater(min(b - a for a, b in zip(sequences, sequences[1:])), 1)  # skipped, never queued
+
+    async def test_frames_older_than_one_second_are_not_sent(self):
+        self.feed()
+        self.state.video['capture_mono_s'] -= 1.2
+        ws = await self.client.ws_connect('/v1/video', headers=self.headers)
+        with self.assertRaises(asyncio.TimeoutError):
+            await ws.receive(timeout=.4)
+        self.feed()
+        self.assertEqual(struct.unpack_from('<Q', await ws.receive_bytes(timeout=2), 8)[0], 2)
+        await ws.close()
+
+    async def test_frames_go_only_to_video_viewers(self):
+        self.feed()
+        ws = await self.client.ws_connect('/v1/stream', headers=self.headers)
+        for _ in range(3):
+            self.feed()
+            message = await ws.receive(timeout=2)
+            self.assertEqual(message.type.name, 'TEXT')
+            self.assertNotIn('jpeg', message.data)
+        await ws.close()
+
+    async def test_video_viewer_limit_is_separate_from_stream(self):
+        streams = [await self.client.ws_connect('/v1/stream', headers=self.headers) for _ in range(4)]
+        videos = [await self.client.ws_connect('/v1/video', headers=self.headers) for _ in range(4)]
+        for path in ['/v1/stream', '/v1/video']:
+            with self.assertRaises(WSServerHandshakeError) as failure:
+                await self.client.ws_connect(path, headers=self.headers)
+            self.assertEqual(failure.exception.status, 503, path)
+        await videos[0].close()
+        await wait_for(lambda: len(self.state.video_clients) < 4)
+        self.assertEqual(len(self.state.clients), 4)
+        videos[0] = await self.client.ws_connect('/v1/video', headers=self.headers)
+        for ws in streams + videos:
+            await ws.close()
+
+    async def test_client_message_closes_with_1008(self):
+        for payload in ['STOP RECORDING', b'\0']:
+            ws = await self.client.ws_connect('/v1/video', headers=self.headers)
+            await (ws.send_str(payload) if isinstance(payload, str) else ws.send_bytes(payload))
+            message = await ws.receive(timeout=2)
+            self.assertEqual(message.type.name, 'CLOSE')
+            self.assertEqual(ws.close_code, 1008)
+            await ws.close()
+        await wait_for(lambda: not self.state.video_clients)
+
+    async def test_demand_file_touched_only_while_watched(self):
+        await asyncio.sleep(.6)
+        self.assertFalse(self.demand.exists())  # nobody watching yet
+        ws = await self.client.ws_connect('/v1/video', headers=self.headers)
+        await wait_for(self.demand.exists, .5)  # immediately on connect
+        self.assertEqual(self.demand.stat().st_mode & 0o777, 0o600)
+        first = self.demand.stat().st_mtime_ns
+        await asyncio.sleep(1.1)
+        touched = self.demand.stat().st_mtime_ns
+        self.assertGreater(touched, first)
+        self.assertLess(time.time() - touched / 1e9, 1.0)  # at least once per second
+        await ws.close()
+        await wait_for(lambda: not self.state.video_clients)
+        last = self.demand.stat().st_mtime_ns
+        await asyncio.sleep(1.2)
+        self.assertEqual(self.demand.stat().st_mtime_ns, last)
+
+    async def test_csp_allows_blob_images_and_identity_has_video(self):
+        response = await self.client.get('/v1/identity', headers=self.headers)
+        csp = response.headers['Content-Security-Policy']
+        self.assertIn("img-src 'self' data: blob:;", csp)
+        self.assertEqual(csp, "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+                              "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        capabilities = (await response.json())['capabilities']
+        self.assertIs(capabilities['video'], True)
+        self.assertFalse(capabilities['controls'])
 
 
 if __name__ == '__main__':
