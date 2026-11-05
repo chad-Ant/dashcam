@@ -1,8 +1,10 @@
 import unittest
 from dataclasses import replace
 import math
+import time
 from lidartracking import *
-from lidartracking.bridge import (crc_line, decode_line, ClockMapper, BridgeDecoder, LatencyBounds)
+from lidartracking.bridge import (crc_line, decode_line, ClockMapper, BridgeDecoder, LatencyBounds,
+                                 SerialBridge)
 from lidartracking.__main__ import synthetic
 
 
@@ -123,6 +125,145 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(results[10].reason,"no_usable_return")
 
 
+class InterpolationTests(unittest.TestCase):
+    """Real-size car (1.8 x 1.5 m) at 40 m, 30 fps camera, sample between frames."""
+    def setUp(self):
+        self.c = Calibration(1456,1088,1200.,1200.,728.,544.,
+            (1.,0.,0.,0.,1.,0.,0.,0.,1.),(0.,0.,0.),(0.,0.,0.),.001,True)
+        self.r = VehicleRanger(self.c); self.r.select(7)
+        self.f0 = CameraFrame(1.,.001,1456,1088,(Detection(7,self.car(40.),.95),))
+        self.f1 = replace(self.f0,time_s=1.+1/30)
+        self.s = RangeSample(1,1.+1/60,.002,40.,40.,20.,20.,True)
+        self.p = ServoFeedback(1.06,0.,.001,True,.9,1.06)
+
+    @staticmethod
+    def car(distance, dx=0.):
+        w, h = 1200*1.8/distance, 1200*1.5/distance
+        return (728+dx-w/2, 544-h/2, 728+dx+w/2, 544+h/2)
+
+    def update(self, f0=None, f1="pair", s=None, ranger=None):
+        f1 = self.f1 if f1 == "pair" else f1
+        return (ranger or self.r).update(f0 or self.f0, s or self.s, self.p, 1.07, next_frame=f1)
+
+    def test_single_frame_cannot_reach_real_car(self):
+        self.assertEqual(self.update(f1=None).reason,"beam_outside_target")
+
+    def test_bracketing_pair_reaches_real_car(self):
+        r = self.update()
+        self.assertTrue(r.valid, r.reason)
+        self.assertEqual(r.slant_m,40.)
+
+    def test_moving_car_interpolated_to_lidar_time(self):
+        # Car crosses 24 px between frames; only its midpoint position is on the beam.
+        f0 = replace(self.f0,detections=(Detection(7,self.car(40.,-12.),.95),))
+        f1 = replace(self.f1,detections=(Detection(7,self.car(40.,12.),.95),))
+        self.assertTrue(self.update(f0,f1).valid)
+        self.r.last_sequence = None
+        self.assertEqual(self.update(f0,None).reason,"beam_outside_target")
+
+    def test_unverified_acceleration_bound_is_honoured(self):
+        r = VehicleRanger(replace(self.c,motion_accel_bound_px_s2=1e7)); r.select(7)
+        self.assertEqual(self.update(ranger=r).reason,"beam_outside_target")
+
+    def test_pair_contracts(self):
+        cases = ((dict(s=replace(self.s,time_s=1.04)),"range_not_bracketed"),
+                 (dict(f1=replace(self.f1,time_s=1.)),"invalid_frame_pair"),
+                 (dict(f1=replace(self.f1,time_s=1.2)),"invalid_frame_pair"),
+                 (dict(f1=replace(self.f1,detections=())),"target_missing_or_unreachable"),
+                 (dict(f1=replace(self.f1,width=1280)),"invalid_camera_frame"))
+        for kwargs, reason in cases:
+            self.r.last_sequence = None; self.r.last_frame_time = None
+            self.assertEqual(self.update(**kwargs).reason,reason)
+
+    def test_other_car_seen_only_in_next_frame(self):
+        f1 = replace(self.f1,detections=self.f1.detections+(Detection(8,self.car(40.),.9),))
+        self.assertEqual(self.update(f1=f1).reason,"ambiguous_target")
+
+    def test_frame_history(self):
+        h = FrameHistory(3)
+        for i in range(5):
+            h.add(replace(self.f0,time_s=1.+i/30))
+        self.assertEqual(len(h.frames),3)
+        before, after = h.bracket(1.+2.5/30)
+        self.assertEqual((before.time_s,after.time_s),(1.+2/30,1.+3/30))
+        self.assertIsNone(h.bracket(1.))   # trimmed
+        self.assertIsNone(h.bracket(1.5))  # its next frame has not arrived yet
+        with self.assertRaises(ValueError): h.add(replace(self.f0,time_s=1.))
+        with self.assertRaises(ValueError): FrameHistory(1)
+
+
+class FirstReturnTests(unittest.TestCase):
+    """Low car (1.8 x 1.3 m) at 50 m, beyond "contained" reach (~38 m).
+
+    Beam centre is image row 544. Box rows are chosen so the beam sits in the
+    lower body: y1=531 (top) .. 562.2 (ground contact)."""
+    def setUp(self):
+        self.c = Calibration(1456,1088,1200.,1200.,728.,544.,
+            (1.,0.,0.,0.,1.,0.,0.,0.,1.),(0.,0.,0.),(0.,0.,0.),.001,True)
+        self.r = self.ranger("first_return")
+        self.f0 = self.frame(1., self.car(531.))
+        self.s = RangeSample(1,1.+1/60,.002,50.,50.,20.,20.,True)
+        self.p = ServoFeedback(1.06,0.,.001,True,.9,1.06)
+
+    def ranger(self, mode):
+        r = VehicleRanger(self.c, association=mode); r.select(7)
+        return r
+
+    @staticmethod
+    def car(top, distance=50.):
+        w, h = 1200*1.8/distance, 1200*1.3/distance
+        return (728-w/2, top, 728+w/2, top+h)
+
+    @staticmethod
+    def frame(t, *boxes):
+        return CameraFrame(t,.001,1456,1088,tuple(Detection(7+i,b,.95) for i, b in enumerate(boxes)))
+
+    def update(self, f0=None, s=None, ranger=None):
+        f0 = f0 or self.f0
+        return (ranger or self.r).update(f0, s or self.s, self.p, 1.07, next_frame=replace(f0,time_s=1.+1/30))
+
+    def test_low_car_beyond_contained_reach(self):
+        r = self.update()
+        self.assertTrue(r.valid, r.reason)
+        self.assertEqual(r.slant_m, 50.)
+        self.assertEqual(self.update(ranger=self.ranger("contained")).reason, "beam_outside_target")
+
+    def test_spill_below_ground_contact_rejected(self):
+        # Box 7 px higher: the beam's lower edge reaches the road nearer than the car.
+        self.assertEqual(self.update(self.frame(1., self.car(524.))).reason, "beam_outside_target")
+
+    def test_beam_centre_above_car_rejected(self):
+        # Box 6 px lower: the beam centre may be above the roof, the car barely in it.
+        self.assertEqual(self.update(self.frame(1., self.car(537.))).reason, "beam_outside_target")
+
+    def test_farther_background_return_uses_first(self):
+        s = replace(self.s, last_m=90., last_db=5.)
+        r = self.update(s=s)
+        self.assertTrue(r.valid, r.reason)
+        self.assertEqual(r.slant_m, 50.)
+        self.assertEqual(self.update(s=s, ranger=self.ranger("contained")).reason, "multiple_returns")
+        # A weak or out-of-range background return does not invalidate the car's.
+        for s in (replace(self.s, sequence=2, time_s=1.02, last_m=90., last_db=-5.),
+                  replace(self.s, sequence=3, time_s=1.03, last_m=250.)):
+            self.assertTrue(self.update(s=s).valid)
+
+    def test_unphysical_or_weak_returns_rejected(self):
+        for s in (replace(self.s, last_m=45.),          # last nearer than first
+                  replace(self.s, last_m=-.1),          # lost-signal sentinel
+                  replace(self.s, first_db=-1.),
+                  replace(self.s, first_m=150., last_m=150.)):
+            self.r.last_sequence = None; self.r.last_frame_time = None
+            self.assertEqual(self.update(s=s).reason, "no_usable_return")
+
+    def test_detected_vehicle_in_spill_is_ambiguous(self):
+        # A truck ahead, visible above the low car's roof, inside the upward spill.
+        f0 = self.frame(1., self.car(531.), (700., 500., 760., 535.))
+        self.assertEqual(self.update(f0).reason, "ambiguous_target")
+
+    def test_association_validated(self):
+        with self.assertRaises(ValueError): VehicleRanger(self.c, association="nearest")
+
+
 class TrackerTests(unittest.TestCase):
     def test_ids_and_loss(self):
         t=BoxTracker(); d=[((10,10,100,100),.9,"car")]
@@ -182,6 +323,62 @@ class BridgeTests(unittest.TestCase):
     def test_invalid_bounds(self):
         for a,b in ((-.1,.1),(.1,0),(0,float("nan"))):
             with self.assertRaises(ValueError): LatencyBounds(a,b)
+
+
+class FakeMkr:
+    """Stands in for os/select: answers Q1 with T1 after reply_s of real time."""
+    def __init__(self, reply_s):
+        self.reply_s, self.ready_at, self.out = reply_s, None, b""
+
+    def write(self, fd, data):
+        self.out = crc_line(b"T1 " + data[3:11] + b" 000F4240")
+        self.ready_at = time.monotonic()+self.reply_s
+        return len(data)
+
+    def read(self, fd, n):
+        if self.ready_at is None or time.monotonic() < self.ready_at:
+            raise BlockingIOError
+        data, self.out, self.ready_at = self.out, b"", None
+        return data
+
+    def select(self, r, w, x, timeout):
+        if self.ready_at is None:
+            time.sleep(timeout); return [], [], []
+        wait = self.ready_at-time.monotonic()
+        time.sleep(max(0., min(wait, timeout)))
+        return (r, [], []) if wait <= timeout else ([], [], [])
+
+
+def fake_bridge(mkr, wait=.02):
+    b = SerialBridge.__new__(SerialBridge) # skip the tty open; I/O is faked
+    b.os, b.select, b.sync_wait_s, b.fd = mkr, mkr.select, wait, 3
+    b.decoder, b.buffer, b.discarding = BridgeDecoder(), bytearray(), False
+    b.pending, b.next_sync, b.nonce, b.status = None, 0., 0, None
+    return b
+
+
+class SyncWaitTests(unittest.TestCase):
+    def test_one_poll_anchors_with_true_round_trip(self):
+        b = fake_bridge(FakeMkr(.002))
+        b.poll() # a 20 Hz caller would otherwise measure >= 50 ms and never sync
+        self.assertIsNotNone(b.decoder.clock.anchor)
+        self.assertLess(b.decoder.clock.anchor[2], .01)
+        self.assertIsNone(b.pending)
+
+    def test_wait_is_bounded_and_late_reply_still_matched(self):
+        mkr = FakeMkr(.03)
+        b = fake_bridge(mkr)
+        start = time.monotonic(); b.poll()
+        self.assertLess(time.monotonic()-start, .028)
+        self.assertIsNone(b.decoder.clock.anchor)
+        self.assertIsNotNone(b.pending)
+        time.sleep(.01); b.poll() # 40 ms RTT: accepted, with honest error
+        self.assertGreater(b.decoder.clock.anchor[2], .015)
+
+    def test_sync_wait_validated(self):
+        for wait in (0., .06, 1):
+            with self.assertRaises(ValueError):
+                SerialBridge("/must/not/be/opened", bench_firmware=True, sync_wait_s=wait)
 
 
 if __name__ == "__main__": unittest.main()

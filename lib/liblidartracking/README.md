@@ -128,7 +128,12 @@ USB drops count refused measurement/clock/health writes. These are bench
 diagnostics, not yet integrated into production telemetry.
 
 Host clock sync uses nonce-matched round trips, uint32 micros wrap handling,
-expiry after 5 s and a conservative drift allowance. Clock synchronization is
+expiry after 5 s and a conservative drift allowance. T1 is timestamped when it
+is read, so once per second `poll()` blocks up to `sync_wait_s` (default 20 ms,
+max 50 ms) for the reply; otherwise the round trip would be at least the
+caller's poll period (a 20 Hz loop would never sync). A reply arriving after
+the wait is still matched by a later `poll()`, with its honest, larger error.
+Clock synchronization is
 **not sensor acquisition synchronization**: ID44 has no acquisition timestamp.
 `LatencyBounds` must be measured for the actual rate/firmware/transport before
 setting it. Without those bounds, `timing_verified=False` and no vehicle range
@@ -155,20 +160,24 @@ calibration is a **placeholder**, `verified:false`; it cannot produce valid
 ranges until intrinsics, mount geometry and uncertainty are measured.
 
 ```python
-from lidartracking import VehicleRanger
+from lidartracking import FrameHistory, VehicleRanger
 from lidartracking.camera import CameraAdapter
 
 camera = CameraAdapter(calibration, original_K, distortion, model_path)
 ranger = VehicleRanger(calibration)
+history = FrameHistory()                     # bounded; clear it on any reset
 ranger.select(selected_track_id)             # explicit; never auto-switches
 frame, rectified = camera.process(bgr, exposure_s, exposure_uncertainty_s)
+history.add(frame)
 request = ranger.aim(frame, now_s)
 if request is not None:
     accepted = servo.request_pan(request)     # future servo library
     if not accepted:
         servo.stop()
 feedback = servo.feedback()                  # measured encoder interval
-result = ranger.update(frame, sample, feedback, now_s)
+pair = history.bracket(sample.time_s)        # None until the frame after it exists
+if pair is not None:                         # keep the sample until then
+    result = ranger.update(pair[0], sample, feedback, now_s, next_frame=pair[1])
 # Display only if result.valid AND current_monotonic_s <= result.expires_s.
 # On missing target, stale frames, serial loss or expiry: clear distance and stop
 # requesting motion; the servo driver's own command-expiry watchdog must hold.
@@ -189,14 +198,81 @@ from encoder history; a single position sample is insufficient. One horizontal
 servo cannot correct vertical misalignment, pitch/bumps or targets outside the
 laser height; these produce invalid range, not fabricated distance.
 
-Association requires the entire uncertainty-expanded beam footprint to fit
-inside the central 60% of the selected box and not intersect another box. It
+By default, association requires the entire uncertainty-expanded beam footprint to fit
+inside the central 60% of the selected box and not intersect another box
+(`association="first_return"`, below, relaxes this for range). It
 includes mount translation, rotating lever arm, optical divergence, encoder
 error, range uncertainty and time-skew apparent-motion margin. Verify the
 configured `motion_bound_px_s`; it is not estimated or guaranteed by IoU.
+
+**Pass the two frames around the sample (`next_frame=`).** LiDAR (20 Hz) and
+camera are unsynchronized. With one frame, the margin is speed bound × skew
+(`motion_bound_px_s`, default 2000 px/s), so a 10 ms gap costs 20 px. That
+limits a real 1.8 × 1.5 m car to roughly 10–16 m. With the frames either side,
+boxes (target and others) are interpolated to the LiDAR time per axis. The
+error then scales with `motion_accel_bound_px_s2` (default 10000 px/s², an
+unverified estimate: 1° pitch at 2 Hz is about 3200 px/s² at fx=1200) times the
+frame interval squared. Measured with `fx=1200`, 0.001 rad boresight, centred car:
+
+| Camera | One frame | Frame pair |
+|---|---|---|
+| 30 fps | 11 m | 44 m |
+| 60 fps | 16.5 m | 50.5 m |
+
+At 0.005 rad boresight the pair reaches 31.5–34.5 m; at 40000 px/s², 27.5 m (30 fps).
+The remaining ~50 m ceiling is the beam (0.5° plus pointing error) outgrowing
+the central 60% of the car at this focal length: a lens/calibration limit, not
+a timing one. A low car (1.3 m tall) stops at 38 m (30 fps).
+
+**Longer reach: `VehicleRanger(..., association="first_return")`.** Opt-in.
+The beam may spill sideways or above the car but never below the box's bottom
+edge (ground contact, minus 10% of box height for a loose box). The beam
+*centre*, with pointing error, must lie inside the box's central 60% width and
+below its top 10%. Range is the first return. Other detected vehicles in the
+spill are still rejected as ambiguous. A farther last return (background seen
+through the spill) is allowed, but a last return nearer than the first, or
+invalid, is rejected.
+
+Why this is safe on flat road: a ray that, at the car's range, is above the
+ground-contact row was above the road the whole way there. So a nearer
+surface can enter the beam only below the box. Everything the spill can reach
+(farther road, background, sky) returns *later*. This assumes the box bottom
+is the vehicle's real ground contact, locally flat road, and the LiDAR above
+the road. Undetected nearer obstacles (poles, pedestrians, spray) defeat both
+modes alike. **The first-return bias on a partly covered target is
+unmeasured.** The guide only says returns closer than ~20 m apart merge.
+Bench-test it before relying on this mode.
+
+Best-case reach for a 1.8 m wide car, measured with the code at 30 fps with a
+frame pair and 3 ms total timing uncertainty. Each row has the beam at the best
+height on the car, i.e. the mount pitched for that range. "Measured-ish"
+assumes the rig proves a 1° pitch at 2 Hz bound (3200 px/s² at fx=1200,
+scaled with focal length):
+
+| fx | Pointing (boresight + encoder) | 1.3 m car | 2.0 m car |
+|---|---|---|---|
+| 1200 | 2 mrad | 64 m (78 measured-ish) | 94 m (120) |
+| 1200 | 1 mrad | 74 m (92) | 114 m (142) |
+| 2400 | 1 mrad | 83 m (108) | 128 m (166) |
+| 3600 | 1 mrad | 89 m (117) | 137 m (180) |
+
+At 60 fps, fx=2400 and 1 mrad, a 1.3 m car reaches 106 m with the default
+acceleration bound (120 m measured-ish). Contained mode stops at 38–59 m for
+the same cars. **100 m on a 1.3 m car therefore needs about 2× the current
+focal length, 1 mrad total pointing error, and either 60 fps or a measured
+acceleration bound.** It also needs the detector to find a car that is about
+31 px tall at 100 m.
+
+The servo only pans, so the beam's height on the car is fixed by the mount and
+changes with range. A level beam at windscreen height (~1.2–1.3 m) runs along
+the roof line of a 1.3 m car. Mount the LiDAR lower, or pitch it down, so the
+beam crosses the lower body over the range band you need. Waiting for the next frame adds up to one frame interval of
+latency; `max_skew_s` (0.1 s) must still cover it plus inference. Frame-time
+errors are treated as common-mode (one camera clock). Detector jitter is not
+motion and is left to the central-box shrink; interpolation never amplifies it.
 Rejects stale/out-of-order/future data, unknown calibration/timing, lost target,
 missing encoder, low strength, sentinel/out-of-range returns and differing
-first/last returns. Defaults: 10–120 m, matching conservative Rev3 minimum.
+first/last returns (in first-return mode: only a nearer or invalid last return). Defaults: 10–120 m, matching conservative Rev3 minimum.
 
 Bounding boxes can contain background/windows; equal first/last returns do not
 prove a car hit. The prototype is a hypothesis generator, not certified object

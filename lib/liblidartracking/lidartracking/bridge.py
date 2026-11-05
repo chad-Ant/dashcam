@@ -98,14 +98,23 @@ class BridgeDecoder:
 
 
 class SerialBridge:
-    """Linux nonblocking bounded bench transport; poll from main thread only."""
-    def __init__(self, path, *, bench_firmware=False, latency=None):
+    """Linux nonblocking bounded bench transport; poll from main thread only.
+
+    Clock sync must not depend on the caller's poll rate: T1 is stamped when
+    read, so poll() blocks up to sync_wait_s (once per second) for the reply.
+    """
+    def __init__(self, path, *, bench_firmware=False, latency=None, sync_wait_s=.02):
         if not bench_firmware:
             raise ValueError("requires dedicated GRF250Bridge bench firmware; never steal production USB")
+        if not (isinstance(sync_wait_s, float) and 0 < sync_wait_s <= .05):
+            raise ValueError("sync_wait_s must be within (0, 0.05] s, the ClockMapper RTT limit")
         import os
         import fcntl
+        import select
         import termios
         self.os = os
+        self.select = select.select
+        self.sync_wait_s = sync_wait_s
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -133,45 +142,62 @@ class SerialBridge:
             self.os.close(self.fd); self.fd = None
 
     def poll(self):
+        samples = []
+        # Drain the backlog first so the sync wait below sees fresh bytes only.
+        for _ in range(8): # <= 4096 bytes
+            if not self._read(samples):
+                break
         now = time.monotonic()
         if now >= self.next_sync:
+            self.next_sync = now+1.
             self.nonce = (self.nonce+1) & 0xffffffff
             message = b"Q1 %08X\n" % self.nonce
+            sent = time.monotonic()
             try:
                 n = self.os.write(self.fd, message)
             except BlockingIOError:
                 n = 0
-            self.pending = (self.nonce, now) if n == len(message) else None
-            self.next_sync = now+1.
-        samples = []
-        for _ in range(8): # <= 4096 bytes per call
-            try:
-                data = self.os.read(self.fd, 512)
-            except BlockingIOError:
-                break
-            if not data:
-                break
-            received = time.monotonic()
-            for byte in data:
-                if byte == 10:
-                    if not self.discarding:
-                        try:
-                            kind, values = decode_line(bytes(self.buffer)+b"\n")
-                            if kind == b"T1" and self.pending and values[0] == self.pending[0]:
-                                self.decoder.clock.observe(values[1], self.pending[1], received)
-                                self.pending = None
-                            elif kind == b"L1":
-                                sample = self.decoder.sample(values, received)
-                                if sample is not None:
-                                    samples.append(sample)
-                            elif kind == b"S1":
-                                self.status = dict(zip(("micros", "ready", "firmware", "faults", "usb_drops", "parse_errors"), values))
-                                self.status["received_s"] = received
-                        except ValueError:
-                            self.decoder.errors += 1
-                    self.buffer.clear(); self.discarding = False
-                elif len(self.buffer) < 62 and not self.discarding:
-                    self.buffer.append(byte)
-                else:
-                    self.discarding = True
+            # A late T1 is still matched by a later poll(), with its honest RTT.
+            self.pending = (self.nonce, sent) if n == len(message) else None
+            for _ in range(8): # bounded: deadline AND read count
+                remaining = sent+self.sync_wait_s-time.monotonic()
+                if self.pending is None or remaining <= 0 or not self.select([self.fd], [], [], remaining)[0]:
+                    break
+                if not self._read(samples):
+                    break
         return samples
+
+    def _read(self, samples):
+        try:
+            data = self.os.read(self.fd, 512)
+        except BlockingIOError:
+            return False
+        if not data:
+            return False
+        received = time.monotonic()
+        for byte in data:
+            if byte == 10:
+                if not self.discarding:
+                    try:
+                        self._line(bytes(self.buffer)+b"\n", received, samples)
+                    except ValueError:
+                        self.decoder.errors += 1
+                self.buffer.clear(); self.discarding = False
+            elif len(self.buffer) < 62 and not self.discarding:
+                self.buffer.append(byte)
+            else:
+                self.discarding = True
+        return True
+
+    def _line(self, line, received, samples):
+        kind, values = decode_line(line)
+        if kind == b"T1" and self.pending and values[0] == self.pending[0]:
+            self.decoder.clock.observe(values[1], self.pending[1], received)
+            self.pending = None
+        elif kind == b"L1":
+            sample = self.decoder.sample(values, received)
+            if sample is not None:
+                samples.append(sample)
+        elif kind == b"S1":
+            self.status = dict(zip(("micros", "ready", "firmware", "faults", "usb_drops", "parse_errors"), values))
+            self.status["received_s"] = received

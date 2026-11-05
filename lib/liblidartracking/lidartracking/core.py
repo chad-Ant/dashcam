@@ -38,6 +38,9 @@ class Calibration:
     verified: bool = False
     beam_half_angle_rad: float = 0.004364 # 0.25 deg; verify delivered unit
     motion_bound_px_s: float = 2000. # Must bound apparent motion over time skew.
+    # Bounds apparent box acceleration; used only when two bracketing frames are
+    # interpolated. 1 deg pitch at 2 Hz is ~3200 px/s^2 at fx=1200. Verify on rig.
+    motion_accel_bound_px_s2: float = 10000.
 
     def __post_init__(self):
         if (not isinstance(self.width, int) or not isinstance(self.height, int)
@@ -45,10 +48,12 @@ class Calibration:
                 or len(self.rotation) != 9 or len(self.pivot_m) != 3 or len(self.sensor_offset_m) != 3
                 or not finite(self.fx, self.fy, self.cx, self.cy, *self.rotation,
                               *self.pivot_m, *self.sensor_offset_m,
-                              self.boresight_error_rad, self.beam_half_angle_rad, self.motion_bound_px_s)
+                              self.boresight_error_rad, self.beam_half_angle_rad, self.motion_bound_px_s,
+                              self.motion_accel_bound_px_s2)
                 or self.fx <= 0 or self.fy <= 0 or not 0 <= self.cx < self.width
                 or not 0 <= self.cy < self.height or not 0 <= self.boresight_error_rad < .1
                 or not 0 < self.beam_half_angle_rad < .1 or not 0 < self.motion_bound_px_s <= 100000
+                or not 0 < self.motion_accel_bound_px_s2 <= 1e7
                 or type(self.verified) is not bool):
             raise ValueError("invalid camera / mount calibration")
         r = self.rotation
@@ -146,12 +151,31 @@ class Result:
 
 
 class VehicleRanger:
+    """association selects how the beam must sit on the target box:
+
+    "contained" (default): the whole beam, with pointing error, lies inside the
+    central 60% of the box. Only the target can return; reach is short (a
+    1.3 m tall car: ~38 m at fx=1200, 30 fps).
+
+    "first_return": the beam may spill sideways or above the car, but never
+    below the box's bottom edge, and its centre must be on the car. Range is
+    the first return. Physics: with the box bottom at the vehicle's ground
+    contact on locally flat road and the LiDAR above the road, every ray that
+    is above that row at the car's range is above the road all the way there,
+    so a nearer surface can enter the beam only below the box or as another
+    vehicle, which the ambiguity check rejects. Spill lands on farther ground,
+    background or sky, so it can only add a LATER return. Undetected nearer
+    obstacles (poles, people, spray) defeat both modes alike.
+    Bench-verify first-return bias on partly covered targets before relying on it.
+    """
     def __init__(self, calibration, *, min_m=10., max_m=120., max_skew_s=.1,
-                 pan_limits=(-.65, .65), min_db=0., range_noise_m=.5):
+                 pan_limits=(-.65, .65), min_db=0., range_noise_m=.5, association="contained"):
         if (not finite(min_m, max_m, max_skew_s, *pan_limits, min_db, range_noise_m)
                 or not 0 < min_m < max_m <= 300 or not 0 < max_skew_s <= .25
-                or not -1.4 < pan_limits[0] < pan_limits[1] < 1.4 or range_noise_m <= 0):
+                or not -1.4 < pan_limits[0] < pan_limits[1] < 1.4 or range_noise_m <= 0
+                or association not in ("contained", "first_return")):
             raise ValueError("invalid ranger settings")
+        self.first_return = association == "first_return"
         self.c = calibration
         self.min_m, self.max_m, self.skew = min_m, max_m, max_skew_s
         self.pan_limits, self.min_db, self.noise = pan_limits, min_db, range_noise_m
@@ -210,17 +234,27 @@ class VehicleRanger:
             return None # do NOT saturate an unreachable bearing into a valid aim
         return ServoCommand(target.track_id, angle, frame.time_s + self.skew)
 
-    def update(self, frame, sample, servo, now):
-        command = self.aim(frame, now)
+    def update(self, frame, sample, servo, now, next_frame=None):
+        """next_frame: the frame after `frame`, with frame <= sample <= next_frame
+        in time. Boxes are then interpolated to the LiDAR time, so the margin
+        grows with acceleration x interval^2, not speed x skew. Without it, the
+        single-frame margin motion_bound_px_s x skew applies (much shorter reach).
+        """
+        latest = frame if next_frame is None else next_frame
+        command = self.aim(latest, now)
         if not self.c.verified:
             return self._reject("uncalibrated")
-        if not self._validate_frame(frame) or not finite(now):
+        if (not self._validate_frame(frame) or not finite(now)
+                or (next_frame is not None and not self._validate_frame(next_frame))):
             return self._reject("invalid_camera_frame")
         if self.last_frame_time is not None and frame.time_s < self.last_frame_time:
             return self._reject("camera_out_of_order")
+        if next_frame is not None and not 0 < next_frame.time_s-frame.time_s <= self.skew:
+            return self._reject("invalid_frame_pair")
         self.last_frame_time = frame.time_s
         target = next((d for d in frame.detections if d.track_id == self.selected), None)
-        if target is None or command is None:
+        later = next((d for d in latest.detections if d.track_id == self.selected), None)
+        if target is None or later is None or command is None:
             return self._reject("target_missing_or_unreachable")
         if (sample.timing_verified is not True or not finite(sample.time_s, sample.uncertainty_s,
                 sample.first_m, sample.last_m, sample.first_db, sample.last_db)
@@ -232,12 +266,15 @@ class VehicleRanger:
             if delta == 0 or delta >= 0x80000000 or sample.time_s <= self.last_time:
                 return self._reject("range_out_of_order", command)
         self.last_sequence, self.last_time = sample.sequence, sample.time_s
-        uncertainty = sample.uncertainty_s + frame.uncertainty_s
-        if (now < sample.time_s or now < frame.time_s
+        # Frame-time errors of one camera are treated as common mode (one clock).
+        uncertainty = sample.uncertainty_s + max(frame.uncertainty_s, latest.uncertainty_s)
+        if (now < sample.time_s or now < latest.time_s
                 or now - sample.time_s + sample.uncertainty_s > self.skew
                 or now - frame.time_s + frame.uncertainty_s > self.skew
                 or abs(sample.time_s-frame.time_s) + uncertainty > self.skew):
             return self._reject("stale_or_unsynchronized", command)
+        if next_frame is not None and not frame.time_s <= sample.time_s <= next_frame.time_s:
+            return self._reject("range_not_bracketed", command)
         if (servo is None or servo.settled is not True or not finite(servo.time_s, servo.pan_rad,
                 servo.error_rad, servo.settled_since_s, servo.valid_until_s)
                 or not 0 <= servo.error_rad < .1 or not self.pan_limits[0] <= servo.pan_rad <= self.pan_limits[1]
@@ -246,47 +283,101 @@ class VehicleRanger:
                 or servo.settled_since_s > sample.time_s-sample.uncertainty_s
                 or servo.valid_until_s < sample.time_s+sample.uncertainty_s):
             return self._reject("servo_not_verified", command)
-        distances = (sample.first_m, sample.last_m)
-        if (any(not self.min_m <= d <= self.max_m for d in distances)
-                or min(sample.first_db, sample.last_db) < self.min_db):
-            return self._reject("no_usable_return", command)
-        if abs(sample.first_m-sample.last_m) > 2*self.noise:
-            return self._reject("multiple_returns", command)
-        distance = min(distances) # never choose a farther background return silently
-        error = self.c.beam_half_angle_rad + self.c.boresight_error_rad + servo.error_rad
-        # Bound a ball around the return (beam cone, calibration, encoder and
-        # lever-arm error) by a 3D box. Project every corner at near/far range.
-        # Conservative vs merely sampling cone edges under an arbitrary R.
-        points = []
+        if self.first_return:
+            # Spill may add a farther (last) return, never a nearer one. A last
+            # return that is invalid or nearer than the first is not physical.
+            if (not self.min_m <= sample.first_m <= self.max_m or sample.first_db < self.min_db
+                    or sample.last_m < sample.first_m-2*self.noise):
+                return self._reject("no_usable_return", command)
+            distance = sample.first_m
+        else:
+            distances = (sample.first_m, sample.last_m)
+            if (any(not self.min_m <= d <= self.max_m for d in distances)
+                    or min(sample.first_db, sample.last_db) < self.min_db):
+                return self._reject("no_usable_return", command)
+            if abs(sample.first_m-sample.last_m) > 2*self.noise:
+                return self._reject("multiple_returns", command)
+            distance = min(distances) # never choose a farther background return silently
+        pointing = self.c.boresight_error_rad + servo.error_rad
         try:
-            for d in (max(.01, distance-3*self.noise), distance+3*self.noise):
-                center = self.c.point(d, servo.pan_rad)
-                lever = sqrt(sum(v*v for v in self.c.sensor_offset_m))
-                radius = 2*(d+lever)*sin(error/2)
-                for x in (-radius, radius):
-                    for y in (-radius, radius):
-                        for z in (-radius, radius):
-                            points.append(self.c.project((center[0]+x,center[1]+y,center[2]+z)))
+            a, b, c, d = self._footprint(distance, servo.pan_rad, self.c.beam_half_angle_rad+pointing)
+            # Where the beam CENTRE can be: pointing error only, no divergence.
+            ca, cb, cc, _ = self._footprint(distance, servo.pan_rad, pointing)
         except ValueError:
             return self._reject("beam_behind_camera", command)
-        margin = 2 + self.c.motion_bound_px_s*(abs(sample.time_s-frame.time_s)+uncertainty)
-        footprint = (min(p[0] for p in points)-margin, min(p[1] for p in points)-margin,
-                     max(p[0] for p in points)+margin, max(p[1] for p in points)+margin)
-        x1, y1, x2, y2 = target.box
+        stamp = sample.time_s
+        tracks = {o.track_id: [o.box, None] for o in frame.detections}
+        if next_frame is not None:
+            for o in next_frame.detections:
+                tracks.setdefault(o.track_id, [None, None])[1] = o.box
+        def moved(b0, b1):
+            if b1 is None:
+                return self._motion(b0, frame.time_s, None, None, stamp, uncertainty)
+            if b0 is None:
+                return self._motion(b1, next_frame.time_s, None, None, stamp, uncertainty)
+            return self._motion(b0, frame.time_s, b1, next_frame.time_s, stamp, uncertainty)
+        (x1, y1, x2, y2), (ex, ey) = moved(*tracks[target.track_id])
         # Shrink to central 60% to avoid edges/background within detector boxes.
         mx, my = .2*(x2-x1), .2*(y2-y1)
-        a,b,c,d = footprint
-        if not (x1+mx <= a <= c <= x2-mx and y1+my <= b <= d <= y2-my):
+        if self.first_return:
+            # Image y points down: y2 is the ground contact. 10% of the height
+            # covers a loose box bottom; the centre stays off box edges/mirrors.
+            inside = (d+ey <= y2-.5*my and y1+.5*my <= cb-ey
+                      and x1+mx <= ca-ex <= cc+ex <= x2-mx)
+        else:
+            inside = x1+mx <= a-ex <= c+ex <= x2-mx and y1+my <= b-ey <= d+ey <= y2-my
+        if not inside:
             return self._reject("beam_outside_target", command)
-        for other in frame.detections:
-            if other.track_id == target.track_id:
+        for track_id, (b0, b1) in tracks.items():
+            if track_id == target.track_id:
                 continue
-            l,t,r,bottom = other.box
-            if max(a,l) < min(c,r) and max(b,t) < min(d,bottom):
+            (l, t, r, bottom), (ex, ey) = moved(b0, b1)
+            if max(a-ex, l) < min(c+ex, r) and max(b-ey, t) < min(d+ey, bottom):
                 return self._reject("ambiguous_target", command)
         forward = self.c.point(distance, servo.pan_rad)[2]
         expiry = min(sample.time_s-sample.uncertainty_s, frame.time_s-frame.uncertainty_s)+self.skew
         return self._filter(sample.time_s, distance, forward, command, expiry)
+
+    def _footprint(self, distance, pan, error):
+        """Image box bounding a ball around the return (beam cone, calibration,
+        encoder and lever-arm error) by a 3D box, every corner projected at
+        near/far range. Conservative vs sampling cone edges under arbitrary R.
+        Raises ValueError if any corner is behind the camera."""
+        points = []
+        lever = sqrt(sum(v*v for v in self.c.sensor_offset_m))
+        for d in (max(.01, distance-3*self.noise), distance+3*self.noise):
+            center = self.c.point(d, pan)
+            radius = 2*(d+lever)*sin(error/2)
+            for x in (-radius, radius):
+                for y in (-radius, radius):
+                    for z in (-radius, radius):
+                        points.append(self.c.project((center[0]+x, center[1]+y, center[2]+z)))
+        return (min(p[0] for p in points), min(p[1] for p in points),
+                max(p[0] for p in points), max(p[1] for p in points))
+
+    def _motion(self, b0, t0, b1, t1, stamp, uncertainty):
+        """Box at `stamp` and a pixel bound on its displacement error.
+
+        One frame: speed bound V times skew. Two frames (t0 <= stamp <= t1, T =
+        t1-t0, w = (stamp-t0)/T): linear interpolation is off by at most
+        w(1-w)T*min(A*T/2, 2V) for acceleration bound A, and near stamp the speed
+        is at most min(V, observed + A(T+u)). Detector jitter is not motion; the
+        central-box shrink covers it, and interpolation never amplifies it.
+        """
+        speed_bound = self.c.motion_bound_px_s
+        if b1 is None:
+            m = 2 + speed_bound*(abs(stamp-t0)+uncertainty)
+            return b0, (m, m)
+        accel = self.c.motion_accel_bound_px_s2
+        span = t1-t0
+        w = (stamp-t0)/span
+        error = w*(1-w)*span*min(accel*span/2, 2*speed_bound)
+        margins = []
+        for axis in (0, 1): # per axis: lateral motion must not widen the vertical gate
+            observed = max(abs(b1[axis]-b0[axis]), abs(b1[axis+2]-b0[axis+2]))/span
+            speed = min(speed_bound, observed + accel*(span+uncertainty))
+            margins.append(2 + error + speed*uncertainty)
+        return tuple(p+w*(q-p) for p, q in zip(b0, b1)), tuple(margins)
 
     def _filter(self, stamp, distance, forward, command, expiry):
         # Alpha-beta filter with innovation gate. Reset on any invalid association
@@ -306,6 +397,35 @@ class VehicleRanger:
             closing = -velocity
         self.filter = (stamp, position, velocity)
         return Result(True, "associated", self.selected, distance, forward, position, closing, command, expiry)
+
+
+class FrameHistory:
+    """Bounded recent CameraFrames; finds the consecutive pair around a sample.
+
+    LiDAR (20 Hz) and camera are unsynchronized, so the frame after a sample
+    arrives later: keep frames here and call update() once it exists.
+    """
+    def __init__(self, size=8):
+        if not isinstance(size, int) or not 2 <= size <= 64:
+            raise ValueError("history size must be 2..64")
+        self.size = size
+        self.frames = []
+
+    def add(self, frame):
+        if not isfinite(frame.time_s) or (self.frames and frame.time_s <= self.frames[-1].time_s):
+            raise ValueError("frames must be finite and strictly increasing in time")
+        self.frames.append(frame)
+        del self.frames[:-self.size]
+
+    def bracket(self, time_s):
+        """(before, after) with before.time_s <= time_s <= after.time_s, else None."""
+        for before, after in zip(self.frames, self.frames[1:]):
+            if before.time_s <= time_s <= after.time_s:
+                return before, after
+        return None
+
+    def clear(self):
+        self.frames = []
 
 
 class BoxTracker:
