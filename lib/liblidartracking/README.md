@@ -92,8 +92,19 @@ flags (payload length in bits 6–15, write flag bit0), command/data, CRC16-XMOD
 bytes, frame gap timeout 20 ms. Reserved flag bits are ignored.
 
 Startup checks product name and reads firmware; it stops streaming, writes and
-reads back output mask `0x2D` (first raw cm, first strength dB, last raw cm, last
+reads back output mask `0x2D` (first raw, first strength dB, last raw, last
 strength dB), lost-signal count 1, rate 20 Hz, then stream mode 5 / command 44.
+**Distances are in 0.1 m (decimetres), not cm.** The guide's ID44 header says
+"in cm", but its body says 0.1 m resolution, and the bench settles it. On fw
+2.0.5 the sensor sent raw 29 for a target tape-measured at 2.9 m. Lost signal is
+raw -10 (= -1 m, the guide's other sentinel).
+
+**Blanking distance hides near targets behind a plausible-looking value.** The
+bench unit shipped with blanking 10 m (Studio's Parameters page; ID 117, in mm).
+Any return nearer than the blanking distance reads as blanking − 0.1 m at full
+strength, e.g. a constant 9.9 m indoors, even with the lenses covered. It does
+NOT read as lost signal. Keep `VehicleRanger(min_m=...)` at or above the unit's
+blanking distance (default 10 m), so that floor value is always rejected.
 First UART command can be consumed by interface selection: bounded retry handles
 this. No flash Save, reset, upgrade or laser-enable command is sent. If a unit
 boots with laser disabled, inspect its configuration explicitly; this driver
@@ -111,7 +122,7 @@ unattended production firmware watchdog implementation.
 USB protocol (ASCII, LF, uppercase hex, maximum 62 bytes per measurement):
 
 ```text
-L1 sequence micros first_cm first_db last_cm last_db crc16
+L1 sequence micros first_dm first_db last_dm last_db crc16   # dm = 0.1 m
 Q1 nonce                          # host request: exactly 8 hex digits
 T1 nonce micros crc16              # MKR reply
 S1 micros ready firmware faults usb_drops parse_errors crc16  # 1 Hz health
@@ -326,8 +337,12 @@ open reader. This library never auto-flashes or stops a running service.
    unpowered, then run a differential loopback with MKR disconnected. Verify
    termination and power during servo stall/load before connecting sensor I/O.
 2. Bench-connect GRF, check reported firmware and a measured target at 10, 20,
-   50 and 100 m. Verify cm units, lost-signal sentinel, first/last behavior,
-   reconnect recovery, strength and USB loss. Capture raw bytes as fixtures.
+   50 and 100 m. Done on 2026-11-09 with the real Driver relayed to the
+   sensor's USB port, no MKR: 0.1 m units, the -10 sentinel, 4-byte write
+   echoes, startup while already streaming, and 20 Hz with no parse errors.
+   Raw frames are fixtures in `test_protocol.cpp`. Still to do: the MKR UART
+   path, first/last behaviour on real split targets, reconnect after power
+   loss, strength vs range, and USB loss.
 3. Calibrate IMX296 intrinsics at its actual focus/resolution. Fit laser mount
    rotation, pivot, encoder zero/sign and lever arm from measured targets over
    several distances and pan positions. Validate on held-out targets; determine

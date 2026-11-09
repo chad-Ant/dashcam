@@ -32,9 +32,9 @@ static void emit(const grf250::Sample& s) {
     char line[64];
     const int n = snprintf(line, sizeof(line), "L1 %08lX %08lX %08lX %08lX %08lX %08lX",
         static_cast<unsigned long>(s.sequence), static_cast<unsigned long>(s.receivedUs),
-        static_cast<unsigned long>(static_cast<uint32_t>(s.firstCm)),
+        static_cast<unsigned long>(static_cast<uint32_t>(s.firstDm)),
         static_cast<unsigned long>(static_cast<uint32_t>(s.firstDb)),
-        static_cast<unsigned long>(static_cast<uint32_t>(s.lastCm)),
+        static_cast<unsigned long>(static_cast<uint32_t>(s.lastDm)),
         static_cast<unsigned long>(static_cast<uint32_t>(s.lastDb)));
     if (!sendLine(line, n, sizeof(line))) ++usbDrops;
 }

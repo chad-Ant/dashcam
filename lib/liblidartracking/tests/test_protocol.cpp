@@ -86,13 +86,31 @@ int main() {
     assert(!receive(driver,packet(44,std::vector<uint8_t>(16)),100,sample));
     configure(driver,0xfffffff0u);
     std::vector<uint8_t> fields;
-    for (const auto value: {10000u,25u,10000u,25u}) { auto bytes=u32(value); fields.insert(fields.end(),bytes.begin(),bytes.end()); }
+    for (const auto value: {1000u,25u,1000u,25u}) { auto bytes=u32(value); fields.insert(fields.end(),bytes.begin(),bytes.end()); }
     assert(receive(driver,packet(44,fields),100,sample));
-    assert(sample.firstCm==10000 && sample.firstDb==25 && sample.sequence==1);
+    assert(sample.firstDm==1000 && sample.firstDb==25 && sample.sequence==1); // 100 m
     assert(!receive(driver,packet(44,std::vector<uint8_t>(12)),200,sample));
     grf250::put32(fields.data(),0xfffffff6u);
     assert(receive(driver,packet(44,fields),300,sample));
-    assert(sample.firstCm==-10 && sample.sequence==2);
+    assert(sample.firstDm==-10 && sample.sequence==2);
+    // Real GRF-250 bytes (fw 2.0.5, 2026-11-09): stream frame for a taped 2.9 m
+    // target, mask 0x2D. Proves CRC, flags and field order on actual hardware data.
+    const std::vector<uint8_t> real44 = {0xaa,0x40,0x04,0x2c,0x1d,0x00,0x00,0x00,0x43,0x00,0x00,0x00,
+                                         0x1d,0x00,0x00,0x00,0x43,0x00,0x00,0x00,0xfd,0xff};
+    assert(receive(driver,real44,400,sample));
+    assert(sample.firstDm==29 && sample.firstDb==67 && sample.lastDm==29 && sample.lastDb==67);
+    // The stale all-fields (mask 0xFF) frame a previously streaming unit sent once
+    // after reconfiguration: a valid frame, but the wrong size, so it is ignored.
+    const std::vector<uint8_t> stale44 = {0xaa,0x40,0x08,0x2c,0x1d,0x00,0x00,0x00,0x1d,0x00,0x00,0x00,
+        0x4a,0x00,0x00,0x00,0x1d,0x00,0x00,0x00,0x1d,0x00,0x00,0x00,0x4a,0x00,0x00,0x00,
+        0x2d,0x0f,0x00,0x00,0x01,0x01,0x00,0x00,0x7b,0xda};
+    const uint32_t before = driver.parseErrors();
+    assert(!receive(driver,stale44,450,sample) && driver.parseErrors()==before && driver.ready());
+    // Real write acknowledgement: ID27 echoes the 4-byte mask with the write bit clear.
+    const std::vector<uint8_t> realAck27 = {0xaa,0x40,0x01,0x1b,0x2d,0x00,0x00,0x00,0xb4,0x69};
+    grf250::Parser realParser;
+    count=0; for (const auto b: realAck27) count += realParser.feed(b,1,parsed);
+    assert(count==1 && parsed.size==5 && parsed.payload[0]==27 && grf250::get32(parsed.payload+1)==0x2du);
     assert(driver.nextCommand(600301,output,sizeof(output))==0 && !driver.ready());
     assert(driver.nextCommand(600302,output,sizeof(output))==0);
     configure(driver,2600302);

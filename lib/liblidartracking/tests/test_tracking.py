@@ -287,9 +287,9 @@ class TrackerTests(unittest.TestCase):
 
 class BridgeTests(unittest.TestCase):
     def test_crc_and_schema(self):
-        body=b"L1 00000001 000F4240 00002710 00000019 00002710 00000019"
+        body=b"L1 00000001 000F4240 000003E8 00000019 000003E8 00000019"
         kind,fields=decode_line(crc_line(body))
-        self.assertEqual(kind,b"L1"); self.assertEqual(fields[2],10000)
+        self.assertEqual(kind,b"L1"); self.assertEqual(fields[2],1000)
         with self.assertRaises(ValueError): decode_line(crc_line(body)[:-2]+b"0\n")
         with self.assertRaises(ValueError): decode_line(crc_line(b"L1 00"))
         with self.assertRaises(ValueError): decode_line(b"x"*100)
@@ -305,18 +305,29 @@ class BridgeTests(unittest.TestCase):
 
     def test_unsynced_not_trusted(self):
         d=BridgeDecoder()
-        s=d.sample((1,1000000,10000,20,10000,20),1.01)
+        s=d.sample((1,1000000,1000,20,1000,20),1.01)
         self.assertFalse(s.timing_verified)
         self.assertEqual(s.first_m,100.)
+
+    def test_real_capture_is_decimetres(self):
+        # Real L1 values from the GRF-250 (fw 2.0.5) via the real C++ Driver,
+        # target tape-measured at 2.9 m on 2026-11-09. Raw 0x1D = 29 = 2.9 m.
+        d=BridgeDecoder()
+        for body, metres in ((b"L1 00000001 0005E705 0000001D 00000043 0000001D 00000043", 2.9),
+                             (b"L1 0000001B 0019C63A 0000001C 00000047 0000001C 00000047", 2.8)):
+            kind,fields=decode_line(crc_line(body))
+            s=d.sample(fields,1.)
+            self.assertAlmostEqual(s.first_m,metres); self.assertAlmostEqual(s.last_m,metres)
+        self.assertEqual(s.first_db,0x47)
 
     def test_latency_and_reboot(self):
         d=BridgeDecoder(LatencyBounds(.01,.02))
         d.clock.observe(1000000,1.,1.002)
-        s=d.sample((20,1000000,10000,20,0xfffffff6,20),1.003)
+        s=d.sample((20,1000000,1000,20,0xfffffff6,20),1.003)
         self.assertTrue(s.timing_verified)
-        self.assertEqual(s.last_m,-.1)
+        self.assertEqual(s.last_m,-1.) # lost-signal sentinel -10 x 0.1 m
         self.assertAlmostEqual(s.time_s,.986)
-        s=d.sample((1,2000000,10000,20,10000,20),2.)
+        s=d.sample((1,2000000,1000,20,1000,20),2.)
         self.assertFalse(s.timing_verified)
         self.assertIsNone(d.clock.anchor)
 

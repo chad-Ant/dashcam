@@ -23,7 +23,7 @@ class SerialTests(unittest.TestCase):
             time.sleep(.002)
             self.assertEqual(bridge.poll(),[])
             self.assertIsNotNone(bridge.decoder.clock.anchor)
-            line=crc_line(b"L1 00000001 000F4240 00002710 00000019 00002710 00000019")
+            line=crc_line(b"L1 00000001 000F4240 000003E8 00000019 000003E8 00000019")
             os.write(master,line[:20]); time.sleep(.002)
             self.assertEqual(bridge.poll(),[])
             os.write(master,line[20:]); time.sleep(.002)

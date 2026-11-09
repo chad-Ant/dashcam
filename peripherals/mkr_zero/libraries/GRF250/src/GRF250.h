@@ -76,9 +76,11 @@ private:
     size_t used_ = 0;
     uint32_t last_ = 0;
 };
+// ID44 distances are in 0.1 m (dm). The guide's "in cm" header is wrong:
+// bench-verified on fw 2.0.5 (raw 29 at a taped 2.9 m; lost signal -10 = -1 m).
 struct Sample {
     uint32_t sequence = 0, receivedUs = 0;
-    int32_t firstCm = -10, firstDb = 0, lastCm = -10, lastDb = 0;
+    int32_t firstDm = -10, firstDb = 0, lastDm = -10, lastDb = 0;
 };
 
 // Single-owner main-loop FSM. A caller MUST service nextCommand and receive
@@ -112,8 +114,8 @@ public:
             if (p.payload[0] != 44 || p.size != 17) return false;
             lastSample_ = nowUs;
             sample.sequence = ++sequence_; sample.receivedUs = nowUs;
-            sample.firstCm = signed32(p.payload + 1); sample.firstDb = signed32(p.payload + 5);
-            sample.lastCm = signed32(p.payload + 9); sample.lastDb = signed32(p.payload + 13);
+            sample.firstDm = signed32(p.payload + 1); sample.firstDb = signed32(p.payload + 5);
+            sample.lastDm = signed32(p.payload + 9); sample.lastDb = signed32(p.payload + 13);
             return true; // Lost-signal sentinels MUST reach the host, not retain old distance.
         }
         if (!waiting_ || cooling_ || p.payload[0] != id()) return false;

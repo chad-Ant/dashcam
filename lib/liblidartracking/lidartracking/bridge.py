@@ -93,7 +93,8 @@ class BridgeDecoder:
         if verified:
             stamp -= (self.latency.minimum_s+self.latency.maximum_s)/2
             uncertainty += (self.latency.maximum_s-self.latency.minimum_s)/2
-        return RangeSample(sequence, stamp, uncertainty, signed(first)/100., signed(last)/100.,
+        # L1 distances are GRF ID44 units: 0.1 m, NOT cm (bench-verified, fw 2.0.5).
+        return RangeSample(sequence, stamp, uncertainty, signed(first)/10., signed(last)/10.,
                            signed(first_db), signed(last_db), verified)
 
 
