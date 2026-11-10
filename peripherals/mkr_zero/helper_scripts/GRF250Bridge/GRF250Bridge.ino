@@ -8,7 +8,9 @@
 // Serial1 stays reserved for the C3. A4/A5 servo reservations are untouched.
 Uart lidarUart(&sercom0, A6, A3, SERCOM_RX_PAD_3, UART_TX_PAD_0);
 void SERCOM0_Handler() { lidarUart.IrqHandler(); }
-static grf250::Driver lidar;
+// true: stream every return (ID45) as L2 lines; false: first/last (ID44) as L1.
+static constexpr bool kFiveReturns = true;
+static grf250::Driver lidar(kFiveReturns);
 static bool pinsOk = false;
 static uint32_t usbDrops = 0, lastLoopUs = 0;
 
@@ -28,7 +30,25 @@ static bool sendLine(char* buf, int n, size_t capacity) {
     if (added != 6) return false;
     return Serial.write(reinterpret_cast<const uint8_t*>(buf), static_cast<size_t>(n + added)) == static_cast<size_t>(n + added);
 }
+// L2: each return is 6 hex digits, distance dm as int16 (4) then strength dB
+// clamped to 0..255 (2), in raw sensor slot order; 000000 is an empty slot.
+// 55 characters + " CRC\n" stays within the 63-byte line limit.
+static unsigned long field24(int32_t dm, int32_t db) {
+    const int32_t d = dm < -32768 ? -32768 : dm > 32767 ? 32767 : dm;
+    const uint32_t s = db < 0 ? 0u : db > 255 ? 255u : static_cast<uint32_t>(db);
+    return static_cast<unsigned long>(static_cast<uint16_t>(static_cast<int16_t>(d))) << 8 | s;
+}
+static void emitReturns(const grf250::Sample& s) {
+    unsigned long f[grf250::kReturnSlots];
+    for (size_t k = 0; k < grf250::kReturnSlots; ++k) f[k] = field24(s.returnDm[k], s.returnDb[k]);
+    char line[64];
+    const int n = snprintf(line, sizeof(line), "L2 %08lX %08lX %06lX %06lX %06lX %06lX %06lX",
+        static_cast<unsigned long>(s.sequence), static_cast<unsigned long>(s.receivedUs),
+        f[0], f[1], f[2], f[3], f[4]);
+    if (!sendLine(line, n, sizeof(line))) ++usbDrops;
+}
 static void emit(const grf250::Sample& s) {
+    if (s.slots) { emitReturns(s); return; }
     char line[64];
     const int n = snprintf(line, sizeof(line), "L1 %08lX %08lX %08lX %08lX %08lX %08lX",
         static_cast<unsigned long>(s.sequence), static_cast<unsigned long>(s.receivedUs),

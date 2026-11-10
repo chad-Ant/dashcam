@@ -8,7 +8,7 @@
 #include <string.h>
 
 namespace grf250 {
-constexpr size_t kMaxPayload = 33; // ID + all eight ID44 int32 fields
+constexpr size_t kMaxPayload = 45; // ID + the 44-byte ID45 result (largest used)
 constexpr size_t kMaxFrame = kMaxPayload + 5;
 inline uint16_t crc(const uint8_t* p, size_t n) {
     uint16_t c = 0;
@@ -78,9 +78,22 @@ private:
 };
 // ID44 distances are in 0.1 m (dm). The guide's "in cm" header is wrong:
 // bench-verified on fw 2.0.5 (raw 29 at a taped 2.9 m; lost signal -10 = -1 m).
+// ID45 (five-return mode) is 10 int32 fields (5 x distance mm, strength dB),
+// then temperature. Its distances are mm in 100 mm steps; they are rounded to
+// dm here so both modes share one unit. Empty slots are 0 mm / 0 dB (bench,
+// fw 2.0.5). Slot order for 3+ returns is unverified, so hosts must sort.
+constexpr size_t kReturnSlots = 5;
+inline int32_t mmToDm(int32_t mm) {
+    const int64_t v = mm;
+    return static_cast<int32_t>(v >= 0 ? (v + 50) / 100 : -((-v + 50) / 100));
+}
 struct Sample {
     uint32_t sequence = 0, receivedUs = 0;
+    // First/last mode (ID44) only; left as lost signal in five-return mode.
     int32_t firstDm = -10, firstDb = 0, lastDm = -10, lastDb = 0;
+    // Five-return mode (ID45) only: slots == kReturnSlots, raw slot order.
+    uint8_t slots = 0;
+    int32_t returnDm[kReturnSlots] = {}, returnDb[kReturnSlots] = {};
 };
 
 // Single-owner main-loop FSM. A caller MUST service nextCommand and receive
@@ -88,7 +101,10 @@ struct Sample {
 // Writes only RAM configuration, never Save/Reset/firmware/laser-enable commands.
 class Driver {
 public:
+    // fiveReturns: stream ID45 (all returns) instead of ID44 (first and last).
+    explicit Driver(bool fiveReturns = false) : five_(fiveReturns) {}
     uint32_t faults = 0, firmware = 0;
+    bool fiveReturns() const { return five_; }
     bool ready() const { return step_ == kRunning; }
     uint32_t parseErrors() const { return parser_.errors; }
     void transportFault(uint32_t nowUs) { fail(nowUs); }
@@ -111,9 +127,19 @@ public:
         Packet p;
         if (!parser_.feed(byte, nowUs, p)) return false;
         if (ready()) {
-            if (p.payload[0] != 44 || p.size != 17) return false;
+            if (five_ ? (p.payload[0] != 45 || p.size != 45) : (p.payload[0] != 44 || p.size != 17))
+                return false;
             lastSample_ = nowUs;
+            sample = Sample();
             sample.sequence = ++sequence_; sample.receivedUs = nowUs;
+            if (five_) {
+                sample.slots = kReturnSlots;
+                for (size_t k = 0; k < kReturnSlots; ++k) {
+                    sample.returnDm[k] = mmToDm(signed32(p.payload + 1 + 8 * k));
+                    sample.returnDb[k] = signed32(p.payload + 5 + 8 * k);
+                }
+                return true; // Empty readings MUST reach the host, not retain old distances.
+            }
             sample.firstDm = signed32(p.payload + 1); sample.firstDb = signed32(p.payload + 5);
             sample.lastDm = signed32(p.payload + 9); sample.lastDb = signed32(p.payload + 13);
             return true; // Lost-signal sentinels MUST reach the host, not retain old distance.
@@ -141,9 +167,10 @@ private:
         if (step_ == 4 || step_ == 5) return 0x2du;
         if (step_ == 6 || step_ == 7) return 1u;
         if (step_ == 8 || step_ == 9) return 20u;
-        if (step_ == 10 || step_ == 11) return 5u;
+        if (step_ == 10 || step_ == 11) return five_ ? 6u : 5u; // stream ID45 / ID44
         return 0;
     }
+    bool five_ = false;
     void fail(uint32_t nowUs) {
         ++faults; step_ = 0; waiting_ = false; tries_ = 0;
         cooling_ = true; sent_ = nowUs; parser_.reset();

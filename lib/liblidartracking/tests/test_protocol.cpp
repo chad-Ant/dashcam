@@ -21,7 +21,7 @@ static bool receive(grf250::Driver& driver, const std::vector<uint8_t>& wire, ui
     for (const uint8_t byte : wire) if (driver.receive(byte,now,out)) got = true;
     return got;
 }
-static void configure(grf250::Driver& driver, uint32_t now) {
+static void configure(grf250::Driver& driver, uint32_t now, uint32_t stream = 5) {
     uint8_t command[10]; grf250::Sample sample;
     for (unsigned i=0; i<12; ++i) {
         const size_t n = driver.nextCommand(now,command,sizeof(command));
@@ -30,7 +30,7 @@ static void configure(grf250::Driver& driver, uint32_t now) {
         if (i == 0) { data.resize(16); memcpy(data.data(),"GRF250",6); }
         else if (i == 1) data = u32(0x00050200);
         else {
-            const uint32_t expected = i < 4 ? 0u : i < 6 ? 0x2du : i < 8 ? 1u : i < 10 ? 20u : 5u;
+            const uint32_t expected = i < 4 ? 0u : i < 6 ? 0x2du : i < 8 ? 1u : i < 10 ? 20u : stream;
             if (n == 10) assert(grf250::get32(command+4) == expected);
             data = u32(expected);
         }
@@ -111,9 +111,44 @@ int main() {
     grf250::Parser realParser;
     count=0; for (const auto b: realAck27) count += realParser.feed(b,1,parsed);
     assert(count==1 && parsed.size==5 && parsed.payload[0]==27 && grf250::get32(parsed.payload+1)==0x2du);
+    // First/last mode ignores ID45 frames without counting a parse error.
+    assert(!receive(driver,packet(45,std::vector<uint8_t>(44)),500,sample) && driver.parseErrors()==before);
     assert(driver.nextCommand(600301,output,sizeof(output))==0 && !driver.ready());
     assert(driver.nextCommand(600302,output,sizeof(output))==0);
     configure(driver,2600302);
+    // Five-return mode: configures stream 6 and parses ID45 (mm -> dm, raw slots).
+    assert(grf250::mmToDm(7149)==71 && grf250::mmToDm(7150)==72 && grf250::mmToDm(-10)==0
+           && grf250::mmToDm(-150)==-2 && grf250::mmToDm(INT32_MIN)==-21474836);
+    grf250::Driver five(true);
+    assert(five.fiveReturns());
+    configure(five,0,6);
+    std::vector<uint8_t> returns;
+    for (const int32_t value: {7100,49,20400,63,0,0,0,0,0,0,3008}) {
+        auto bytes=u32(static_cast<uint32_t>(value)); returns.insert(returns.end(),bytes.begin(),bytes.end());
+    }
+    assert(receive(five,packet(45,returns),100,sample));
+    assert(sample.slots==5 && sample.returnDm[0]==71 && sample.returnDb[0]==49
+           && sample.returnDm[1]==204 && sample.returnDb[1]==63 && sample.returnDm[2]==0
+           && sample.returnDb[4]==0 && sample.firstDm==-10 && sample.sequence==1);
+    // Real ID45 frames (fw 2.0.5, 2026-11-10): a 0.9 m blanked return at 73 dB
+    // (blanking 1 m), and an empty reading. Temperature (4151 = 41.51 C) ignored.
+    const std::vector<uint8_t> real45 = {0xaa,0x40,0x0b,0x2d,0x84,0x03,0,0,0x49,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x37,0x10,0,0,0x0e,0x48};
+    assert(receive(five,real45,200,sample));
+    assert(sample.returnDm[0]==9 && sample.returnDb[0]==73 && sample.returnDm[1]==0 && sample.sequence==2);
+    const std::vector<uint8_t> empty45 = {0xaa,0x40,0x0b,0x2d,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0xc0,0x0b,0,0,0xa9,0xa2};
+    assert(receive(five,empty45,300,sample));
+    for (size_t k=0;k<grf250::kReturnSlots;++k) assert(sample.returnDm[k]==0 && sample.returnDb[k]==0);
+    // Real three-return frame through the café window: 4.1 m (glass) + 31.4 m +
+    // 120.6 m. The third return fills slot 3; the "last" slot stays empty.
+    const std::vector<uint8_t> three45 = {0xaa,0x40,0x0b,0x2d,0x04,0x10,0,0,0x36,0,0,0,
+        0xa8,0x7a,0,0,0x36,0,0,0,0x18,0xd7,0x01,0,0x16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0x7b,0x10,0,0,0xac,0xa1};
+    assert(receive(five,three45,350,sample));
+    assert(sample.returnDm[0]==41 && sample.returnDm[1]==314 && sample.returnDm[2]==1206
+           && sample.returnDb[2]==22 && sample.returnDm[4]==0 && sample.returnDb[4]==0);
+    assert(!receive(five,packet(44,fields),400,sample) && five.parseErrors()==0); // ID44 ignored
     // Five bounded retries incl. UART interface-selection first command loss.
     grf250::Driver absent;
     for (uint32_t i=0;i<5;++i) assert(absent.nextCommand(i*250000,output,10)==6);

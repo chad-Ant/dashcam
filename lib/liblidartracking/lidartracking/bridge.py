@@ -22,10 +22,25 @@ def decode_line(line):
     if not re.fullmatch(rb"[0-9A-F]{4}", check) or int(check, 16) != binascii.crc_hqx(body, 0):
         raise ValueError("bridge CRC")
     fields = body.split(b" ")
-    count = {b"L1": 7, b"T1": 3, b"S1": 7}.get(fields[0])
-    if count is None or len(fields) != count or any(not re.fullmatch(rb"[0-9A-F]{8}", v) for v in fields[1:]):
+    # Hex digits per field. L2 packs each return in 6: dm int16 (4) + dB 0..255 (2).
+    widths = {b"L1": (8,)*6, b"L2": (8, 8) + (6,)*5, b"T1": (8,)*2, b"S1": (8,)*6}.get(fields[0])
+    if (widths is None or len(fields) != len(widths)+1
+            or any(not re.fullmatch(rb"[0-9A-F]{%d}" % w, v) for w, v in zip(widths, fields[1:]))):
         raise ValueError("bridge schema")
     return fields[0], tuple(int(v,16) for v in fields[1:])
+
+
+def returns_from_fields(fields):
+    """L2 return fields -> ((metres, dB), ...) sorted nearest first, empty slots dropped.
+
+    Sensor slot order for 3+ returns is unverified, so order is never trusted."""
+    returns = []
+    for v in fields:
+        dm, db = v >> 8, v & 0xff
+        dm = dm-0x10000 if dm >= 0x8000 else dm
+        if dm or db:
+            returns.append((dm/10., float(db)))
+    return tuple(sorted(returns))
 
 
 def signed(u):
@@ -76,7 +91,29 @@ class BridgeDecoder:
         self.generation = 0
 
     def sample(self, values, received_s):
+        """L1 (first/last) fields -> RangeSample, or None for a duplicate."""
         sequence, tick, first, first_db, last, last_db = values
+        timing = self._timing(sequence, tick, received_s)
+        if timing is None:
+            return None
+        # L1 distances are GRF ID44 units: 0.1 m, NOT cm (bench-verified, fw 2.0.5).
+        return RangeSample(sequence, *timing[:2], signed(first)/10., signed(last)/10.,
+                           signed(first_db), signed(last_db), timing[2])
+
+    def returns_sample(self, values, received_s):
+        """L2 (five-return) fields -> RangeSample, or None for a duplicate.
+
+        first/last are the nearest/farthest return (-1 m, 0 dB when there is none)."""
+        sequence, tick, *fields = values
+        timing = self._timing(sequence, tick, received_s)
+        if timing is None:
+            return None
+        returns = returns_from_fields(fields)
+        first, last = (returns[0], returns[-1]) if returns else ((-1., 0.), (-1., 0.))
+        return RangeSample(sequence, *timing[:2], first[0], last[0], first[1], last[1],
+                           timing[2], returns)
+
+    def _timing(self, sequence, tick, received_s):
         if self.previous is not None:
             delta = (sequence-self.previous) & 0xffffffff
             if delta == 0:
@@ -93,9 +130,7 @@ class BridgeDecoder:
         if verified:
             stamp -= (self.latency.minimum_s+self.latency.maximum_s)/2
             uncertainty += (self.latency.maximum_s-self.latency.minimum_s)/2
-        # L1 distances are GRF ID44 units: 0.1 m, NOT cm (bench-verified, fw 2.0.5).
-        return RangeSample(sequence, stamp, uncertainty, signed(first)/10., signed(last)/10.,
-                           signed(first_db), signed(last_db), verified)
+        return stamp, uncertainty, verified
 
 
 class SerialBridge:
@@ -195,8 +230,9 @@ class SerialBridge:
         if kind == b"T1" and self.pending and values[0] == self.pending[0]:
             self.decoder.clock.observe(values[1], self.pending[1], received)
             self.pending = None
-        elif kind == b"L1":
-            sample = self.decoder.sample(values, received)
+        elif kind in (b"L1", b"L2"):
+            decode = self.decoder.sample if kind == b"L1" else self.decoder.returns_sample
+            sample = decode(values, received)
             if sample is not None:
                 samples.append(sample)
         elif kind == b"S1":

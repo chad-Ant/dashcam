@@ -88,12 +88,15 @@ Cross-checked against [manufacturer guide Rev 5.2](https://lightwarelidar.com/wp
 
 115200 baud, 8N1, no flow control, full duplex. Protocol: AA, little-endian
 flags (payload length in bits 6–15, write flag bit0), command/data, CRC16-XMODEM
-(initial zero, polynomial 0x1021), CRC low byte first. Supported payload <=33
-bytes, frame gap timeout 20 ms. Reserved flag bits are ignored.
+(initial zero, polynomial 0x1021), CRC low byte first. Supported payload <=45
+bytes (ID + the 44-byte ID45 result), frame gap timeout 20 ms. Reserved flag
+bits are ignored.
 
 Startup checks product name and reads firmware; it stops streaming, writes and
 reads back output mask `0x2D` (first raw, first strength dB, last raw, last
-strength dB), lost-signal count 1, rate 20 Hz, then stream mode 5 / command 44.
+strength dB), lost-signal count 1, rate 20 Hz, then stream mode 5 / command 44,
+or with `grf250::Driver(true)` stream mode 6 / command 45 (every return, below).
+The bench sketch uses five-return mode (`kFiveReturns` in GRF250Bridge.ino).
 **Distances are in 0.1 m (decimetres), not cm.** The guide's ID44 header says
 "in cm", but its body says 0.1 m resolution, and the bench settles it. On fw
 2.0.5 the sensor sent raw 29 for a target tape-measured at 2.9 m. Lost signal is
@@ -105,12 +108,34 @@ Any return nearer than the blanking distance reads as blanking − 0.1 m at full
 strength, e.g. a constant 9.9 m indoors, even with the lenses covered. It does
 NOT read as lost signal. Keep `VehicleRanger(min_m=...)` at or above the unit's
 blanking distance (default 10 m), so that floor value is always rejected.
+
+**Mount the sensor exposed, with no window in the beam.** This is the design
+assumption. Glass in front of the lens returns an echo, and that echo takes the
+first slot. Bench, 2026-11-10: the sensor aimed through a café window 3–4 m
+away. Over 431 ID45 polls in 20 s, every reading had a 2.9–6.2 m first return:
+the glass, possibly merged with tree trunks just outside. In 18% of polls it was
+the only return, so the street behind it was lost. Farther returns appeared at
+31 m, 74 m and 120 m. Behind a windscreen, first-return mode would range the
+glass. With the factory 10 m blanking, it would instead read 9.9 m and reject
+the sample. LightWare also advises against window mounting.
+
 First UART command can be consumed by interface selection: bounded retry handles
 this. No flash Save, reset, upgrade or laser-enable command is sent. If a unit
 boots with laser disabled, inspect its configuration explicitly; this driver
 does not silently turn it on. Defaults / changed firmware require bench checks.
-Five-return ID45 is not implemented: both cited guides list a 44-byte result
-but enumerate 40 bytes of fields. Do not guess a parser for it.
+**Five-return ID45 follows the bench layout, not the guide.** The guide lists a
+44-byte result but enumerates only 40 bytes of fields. Bench reads (fw 2.0.5,
+2026-11-10) found:
+- 10 int32 fields (5 × distance, dB), then temperature in 0.01 °C (ignored)
+- distances in **mm**, unlike ID44's 0.1 m; the driver rounds them to dm
+- unused slots read 0 / 0 dB, not the -10 sentinel; an empty reading is all zeros
+- returns fill slots 1, 2, 3 in order and nearest first; the "last" slot
+  stayed 0 in every reading (1291 polls through a café window, up to three
+  returns, e.g. 4.1 + 31.4 + 120.6 m)
+
+Four or five returns have not been seen, so whether the fifth uses "last" is
+unknown. The driver passes raw slots, and the host drops empty ones and sorts
+by distance, so the order never matters.
 
 `-10` lost-return sentinel is preserved; the host never substitutes the previous
 range. At 500 ms without the expected stream, the FSM fails closed and restarts
@@ -123,13 +148,18 @@ USB protocol (ASCII, LF, uppercase hex, maximum 62 bytes per measurement):
 
 ```text
 L1 sequence micros first_dm first_db last_dm last_db crc16   # dm = 0.1 m
+L2 sequence micros r1 r2 r3 r4 r5 crc16  # five-return mode, raw slot order
 Q1 nonce                          # host request: exactly 8 hex digits
 T1 nonce micros crc16              # MKR reply
 S1 micros ready firmware faults usb_drops parse_errors crc16  # 1 Hz health
 ```
 
 Every field except prefix/CRC is exactly eight hex digits; signed values are
-two's-complement int32. CRC covers ASCII before the final space. Sequence counts
+two's-complement int32. The exception is the L2 returns, six hex digits each:
+distance in dm as int16 (four digits), then strength dB clamped to 0–255 (two),
+`000000` for an empty slot. `BridgeDecoder.returns_sample` turns L2 into a
+`RangeSample` whose `returns` holds `(metres, dB)` nearest first, with
+first/last set to the nearest/farthest (-1 m, 0 dB when there is none). CRC covers ASCII before the final space. Sequence counts
 all parsed samples, including USB drops; no queue preserves stale ranges. Writes
 are <=63 bytes and only when the CDC IN bank is idle (the stock core's
 `availableForWrite()` alone is not sufficient). `SerialBridge.status` exposes
@@ -253,6 +283,40 @@ the road. Undetected nearer obstacles (poles, pedestrians, spray) defeat both
 modes alike. **The first-return bias on a partly covered target is
 unmeasured.** The guide only says returns closer than ~20 m apart merge.
 Bench-test it before relying on this mode.
+
+**Camera-gated: `VehicleRanger(..., association="gated")`.** Opt-in; intended
+for five-return samples. The beam geometry is first_return's. The range is the
+nearest return whose camera-frame forward distance fits a window. The window
+comes from the box height and the label's real height bounds (`heights_m`,
+defaults below), allowing a box 10% + 2 px too tight or loose plus motion, and
+±3× range noise.
+- First/last data can hide the car. With spray at 15 m, the car at 50 m and the
+  background at 120 m, ID44 reports only 15 and 120 m, so first_return ranges
+  the spray. With five returns, gated mode skips the spray and ranges the car.
+  The bench has seen three returns in one reading (5 + 34 + 120 m).
+- Nearer returns outside the window are skipped and reported as
+  `Result.skipped_nearer_m`. That covers spray, lens dirt, a motorbike between,
+  and any undetected obstacle, so a consumer should watch it rather than
+  ignore it. A near return that persists while moving means a dirty lens.
+- Spray within the window just in front of the target reads short (the safe
+  side). The window's upper bound rarely binds; the lower bound does the work.
+- Rejections: `no_return_in_window` when nothing fits (also when the box is
+  truncated or the label wrong), `box_too_small` when the box is too short to
+  bound its height, and `no_usable_return` for unphysical first/last data.
+- Without `returns` (ID44 samples) it falls back to first/last as candidates.
+
+| label | default height bounds |
+|---|---|
+| car | 1.3–2.0 m |
+| truck | 2.0–4.3 m |
+| bus | 2.8–4.3 m |
+| motorcycle | 1.0–1.9 m (with rider) |
+
+At 50 m a 1.3 m car (31 px at fx=1200) gets a window of about 33–140 m. Reach
+is still first_return's (the table below). Relaxing the centre-on-car rule for
+partly covered targets needs a return-strength model first. Camera pitch and
+roll are ignored by the window. The two-returns-must-be-~20 m-apart limit still
+applies: a vehicle within ~13–20 m behind the target merges with it.
 
 Best-case reach for a 1.8 m wide car, measured with the code at 30 fps with a
 frame pair and 3 ms total timing uncertainty. Each row has the beam at the best

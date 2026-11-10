@@ -34,6 +34,10 @@ class SerialTests(unittest.TestCase):
             os.write(master,b"x"*200+b"\n"+line); time.sleep(.002)
             self.assertEqual(bridge.poll(),[]) # duplicate sequence, not a new sample
             self.assertLessEqual(len(bridge.buffer),62)
+            os.write(master,crc_line(b"L2 00000002 000F4240 01F431 0C8014 000000 000000 000000"))
+            time.sleep(.002)
+            results=bridge.poll()
+            self.assertEqual([r.returns for r in results],[((50.,49.),(320.,20.))])
             os.write(master,crc_line(b"S1 000F4240 00000001 00050200 00000000 00000002 00000003"))
             time.sleep(.002)
             bridge.poll()

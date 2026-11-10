@@ -4,7 +4,7 @@ Input boxes MUST be from rectified images at the calibrated resolution. A box
 is not a segmentation mask: association is a hypothesis, never proof of a hit.
 No motor commands are executed here. Only measured servo feedback can gate range.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import atan2, cos, sin, isfinite, sqrt
 from typing import Optional, Protocol, Tuple
 
@@ -109,6 +109,9 @@ class RangeSample:
     last_db: float
     # False until sensor acquisition-to-UART latency has a measured bound.
     timing_verified: bool = False
+    # Five-return mode only: every return as (metres, dB), nearest first, at
+    # most five. Empty in first/last mode (first/last fields are then used).
+    returns: Tuple[Tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,9 @@ class Result:
     closing_mps: Optional[float] = None # positive = approaching; not ego velocity
     pan_request: Optional[ServoCommand] = None
     expires_s: Optional[float] = None # consumer MUST clear distance after this time
+    # "gated" only: nearest valid return skipped as nearer than the target could
+    # be (spray, lens dirt, an undetected object in the beam). None if none.
+    skipped_nearer_m: Optional[float] = None
 
 
 class VehicleRanger:
@@ -167,15 +173,33 @@ class VehicleRanger:
     background or sky, so it can only add a LATER return. Undetected nearer
     obstacles (poles, people, spray) defeat both modes alike.
     Bench-verify first-return bias on partly covered targets before relying on it.
+
+    "gated": the first_return beam geometry, but the range is the nearest
+    return inside a window from the box height and the label's real height
+    bounds (heights_m), with 10% + 2 px box error and motion margin. Nearer
+    returns are skipped: spray, lens dirt, a motorbike between, and also any
+    undetected obstacle, which the result reports as skipped_nearer_m. Meant for
+    five-return samples (RangeSample.returns), where the target can be a middle
+    return that first/last never reports; falls back to first/last otherwise.
+    Spray within the window just in front of the target reads short (safe side).
     """
+    DEFAULT_HEIGHTS_M = {"car": (1.3, 2.0), "truck": (2.0, 4.3), "bus": (2.8, 4.3),
+                         "motorcycle": (1.0, 1.9)}
+
     def __init__(self, calibration, *, min_m=10., max_m=120., max_skew_s=.1,
-                 pan_limits=(-.65, .65), min_db=0., range_noise_m=.5, association="contained"):
+                 pan_limits=(-.65, .65), min_db=0., range_noise_m=.5, association="contained",
+                 heights_m=None):
+        heights = dict(self.DEFAULT_HEIGHTS_M if heights_m is None else heights_m)
         if (not finite(min_m, max_m, max_skew_s, *pan_limits, min_db, range_noise_m)
                 or not 0 < min_m < max_m <= 300 or not 0 < max_skew_s <= .25
                 or not -1.4 < pan_limits[0] < pan_limits[1] < 1.4 or range_noise_m <= 0
-                or association not in ("contained", "first_return")):
+                or association not in ("contained", "first_return", "gated")
+                or set(heights) != set(self.DEFAULT_HEIGHTS_M)
+                or any(len(h) != 2 or not finite(*h) or not 0 < h[0] < h[1] <= 6 for h in heights.values())):
             raise ValueError("invalid ranger settings")
-        self.first_return = association == "first_return"
+        self.heights = {k: (float(v[0]), float(v[1])) for k, v in heights.items()}
+        self.gated = association == "gated"
+        self.first_return = association in ("first_return", "gated") # beam geometry
         self.c = calibration
         self.min_m, self.max_m, self.skew = min_m, max_m, max_skew_s
         self.pan_limits, self.min_db, self.noise = pan_limits, min_db, range_noise_m
@@ -259,7 +283,8 @@ class VehicleRanger:
         if (sample.timing_verified is not True or not finite(sample.time_s, sample.uncertainty_s,
                 sample.first_m, sample.last_m, sample.first_db, sample.last_db)
                 or sample.uncertainty_s < 0 or not isinstance(sample.sequence, int)
-                or not 0 <= sample.sequence <= 0xffffffff):
+                or not 0 <= sample.sequence <= 0xffffffff
+                or not self._valid_returns(sample.returns)):
             return self._reject("invalid_range_or_timing", command)
         if self.last_sequence is not None:
             delta = (sample.sequence-self.last_sequence) & 0xffffffff
@@ -283,7 +308,25 @@ class VehicleRanger:
                 or servo.settled_since_s > sample.time_s-sample.uncertainty_s
                 or servo.valid_until_s < sample.time_s+sample.uncertainty_s):
             return self._reject("servo_not_verified", command)
-        if self.first_return:
+        stamp = sample.time_s
+        tracks = {o.track_id: [o.box, None] for o in frame.detections}
+        if next_frame is not None:
+            for o in next_frame.detections:
+                tracks.setdefault(o.track_id, [None, None])[1] = o.box
+        def moved(b0, b1):
+            if b1 is None:
+                return self._motion(b0, frame.time_s, None, None, stamp, uncertainty)
+            if b0 is None:
+                return self._motion(b1, next_frame.time_s, None, None, stamp, uncertainty)
+            return self._motion(b0, frame.time_s, b1, next_frame.time_s, stamp, uncertainty)
+        (x1, y1, x2, y2), (ex, ey) = moved(*tracks[target.track_id])
+        skipped = None
+        if self.gated:
+            picked = self._gated_return(sample, target.label, y2-y1, 2*ey, servo.pan_rad)
+            if isinstance(picked, str):
+                return self._reject(picked, command)
+            distance, skipped = picked
+        elif self.first_return:
             # Spill may add a farther (last) return, never a nearer one. A last
             # return that is invalid or nearer than the first is not physical.
             if (not self.min_m <= sample.first_m <= self.max_m or sample.first_db < self.min_db
@@ -305,18 +348,6 @@ class VehicleRanger:
             ca, cb, cc, _ = self._footprint(distance, servo.pan_rad, pointing)
         except ValueError:
             return self._reject("beam_behind_camera", command)
-        stamp = sample.time_s
-        tracks = {o.track_id: [o.box, None] for o in frame.detections}
-        if next_frame is not None:
-            for o in next_frame.detections:
-                tracks.setdefault(o.track_id, [None, None])[1] = o.box
-        def moved(b0, b1):
-            if b1 is None:
-                return self._motion(b0, frame.time_s, None, None, stamp, uncertainty)
-            if b0 is None:
-                return self._motion(b1, next_frame.time_s, None, None, stamp, uncertainty)
-            return self._motion(b0, frame.time_s, b1, next_frame.time_s, stamp, uncertainty)
-        (x1, y1, x2, y2), (ex, ey) = moved(*tracks[target.track_id])
         # Shrink to central 60% to avoid edges/background within detector boxes.
         mx, my = .2*(x2-x1), .2*(y2-y1)
         if self.first_return:
@@ -336,7 +367,42 @@ class VehicleRanger:
                 return self._reject("ambiguous_target", command)
         forward = self.c.point(distance, servo.pan_rad)[2]
         expiry = min(sample.time_s-sample.uncertainty_s, frame.time_s-frame.uncertainty_s)+self.skew
-        return self._filter(sample.time_s, distance, forward, command, expiry)
+        result = self._filter(sample.time_s, distance, forward, command, expiry)
+        return replace(result, skipped_nearer_m=skipped) if result.valid and skipped is not None else result
+
+    @staticmethod
+    def _valid_returns(returns):
+        try:
+            return len(returns) <= 5 and all(len(r) == 2 and finite(*r) for r in returns)
+        except TypeError:
+            return False
+
+    def _gated_return(self, sample, label, height_px, motion_px, pan):
+        """(distance, skipped nearer return or None), else a reject reason.
+
+        Window on camera-frame forward distance: real height bounds over the box
+        height, allowing a box 10% + 2 px too tight or loose plus motion."""
+        returns = sample.returns
+        if not returns: # first/last fallback; a last return nearer than the first is not physical
+            if sample.last_m < sample.first_m-2*self.noise:
+                return "no_usable_return"
+            returns = ((sample.first_m, sample.first_db), (sample.last_m, sample.last_db))
+        low, high = self.heights[label]
+        loose, tight = 1.1*height_px+2+motion_px, .9*height_px-2-motion_px
+        if tight <= 0:
+            return "box_too_small"
+        near = self.c.fy*low/loose - 3*self.noise
+        far = self.c.fy*high/tight + 3*self.noise
+        usable = sorted(m for m, db in returns
+                        if self.min_m <= m <= self.max_m and db >= self.min_db)
+        try:
+            inside = [m for m in usable if near <= self.c.point(m, pan)[2] <= far]
+        except ValueError:
+            return "beam_behind_camera"
+        if not inside:
+            return "no_return_in_window"
+        nearer = [m for m in usable if m < inside[0]]
+        return inside[0], (nearer[0] if nearer else None)
 
     def _footprint(self, distance, pan, error):
         """Image box bounding a ball around the return (beam cone, calibration,

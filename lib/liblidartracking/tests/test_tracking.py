@@ -264,6 +264,69 @@ class FirstReturnTests(unittest.TestCase):
         with self.assertRaises(ValueError): VehicleRanger(self.c, association="nearest")
 
 
+class GatedTests(FirstReturnTests):
+    """Same low car at 50 m (box 31.2 px tall): window is roughly 33-140 m."""
+    def setUp(self):
+        super().setUp()
+        self.r = self.ranger("gated")
+
+    def returns(self, *pairs, sequence=1):
+        first, last = pairs[0] if pairs else (-1., 0.), pairs[-1] if pairs else (-1., 0.)
+        return replace(self.s, sequence=sequence, first_m=first[0], first_db=first[1],
+                       last_m=last[0], last_db=last[1], returns=tuple(sorted(pairs)))
+
+    # Inherited first-return tests run here too, through the first/last fallback,
+    # except where gating deliberately behaves differently (overridden below).
+    def test_unphysical_or_weak_returns_rejected(self):
+        for s, why in ((replace(self.s, last_m=45.), "no_usable_return"),  # last nearer than first
+                       (replace(self.s, last_m=-.1), "no_usable_return"),  # lost-signal sentinel
+                       (replace(self.s, first_db=-1., last_db=-1.), "no_return_in_window"),
+                       (replace(self.s, first_m=150., last_m=150.), "no_return_in_window"),
+                       (replace(self.s, first_m=15., last_m=15.), "no_return_in_window")):
+            self.r.last_sequence = None; self.r.last_frame_time = None
+            self.assertEqual(self.update(s=s).reason, why)
+
+    def test_spray_before_target_is_skipped(self):
+        s = self.returns((15., 40.), (50., 20.))
+        r = self.update(s=s)
+        self.assertTrue(r.valid, r.reason)
+        self.assertEqual((r.slant_m, r.skipped_nearer_m), (50., 15.))
+        # first_return trusts the 15 m spray, a range for the wrong object.
+        self.assertEqual(self.update(s=s, ranger=self.ranger("first_return")).slant_m, 15.)
+
+    def test_middle_return_first_last_cannot_see(self):
+        s = self.returns((15., 40.), (50., 20.), (120., 5.))
+        self.assertEqual((s.first_m, s.last_m), (15., 120.)) # what ID44 would report
+        r = self.update(s=s)
+        self.assertTrue(r.valid, r.reason)
+        self.assertEqual(r.slant_m, 50.)
+
+    def test_no_return_in_window(self):
+        for k, s in enumerate((self.returns((15., 40.)), self.returns()), 1):
+            s = replace(s, sequence=k, time_s=1.+k/100)
+            self.assertEqual(self.update(s=s).reason, "no_return_in_window")
+
+    def test_label_heights_move_the_window(self):
+        # A 31.2 px truck is at least 2.0 m tall, so it is >= ~51 m away: 50 m is out.
+        f0 = CameraFrame(1.,.001,1456,1088,(Detection(7,self.car(531.),.95,"truck"),))
+        self.assertEqual(self.update(f0).reason, "no_return_in_window")
+        ranger = VehicleRanger(self.c, association="gated",
+                               heights_m=dict(VehicleRanger.DEFAULT_HEIGHTS_M, truck=(1.2, 4.3)))
+        ranger.select(7)
+        self.assertTrue(self.update(f0, ranger=ranger).valid)
+
+    def test_box_too_small(self):
+        f0 = self.frame(1., (720., 540., 736., 548.))
+        self.assertEqual(self.update(f0).reason, "box_too_small")
+
+    def test_invalid_returns_and_heights(self):
+        for k, returns in enumerate((((float("nan"), 1.),), ((50., 20.),)*6, ((50.,),)), 1):
+            s = replace(self.s, sequence=k, time_s=1.+k/100, returns=returns)
+            self.assertEqual(self.update(s=s).reason, "invalid_range_or_timing")
+        for heights in ({"car": (1.3, 2.)}, dict(VehicleRanger.DEFAULT_HEIGHTS_M, car=(2., 1.3))):
+            with self.assertRaises(ValueError): VehicleRanger(self.c, association="gated", heights_m=heights)
+
+
 class TrackerTests(unittest.TestCase):
     def test_ids_and_loss(self):
         t=BoxTracker(); d=[((10,10,100,100),.9,"car")]
@@ -319,6 +382,24 @@ class BridgeTests(unittest.TestCase):
             s=d.sample(fields,1.)
             self.assertAlmostEqual(s.first_m,metres); self.assertAlmostEqual(s.last_m,metres)
         self.assertEqual(s.first_db,0x47)
+
+    def test_five_return_line(self):
+        # 50.0 m @ 0x31 dB in slot 1 and 320.0 m @ 20 dB in slot 3; slots unsorted on purpose.
+        body=b"L2 00000005 000F4240 0C8014 000000 01F431 000000 000000"
+        line=crc_line(body)
+        self.assertLessEqual(len(line),63)
+        kind,fields=decode_line(line)
+        s=BridgeDecoder().returns_sample(fields,1.)
+        self.assertEqual(kind,b"L2")
+        self.assertEqual(s.returns,((50.,49.),(320.,20.)))
+        self.assertEqual((s.first_m,s.first_db,s.last_m,s.last_db),(50.,49.,320.,20.))
+        # Bench reading (2026-11-10): 7.1 m @ 49 dB + 20.4 m @ 63 dB, as the sketch packs it.
+        kind,fields=decode_line(crc_line(b"L2 00000006 000F4241 004731 00CC3F 000000 000000 000000"))
+        self.assertEqual(BridgeDecoder().returns_sample(fields,1.).returns,((7.1,49.),(20.4,63.)))
+        empty=BridgeDecoder().returns_sample((7,1,0,0,0,0,0),1.)
+        self.assertEqual((empty.returns,empty.first_m,empty.last_m),((),-1.,-1.))
+        with self.assertRaises(ValueError): decode_line(crc_line(body.replace(b"0C8014",b"0C801400")))
+        with self.assertRaises(ValueError): decode_line(crc_line(b"L1 00000005 000F4240 0C8014 000000 01F431 000000"))
 
     def test_latency_and_reboot(self):
         d=BridgeDecoder(LatencyBounds(.01,.02))
