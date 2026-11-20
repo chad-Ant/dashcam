@@ -2,7 +2,8 @@
 #include <Adafruit_ILI9341.h>
 
 // IPS panel power, VCOM, inversion and gamma from LCDWiki's ILI9341V_Init.txt.
-inline void es3ConfigureIpsPanel(Adafruit_ILI9341& panel)
+// rotated180 turns the landscape image upside down for an inverted mounting.
+inline void es3ConfigureIpsPanel(Adafruit_ILI9341& panel, bool rotated180 = false)
 {
     uint8_t data0[] = {0x0, 0xc1, 0x30};
     panel.sendCommand(0xcf, data0, sizeof(data0));
@@ -41,9 +42,10 @@ inline void es3ConfigureIpsPanel(Adafruit_ILI9341& panel)
     panel.sendCommand(0xe1, data17, sizeof(data17));
 
     // Set the library's 320x240 bounds, then apply LCDWiki's landscape
-    // MADCTL value (MX | MV | BGR) for this panel's mounting.
+    // MADCTL value (MX | MV | BGR) for this panel's mounting; rotated by 180
+    // degrees, both row and column order flip (MY | MV | BGR).
     panel.setRotation(1);
-    uint8_t landscape = 0x68;
+    uint8_t landscape = rotated180 ? 0xa8 : 0x68;
     panel.sendCommand(ILI9341_MADCTL, &landscape, sizeof(landscape));
 }
 

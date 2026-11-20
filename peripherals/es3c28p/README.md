@@ -118,15 +118,15 @@ need one fresh calibration for the corrected display orientation.
 Saving verifies a temporary record before replacing the primary and retains
 `.cal.bak` for recovery; boot falls back to that backup if the primary is invalid.
 This protects against failed writes/renames, not every SD power-loss failure.
-Re-tap the active SET tab to recalibrate. With no SD card the wizard still
+Tap RECALIBRATE on the SET tab (or re-tap the active SET tab) to recalibrate. With no SD card the wizard still
 works, but calibration is lost on reboot. Out-of-range, repeated or unordered
 calibration knots are rejected before piecewise mapping.
 
 ## Brightness
 
-This board has **no onboard LDR**. By default, Settings `-` / `+` changes
-manual PWM brightness (`B=8..255`), starting at full brightness. The lower
-limit keeps the controls visible; brightness resets on reboot.
+This board has **no onboard LDR**. By default, the Settings BRIGHTNESS
+slider sets the manual PWM brightness (8..255), saved in `/settings.xml`.
+The lower limit keeps the controls visible.
 
 For CYD-style automatic brightness, connect a 3.3 V LDR voltage divider to
 GPIO2 and enable `kAutoBrightness` in `src/DashboardConfig.h`. Measure the
@@ -134,9 +134,51 @@ divider's dark and bright ADC readings, then set `kBrightness.darkRaw`,
 `brightRaw`, and
 `brightThresholdRaw` accordingly; the supplied values are examples.
 The external divider uses 11 dB ADC attenuation. GPIO9 is the battery
-monitor, not a light sensor. Settings then adjusts the raw light threshold
-by 10, and `L:<raw> B:<duty>` shows the filtered input and smoothly faded PWM.
-The threshold also resets on reboot.
+monitor, not a light sensor. The BRIGHTNESS slider then sets the bright level;
+`L:<raw> B:<duty>` shows the filtered input and smoothly faded PWM.
+
+## Settings tab and /settings.xml
+
+The SET tab holds the user's controls, top to bottom:
+
+- **MASTER VOLUME** slider (0-100 %, 0 = muted) with a **TEST** button. It
+  scales every sound linearly, including the boot tone and alerts requested
+  over USB (`ALERT` volume x master). TEST plays `/alert.wav` at full alert
+  volume, the loudest any notification can be at that setting.
+- **BRIGHTNESS** slider: backlight PWM 8-255 (never fully dark). With the
+  optional LDR (`kAutoBrightness`) it sets the bright level and the dim level
+  never exceeds it; the LDR threshold is then fixed by `kBrightness`.
+- **MIC THRESHOLD** slider with a **MIC IN** indicator: grey while there is
+  no input (or no microphone source), green once the input level reaches the
+  threshold. No microphone driver exists yet; `Es3Graphics::setMicLevel()`
+  is the hook for it.
+- **RECALIBRATE** starts the touch wizard (re-tapping the SET tab still works).
+
+Drag or tap a slider; the value is written when the finger lifts. The title
+bar shows DEFAULTS, FROM SD, SAVED or NOT SAVED (no card or write failure).
+Values persist on the card as `/settings.xml`, read at boot (before the boot
+tone, so it plays at the saved master volume):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<settings version="1">
+  <masterVolume>10</masterVolume>
+  <brightness>100</brightness>
+  <micThreshold>50</micThreshold>
+</settings>
+```
+
+Every value is a percentage. A missing or invalid element keeps its default
+from `kDefaultSettings` (`src/DashboardConfig.h`); a file without the
+`<settings>` root is ignored. Saving uses the calibration's scheme: verify
+`/settings.xml.tmp`, keep the previous file as `/settings.xml.bak`, promote;
+boot falls back to the backup. STATUS does not report these values.
+
+## Display orientation
+
+`kRotateDisplay180` (`src/DashboardConfig.h`) turns the image and touch
+input upside down for an inverted mounting. Touch coordinates are mirrored
+in pixel space, so an existing calibration remains valid.
 
 ## Build and upload
 
@@ -206,8 +248,11 @@ For `/dev/dashcam-display`, replace `DISPLAY_SERIAL_HERE` in the supplied udev
 template with the ES3C28P's serial, install it in `/etc/udev/rules.d/`, reload
 rules with `sudo udevadm control --reload-rules`, and replug the board. The
 template does nothing until customized. Both C3 and S3 share VID/PID
-303a:1001, so serial matching is required. The template also removes the
-existing broad C3 `dashcam-bridge` alias from the matched display. Pin the C3
+303a:1001, so serial matching is required; the alias then follows the board
+to any USB port. The C3's `99-dashcam-bridge.rules` matches every 303a:1001
+device, so with both boards attached add the C3's serial to it, or the display
+also gets `/dev/dashcam-bridge` (udev 249 on JetPack 6 has no `SYMLINK-=` to
+remove it from the display rule). Pin the C3
 link's `CommLinkConfig::device` to its own by-id path or `/dev/dashcam-bridge`
 when running both links, to avoid its generic `USB_JTAG` discovery probing
 the display. The firmware rejects the C3 protocol independently of naming.

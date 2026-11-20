@@ -1,6 +1,8 @@
 #include "../lib/es3Graphics/BmpLayout.h"
 #include "../src/DashboardConfig.h"
 #include "../lib/es3Audio/WavHeader.h"
+#include "../lib/es3Audio/AudioLevel.h"
+#include "../lib/es3Graphics/SettingsLayout.h"
 #include <vector>
 #include <cstring>
 #include <cassert>
@@ -67,6 +69,54 @@ static void wave() {
     bad = wav(); u32(bad.data.data()+42,100); assert(!parse(bad)); // data outside RIFF
     bad = wav(); bad.data.resize(10); assert(!parse(bad));
 }
+static void levels() {
+    using es3audio::scaleSample;
+    assert(scaleSample(128, 100, 100) == 0);
+    assert(scaleSample(255, 100, 100) == 127 * 256 && scaleSample(0, 100, 100) == -32768);
+    assert(scaleSample(255, 100, 0) == 0 && scaleSample(0, 0, 100) == 0); // either level mutes
+    assert(scaleSample(255, 100, 10) == 127 * 256 / 10);                  // master scales linearly
+    assert(scaleSample(0, 80, 10) == -128 * 256 * 80 * 10 / 10000);       // boot tone at default master
+    assert(scaleSample(0, 255, 255) == -32768);                           // out-of-range levels clamp
+    assert(scaleSample(132, 50, 50) == 4 * 256 / 4);
+    assert(kDefaultMasterVolume <= 100 && kDefaultSettings.masterVolume == kDefaultMasterVolume);
+    assert(kDefaultSettings.brightness <= 100 && kDefaultSettings.micThreshold <= 100);
+}
+static void settingsLayout() {
+    using namespace es3settings;
+    // Slider value mapping: ends clamp, round trip through the knob position.
+    assert(sliderValue(-5) == 0 && sliderValue(kTrackLeft) == 0);
+    assert(sliderValue(kTrackRight) == 100 && sliderValue(400) == 100);
+    for (int v = 0; v <= 100; ++v) assert(sliderValue(knobX(uint8_t(v))) == v);
+    assert(knobX(200) == kTrackRight);
+    // Hit targets: each control, gaps, and nothing in the title/footer/tabs.
+    for (uint8_t s = 0; s < kSliderCount; ++s) {
+        const Box z = sliderZone(s);
+        assert(hitTest(z.x + z.w / 2, z.y + 1) == Target(VolumeTarget + s));
+        assert(trackCenterY(s) - kKnobRadius >= z.y && trackCenterY(s) + kKnobRadius < z.y + z.h);
+        assert(knobX(0) - kKnobRadius >= z.x && knobX(100) + kKnobRadius < z.x + z.w);
+        assert(labelY(s) + 8 <= z.y && labelY(s) >= kTitleHeight);
+    }
+    const Box test = testButton(), mic = micIndicator(), recal = recalibrateButton();
+    assert(hitTest(test.x + 2, test.y + 2) == TestTarget);
+    assert(hitTest(recal.x + 2, recal.y + 2) == RecalibrateTarget);
+    assert(hitTest(mic.x + 2, mic.y + 2) == NoTarget);   // indicator is display only
+    assert(hitTest(160, 5) == NoTarget && hitTest(160, kFooterTop + 2) == NoTarget);
+    // No two controls overlap, and all stay above the footer and the tabs.
+    const Box all[] = {sliderZone(0), sliderZone(1), sliderZone(2), test, mic, recal};
+    for (const Box& a : all) {
+        assert(a.y >= kTitleHeight && a.y + a.h <= kFooterTop && a.x >= 0 && a.x + a.w <= 320);
+        for (const Box& b : all) {
+            if (&a == &b) continue;
+            assert(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+        }
+    }
+    // Brightness never turns the backlight fully off.
+    assert(brightnessDuty(0) == 8 && brightnessDuty(100) == 255 && brightnessDuty(250) == 255);
+    for (int p = 1; p <= 100; ++p) assert(brightnessDuty(uint8_t(p)) >= brightnessDuty(uint8_t(p - 1)));
+    // Mic indicator: grey with no source, silence or a level under threshold.
+    assert(!micDetected(kNoMicLevel, 0) && !micDetected(0, 0));
+    assert(!micDetected(49, 50) && micDetected(50, 50) && micDetected(1, 0));
+}
 int main() {
     const uint8_t count = sizeof(kDemoPages) / sizeof(kDemoPages[0]);
     assert(count == 6 && es3ValidPages(kDemoPages, count, 6));
@@ -77,5 +127,5 @@ int main() {
     page.line4 = "12345678901234567890123";
     assert(es3ValidPages(&page, 1, 6));
     page.line4 = nullptr; assert(!es3ValidPages(&page, 1, 6));
-    bmp(); wave(); puts("default page configuration and BMP/WAV bounds checks passed");
+    bmp(); wave(); levels(); settingsLayout(); puts("default page configuration, BMP/WAV bounds, volume level and settings layout checks passed");
 }

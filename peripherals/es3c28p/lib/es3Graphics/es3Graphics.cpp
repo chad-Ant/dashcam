@@ -7,6 +7,7 @@
 #include "Es3Panel.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
@@ -127,6 +128,16 @@ bool Es3Graphics::setBrightnessConfig(const Es3BrightnessConfig& config)
     }
     _brightnessConfig = config;
     _brightnessConfigured = config.enabled;
+    _autoMinDuty = config.minDuty;
+    return true;
+}
+
+bool Es3Graphics::setRotated180(bool rotated)
+{
+    if (_started) {
+        return false;
+    }
+    _rotated180 = rotated;
     return true;
 }
 
@@ -137,9 +148,6 @@ bool Es3Graphics::setBrightnessThresholdRaw(uint16_t raw)
     }
     _brightnessConfig.brightThresholdRaw = raw;
     Serial0.printf("[es3] brightness threshold L=%u\n", raw);
-    if (_started && _pages[_activePage].showBrightnessControl) {
-        drawBrightnessControls();
-    }
     return true;
 }
 
@@ -149,6 +157,12 @@ bool Es3Graphics::begin()
         return false;
     }
 
+    // Settings first: brightness applies from the first backlight write.
+    _settingsState = _storage.loadSettings(_settings) ? SettingsLoaded : SettingsDefaults;
+    Serial0.printf("[es3] settings %s: volume %u%% brightness %u%% mic threshold %u%%\n",
+                   _settingsState == SettingsLoaded ? "loaded" : "defaults",
+                   _settings.masterVolume, _settings.brightness, _settings.micThreshold);
+    applyBrightnessSetting();
     pinMode(kTftBacklight, OUTPUT);
     if (_brightnessConfigured) {
         analogReadResolution(12);
@@ -168,7 +182,7 @@ bool Es3Graphics::begin()
     }
     gTftSpi.begin(kTftSclk, kTftMiso, kTftMosi, kTftCs);
     panel.begin();
-    es3ConfigureIpsPanel(panel);
+    es3ConfigureIpsPanel(panel, _rotated180);
 
     if (!Es3Board::beginI2c()) {
         return false;
@@ -301,66 +315,6 @@ void Es3Graphics::drawBrightnessStatus()
     panel.printf("L:%4d B:%3u", _filteredLightRaw, _brightnessDuty);
 }
 
-void Es3Graphics::drawBrightnessControls()
-{
-    if (!_pages[_activePage].showBrightnessControl) {
-        return;
-    }
-
-    panel.fillRect(0, kBrightnessControlTop - 2, kScreenWidth,
-                  kBrightnessControlHeight + 4, ILI9341_BLACK);
-    panel.fillRoundRect(kBrightnessDecreaseLeft, kBrightnessControlTop,
-                       kBrightnessDecreaseWidth, kBrightnessControlHeight, 4,
-                       ILI9341_WHITE);
-    panel.fillRoundRect(kBrightnessIncreaseLeft, kBrightnessControlTop,
-                       kBrightnessIncreaseWidth, kBrightnessControlHeight, 4,
-                       ILI9341_WHITE);
-    panel.setTextSize(3);
-    panel.setTextColor(ILI9341_BLACK);
-    panel.setCursor(kBrightnessDecreaseLeft + 25, kBrightnessControlTop + 3);
-    panel.print("-");
-    panel.setCursor(kBrightnessIncreaseLeft + 25, kBrightnessControlTop + 3);
-    panel.print("+");
-
-    panel.setTextSize(1);
-    panel.setTextColor(ILI9341_CYAN);
-    panel.setCursor(106, kBrightnessControlTop + 1);
-    panel.print(_brightnessConfigured ? "BRIGHT AT" : "BACKLIGHT");
-    panel.setTextSize(2);
-    panel.setTextColor(ILI9341_WHITE);
-    panel.setCursor(126, kBrightnessControlTop + 12);
-    panel.printf("%c=%u", _brightnessConfigured ? 'L' : 'B',
-                _brightnessConfigured ? _brightnessConfig.brightThresholdRaw : _brightnessDuty);
-}
-
-bool Es3Graphics::handleBrightnessControlTouch(int screenX, int screenY)
-{
-    if (!_pages[_activePage].showBrightnessControl ||
-        screenY < kBrightnessControlTop ||
-        screenY >= kBrightnessControlTop + kBrightnessControlHeight) {
-        return false;
-    }
-
-    constexpr uint16_t kThresholdStep = 10;
-    const uint16_t maximum = _brightnessConfigured ? 4095 : 255;
-    uint16_t threshold = _brightnessConfigured ? _brightnessConfig.brightThresholdRaw : _brightnessDuty;
-    if (screenX >= kBrightnessDecreaseLeft &&
-        screenX < kBrightnessDecreaseLeft + kBrightnessDecreaseWidth) {
-        threshold = threshold >= kThresholdStep ? threshold - kThresholdStep : 0;
-    } else if (screenX >= kBrightnessIncreaseLeft &&
-               screenX < kBrightnessIncreaseLeft + kBrightnessIncreaseWidth) {
-        threshold = threshold <= maximum - kThresholdStep ? threshold + kThresholdStep : maximum;
-    } else {
-        return false;
-    }
-    if (_brightnessConfigured) {
-        return setBrightnessThresholdRaw(threshold);
-    }
-    _brightnessDuty = static_cast<uint8_t>(max<uint16_t>(threshold, 8));
-    ledcWrite(kTftBacklight, _brightnessDuty);
-    drawBrightnessControls();
-    return true;
-}
 
 void Es3Graphics::printCentered(const char* text, int centerX, int y, uint16_t colour)
 {
@@ -405,6 +359,11 @@ void Es3Graphics::drawPage()
     }
     const Es3DashboardPage& page = _pages[_activePage];
     panel.fillRect(0, 0, kScreenWidth, kTabTop, ILI9341_BLACK);
+    if (page.settingsPage) {
+        drawSettingsPage();
+        drawTabs();
+        return;
+    }
     if (page.showSdSplash) {
         bool splashDrawn = false;
         if (_storage.exists(kSplashRgb565File)) {
@@ -437,6 +396,12 @@ void Es3Graphics::drawPage()
     drawField(page.line3, 120, ILI9341_WHITE);
     drawField(page.line4, 154, ILI9341_WHITE);
 
+    drawFooter();
+    drawTabs();
+}
+
+void Es3Graphics::drawFooter()
+{
     panel.setTextSize(1);
     panel.setTextColor(_storage.available() ? ILI9341_GREEN : ILI9341_RED);
     panel.setCursor(12, 202);
@@ -449,8 +414,6 @@ void Es3Graphics::drawPage()
     panel.setTextColor(ILI9341_LIGHTGREY);
     panel.setCursor(12, 214);
     panel.print(_hostConnected ? "USB: Jetson online" : "USB: Jetson offline (data stale)");
-    drawBrightnessControls();
-    drawTabs();
 }
 
 void Es3Graphics::drawSplashFallback()
@@ -480,10 +443,19 @@ void Es3Graphics::handleDashboardTouch()
 {
     TouchRaw raw{};
     if (!readTouchRaw(raw)) {
+        if (_dragSlider != kNoSlider) finishSliderDrag();
         _touchHeld = false;
         return;
     }
-    if (_touchHeld || millis() - _lastTouchMs < kTouchDebounceMs) {
+    if (_touchHeld) {
+        // A held finger keeps moving the slider it started on.
+        int dragX = 0, dragY = 0;
+        if (_dragSlider != kNoSlider && mapTouch(raw, dragX, dragY)) {
+            setSliderValue(_dragSlider, es3settings::sliderValue(dragX));
+        }
+        return;
+    }
+    if (millis() - _lastTouchMs < kTouchDebounceMs) {
         return;
     }
     _touchHeld = true;
@@ -507,7 +479,7 @@ void Es3Graphics::handleDashboardTouch()
         return;
     }
     if (screenY < kTabTop) {
-        (void)handleBrightnessControlTouch(screenX, screenY);
+        if (_pages[_activePage].settingsPage) handleSettingsPress(screenX, screenY);
         return;
     }
     const int selectedPage = es3map::tabAt(screenX, _pageCount);

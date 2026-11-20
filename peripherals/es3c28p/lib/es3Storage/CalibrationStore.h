@@ -1,5 +1,6 @@
 #pragma once
 #include "es3Calibration.h"
+#include "GenerationFiles.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -49,39 +50,19 @@ inline bool sameCalibration(const Es3TouchCalibrationRecord& a, const Es3TouchCa
         a.yAtBottom == b.yAtBottom;
 }
 
-// Store supplies read/write/exists/remove/rename. Preserve a readable generation
-// across short writes and failed renames; FAT power-loss atomicity is not assumed.
+constexpr GenerationPaths kCalibrationPaths{kCalibrationFile, kCalibrationBackup, kCalibrationTemporary};
+
 template<class Store>
 bool loadCalibration(Store& store, Es3TouchCalibrationRecord& record) {
-    return store.read(kCalibrationFile, record) || store.read(kCalibrationBackup, record);
+    return loadGeneration(store, kCalibrationPaths, record);
 }
 template<class Store>
 bool saveCalibration(Store& store, const Es3TouchCalibrationRecord& record) {
     if (!es3CalibrationIsSane(record)) return false;
-    if (store.exists(kCalibrationTemporary) && !store.remove(kCalibrationTemporary)) return false;
-    Es3TouchCalibrationRecord check{};
-    if (!store.write(kCalibrationTemporary, record) || !store.read(kCalibrationTemporary, check) ||
-        !sameCalibration(check, record)) return false;
-    if (store.exists(kCalibrationFile)) {
-        if (!store.exists(kCalibrationBackup) || store.read(kCalibrationFile, check)) {
-            if (store.exists(kCalibrationBackup) && !store.remove(kCalibrationBackup)) return false;
-            if (!store.rename(kCalibrationFile, kCalibrationBackup)) return false;
-        } else {
-            // A read failure may be transient. Never remove the primary unless
-            // another readable generation is known to survive a failed promote.
-            if (!store.read(kCalibrationBackup, check) || !store.remove(kCalibrationFile)) return false;
-        }
-    }
-    return store.rename(kCalibrationTemporary, kCalibrationFile) &&
-        store.read(kCalibrationFile, check) && sameCalibration(check, record);
+    return saveGeneration(store, kCalibrationPaths, record, sameCalibration);
 }
 template<class Store>
 bool clearCalibration(Store& store) {
-    // Remove backup first: a failed primary removal must leave the active file.
-    const char* paths[] = {kCalibrationBackup, kCalibrationTemporary, kCalibrationFile};
-    for (const char* path : paths) {
-        if (store.exists(path) && !store.remove(path)) return false;
-    }
-    return true;
+    return clearGeneration(store, kCalibrationPaths);
 }
 } // namespace es3storage

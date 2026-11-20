@@ -9,7 +9,7 @@ struct Es3DashboardPage {
     const char* line2;
     const char* line3;
     const char* line4;
-    bool showBrightnessControl;
+    bool settingsPage;  // draws the SET-tab controls instead of text lines
     bool showSdSplash;
     bool allowTouchCalibration;
 };

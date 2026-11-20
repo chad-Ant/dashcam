@@ -1,5 +1,6 @@
 #include "../lib/es3Video/VideoBuffers.h"
 #include "../lib/es3Storage/CalibrationStore.h"
+#include "../lib/es3Storage/SettingsStore.h"
 #include <cassert>
 #include <cstdlib>
 #include <map>
@@ -22,6 +23,16 @@ struct Files {
         char text[kCalibrationBytes]; const auto n = formatCalibration(r, text);
         if (!n || fail()) { files[p] = "short"; return false; }
         files[p] = corruptWrite ? "corrupted" : std::string(text, n); return true;
+    }
+    bool write(const char* p, const Es3Settings& r) {
+        char text[kSettingsBytes]; const auto n = formatSettings(r, text);
+        if (!n || fail()) { files[p] = "short"; return false; }
+        files[p] = corruptWrite ? "corrupted" : std::string(text, n); return true;
+    }
+    bool read(const char* p, Es3Settings& r) {
+        if (unreadablePrimary && std::string(p) == kSettingsFile) return false;
+        const auto it = files.find(p);
+        return it != files.end() && parseSettings(it->second.data(), it->second.size(), r);
     }
     bool read(const char* p, Es3TouchCalibrationRecord& r) {
         if (unreadablePrimary && std::string(p) == kCalibrationFile) return false;
@@ -75,6 +86,68 @@ static void calibration() {
     assert(clearCalibration(success));
     assert(success.files.empty() && !loadCalibration(success, out));
 }
+static void settings() {
+    const Es3Settings defaults{10, 100, 50}, chosen{35, 60, 72};
+    // Round trip of the firmware's own format, and the exact file text.
+    char text[kSettingsBytes]; size_t n = formatSettings(chosen, text);
+    assert(n > 0 && n < kSettingsBytes);
+    assert(std::string(text, n) ==
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<settings version=\"1\">\n"
+        "  <masterVolume>35</masterVolume>\n  <brightness>60</brightness>\n"
+        "  <micThreshold>72</micThreshold>\n</settings>\n");
+    Es3Settings out = defaults;
+    assert(parseSettings(text, n, out) && sameSettings(out, chosen));
+    // Hand edits: whitespace, other order, unknown elements.
+    const char* edited = "<settings>\r\n<extra>7</extra><micThreshold> 0 </micThreshold>"
+                         "<brightness>100</brightness><masterVolume>\n5\n</masterVolume></settings>";
+    out = defaults; assert(parseSettings(edited, strlen(edited), out));
+    assert(out.masterVolume == 5 && out.brightness == 100 && out.micThreshold == 0);
+    // A bad or missing element keeps only that default.
+    const char* partial = "<settings version=\"1\"><masterVolume>101</masterVolume>"
+                          "<brightness>4x</brightness><micThreshold>20</micThreshold></settings>";
+    out = defaults; assert(parseSettings(partial, strlen(partial), out));
+    assert(out.masterVolume == 10 && out.brightness == 100 && out.micThreshold == 20);
+    const char* tooManyDigits = "<settings><masterVolume>0010</masterVolume></settings>";
+    out = defaults; assert(parseSettings(tooManyDigits, strlen(tooManyDigits), out) && sameSettings(out, defaults));
+    const char* unclosed = "<settings><masterVolume>30</settings>";
+    out = defaults; assert(parseSettings(unclosed, strlen(unclosed), out) && sameSettings(out, defaults));
+    // Not a settings document: rejected, defaults untouched.
+    const char* bad[] = {"", "garbage", "<setting><masterVolume>30</masterVolume></setting>",
+                         "<settings><masterVolume>30</masterVolume>", "<settingsX></settings>"};
+    for (const char* value : bad) {
+        out = defaults; assert(!parseSettings(value, strlen(value), out) && sameSettings(out, defaults));
+    }
+    std::string big = "<settings>" + std::string(kSettingsBytes, ' ') + "</settings>";
+    out = defaults; assert(!parseSettings(big.data(), big.size(), out));
+    // An unterminated buffer is read only within its size.
+    const char cut[] = {'<','s','e','t','t','i','n','g','s','>','<','/','s','e','t','t','i','n','g','s','>','X'};
+    out = defaults; assert(parseSettings(cut, sizeof(cut) - 1, out));
+    Files rejected; assert(!saveSettings(rejected, Es3Settings{101, 0, 0}) && rejected.files.empty());
+
+    // Persistence: absent file keeps defaults; each interrupted save keeps a
+    // readable previous generation, and a retry succeeds.
+    Files none; out = defaults; assert(!loadSettings(none, out) && sameSettings(out, defaults));
+    Files original; assert(saveSettings(original, defaults) && saveSettings(original, defaults));
+    out = Es3Settings{}; assert(loadSettings(original, out) && sameSettings(out, defaults));
+    Files success = original; success.operation = 0;
+    assert(saveSettings(success, chosen));
+    const unsigned operations = success.operation;
+    for (unsigned i = 1; i <= operations; ++i) {
+        Files interrupted = original; interrupted.operation = 0; interrupted.failAt = i;
+        assert(!saveSettings(interrupted, chosen));
+        out = Es3Settings{}; assert(loadSettings(interrupted, out) && sameSettings(out, defaults));
+        interrupted.failAt = 0;
+        assert(saveSettings(interrupted, chosen));
+        out = Es3Settings{}; assert(loadSettings(interrupted, out) && sameSettings(out, chosen));
+    }
+    Files corrupt = original; corrupt.corruptWrite = true;
+    assert(!saveSettings(corrupt, chosen));
+    out = Es3Settings{}; assert(loadSettings(corrupt, out) && sameSettings(out, defaults));
+    Files lostPrimary = success; lostPrimary.files.erase(kSettingsFile);
+    out = Es3Settings{}; assert(loadSettings(lostPrimary, out) && sameSettings(out, defaults));
+    // Settings and calibration files never collide.
+    assert(std::string(kSettingsFile) != kCalibrationFile && success.files.count(kSettingsBackup));
+}
 static void buffers() {
     using namespace es3video;
     for (unsigned failure = 0; failure <= 8; ++failure) {
@@ -107,4 +180,7 @@ static void buffers() {
         freeBuffers(state, capacity, release); assert(live.empty());
     }
 }
-int main() { calibration(); buffers(); puts("calibration persistence and allocation failure checks passed"); }
+int main() {
+    calibration(); settings(); buffers();
+    puts("calibration and settings persistence and allocation failure checks passed");
+}

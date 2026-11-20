@@ -13,6 +13,7 @@
 #include <FS.h>
 
 #include "es3Calibration.h"
+#include "SettingsStore.h"
 
 class Es3Storage {
 public:
@@ -38,6 +39,13 @@ public:
 
     /** Removes the calibration file; no error if it is already absent. */
     bool clearTouchCalibration();
+
+    /** Reads /settings.xml (or its backup) over the defaults in settings.
+     * Returns false, leaving the defaults, when neither is readable. */
+    bool loadSettings(Es3Settings& settings) const;
+
+    /** Verifies a temporary /settings.xml, retains a backup, then promotes it. */
+    bool saveSettings(const Es3Settings& settings);
 
     /** Opens a readable file; missing files never unmount active readers. */
     bool openRead(const char* path, File& file);

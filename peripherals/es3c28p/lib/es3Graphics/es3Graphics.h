@@ -14,6 +14,7 @@
 #include "PanRaster.h"
 
 #include "PageConfig.h"
+#include "SettingsLayout.h"
 
 /**
  * Ambient-light to screen-backlight mapping.
@@ -52,6 +53,27 @@ public:
 
     /** Configures LDR-driven PWM backlight control. Call before begin(). */
     bool setBrightnessConfig(const Es3BrightnessConfig& config);
+
+    /** Rotates the image and touch input by 180 degrees. Call before begin(). */
+    bool setRotated180(bool rotated);
+
+    /** Values used when /settings.xml is absent or unreadable (elements that
+     * are missing from the file also keep these). Call before begin(). */
+    bool setDefaultSettings(const Es3Settings& defaults);
+
+    /** Current Settings-tab values (loaded from the SD card by begin()). */
+    const Es3Settings& settings() const { return _settings; }
+
+    /** True once after the user changes a setting on screen. The new values
+     * have already been saved; the caller applies the audio-side ones. */
+    bool takeSettingsChange(Es3Settings& settings);
+
+    /** True once after the user taps the TEST (volume) button. */
+    bool takeAudioTestRequest();
+
+    /** Microphone input level 0..100, or es3settings::kNoMicLevel while no
+     * microphone source exists. Drives the SET tab's input indicator. */
+    void setMicLevel(int level);
 
     /** Changes the bright/dim raw-LDR switching point while the UI is running. */
     bool setBrightnessThresholdRaw(uint16_t raw);
@@ -125,12 +147,6 @@ private:
     static constexpr int kCalibrationFirstThirdX = 114;
     static constexpr int kCalibrationSecondThirdX = 205;
     static constexpr int kCalibrationCenterY = kScreenHeight / 2;
-    static constexpr int kBrightnessControlTop = 170;
-    static constexpr int kBrightnessControlHeight = 26;
-    static constexpr int kBrightnessDecreaseLeft = 18;
-    static constexpr int kBrightnessDecreaseWidth = 70;
-    static constexpr int kBrightnessIncreaseLeft = 232;
-    static constexpr int kBrightnessIncreaseWidth = 70;
 
     Es3Storage& _storage;
     const Es3DashboardPage* _pages;
@@ -154,6 +170,18 @@ private:
     uint32_t _lastTouchMs;
     Es3BrightnessConfig _brightnessConfig;
     bool _brightnessConfigured;
+    bool _rotated180 = false;
+    // SET tab state. Values persist in /settings.xml; see SettingsStore.h.
+    enum SettingsState : uint8_t { SettingsDefaults, SettingsLoaded, SettingsSaved, SettingsSaveFailed };
+    static constexpr uint8_t kNoSlider = 0xff;
+    Es3Settings _settings{100, 100, 50};
+    SettingsState _settingsState = SettingsDefaults;
+    bool _settingsChanged = false;      // reported to the caller once
+    bool _settingsEdited = false;       // changed during the current drag
+    bool _audioTestRequested = false;
+    uint8_t _dragSlider = kNoSlider;
+    int _micLevel = es3settings::kNoMicLevel;
+    uint8_t _autoMinDuty = 0;
     bool _brightnessPwmAttached;
     uint8_t _brightnessDuty;
     uint8_t _brightnessTargetDuty;
@@ -168,8 +196,16 @@ private:
     bool brightnessConfigIsSane(const Es3BrightnessConfig& config) const;
     void updateBrightness(bool force);
     void drawBrightnessStatus();
-    void drawBrightnessControls();
-    bool handleBrightnessControlTouch(int screenX, int screenY);
+    void drawFooter();
+    bool settingsVisible() const;
+    void applyBrightnessSetting();
+    void drawSettingsPage();
+    void drawSettingsState();
+    void drawSlider(uint8_t slider);
+    void drawMicIndicator();
+    void handleSettingsPress(int screenX, int screenY);
+    void setSliderValue(uint8_t slider, uint8_t value);
+    void finishSliderDrag();
     void drawSplashFallback();
 
     bool buildCalibration();

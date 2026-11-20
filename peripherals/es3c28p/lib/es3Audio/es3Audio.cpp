@@ -2,6 +2,7 @@
 
 #include "es3Audio.h"
 #include "WavHeader.h"
+#include "AudioLevel.h"
 
 #include <cstring>
 #include "es3Board.h"
@@ -56,6 +57,7 @@ Es3Audio::Es3Audio(Es3Storage& storage)
     , _ready(false)
     , _playing(false)
     , _volume(80)
+    , _masterVolume(100)
     , _sampleRate(0)
     , _dataRemaining(0)
     , _drainDeadline(0)
@@ -155,8 +157,7 @@ bool Es3Audio::readBlock()
     }
     _dataRemaining -= read;
     for (size_t index = 0; index < read; ++index) {
-        const int centered = static_cast<int>(input[index]) - 128;
-        const int16_t scaled = static_cast<int16_t>(centered * 256 * _volume / 100);
+        const int16_t scaled = es3audio::scaleSample(input[index], _volume, _masterVolume);
         // Duplicate mono into both slots; ES8311 receives the left slot.
         _pcm[index * 2] = scaled;
         _pcm[index * 2 + 1] = scaled;
@@ -229,6 +230,12 @@ void Es3Audio::setVolume(uint8_t percent)
     _volume = min<uint8_t>(percent, 100);
 }
 
+void Es3Audio::setMasterVolume(uint8_t percent)
+{
+    _masterVolume = min<uint8_t>(percent, 100);
+}
+
 bool Es3Audio::ready() const { return _ready; }
 bool Es3Audio::isPlaying() const { return _playing; }
 uint8_t Es3Audio::volume() const { return _volume; }
+uint8_t Es3Audio::masterVolume() const { return _masterVolume; }

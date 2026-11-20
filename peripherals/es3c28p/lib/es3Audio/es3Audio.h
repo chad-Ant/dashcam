@@ -24,9 +24,14 @@ public:
     /** Adjusts software volume from silent (0) to full scale (100). */
     void setVolume(uint8_t percent);
 
+    /** User master volume (0..100). Scales every playback, including alerts
+     * requested over USB; takes effect from the next streamed block. */
+    void setMasterVolume(uint8_t percent);
+
     bool ready() const;
     bool isPlaying() const;
     uint8_t volume() const;
+    uint8_t masterVolume() const;
 
 private:
     static constexpr size_t kStreamBlockSamples = 128;
@@ -37,6 +42,7 @@ private:
     bool _ready;
     bool _playing;
     uint8_t _volume;
+    uint8_t _masterVolume;
     uint32_t _sampleRate;
     uint32_t _dataRemaining;
     uint32_t _drainDeadline;

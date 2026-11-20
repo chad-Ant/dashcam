@@ -33,9 +33,14 @@ void setup()
     const bool storageOk = gStorage.begin();
     Serial0.printf("[es3] storage %s\n", storageOk ? "ready" : "unavailable");
     if (!gGraphics.setPages(kDemoPages, pageCount) ||
-        !gGraphics.setBrightnessConfig(kBrightness) || !gGraphics.begin()) {
+        !gGraphics.setBrightnessConfig(kBrightness) ||
+        !gGraphics.setDefaultSettings(kDefaultSettings) ||
+        !gGraphics.setRotated180(kRotateDisplay180) || !gGraphics.begin()) {
         Serial0.println("[es3] graphics startup failed");
     }
+    // graphics.begin() loaded /settings.xml; apply the master volume before
+    // the boot tone so it already plays at the user's level.
+    gAudio.setMasterVolume(gGraphics.settings().masterVolume);
     if (!gAudio.begin()) {
         Serial0.println("[es3] audio startup failed");
     } else if (gStorage.exists("/alert.wav")) {
@@ -52,6 +57,20 @@ void loop()
 {
     gUsb.update();
     gGraphics.update();
+    Es3Settings settings{};
+    if (gGraphics.takeSettingsChange(settings)) {
+        gAudio.setMasterVolume(settings.masterVolume);
+    }
+    if (gGraphics.takeAudioTestRequest()) {
+        // The alert tone at full alert volume: the loudest any notification
+        // can be at this master level. Muted plays nothing.
+        gAudio.setVolume(100);
+        if (gAudio.masterVolume() == 0) {
+            gAudio.stop();
+        } else {
+            (void)gAudio.playWav("/alert.wav");
+        }
+    }
     gAudio.update();
     static uint32_t lastReport = 0;
     static es3video::VideoState::Stats previous;

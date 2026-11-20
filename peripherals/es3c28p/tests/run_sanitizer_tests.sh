@@ -8,7 +8,7 @@ for test in calibration video_state map_surface pan_state resource media_header 
     c++ -std=c++17 -Wall -Wextra -Werror -g \
         -fsanitize=address,undefined -fno-sanitize-recover=all \
         -I"$TEST_DIR/../lib/es3Graphics" -I"$TEST_DIR/../lib/es3UsbLink" -I"$TEST_DIR/../lib/es3Video" \
-        -I"$TEST_DIR/../lib/es3Map" \
+        -I"$TEST_DIR/../lib/es3Map" -I"$TEST_DIR/../lib/es3Storage" \
         "$TEST_DIR/${test}_test.cpp" -o "$TEST_BUILD/$test"
     "$TEST_BUILD/$test"
 done

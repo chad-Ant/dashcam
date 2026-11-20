@@ -32,6 +32,30 @@ struct CalibrationFiles {
         return ok;
     }
 };
+struct SettingsFiles {
+    bool exists(const char* path) { return SD_MMC.exists(path); }
+    bool remove(const char* path) { return SD_MMC.remove(path); }
+    bool rename(const char* from, const char* to) { return SD_MMC.rename(from, to); }
+    bool read(const char* path, Es3Settings& settings) {
+        File file = SD_MMC.open(path, FILE_READ);
+        if (!file || file.isDirectory()) return false;
+        const size_t size = file.size();
+        if (!size || size > es3storage::kSettingsBytes) return false;
+        char text[es3storage::kSettingsBytes];
+        return file.read(reinterpret_cast<uint8_t*>(text), size) == size &&
+            es3storage::parseSettings(text, size, settings);
+    }
+    bool write(const char* path, const Es3Settings& settings) {
+        char text[es3storage::kSettingsBytes];
+        const size_t size = es3storage::formatSettings(settings, text);
+        if (!size) return false;
+        File file = SD_MMC.open(path, FILE_WRITE);
+        if (!file) return false;
+        const bool ok = file.write(reinterpret_cast<const uint8_t*>(text), size) == size;
+        file.flush(); file.close();
+        return ok;
+    }
+};
 }  // namespace
 
 Es3Storage::Es3Storage()
@@ -105,6 +129,20 @@ bool Es3Storage::clearTouchCalibration()
     if (!_available) return false;
     CalibrationFiles files;
     return es3storage::clearCalibration(files);
+}
+
+bool Es3Storage::loadSettings(Es3Settings& settings) const
+{
+    if (!_available) return false;
+    SettingsFiles files;
+    return es3storage::loadSettings(files, settings);
+}
+
+bool Es3Storage::saveSettings(const Es3Settings& settings)
+{
+    if (!_available) return false;
+    SettingsFiles files;
+    return es3storage::saveSettings(files, settings);
 }
 
 bool Es3Storage::openRead(const char* path, File& file)

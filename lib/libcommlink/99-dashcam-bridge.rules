@@ -11,6 +11,8 @@
 # Systems, "USB JTAG/serial debug unit").  Note that 303a:1001 is shared by
 # several ESP32 variants; if more than one is attached, add ATTRS{serial}=="..."
 # (read it from `udevadm info -a -n /dev/ttyACM0 | grep serial`) to disambiguate.
+# The ES3C28P display is one of them: with it attached, add the C3's serial to
+# rule 1 at least, or the display also gets /dev/dashcam-bridge.
 
 # 1) Stable name, so the application never has to guess a ttyACM index.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="dashcam-bridge"

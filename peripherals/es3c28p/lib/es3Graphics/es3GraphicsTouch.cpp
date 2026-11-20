@@ -36,7 +36,16 @@ bool Es3Graphics::readTouchRaw(TouchRaw& raw)
     raw.x = ((data[1] & 0x0f) << 8) | data[2];
     raw.y = ((data[3] & 0x0f) << 8) | data[4];
     // Native capacitive coordinates; the existing wizard learns orientation.
-    return raw.x < 240 && raw.y < 320;
+    if (raw.x >= 240 || raw.y >= 320) {
+        return false;
+    }
+    // The touch layer turns with the panel. Its coordinates are already
+    // pixels, so mirroring both axes keeps an existing calibration valid.
+    if (_rotated180) {
+        raw.x = 239 - raw.x;
+        raw.y = 319 - raw.y;
+    }
+    return true;
 }
 
 int Es3Graphics::mapCalibrationAxis(int raw, int atLowTarget, int atMiddleTarget,
@@ -231,20 +240,15 @@ void Es3Graphics::drawCalibrationTest()
     printCentered("RETRY", 79, 62, ILI9341_BLACK);
     printCentered("SAVE", 241, 62, ILI9341_BLACK);
 
-    panel.setTextColor(ILI9341_CYAN);
-    panel.setCursor(82, 98);
-    panel.print("Brightness-control targets");
-    panel.drawRoundRect(kBrightnessDecreaseLeft, kBrightnessControlTop,
-                       kBrightnessDecreaseWidth, kBrightnessControlHeight, 4,
-                       ILI9341_WHITE);
-    panel.drawRoundRect(kBrightnessIncreaseLeft, kBrightnessControlTop,
-                       kBrightnessIncreaseWidth, kBrightnessControlHeight, 4,
-                       ILI9341_WHITE);
-    printCentered("-", kBrightnessDecreaseLeft + kBrightnessDecreaseWidth / 2,
-                  kBrightnessControlTop + 8, ILI9341_WHITE);
-    printCentered("+", kBrightnessIncreaseLeft + kBrightnessIncreaseWidth / 2,
-                  kBrightnessControlTop + 8, ILI9341_WHITE);
-
+    // SET-tab controls: the recalibrate button and the slider tracks.
+    const es3settings::Box recal = es3settings::recalibrateButton();
+    panel.drawRoundRect(recal.x, recal.y, recal.w, recal.h, 4, ILI9341_WHITE);
+    printCentered("RECALIBRATE", recal.x + recal.w / 2, recal.y + 10, ILI9341_WHITE);
+    for (uint8_t slider = es3settings::BrightnessSlider; slider < es3settings::kSliderCount; ++slider) {
+        const int y = es3settings::trackCenterY(slider);
+        panel.drawFastHLine(es3settings::kTrackLeft, y, es3settings::kTrackRight - es3settings::kTrackLeft,
+                            ILI9341_DARKGREY);
+    }
     panel.setTextColor(ILI9341_CYAN);
     panel.setCursor(110, 204);
     panel.print("Tab targets");
