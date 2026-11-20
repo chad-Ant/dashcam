@@ -198,9 +198,16 @@ void Es3UsbLink::service()
 {
     const uint32_t now = millis();
     if (!Serial) {
-        if (_session.load() || _pending || _txSize) reset();
+        // The core's HWCDC monitor compares the board's 1 kHz tick with the host's
+        // 1 kHz USB frames and can report "unplugged" for a moment when the two
+        // clocks slip past each other (every ~32 s on the bench, 2026-11-20). Ending
+        // the session on that blip blanked the video until the host's next HELLO.
+        // Pause USB work through a blip; only a loss that lasts ends the session.
+        if (!_serialLost) { _serialLost = true; _serialLostAt = now; }
+        if (now - _serialLostAt > kSerialLossMs && (_session.load() || _pending || _txSize)) reset();
         return;
     }
+    _serialLost = false;
     if ((_session.load() && now - _lastRequest > 5000) ||
         (_txSize && now - _txStarted > 1000) || _video.fault()) reset();
     _video.expire(now);

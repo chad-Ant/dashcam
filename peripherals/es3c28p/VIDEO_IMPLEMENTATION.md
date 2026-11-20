@@ -58,9 +58,10 @@ decode failure. READY output can be superseded, DRAWING output cannot.
 RESULT Ok acknowledges assembly. PRESENTED acknowledges software display;
 a later RESULT reports decode/visibility/supersession failure. A fixed 32-event
 queue never silently drops a grant: overflow faults the session and forces
-HELLO/negotiation again. USB loss, HELLO and heartbeat expiry invalidate the
-session. STOP_VIDEO with an old token is a no-op. Commands handed to the loop
-carry a connection generation so queued old-session commands/replies are
+HELLO/negotiation again. USB loss (`!Serial` for more than 200 ms; shorter
+blips of the core's connection monitor, seen every ~32 s on the bench, only
+pause USB servicing), HELLO and heartbeat expiry invalidate the session.
+STOP_VIDEO with an old token is a no-op. Commands handed to the loop carry a connection generation so queued old-session commands/replies are
 rejected; a command already executing when USB disconnects may still finish.
 Alerts are never replayed by this firmware.
 

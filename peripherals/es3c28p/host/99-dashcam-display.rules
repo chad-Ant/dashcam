@@ -3,10 +3,9 @@
 # Native USB Serial/JTAG VID/PID is shared with the C3: NEVER remove the serial match.
 # Install as /etc/udev/rules.d/99-dashcam-display.rules, reload rules and replug.
 # Matching is by serial, so the alias follows the board to any USB port.
-# The C3 bridge rule (lib/libcommlink/99-dashcam-bridge.rules) matches every
-# 303a:1001 device; when both boards are used, add the C3's ATTRS{serial} to
-# that rule, or the display also gets /dev/dashcam-bridge. (SYMLINK-= cannot
-# remove it here: udev 249 on JetPack 6 rejects that operator and drops the
-# whole line.)
+# The C3 bridge rule (lib/libcommlink/99-dashcam-bridge.rules) is matched on the
+# C3's serial the same way, so neither board gets the other's alias. (SYMLINK-=
+# cannot remove an alias here: udev 249 on JetPack 6 rejects that operator and
+# drops the whole line.)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="DISPLAY_SERIAL_HERE", SYMLINK+="dashcam-display", MODE="0660", GROUP="dialout", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="1001", ATTR{serial}=="DISPLAY_SERIAL_HERE", TEST=="power/control", ATTR{power/control}="on"

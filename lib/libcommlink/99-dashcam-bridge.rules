@@ -1,34 +1,31 @@
 # udev rules for the ESP32-C3 telemetry bridge on the Jetson Orin Nano.
 #
+# Replace BRIDGE_SERIAL_HERE (every line) with this C3's ATTRS{serial}, obtained with:
+#   udevadm info --attribute-walk --name=/dev/ttyACMx | grep -m1 'ATTRS{serial}'
 # Install:
-#   sudo cp 99-dashcam-bridge.rules /etc/udev/rules.d/
+#   sudo cp 99-dashcam-bridge.rules /etc/udev/rules.d/   (with the serial filled in)
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Matching is by serial, so the alias follows the board to any USB port.
 #
-# Then set CommLinkConfig::device = "/dev/dashcam-bridge" instead of relying on
-# /dev/ttyACM* auto-discovery.
+# Then set <Bridge><Device>/dev/dashcam-bridge</Device></Bridge> in dashcam.xml
+# (CommLinkConfig::device) instead of relying on /dev/ttyACM* auto-discovery.
 #
 # The ESP32-C3's built-in USB Serial/JTAG enumerates as 303a:1001 (Espressif
-# Systems, "USB JTAG/serial debug unit").  Note that 303a:1001 is shared by
-# several ESP32 variants; if more than one is attached, add ATTRS{serial}=="..."
-# (read it from `udevadm info -a -n /dev/ttyACM0 | grep serial`) to disambiguate.
-# The ES3C28P display is one of them: with it attached, add the C3's serial to
-# rule 1 at least, or the display also gets /dev/dashcam-bridge.
+# Systems, "USB JTAG/serial debug unit"). That VID:PID is shared by several
+# ESP32 variants, among them the ES3C28P display
+# (peripherals/es3c28p/host/99-dashcam-display.rules): NEVER remove the serial
+# match, or the display also gets /dev/dashcam-bridge.
 
 # 1) Stable name, so the application never has to guess a ttyACM index.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="dashcam-bridge"
-
-# 2) Group access, so the dashcam does not need root to open the port.
-#    (dialout is the conventional group; add the service user to it.)
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", MODE="0660", GROUP="dialout"
-
-# 3) Keep ModemManager away.  It probes every new ACM device with AT commands,
+# 2) Group access, so the dashcam does not need root to open the port
+#    (dialout is the conventional group; add the service user to it).
+# 3) Keep ModemManager away. It probes every new ACM device with AT commands,
 #    which injects bytes into the first seconds of the session and shows up as a
-#    burst of CRC errors — or a bridge that appears dead until the probe gives
-#    up.  This is the single most common cause of a link that "works on the
+#    burst of CRC errors, or a bridge that appears dead until the probe gives
+#    up. This is the single most common cause of a link that "works on the
 #    desktop but not on the Jetson".
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ENV{ID_MM_DEVICE_IGNORE}="1"
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ENV{ID_MM_PORT_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="BRIDGE_SERIAL_HERE", SYMLINK+="dashcam-bridge", MODE="0660", GROUP="dialout", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
 
 # 4) Do not let the USB port autosuspend: a suspended bridge stops streaming and
 #    the link flaps.
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="1001", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="1001", ATTR{serial}=="BRIDGE_SERIAL_HERE", TEST=="power/control", ATTR{power/control}="on"

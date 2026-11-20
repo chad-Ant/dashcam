@@ -251,10 +251,10 @@ template with the ES3C28P's serial, install it in `/etc/udev/rules.d/`, reload
 rules with `sudo udevadm control --reload-rules`, and replug the board. The
 template does nothing until customized. Both C3 and S3 share VID/PID
 303a:1001, so serial matching is required; the alias then follows the board
-to any USB port. The C3's `99-dashcam-bridge.rules` matches every 303a:1001
-device, so with both boards attached add the C3's serial to it, or the display
-also gets `/dev/dashcam-bridge` (udev 249 on JetPack 6 has no `SYMLINK-=` to
-remove it from the display rule). Pin the C3
+to any USB port. The C3's `99-dashcam-bridge.rules` is a template
+matched on the C3's own serial in the same way, so the display never gets
+`/dev/dashcam-bridge` (udev 249 on JetPack 6 has no `SYMLINK-=`, so the serial
+match is the only way to keep the two apart). Pin the C3
 link's `CommLinkConfig::device` to its own by-id path or `/dev/dashcam-bridge`
 when running both links, to avoid its generic `USB_JTAG` discovery probing
 the display. The firmware rejects the C3 protocol independently of naming.

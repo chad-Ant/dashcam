@@ -123,10 +123,15 @@ peripherals/mkr_zero/BuildAndUpload.cmd
 1. Flash this sketch to the C3 with the board settings above.
 2. Install the udev rule so the port has a stable name and ModemManager stops
    probing it (this is the most common cause of a link that works on a desktop
-   but not on the Jetson):
+   but not on the Jetson). The rule matches this C3's USB serial (the ES3C28P
+   display shares its VID:PID), so fill it in first:
    ```bash
-   sudo cp lib/libcommlink/99-dashcam-bridge.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+   serial=$(udevadm info --attribute-walk --name=/dev/ttyACM0 | grep -m1 -o 'ATTRS{serial}=="[^"]*"' | cut -d'"' -f2)
+   sed "s/BRIDGE_SERIAL_HERE/$serial/" lib/libcommlink/99-dashcam-bridge.rules | sudo tee /etc/udev/rules.d/99-dashcam-bridge.rules
+   sudo udevadm control --reload-rules && sudo udevadm trigger
    ```
+   (use the C3's `ttyACM` node; `ls -l /dev/serial/by-id/` shows which one is
+   which.) The C3 is then `/dev/dashcam-bridge` on any USB port.
 3. Build and run the Jetson-side test:
    ```bash
    make commlink_test && ./bin/build_*/commlink_test

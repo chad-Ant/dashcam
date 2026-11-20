@@ -37,7 +37,7 @@ This file has three parts:
 | GRF-250 ranging | `e46bf71` | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
 | Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
 | CYD dashboard | `2f6b3f6`; Linux tooling uncommitted | Bring-up sketch (display + read-only SD); its wiring was fixed 2026-10-12 (backlight, SD bus, reset pin), still never run on a board. The image now builds it (Adafruit ILI9341 1.6.4); `peripherals/cyd/build_and_upload.sh` is the Linux twin. The host has no CH340 driver: `ch341.ko` built and verified, **not installed** (sudo). | Driver installed and flash backed up (2026-10-12). Dashboard app source now in `peripherals/cyd/` (copied in by the user); boot-crash fixed; **flashed 2026-10-13**, boots clean (SD 20 MHz, calibration loaded, splash 130 ms, audio starts, LDR logs). Still to do at the board: hear the alert, check touch and the LDR fade. |
-| ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). **Board here since 2026-11-20:** flashed (factory flash backed up), USB link, pages, touch, rotation, SET tab, audio and `/settings.xml` checked on the board; microphone level drives the SET tab MIC IN indicator (`MIC_LEVEL_PLAN.md`; 2026-11-20 log sections). | C3 udev rule pinned by serial (needs the C3 attached); bench sketches (need a 3.3 V UART adapter); enable `<DisplayPreview>` and soak at 10 and 15 fps with the UGREEN. |
+| ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). **Board here since 2026-11-20:** flashed (factory flash backed up), USB link, pages, touch, rotation, SET tab, audio and `/settings.xml` checked on the board; microphone level drives the SET tab MIC IN indicator (`MIC_LEVEL_PLAN.md`; 2026-11-20 log sections). | Bench sketches (need a 3.3 V UART adapter). Done 2026-11-20 evening: C3 rule pinned by serial, `<DisplayPreview>` enabled and soaked at 10 and 15 fps, firmware fix for the 32 s session resets. |
 | ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
 | Android connector (Dashcam Connect) | `9fac0c2`, browser `d911446`, camera video in the commits after this file's 2026-10-29 video update | Read-only phone/tablet dashboard for v0.4 (2026-10-29 log section): v0.4 publishes a JSON snapshot each supervisor tick (~5 Hz) to a nonblocking Unix datagram socket (`src/monitoring.h`, `<MonitoringEnabled>` / `<MonitoringSocket>` under `<Network>`, off by default); a host Python agent (`connector/service.py`, systemd unit `connector/dashcam-monitor.service`) adds 1 Hz host health and serves up to four Android clients over a certificate-pinned, bearer-authenticated TLS WebSocket on TCP 8443, with optional mDNS. **Browser client** (2026-10-29, `d911446`): the agent also serves a web dashboard (`connector/web/`) signed by its own name-constrained local CA, which the user installs on browser devices; browsers pair with a link and get a 30-day HttpOnly session cookie; same-origin checks block cross-site WebSockets. **Camera video** (2026-10-29): a 640x360 ≤ 10 fps preview of the recording USB camera in the Live tab of both clients (`<MonitoringVideoEnabled>`, off by default; converts only while someone watches; verified with the real UGREEN; Android part not compiled here). Android app in `android/` (Kotlin/Compose, minSdk 28, target 37; pages Live / Vehicle / System / Connection; Keystore-encrypted pairings). No commands, preview, map or ADAS. Software-validated (`connector/VALIDATION.md`): Android unit/lint/emulator, 10 agent tests, `monitoring_test`, `config_test`, an end-to-end v0.4 → agent → TLS smoke test on this Jetson. **Not deployed** on the rig: no agent service, state dir or launcher socket mount. | Install the agent, add the socket mount and XML keys, pair the Samsung S25 Ultra and Tab S10 FE; then the physical acceptance in `connector/VALIDATION.md`. |
 | Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
@@ -89,16 +89,18 @@ This file has three parts:
    board with the Jetson, including pose-only freshness, background/strip swaps, low-speed dots, reconnects,
    camera/map exclusion and memory fallback; measure actual redraw rate and USB traffic, then enable `<Navigation>`.
    **ES3C28P preview** (2026-10-14 log section): committed. **The board arrived 2026-11-20 and is flashed**
-   (2026-11-20 log section). The fixed `99-dashcam-display.rules` is installed (`/dev/dashcam-display`). Still to do: a serial-pinned C3
-   bridge rule, run the bench sketches
-   (USB throughput hwcdc vs TinyUSB, JPEG decode/blit), then set `<DisplayPreview><Enabled>true` in the deployed config
-   (the section is absent there, so the preview stays off until added) and soak at 10 fps, then 15 fps.
+   (2026-11-20 log section). The fixed `99-dashcam-display.rules` is installed (`/dev/dashcam-display`). **2026-11-20
+   evening:** the C3 rule is serial-pinned and installed (`/dev/dashcam-bridge`, v0.4 pinned to it), `<DisplayPreview>`
+   is enabled in the deployed config (TargetFps 15 now) and soaked at 10 and 15 fps with the UGREEN; a firmware fix
+   stopped the 32 s session resets (blinks); see the "local tests" log section. Still to do: the bench sketches (USB
+   throughput hwcdc vs TinyUSB, JPEG decode/blit; need a 3.3 V UART adapter), the 15 fps totals (logged at v0.4's next stop).
 10. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
    boot alert, tap-test touch, cover/uncover the LDR (it read ~980 in the room and held the backlight at 32/255).
 11. **Android connector** (`connector/README.md`, `connector/VALIDATION.md`; 2026-10-29 log section). **2026-11-20:
     the agent is deployed (systemd, real data); the web client passed on the laptop and the app on the S25 Ultra;
     the Vehicle page gained a map (web harness-tested, Android uncompiled); see those log sections. Left: Android map
-    build and test on Windows, map with real tiles on the laptop, camera video with the UGREEN, two-viewer load.** Original list: install the host
+    build and test on Windows, map with real tiles on the laptop; two physical viewers (phone + laptop) on the car network.
+    Camera video with the UGREEN and a two-viewer load passed locally on the Jetson (2026-11-20 local tests).** Original list: install the host
     agent (venv, `service.py init`, `service.env` with `LAN_ADDRESS` and the host footage path), enable
     `dashcam-monitor.service` (sudo), add `--volume /run/dashcam-monitor:/run/dashcam-monitor` to the v0.4 launcher and
     `<MonitoringEnabled>true</MonitoringEnabled>` to the deployed config, pair the phone and tablet. Then the physical
@@ -413,6 +415,47 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-20 (Jetson, bench): local tests with the UGREEN, C3 and display; display session-reset fix
+
+All on the Jetson itself (it was on Wi-Fi 192.168.1.x, so no phone or laptop): v0.4 deployed service, the UGREEN on
+`/dev/video2`, the C3 on a USB-A port, the ES3C28P on USB-C. No MKR, so the C3 link is up (1 Hz status) but carries no
+vehicle data. Measurements and a preview frame: `~/drive_logs/connector_local_20261120/` (not in the repo).
+
+- **Connector, real camera:** a local bearer client (Android path) against the deployed agent got the UGREEN preview
+  (640x360 JPEG, real scene) and telemetry. Two viewers (telemetry + video each), 60 s per phase:
+
+  | | no viewer | 2 viewers | after |
+  |---|---|---|---|
+  | recording fps | 19.97 | 19.99 | 19.96 |
+  | v0.4 CPU / RSS | 8.2 % / 29 MB | 36.4 % / 29 MB | 8.0 % / 28 MB |
+  | agent CPU | 1.0 % | 3.5 % | 1.0 % |
+
+  Each viewer received 9.75 video fps (15 kB frames) and 5 snapshots/s. The extra v0.4 CPU is the one shared
+  converter, idle without viewers. 20 fps was the camera's own night-mode rate (dark room), not load.
+- **C3 udev rule pinned by serial:** `lib/libcommlink/99-dashcam-bridge.rules` is now a template
+  (`BRIDGE_SERIAL_HERE`, like the display rule), installed with the C3's serial. Verified: `/dev/dashcam-bridge` ->
+  the C3 only (ModemManager ignored, autosuspend off), `/dev/dashcam-display` -> the display only, after replugging
+  each board. The deployed `dashcam.xml` now has `<Bridge><Device>/dev/dashcam-bridge</Device></Bridge>` (log:
+  `telemetry bridge: pinned to /dev/dashcam-bridge`); previous config:
+  `~/drive_logs/connector_local_20261120/dashcam.xml.before`.
+- **Display preview enabled and soaked** (`<DisplayPreview><Enabled>true`, 320x180 letterboxed in the 320x240 canvas,
+  credits 1). The board's LIVE tab shows the camera.
+  - 10 fps, original firmware, 26 min: 15,548 of 15,732 frames presented (98.8 %), 0 dropped, p95 capture->presented
+    227 ms; v0.4 25 % CPU, 37 MB; recording unaffected (25 fps camera rate, then 30). **But the screen blinked:** the
+    board ended its session 15 times in 10 min, always at multiples of 32.1 s, while it was responsive (it answered
+    `NoSession` at once; only one PING timeout). In the Arduino core 3.2.0 HWCDC, `Serial` is false while
+    `usb_serial_jtag_is_connected()` is, a monitor that compares the board's 1 kHz tick with the host's 1 kHz USB
+    frames; a ~31 ppm clock difference slips one period every ~32 s, and `es3UsbLink::service()` reset the session on
+    any `!Serial`. Jetson side ruled out: the display port never runtime-suspended.
+  - **Fix** (`peripherals/es3c28p/lib/es3UsbLink`): the session ends only if `!Serial` lasts more than 200 ms;
+    shorter blips pause USB servicing. Flashed from the Jetson (container, v0.4 stopped). 10 fps, 13 min: 7,850 of 7,852
+    presented, 0 dropped, p95 215 ms, **0 session resets** (about 25 expected before).
+  - 15 fps, fixed firmware, 10 min: 0 session resets; recording 30.0 fps throughout; v0.4 26-31 % CPU, 32 MB; with
+    two connector viewers on top 57.5 % CPU, recording still 30.0 fps. Host CPU 10-30 % (the desktop session included),
+    CPU about 53 °C. Frame totals at 15 fps are logged at v0.4's next stop.
+- The deployed config stays at TargetFps 15 (prepared copies: 10 and 15 fps). v0.4 exits 0 on every `systemctl stop`.
+- **Known, harmless:** one `video preview: source frame is not a JPEG` at each start (the first UVC frame).
 
 ## 2026-11-20 (Jetson, bench): connector Vehicle map; client review fixes; agent mDNS crash loop
 

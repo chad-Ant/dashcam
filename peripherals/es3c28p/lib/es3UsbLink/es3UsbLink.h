@@ -29,6 +29,10 @@ private:
     uint8_t _tx[es3proto::kMaxFrame]{};
     size_t _txSize = 0, _txOffset = 0;
     uint32_t _lastRequest = 0, _txStarted = 0;
+    // USB loss must last this long before the session ends (see service()).
+    static constexpr uint32_t kSerialLossMs = 200;
+    uint32_t _serialLostAt = 0;
+    bool _serialLost = false;
     bool _pending = false;
     Response _appResponse{}; // application-task only
     void dispatch(const es3proto::Frame& frame);

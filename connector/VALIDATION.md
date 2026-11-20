@@ -132,6 +132,14 @@ OSM tiles fetched by the phone/browser itself, follow mode, free pan/zoom, Recen
 - 48 agent tests pass. The Android map and fixes are **not compiled** here (no JDK/Android SDK): build and run
   `:app:assembleDebug :app:testDebugUnitTest :app:lintDebug` on the Windows machine (adds `TileMathTest`).
 
+## Real camera and two-viewer load on the Jetson — 2026-11-20 (local)
+
+Deployed agent and v0.4 with the UGREEN (1080p30 MJPEG), clients on the Jetson itself (bearer, as Android):
+recording 19.97 fps without viewers and 19.99 with two (camera night-mode rate in a dark room); v0.4 CPU 8 % -> 36 %
+while someone watches (one shared converter), memory unchanged (29 MB); agent 1 % -> 3.5 %; each viewer 9.75 video
+fps (15 kB) and 5 snapshots/s. With the ES3C28P display preview also on (15 fps): recording 30.0 fps, v0.4 57.5 %
+CPU with two viewers. Details: HANDOVER, 2026-11-20 local tests.
+
 ## Remaining physical acceptance
 
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.
@@ -139,7 +147,8 @@ OSM tiles fetched by the phone/browser itself, follow mode, free pan/zoom, Recen
   passed on 2026-11-20 (above), as did mDNS on the router.
 - CAN/GNSS source-loss transitions, reconnect after router/Jetson reboot and
   accurate storage-path configuration on the deployed system.
-- Compare recording FPS/CPU/memory before and during two physical viewers.
+- Compare recording FPS/CPU/memory before and during two physical viewers (passed with two local clients on
+  2026-11-20; repeat with a phone and a laptop on the car network).
 - Enable the monitoring socket directory mount and XML settings in the deployed
   recording launcher, then verify with live vehicle telemetry.
 
