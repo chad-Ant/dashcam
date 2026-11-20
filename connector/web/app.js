@@ -189,6 +189,275 @@
     return card('Temperatures', empty, list);
   }
 
+  // ---- vehicle map ---------------------------------------------------------
+  // A small slippy map: OpenStreetMap tiles as <img> (pixels are never read, so no CORS),
+  // fetched straight from OSM only while Vehicle is visible and a fix has been received:
+  // the viewport plus half a tile, at most four at a time, a failed tile again after 30 s.
+  const TILE = 256, MIN_ZOOM = 3, MAX_ZOOM = 19, DEFAULT_ZOOM = 16, MAX_LAT = 85.0511;
+  const TILE_URL = 'https://tile.openstreetmap.org/', ATTRIBUTION_URL = 'https://www.openstreetmap.org/copyright';
+  const TILE_INFLIGHT = 4, TILE_RETRY_MS = 30000, TILE_TIMEOUT_MS = 15000, TILE_SETTLE_MS = 200, TILE_KEEP = 128;
+  const MAP_MARGIN = TILE / 2, DRAG_SLOP = 6, WHEEL_STEP = 100, WHEEL_NOTCH_PX = 40, WHEEL_MIN_GAP_MS = 150;
+  const clampZoom = z => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+  const clamp01 = x => Math.min(1, Math.max(0, x));
+  const wrap01 = x => x - Math.floor(x);
+  // Web Mercator, normalised to 0..1 (x east, y south); null for unusable coordinates.
+  function mapFix(vehicle) {
+    const lat = num(vehicle?.latitude), lon = num(vehicle?.longitude);
+    if (lat === null || lon === null || Math.abs(lat) > MAX_LAT || Math.abs(lon) > 180 || (lat === 0 && lon === 0)) {
+      return null;
+    }
+    const r = lat * Math.PI / 180, heading = num(vehicle.heading_deg);
+    return { x: (lon + 180) / 360, y: (1 - Math.log(Math.tan(Math.PI / 4 + r / 2)) / Math.PI) / 2,
+      heading: heading === null ? null : ((heading % 360) + 360) % 360 };
+  }
+  function mapCard() {
+    const box = h('div', 'map-box empty'), layer = h('div', 'map-layer');
+    box.setAttribute('role', 'group');
+    box.setAttribute('aria-label', 'Map of the car position');
+    const marker = h('div', 'map-marker'), arrow = h('div', 'map-arrow');
+    const label = h('span', 'map-label', 'Last known position');
+    marker.append(arrow, h('div', 'map-dot'), label);
+    marker.hidden = true;
+    const note = h('p', 'map-note', 'No GNSS fix yet'), offline = h('p', 'map-offline', 'Map tiles need internet');
+    offline.hidden = true;
+    const zoomIn = button('+', 'map-btn', () => zoomStep(1)), zoomOut = button('−', 'map-btn', () => zoomStep(-1));
+    zoomIn.setAttribute('aria-label', 'Zoom in');
+    zoomOut.setAttribute('aria-label', 'Zoom out');
+    const recentre = button('Recentre', 'map-btn map-recentre', () => { follow = true; requestDraw(); render(); });
+    recentre.setAttribute('aria-label', 'Recentre on the car');
+    const controls = h('div', 'map-controls');
+    controls.append(zoomIn, zoomOut);
+    const link = h('a', null, '© OpenStreetMap contributors');
+    Object.assign(link, { href: ATTRIBUTION_URL, target: '_blank', rel: 'noopener noreferrer' });
+    const attribution = h('p', 'map-attrib');
+    attribution.append(link);
+    box.append(layer, marker, note, offline, controls, recentre, attribution);
+    const caption = h('p', 'hint');
+
+    // fix: last usable position, client memory only (dropped when unpaired or the Jetson changes).
+    let fix = null, fixDevice = null, live = false, follow = true, wanted = false;
+    let cx = 0.5, cy = 0.5, zoom = DEFAULT_ZOOM, tileZoom = -1, tileZoomMs = 0, rafId = 0;
+    let wheelAcc = 0, wheelMs = 0, wheelStepMs = 0;
+    const tiles = new Map();      // "z/x/y" -> {z, x, y, el, img, state: idle|loading|ok|failed, ...}
+    const pointers = new Map();   // pointerId -> {x, y, sx, sy}
+
+    binds.push(v => {
+      if (!identity || (fixDevice !== null && fixDevice !== identity.id)) {
+        fix = null; fixDevice = null; follow = true;
+      }
+      const f = identity ? mapFix(v.vehicle) : null;   // v.vehicle is null unless fresh and bridge_fresh
+      live = f !== null;
+      if (f) { fix = f; fixDevice = identity.id; }
+      wanted = fix !== null && page === 'vehicle' && !document.hidden;
+      setText(caption, fix === null ? 'The map appears with the first GNSS fix'
+        : !live ? 'No fresh position · showing the last known position'
+          : follow ? 'Following the car' : 'Free view · Recentre to follow the car');
+      draw(v.now);
+    });
+
+    function requestDraw() {
+      if (!rafId) rafId = requestAnimationFrame(() => { rafId = 0; draw(performance.now()); });
+    }
+    function draw(now) {
+      const W = box.clientWidth, H = box.clientHeight;
+      box.classList.toggle('empty', fix === null);
+      note.hidden = fix !== null;
+      layer.hidden = fix === null;
+      zoomIn.disabled = fix === null || zoom >= MAX_ZOOM;
+      zoomOut.disabled = fix === null || zoom <= MIN_ZOOM;
+      recentre.hidden = fix === null || follow;
+      if (!wanted || W === 0 || H === 0) {
+        for (const t of tiles.values()) if (t.state === 'loading') cancel(t);
+        marker.hidden = true; offline.hidden = true;
+        return;
+      }
+      if (follow) { cx = fix.x; cy = fix.y; }
+      const scale = TILE * 2 ** zoom, z = Math.round(zoom), n = 2 ** z;
+      if (z !== tileZoom) { tileZoom = z; tileZoomMs = now; }
+      const hw = (W / 2 + MAP_MARGIN) / scale, hh = (H / 2 + MAP_MARGIN) / scale;
+      const x0 = Math.floor((cx - hw) * n), x1 = Math.floor((cx + hw) * n);
+      const y0 = Math.max(0, Math.floor((cy - hh) * n)), y1 = Math.min(n - 1, Math.floor((cy + hh) * n));
+      const need = [];
+      for (let y = y0; y <= y1; y += 1) {
+        for (let x = x0; x <= x1; x += 1) {
+          const key = z + '/' + x + '/' + y;
+          let t = tiles.get(key);
+          if (!t) { t = newTile(z, x, y); tiles.set(key, t); }
+          t.usedMs = now;
+          need.push(t);
+        }
+      }
+      const cxt = cx * n, cyt = cy * n;   // nearest to the centre loads first
+      const away = t => (t.x + .5 - cxt) ** 2 + (t.y + .5 - cyt) ** 2;
+      need.sort((a, b) => away(a) - away(b));
+      const needed = new Set(need), complete = need.every(t => t.state === 'ok');
+      for (const t of tiles.values()) {
+        if (!needed.has(t) && t.state === 'loading') cancel(t);
+        if (t.state === 'loading' && now - t.startedMs > TILE_TIMEOUT_MS) fail(t, now);
+        const s = scale / 2 ** t.z;
+        const l = Math.round(W / 2 + t.x * s - cx * scale), r = Math.round(W / 2 + (t.x + 1) * s - cx * scale);
+        const tp = Math.round(H / 2 + t.y * s - cy * scale), b = Math.round(H / 2 + (t.y + 1) * s - cy * scale);
+        // Until this zoom is fully loaded, loaded tiles of nearby zooms fill the gaps (never fetched for it).
+        const show = needed.has(t) || (!complete && t.state === 'ok' && Math.abs(t.z - z) <= 2 &&
+          r > 0 && l < W && b > 0 && tp < H);
+        if (!show) { if (t.el.parentNode) t.el.remove(); continue; }
+        place(t, l, tp, r - l, b - tp, t.z === z ? 10 : 5 - Math.abs(t.z - z));
+        if (t.el.parentNode !== layer) layer.append(t.el);
+      }
+      if (now - tileZoomMs >= TILE_SETTLE_MS) {   // no requests while a zoom is still changing
+        let inflight = 0;
+        for (const t of tiles.values()) if (t.state === 'loading') inflight += 1;
+        for (const t of need) {
+          if (inflight >= TILE_INFLIGHT) break;
+          if (t.state !== 'idle' && !(t.state === 'failed' && now - t.failedMs >= TILE_RETRY_MS)) continue;
+          load(t, now, n);
+          inflight += 1;
+        }
+      }
+      offline.hidden = !need.some(t => t.state === 'failed');
+      evict(needed);
+      let ddx = fix.x - cx;
+      ddx -= Math.round(ddx);   // shortest way round: the copy of the car nearest the view (±180°)
+      const mx = Math.round(W / 2 + ddx * scale), my = Math.round(H / 2 + (fix.y - cy) * scale);
+      marker.hidden = mx < -48 || mx > W + 48 || my < -48 || my > H + 48;
+      marker.style.transform = 'translate(' + mx + 'px, ' + my + 'px)';
+      marker.classList.toggle('stale', !live);
+      label.hidden = live;
+      arrow.hidden = !live || fix.heading === null;
+      if (!arrow.hidden) arrow.style.transform = 'rotate(' + fix.heading.toFixed(1) + 'deg)';
+    }
+    function newTile(z, x, y) {
+      return { z, x, y, el: h('div', 'map-tile'), img: null, state: 'idle', startedMs: 0, failedMs: 0, usedMs: 0,
+        geometry: '' };
+    }
+    function place(t, left, top, width, height, z) {
+      const geometry = left + ',' + top + ',' + width + ',' + height + ',' + z;
+      if (geometry === t.geometry) return;
+      t.geometry = geometry;
+      Object.assign(t.el.style, { left: left + 'px', top: top + 'px', width: width + 'px', height: height + 'px',
+        zIndex: String(z) });
+    }
+    function load(t, now, n) {
+      cancel(t);
+      const img = h('img');   // a fresh element per attempt: events of an aborted one are ignored
+      img.alt = '';
+      img.draggable = false;
+      img.decoding = 'async';
+      img.hidden = true;
+      // The document policy is no-referrer; OSM's tile policy wants a Referer (only the page origin is sent).
+      img.referrerPolicy = 'strict-origin-when-cross-origin';
+      img.addEventListener('load', () => {
+        if (t.img === img && t.state === 'loading') { t.state = 'ok'; img.hidden = false; requestDraw(); }
+      });
+      img.addEventListener('error', () => {
+        if (t.img === img && t.state === 'loading') { fail(t, performance.now()); requestDraw(); }
+      });
+      t.img = img; t.state = 'loading'; t.startedMs = now;
+      t.el.classList.remove('failed');
+      t.el.replaceChildren(img);
+      img.src = TILE_URL + t.z + '/' + (((t.x % n) + n) % n) + '/' + t.y + '.png';
+    }
+    function cancel(t) {             // drops the picture; removing src aborts a pending request
+      const img = t.img;
+      t.img = null; t.state = 'idle';
+      if (img) { img.removeAttribute('src'); img.remove(); }
+    }
+    function fail(t, now) {
+      cancel(t);
+      t.state = 'failed'; t.failedMs = now;
+      t.el.classList.add('failed');
+    }
+    function evict(needed) {
+      if (tiles.size <= TILE_KEEP) return;
+      const old = [...tiles.entries()].filter(([, t]) => !needed.has(t)).sort((a, b) => a[1].usedMs - b[1].usedMs);
+      for (const [key, t] of old.slice(0, tiles.size - TILE_KEEP)) {
+        cancel(t);
+        t.el.remove();
+        tiles.delete(key);
+      }
+    }
+
+    // ---- gestures: any pan or zoom gesture stops following; +/- keep following the car
+    const at = e => { const r = box.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+    function panBy(dx, dy) {
+      const s = TILE * 2 ** zoom;
+      cx = wrap01(cx - dx / s); cy = clamp01(cy - dy / s);   // x wraps like the tiles do
+    }
+    function zoomAround(next, px, py) {           // keeps the map point under (px, py) in place
+      next = clampZoom(next);
+      if (next === zoom) return false;
+      const dx = px - box.clientWidth / 2, dy = py - box.clientHeight / 2;
+      const s0 = TILE * 2 ** zoom, s1 = TILE * 2 ** next;
+      cx = wrap01(cx + dx / s0 - dx / s1); cy = clamp01(cy + dy / s0 - dy / s1);
+      zoom = next;
+      return true;
+    }
+    function zoomStep(step) {
+      if (fix !== null && zoomAround(Math.round(zoom) + step, box.clientWidth / 2, box.clientHeight / 2)) requestDraw();
+    }
+    function goFree() {
+      if (!follow) return;
+      follow = false;
+      render();
+    }
+    box.addEventListener('pointerdown', e => {
+      if (fix === null || pointers.size >= 2 || e.target.closest('button, a')) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      try { box.setPointerCapture(e.pointerId); } catch (_) { /* pointer already gone */ }
+      const p = at(e);
+      pointers.set(e.pointerId, { x: p.x, y: p.y, sx: p.x, sy: p.y });
+      box.classList.add('dragging');
+      e.preventDefault();
+    });
+    box.addEventListener('pointermove', e => {
+      const prev = pointers.get(e.pointerId);
+      if (!prev || fix === null) return;
+      const p = at(e);
+      if (pointers.size === 1) {
+        if (follow && Math.hypot(p.x - prev.sx, p.y - prev.sy) < DRAG_SLOP) return;   // a tap is not a pan
+        goFree();
+        panBy(p.x - prev.x, p.y - prev.y);
+        prev.x = p.x; prev.y = p.y;
+      } else {
+        const [a0, b0] = [...pointers.values()].map(q => ({ x: q.x, y: q.y }));
+        prev.x = p.x; prev.y = p.y;
+        const [a1, b1] = [...pointers.values()];
+        const d0 = Math.hypot(a0.x - b0.x, a0.y - b0.y), d1 = Math.hypot(a1.x - b1.x, a1.y - b1.y);
+        const mx = (a1.x + b1.x) / 2, my = (a1.y + b1.y) / 2;
+        goFree();
+        panBy(mx - (a0.x + b0.x) / 2, my - (a0.y + b0.y) / 2);
+        if (d0 > 0 && d1 > 0) zoomAround(zoom + Math.log2(d1 / d0), mx, my);
+      }
+      requestDraw();
+    });
+    const lift = e => {
+      if (!pointers.delete(e.pointerId)) return;
+      if (pointers.size === 0) box.classList.remove('dragging');
+    };
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) box.addEventListener(type, lift);
+    // One zoom level per wheel notch (a line/page event or one large pixel event) or per 100 px of
+    // trackpad scroll, at most one level every 150 ms so trackpad momentum cannot zoom several at once.
+    box.addEventListener('wheel', e => {
+      if (fix === null) return;
+      e.preventDefault();
+      const now = performance.now();
+      if (now - wheelMs > 300) wheelAcc = 0;
+      wheelMs = now;
+      const mode = e.deltaMode;                     // read deltaMode first so Firefox keeps line mode
+      const px = e.deltaY * (mode === 1 ? 40 : mode === 2 ? 800 : 1);
+      wheelAcc += px;
+      const notch = mode !== 0 || Math.abs(px) >= WHEEL_NOTCH_PX;
+      if (!notch && Math.abs(wheelAcc) < WHEEL_STEP) return;
+      if (now - wheelStepMs < WHEEL_MIN_GAP_MS) return;
+      const step = wheelAcc < 0 ? 1 : -1, p = at(e);
+      wheelAcc = 0;
+      wheelStepMs = now;
+      if (zoomAround(Math.round(zoom) + step, p.x, p.y)) { goFree(); requestDraw(); }
+    }, { passive: false });
+
+    return card('Map', box, caption);
+  }
+
   // ---- connection page -----------------------------------------------------
   function connectionPage() {
     const steps = h('ol', 'steps');
@@ -527,7 +796,7 @@
   }
   function init() {
     $('page-live').append(cameraCard(), speedCard(), duo(recordingCard(), adasCard()), duo(positionCard(), healthCard()));
-    $('page-vehicle').append(speedCard(), duo(powertrainCard(), positionCard()), linkCard());
+    $('page-vehicle').append(speedCard(), mapCard(), duo(powertrainCard(), positionCard()), linkCard());
     $('page-system').append(duo(healthCard(), memoryCard()), temperaturesCard(), adasCard());
     $('page-connection').append(...connectionPage());
     const banner = $('banner'), statusLine = $('status'), detail = $('detail'), subtitle = $('subtitle');

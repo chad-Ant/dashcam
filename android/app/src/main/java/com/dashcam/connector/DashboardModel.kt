@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 class DashboardModel(app: Application) : AndroidViewModel(app) {
     private val store = ProfileStore(app)
@@ -17,7 +18,21 @@ class DashboardModel(app: Application) : AndroidViewModel(app) {
     val selected = MutableStateFlow(saved.value.firstOrNull()?.id)
     val repository = MonitorRepository(app, viewModelScope)
     val discovery = Discovery(app)
-    init { repository.select(saved.value.firstOrNull()) }
+    // Vehicle map: view state and last known position in memory only, OSM tiles.
+    val map = MapViewState()
+    val tiles = TileLoader(app, viewModelScope)
+    init {
+        repository.select(saved.value.firstOrNull())
+        viewModelScope.launch {
+            // Same freshness rule as the cards: vehicle values only while runtime
+            // and bridge are fresh (Snapshot.vehicle), else no current fix.
+            repository.state.collect { state ->
+                val vehicle = state.snapshot?.vehicle?.takeIf { state.runtimeFresh }
+                map.update(TileMath.fix(vehicle.finite("latitude"), vehicle.finite("longitude"),
+                    vehicle.finite("heading_deg")))
+            }
+        }
+    }
     fun pair(link: String): Boolean {
         val profile = try {
             DeviceProfile.parse(link)
@@ -36,6 +51,7 @@ class DashboardModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun select(id: String) {
+        if (selected.value != id) map.forget()
         selected.value = id
         repository.select(saved.value.find { it.id == id })
     }
@@ -54,5 +70,5 @@ class DashboardModel(app: Application) : AndroidViewModel(app) {
             store.save(next); saved.value = next; select(device.id)
         } catch (_: Exception) { error.value = "Could not update device address" }
     }
-    override fun onCleared() { repository.close(); discovery.stop() }
+    override fun onCleared() { repository.close(); discovery.stop(); tiles.close() }
 }

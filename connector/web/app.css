@@ -5,6 +5,7 @@
   --ok-bg: rgba(10, 117, 100, .10); --warn: #8a4f00; --warn-bg: rgba(170, 100, 0, .12);
   --danger: #b3261e; --danger-bg: rgba(179, 38, 30, .10);
   --video-bg: #05090d; --video-text: #c9d4de;
+  --map-bg: #e3e8ed; --map-chip: rgba(255, 255, 255, .88);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -12,6 +13,7 @@
     --accent: #5ce0c6; --on-accent: #062019; --sel: #23443f;
     --ok-bg: rgba(92, 224, 198, .10); --warn: #ffca80; --warn-bg: rgba(255, 202, 128, .10);
     --danger: #ffb4ab; --danger-bg: rgba(255, 180, 171, .12);
+    --map-bg: #212c37; --map-chip: rgba(21, 33, 45, .88);
   }
 }
 * { box-sizing: border-box; }
@@ -96,6 +98,60 @@ h1 { font-size: 2rem; font-weight: 600; line-height: 1.2; }
   color: var(--video-text); font-weight: 600;
 }
 .video-caption { font-variant-numeric: tabular-nums; }
+/* Vehicle map: OSM tiles (always light) under a marker, controls and the attribution. */
+.map-box {
+  position: relative; height: clamp(260px, 62vw, 440px); overflow: hidden; border-radius: 14px;
+  background: var(--map-bg); touch-action: none; user-select: none; -webkit-user-select: none; cursor: grab;
+}
+.map-box.dragging { cursor: grabbing; }
+.map-box.empty { cursor: default; touch-action: auto; }
+.map-layer { position: absolute; inset: 0; z-index: 0; }
+.map-tile { position: absolute; overflow: hidden; }
+/* A failed tile stays transparent: cached tiles of nearby zooms underneath stay visible, and
+   uncovered areas show the map background; the "Map tiles need internet" note reports it. */
+.map-tile img { display: block; width: 100%; height: 100%; pointer-events: none; -webkit-user-drag: none; }
+.map-marker { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 1; pointer-events: none; }
+.map-dot {
+  position: absolute; left: -9px; top: -9px; width: 18px; height: 18px; border-radius: 50%;
+  background: #1a73e8; border: 3px solid #ffffff; box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+}
+.map-marker.stale .map-dot { background: #7d8996; }
+.map-arrow {   /* points north, rotated about the dot's centre by heading_deg */
+  position: absolute; left: -8px; top: -30px; width: 0; height: 0; transform-origin: 8px 30px;
+  border-left: 8px solid transparent; border-right: 8px solid transparent;
+  border-bottom: 14px solid #1a73e8;
+  filter: drop-shadow(0 0 1.5px #ffffff);
+}
+.map-label {
+  position: absolute; left: 0; top: 15px; transform: translateX(-50%);
+  white-space: nowrap; font-size: .75rem; font-weight: 600;
+  color: #33404c; background: rgba(255, 255, 255, .9); border-radius: 6px; padding: 1px 6px;
+}
+.map-note {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-weight: 600; z-index: 2;
+}
+.map-offline {
+  position: absolute; left: 8px; top: 8px; z-index: 2; font-size: .75rem; font-weight: 600;
+  color: var(--text); background: var(--map-chip); border-radius: 8px; padding: 2px 8px;
+}
+.map-controls { position: absolute; right: 8px; top: 8px; z-index: 3; display: flex; flex-direction: column; gap: 6px; }
+.map-btn {
+  min-width: 44px; height: 44px; padding: 0; border-radius: 12px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--text); font: inherit; font-size: 1.375rem; line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+}
+.map-btn:disabled { opacity: .5; cursor: default; }
+.map-recentre {
+  position: absolute; left: 8px; bottom: calc(8px + 1.5rem); z-index: 3; padding: 0 14px; font-size: .875rem; font-weight: 600;
+}
+.map-attrib {
+  position: absolute; right: 0; bottom: 0; z-index: 3; font-size: .75rem; padding: 2px 8px;
+  background: rgba(255, 255, 255, .85); color: #1d2733; border-top-left-radius: 8px;
+}
+.map-attrib a { color: #0b57d0; }
+.map-btn:focus-visible, .map-attrib a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .temps { display: flex; flex-direction: column; gap: 10px; }
 .temps:empty { display: none; }
 .steps { margin: 0; padding-left: 1.25rem; display: flex; flex-direction: column; gap: 6px; }

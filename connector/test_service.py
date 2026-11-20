@@ -984,8 +984,11 @@ class VideoApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_csp_allows_blob_images_and_identity_has_video(self):
         response = await self.client.get('/v1/identity', headers=self.headers)
         csp = response.headers['Content-Security-Policy']
-        self.assertIn("img-src 'self' data: blob:;", csp)
-        self.assertEqual(csp, "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+        # Vehicle map: OSM tiles are images only; connections stay same-origin.
+        self.assertIn("img-src 'self' data: blob: https://tile.openstreetmap.org;", csp)
+        self.assertIn("connect-src 'self';", csp)
+        self.assertEqual(csp, "default-src 'none'; script-src 'self'; style-src 'self'; "
+                              "img-src 'self' data: blob: https://tile.openstreetmap.org; "
                               "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         capabilities = (await response.json())['capabilities']
         self.assertIs(capabilities['video'], True)

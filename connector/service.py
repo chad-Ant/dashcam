@@ -51,7 +51,8 @@ LABEL = re.compile(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?')
 COOKIE = '__Host-dcsession'
 COOKIE_VALUE = re.compile(r'v1\.([0-9]{1,12})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})')
 SECURITY_HEADERS = {
-    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; "
+                               "img-src 'self' data: blob: https://tile.openstreetmap.org; "   # Vehicle map tiles
                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY',
     'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Resource-Policy': 'same-origin',

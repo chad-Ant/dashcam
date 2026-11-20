@@ -59,7 +59,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onStart() { super.onStart(); foreground = true; ensurePermission() }
     override fun onStop() {
-        foreground = false; model.repository.setActive(false); model.discovery.stop()
+        foreground = false; model.repository.setActive(false); model.discovery.stop(); model.tiles.pause()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
@@ -138,6 +138,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                             }
                             1 -> {
                                 item { SpeedCard(vehicle, runtime) }
+                                item { MapCard(model.map, model.tiles) }
                                 item { AdaptivePair(wide, { SurfaceCard("Powertrain") {
                                     Metric("Engine speed", vehicle.finite("rpm"), "rpm", 0)
                                     Metric("Coolant", vehicle.finite("coolant_c"), "°C", 1)
@@ -187,7 +188,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
         }
     }
 }
-@Composable private fun SurfaceCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+@Composable internal fun SurfaceCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(22.dp)) {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -201,7 +202,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     } else Column(verticalArrangement = Arrangement.spacedBy(16.dp)) { first(); second() }
 }
 @Composable private fun BigValue(value: String) { Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold) }
-@Composable private fun Hint(value: String) { Text(value, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
+@Composable internal fun Hint(value: String) { Text(value, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
 @Composable private fun Metric(label: String, value: Double?, unit: String, decimals: Int = 1) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(label, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)

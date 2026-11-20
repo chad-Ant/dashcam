@@ -3,9 +3,11 @@
 Read-only vehicle telemetry, recorder state and host health for `dashcam_v0_4`.
 Phone portrait and tablet landscape use the same adaptive Android app; any other
 device (desktop, laptop, iPad, a phone without the app) can use the built-in web
-client in a browser, see [Browser access](#browser-access). No internet, map,
-commands or background monitoring is required. An optional low-rate preview of
-the recording camera is off by default, see [Camera video](#camera-video).
+client in a browser, see [Browser access](#browser-access). No internet, commands
+or background monitoring is required; only the Vehicle map's tiles need internet
+on the phone or browser device, see [Vehicle map](#vehicle-map). An optional
+low-rate preview of the recording camera is off by default, see
+[Camera video](#camera-video).
 v0.4 has no integrated ADAS: lane/driver capabilities explicitly remain false.
 
 ## Architecture and protocol
@@ -310,13 +312,52 @@ client displays it through a `blob:` object URL (the Content-Security-Policy
 allows `img-src 'self' data: blob:`) and revokes the previous URL once the new
 image has loaded.
 
+## Vehicle map
+
+The **Vehicle** page of the Android app and of the web client shows a **Map**
+card above the GNSS position: the car as a blue dot with a heading arrow while
+the vehicle data is fresh, a grey dot labelled "Last known position" once it goes
+stale (kept in client memory only, never stored), and "No GNSS fix yet" over a
+plain background until the first fix. It follows the car by default; dragging,
+pinching or (web) mouse-wheel zooming switches to a free view, **Recentre**
+follows the car again at the current zoom, and **+/−** zoom (levels 3–19,
+default 16). The Live page is unchanged.
+
+- **Tiles come straight from OpenStreetMap** (`https://tile.openstreetmap.org`,
+  256 px Web Mercator), not through the Jetson: the phone or browser device needs
+  its own internet connection. The bench router's DNS blocks openstreetmap.org,
+  so there the map shows its plain background (plus any tiles already loaded at
+  nearby zooms, which a failed tile never covers) with "Map tiles need internet";
+  everything else on the page is unaffected, and a failed tile is retried no
+  sooner than 30 s later.
+- **Tile usage policy**: requests start only after a fix and only while the
+  Vehicle page is shown and the app/page is in the foreground; only the tiles
+  covering the view plus a small margin, at most four at a time, no prefetching
+  of other zooms or areas, no bulk download. Android identifies itself as
+  `DashcamConnect/<version> (Android; com.dashcam.connector)` through a separate
+  HTTP client (platform trust, no Jetson pin or credentials) with a ~50 MB
+  HTTP cache; a browser sends its own User-Agent and, for tile images only, the
+  page origin as Referer (`referrerpolicy="strict-origin-when-cross-origin"`;
+  the page itself stays `no-referrer`).
+- **Attribution**: "© OpenStreetMap contributors" is always visible on the map
+  and opens <https://www.openstreetmap.org/copyright>.
+- **Privacy**: tile requests reveal the car's approximate position (the tiles
+  around it) and the device's IP address to the OSM tile servers. Nothing is
+  requested before the first fix or while the Vehicle page is not shown; stay off
+  the Vehicle page if that is not acceptable.
+- **CSP**: for the web client the agent's Content-Security-Policy adds exactly
+  `https://tile.openstreetmap.org` to `img-src`; `connect-src` stays `'self'`.
+  Tiles are plain `<img>` elements (no pixel reads), so no CORS is involved.
+
 ## Browser access
 
 The agent also serves a small web client (`connector/web/`: plain HTML/JS/CSS,
-no build step, no frameworks, no external resources, no analytics) with the same
+no build step, no frameworks, no analytics, no external resources except the
+OpenStreetMap tiles of the [Vehicle map](#vehicle-map)) with the same
 pages as the Android app: **Live** (camera preview, see
 [Camera video](#camera-video), speed and source, recording, fps, frames,
-bridge age, connection state), **Vehicle**, **System** and **Connection**
+bridge age, connection state), **Vehicle** (speed, map, powertrain, GNSS
+position, telemetry link), **System** and **Connection**
 (device, session, pairing, sign out, optional "Keep screen on" where the browser
 supports the Wake Lock API). It adapts from phone portrait (bottom navigation)
 to tablet landscape/desktop (side navigation from ~840 px) and follows the
@@ -463,7 +504,8 @@ revoked session shows the "not paired" state with instructions.
   sent.
 - **Headers on every response** (also errors): a strict Content-Security-Policy
   (`default-src 'none'`, scripts/styles/connections only from the agent itself,
-  images only from the agent, `data:` or `blob:` (the camera frames), no
+  images only from the agent, `data:` or `blob:` (the camera frames) and
+  `https://tile.openstreetmap.org` (the [Vehicle map](#vehicle-map) tiles), no
   framing, no forms), `nosniff`, `no-referrer`, `X-Frame-Options: DENY`,
   same-origin COOP/CORP, a Permissions-Policy denying geolocation, camera and
   microphone, and `Cache-Control: no-store`. The page builds all DOM with
