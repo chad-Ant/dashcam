@@ -21,26 +21,33 @@ bool codecWrite(uint8_t reg, uint8_t value)
     return Wire.endTransmission() == 0;
 }
 
-bool configureCodec()
+// Register sequence: Espressif esp_codec_dev ES8311 driver (esp-adf
+// e05f54d4), slave, external MCLK = 256 * Fs, 16-bit Philips I2S. The 8--16 kHz
+// coefficients all use prediv=1, mult=1, ADC OSR 0x10, DAC OSR 0x20. Playback
+// and capture differ only in the entries marked; see MIC_LEVEL_PLAN.md.
+bool configureCodec(bool capture)
 {
-    // Slave, external MCLK = 256 * Fs, normal polarity, 16-bit Philips I2S.
-    // The 8--16 kHz coefficients all use prediv=1, mult=1, DAC OSR=32.
-    // Register meanings/sequence: Espressif esp_codec_dev ES8311 driver.
     // A first write may fail at power-on; repeat for I2C noise immunity.
     (void)codecWrite(0x44, 0x08);
     if (!codecWrite(0x44, 0x08)) {
         return false;
     }
     const uint8_t registers[][2] = {
-        {0x01, 0x30}, {0x02, 0x00}, {0x03, 0x10}, {0x16, 0x24},
+        {0x01, 0x30}, {0x02, 0x00}, {0x03, 0x10}, {0x16, 0x24},  // ADC scale 24 dB
         {0x04, 0x20}, {0x05, 0x00}, {0x0b, 0x00}, {0x0c, 0x00},
         {0x10, 0x1f}, {0x11, 0x7f}, {0x00, 0x80}, {0x01, 0x3f},
         {0x06, 0x03}, {0x07, 0x00}, {0x08, 0xff},
-        {0x09, 0x0c}, {0x0a, 0x4c},  // DAC enabled, ADC serial out disabled
+        // Mode: DAC input and ADC output enabled (bit 6 clear) or muted.
+        {0x09, static_cast<uint8_t>(capture ? 0x4c : 0x0c)},
+        {0x0a, static_cast<uint8_t>(capture ? 0x0c : 0x4c)},
         {0x13, 0x10}, {0x1b, 0x0a}, {0x1c, 0x6a},
-        {0x0e, 0x02}, {0x12, 0x00}, {0x14, 0x1a}, {0x0d, 0x01},
-        {0x15, 0x40}, {0x37, 0x08}, {0x45, 0x00},
-        {0x31, 0x00}, {0x32, 0xbf},  // unmute; 0 dB (software volume below)
+        {0x0e, 0x02},
+        {0x12, static_cast<uint8_t>(capture ? 0x02 : 0x00)},     // DAC powered down in capture
+        {0x14, 0x1a},                                            // MIC1P/N, PGA 30 dB
+        {0x0d, 0x01}, {0x15, 0x40}, {0x37, 0x08}, {0x45, 0x00},
+        {0x17, static_cast<uint8_t>(capture ? 0xbf : 0x00)},     // ADC volume 0 dB / muted
+        {0x31, static_cast<uint8_t>(capture ? 0x60 : 0x00)},     // DAC muted in capture
+        {0x32, static_cast<uint8_t>(capture ? 0x00 : 0xbf)},     // DAC 0 dB (software volume)
     };
     for (const auto& entry : registers) {
         if (!codecWrite(entry[0], entry[1])) {
@@ -49,6 +56,13 @@ bool configureCodec()
     }
     return true;
 }
+
+constexpr uint32_t kCaptureRate = 16000;
+constexpr uint32_t kCaptureDmaDescriptors = 8;
+constexpr uint32_t kCaptureDmaFrames = 256;          // 8 x 256 frames = 128 ms
+constexpr uint32_t kCaptureReadTimeoutMs = 50;      // bounds the stop handshake
+constexpr uint32_t kCaptureStopWaitMs = 300;
+constexpr uint8_t kCaptureSlot = 0;                 // L and R carry the same ADC data
 }  // namespace
 
 Es3Audio::Es3Audio(Es3Storage& storage)
@@ -109,7 +123,7 @@ bool Es3Audio::openOutput(uint32_t sampleRate)
         _tx = nullptr;
         return false;
     }
-    if (!configureCodec()) {
+    if (!configureCodec(false)) {
         closeOutput();
         return false;
     }
@@ -132,6 +146,7 @@ bool Es3Audio::playWav(const char* path)
     if (!_ready || path == nullptr) {
         return false;
     }
+    stopCapture();   // playback always wins I2S0
     stop();
     es3audio::WavHeader<File> header(_file);
     if (!_storage.openRead(path, _file) || !header.parse() || !openOutput(header.sampleRate())) {
@@ -234,6 +249,107 @@ void Es3Audio::setMasterVolume(uint8_t percent)
 {
     _masterVolume = min<uint8_t>(percent, 100);
 }
+
+bool IRAM_ATTR Es3Audio::onCaptureOverflow(i2s_chan_handle_t, i2s_event_data_t*, void* self)
+{
+    static_cast<Es3Audio*>(self)->_captureOverflows.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+bool Es3Audio::startCapture()
+{
+    if (!_ready || _playing || _tx != nullptr || _rx != nullptr) {
+        return _rx != nullptr;
+    }
+    i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    channel.dma_desc_num = kCaptureDmaDescriptors;
+    channel.dma_frame_num = kCaptureDmaFrames;
+    if (i2s_new_channel(&channel, nullptr, &_rx) != ESP_OK) {
+        _rx = nullptr;
+        return false;
+    }
+    i2s_std_config_t config{};
+    config.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kCaptureRate);
+    config.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO);
+    config.gpio_cfg.mclk = static_cast<gpio_num_t>(Es3Board::audioMclk);
+    config.gpio_cfg.bclk = static_cast<gpio_num_t>(Es3Board::audioBclk);
+    config.gpio_cfg.ws = static_cast<gpio_num_t>(Es3Board::audioWs);
+    config.gpio_cfg.dout = I2S_GPIO_UNUSED;
+    config.gpio_cfg.din = static_cast<gpio_num_t>(Es3Board::audioIn);
+    i2s_event_callbacks_t callbacks{};
+    callbacks.on_recv_q_ovf = onCaptureOverflow;
+    digitalWrite(Es3Board::amplifierDisable, HIGH);
+    if (i2s_channel_init_std_mode(_rx, &config) != ESP_OK ||
+        i2s_channel_register_event_callback(_rx, &callbacks, this) != ESP_OK ||
+        i2s_channel_enable(_rx) != ESP_OK || !configureCodec(true)) {
+        i2s_channel_disable(_rx);
+        i2s_del_channel(_rx);
+        _rx = nullptr;
+        return false;
+    }
+    _meter.reset();
+    _micLevel.store(es3audio::kMicLevelNone);
+    _captureStop.store(false);
+    _captureRunning.store(true);
+    if (xTaskCreatePinnedToCore(captureTask, "es3mic", 4096, this, 5, &_captureTask, 0) != pdPASS) {
+        _captureRunning.store(false);
+        _captureTask = nullptr;
+        (void)codecWrite(0x0a, 0x4c);
+        i2s_channel_disable(_rx);
+        i2s_del_channel(_rx);
+        _rx = nullptr;
+        return false;
+    }
+    Serial0.println("[es3] microphone capture started");
+    return true;
+}
+
+void Es3Audio::captureTask(void* self)
+{
+    Es3Audio& audio = *static_cast<Es3Audio*>(self);
+    static int16_t frames[kCaptureDmaFrames * 2];
+    while (!audio._captureStop.load()) {
+        size_t bytes = 0;
+        const esp_err_t result = i2s_channel_read(audio._rx, frames, sizeof(frames), &bytes,
+                                                  pdMS_TO_TICKS(kCaptureReadTimeoutMs));
+        if (result != ESP_OK && result != ESP_ERR_TIMEOUT) continue;
+        audio._meter.addFrames(frames, bytes / (2 * sizeof(int16_t)), 2, kCaptureSlot);
+        audio._micLevel.store(audio._meter.level());
+    }
+    audio._captureRunning.store(false);   // after this the task touches nothing
+    vTaskDelete(nullptr);
+}
+
+void Es3Audio::stopCapture()
+{
+    if (_rx == nullptr) {
+        return;
+    }
+    _captureStop.store(true);
+    const uint32_t started = millis();
+    while (_captureRunning.load() && millis() - started < kCaptureStopWaitMs) {
+        delay(1);
+    }
+    if (_captureRunning.load()) {
+        // The task still holds the channel: never delete it under a reader.
+        Serial0.println("[es3] capture task did not stop; I2S0 left allocated");
+        return;
+    }
+    _captureTask = nullptr;
+    (void)codecWrite(0x0a, 0x4c);   // ADC serial output muted
+    (void)codecWrite(0x17, 0x00);   // ADC volume muted
+    i2s_channel_disable(_rx);
+    i2s_del_channel(_rx);
+    _rx = nullptr;
+    _micLevel.store(es3audio::kMicLevelNone);
+    Serial0.printf("[es3] microphone capture stopped (overflows %lu)\n",
+                   static_cast<unsigned long>(_captureOverflows.load()));
+}
+
+bool Es3Audio::capturing() const { return _rx != nullptr; }
+int Es3Audio::micLevel() const { return _rx != nullptr ? _micLevel.load() : es3audio::kMicLevelNone; }
+uint32_t Es3Audio::captureOverflows() const { return _captureOverflows.load(); }
 
 bool Es3Audio::ready() const { return _ready; }
 bool Es3Audio::isPlaying() const { return _playing; }

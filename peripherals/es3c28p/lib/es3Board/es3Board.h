@@ -32,6 +32,7 @@ constexpr int audioMclk = 4;
 constexpr int audioBclk = 5;
 constexpr int audioWs = 7;
 constexpr int audioOut = 8;
+constexpr int audioIn = 6;   // ES8311 ASDOUT (microphone ADC), schematic net I2S_DO
 constexpr int externalLdr = 2;
 
 // Touch and codec share Wire. Call from the Arduino loop task only.

@@ -148,10 +148,12 @@ The SET tab holds the user's controls, top to bottom:
 - **BRIGHTNESS** slider: backlight PWM 8-255 (never fully dark). With the
   optional LDR (`kAutoBrightness`) it sets the bright level and the dim level
   never exceeds it; the LDR threshold is then fixed by `kBrightness`.
-- **MIC THRESHOLD** slider with a **MIC IN** indicator: grey while there is
-  no input (or no microphone source), green once the input level reaches the
-  threshold. No microphone driver exists yet; `Es3Graphics::setMicLevel()`
-  is the hook for it.
+- **MIC THRESHOLD** slider with a **MIC IN** indicator and a live level bar
+  under the slider. The onboard microphone is captured only while the SET tab
+  is visible (16 kHz, gain 54 dB, see [MIC_LEVEL_PLAN.md](MIC_LEVEL_PLAN.md));
+  the indicator turns green when the level reaches the threshold and back to
+  grey after 300 ms at least 5 points below it. It shows "paused" while a
+  sound plays (playback and capture take turns) and "no input" otherwise.
 - **RECALIBRATE** starts the touch wizard (re-tapping the SET tab still works).
 
 Drag or tap a slider; the value is written when the finger lifts. The title

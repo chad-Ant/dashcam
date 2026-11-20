@@ -71,9 +71,13 @@ public:
     /** True once after the user taps the TEST (volume) button. */
     bool takeAudioTestRequest();
 
-    /** Microphone input level 0..100, or es3settings::kNoMicLevel while no
-     * microphone source exists. Drives the SET tab's input indicator. */
+    /** Microphone input level 0..100, es3settings::kNoMicLevel while not
+     * capturing, or kMicPaused while a sound plays. Call every loop: it also
+     * runs the indicator's release timer. */
     void setMicLevel(int level);
+
+    /** True while the SET tab is on screen: the caller should capture. */
+    bool micMeterWanted() const;
 
     /** Changes the bright/dim raw-LDR switching point while the UI is running. */
     bool setBrightnessThresholdRaw(uint16_t raw);
@@ -181,6 +185,10 @@ private:
     bool _audioTestRequested = false;
     uint8_t _dragSlider = kNoSlider;
     int _micLevel = es3settings::kNoMicLevel;
+    es3settings::MicDetector _micDetector;
+    int _micBarLevel = -1;
+    uint32_t _micBarDrawnMs = 0;
+    bool _micBarDetected = false;
     uint8_t _autoMinDuty = 0;
     bool _brightnessPwmAttached;
     uint8_t _brightnessDuty;
@@ -203,6 +211,7 @@ private:
     void drawSettingsState();
     void drawSlider(uint8_t slider);
     void drawMicIndicator();
+    void drawMicLevelBar(bool force);
     void handleSettingsPress(int screenX, int screenY);
     void setSliderValue(uint8_t slider, uint8_t value);
     void finishSliderDrag();

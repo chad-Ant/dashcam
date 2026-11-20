@@ -36,3 +36,18 @@ Log its UART counters and host PRESENTED latency while playing alerts, changing
 tabs, calibrating, and unplugging USB. Verify stale at 500 ms and placeholder at
 2 s, bounded memory, camera recording health, and reconnect for 30 minutes.
 No board performance or hardware correctness is claimed by a successful build.
+
+## Microphone capture (MIC_LEVEL_PLAN.md, P1)
+
+```sh
+peripherals/es3c28p/bench/build.sh mic_capture /dev/dashcam-display
+```
+
+Captures the ES8311 ADC at 16 kHz (I2S0, DIN GPIO6) and shows, for each I2S
+slot (L/R), the RMS and peak level in dBFS, the 3 s RMS maximum, the DC offset
+and clipped samples, plus DMA overflows, all on the TFT (UART0 prints the same
+line every 200 ms). A tap anywhere steps the gain: PGA 0/12/24/30 dB, then
+PGA 30 dB plus ADC scale 6/12/18/24 dB; 300 ms after each change is discarded.
+The amplifier stays disabled and the DAC muted. Note for each gain step the
+level in a quiet room, for speech at about 30 cm, and for a clap (clipping),
+and which slot carries the signal. Reflash the main firmware afterwards.

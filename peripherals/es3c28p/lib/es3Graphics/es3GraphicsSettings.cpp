@@ -3,6 +3,7 @@
 #include "GraphicsInternal.h"
 #include "es3Board.h"
 #include <cstdio>
+#include <cstdlib>
 
 using namespace es3settings;
 
@@ -38,14 +39,35 @@ bool Es3Graphics::takeAudioTestRequest()
 
 void Es3Graphics::setMicLevel(int level)
 {
-    const int clamped = level < 0 ? kNoMicLevel : (level > 100 ? 100 : level);
-    const bool wasDetected = micDetected(_micLevel, _settings.micThreshold);
-    const bool hadSource = _micLevel != kNoMicLevel;
+    const int clamped = level == kMicPaused ? kMicPaused : (level < 0 ? kNoMicLevel : (level > 100 ? 100 : level));
+    const bool wasDetected = _micDetector.detected();
+    const int oldState = _micLevel < 0 ? _micLevel : 0;   // none / paused / measuring
     _micLevel = clamped;
-    if (settingsVisible() && (micDetected(_micLevel, _settings.micThreshold) != wasDetected ||
-                              (_micLevel != kNoMicLevel) != hadSource)) {
-        drawMicIndicator();
+    const bool detected = _micDetector.update(_micLevel, _settings.micThreshold, millis());
+    if (!settingsVisible()) return;
+    if (detected != wasDetected || (_micLevel < 0 ? _micLevel : 0) != oldState) drawMicIndicator();
+    drawMicLevelBar(false);
+}
+
+bool Es3Graphics::micMeterWanted() const { return settingsVisible(); }
+
+void Es3Graphics::drawMicLevelBar(bool force)
+{
+    // Live level under the threshold track, so speech can be compared with
+    // the knob. At most 10 redraws/s, and only when it moves 2+ points.
+    const int level = _micLevel > 0 ? _micLevel : 0;
+    const uint32_t now = millis();
+    if (!force && (std::abs(level - _micBarLevel) < 2 || now - _micBarDrawnMs < 100) &&
+        _micDetector.detected() == _micBarDetected) {
+        return;
     }
+    _micBarLevel = level;
+    _micBarDrawnMs = now;
+    _micBarDetected = _micDetector.detected();
+    const int y = trackCenterY(MicSlider) + kKnobRadius + 2;
+    const int end = knobX(static_cast<uint8_t>(level));
+    panel.fillRect(kTrackLeft, y, end - kTrackLeft, 3, _micBarDetected ? ILI9341_GREEN : ILI9341_LIGHTGREY);
+    panel.fillRect(end, y, kTrackRight + 1 - end, 3, ILI9341_BLACK);
 }
 
 bool Es3Graphics::settingsVisible() const
@@ -141,17 +163,18 @@ void Es3Graphics::drawSlider(uint8_t slider)
     }
     panel.fillCircle(knob, y, kKnobRadius, ILI9341_WHITE);
     panel.drawCircle(knob, y, kKnobRadius, kSliderColours[slider]);
+    if (slider == MicSlider) drawMicLevelBar(true);
 }
 
 void Es3Graphics::drawMicIndicator()
 {
     const Box box = micIndicator();
-    const bool detected = micDetected(_micLevel, _settings.micThreshold);
+    const bool detected = _micDetector.detected();
     const uint16_t fill = detected ? ILI9341_GREEN : ILI9341_DARKGREY;
     const uint16_t ink = detected ? ILI9341_BLACK : ILI9341_LIGHTGREY;
     panel.fillRoundRect(box.x, box.y, box.w, box.h, 5, fill);
     printCentered("MIC IN", box.x + box.w / 2, box.y + 7, ink);
-    printCentered(_micLevel == kNoMicLevel ? "no source" : (detected ? "detected" : "quiet"),
+    printCentered(_micLevel == kMicPaused ? "paused" : (_micLevel == kNoMicLevel ? "no input" : (detected ? "detected" : "quiet")),
                   box.x + box.w / 2, box.y + 20, ink);
 }
 
@@ -184,14 +207,15 @@ void Es3Graphics::setSliderValue(uint8_t slider, uint8_t value)
     uint8_t* fields[kSliderCount] = {&_settings.masterVolume, &_settings.brightness,
                                      &_settings.micThreshold};
     if (slider >= kSliderCount || *fields[slider] == value) return;
-    const bool wasDetected = micDetected(_micLevel, _settings.micThreshold);
+    const bool wasDetected = _micDetector.detected();
     *fields[slider] = value;
     _settingsEdited = true;
     if (slider == BrightnessSlider) applyBrightnessSetting();
     if (!settingsVisible()) return;
     drawSlider(slider);
-    if (slider == MicSlider && micDetected(_micLevel, _settings.micThreshold) != wasDetected) {
-        drawMicIndicator();
+    if (slider == MicSlider) {
+        // drawSlider() above already redrew the level bar.
+        if (_micDetector.update(_micLevel, _settings.micThreshold, millis()) != wasDetected) drawMicIndicator();
     }
 }
 

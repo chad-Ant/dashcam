@@ -113,9 +113,8 @@ static void settingsLayout() {
     // Brightness never turns the backlight fully off.
     assert(brightnessDuty(0) == 8 && brightnessDuty(100) == 255 && brightnessDuty(250) == 255);
     for (int p = 1; p <= 100; ++p) assert(brightnessDuty(uint8_t(p)) >= brightnessDuty(uint8_t(p - 1)));
-    // Mic indicator: grey with no source, silence or a level under threshold.
-    assert(!micDetected(kNoMicLevel, 0) && !micDetected(0, 0));
-    assert(!micDetected(49, 50) && micDetected(50, 50) && micDetected(1, 0));
+    // MIC IN hysteresis: tests/mic_level_test.cpp.
+    assert(kNoMicLevel != kMicPaused && kNoMicLevel < 0 && kMicPaused < 0);
 }
 int main() {
     const uint8_t count = sizeof(kDemoPages) / sizeof(kDemoPages[0]);

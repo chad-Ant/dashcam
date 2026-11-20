@@ -62,10 +62,43 @@ inline uint8_t brightnessDuty(uint8_t percent) {
     return static_cast<uint8_t>(8 + (247 * p + 50) / 100);
 }
 
-/** Microphone input level: no source yet (the mic library is not implemented). */
+/** Microphone level values besides 0..100: not capturing (or settling), and
+ * capture paused because a sound is playing. */
 constexpr int kNoMicLevel = -1;
-/** Detected when a level is available, non-zero and at or above the threshold. */
-inline bool micDetected(int level, uint8_t threshold) {
-    return level > 0 && level >= threshold;
-}
+constexpr int kMicPaused = -2;
+
+/**
+ * MIC IN indicator state with hysteresis: detected as soon as a level is at or
+ * above the threshold (and above 0); cleared only after the level has stayed
+ * kReleaseMargin points below the threshold for kReleaseMs. No level (none or
+ * paused) clears it at once.
+ */
+class MicDetector {
+public:
+    static constexpr int kReleaseMargin = 5;
+    static constexpr uint32_t kReleaseMs = 300;
+
+    bool update(int level, uint8_t threshold, uint32_t nowMs) {
+        if (level <= 0) {
+            _detected = false;
+        } else if (level >= threshold) {
+            _detected = true;
+            _belowSince = 0;
+            _below = false;
+        } else if (_detected && level <= threshold - kReleaseMargin) {
+            if (!_below) { _below = true; _belowSince = nowMs; }
+            else if (nowMs - _belowSince >= kReleaseMs) { _detected = false; _below = false; }
+        } else {
+            _below = false;   // inside the margin: neither set nor start release
+        }
+        return _detected;
+    }
+    bool detected() const { return _detected; }
+    void clear() { _detected = false; _below = false; }
+
+private:
+    bool _detected = false;
+    bool _below = false;
+    uint32_t _belowSince = 0;
+};
 }  // namespace es3settings

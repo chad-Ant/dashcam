@@ -71,6 +71,19 @@ void loop()
             (void)gAudio.playWav("/alert.wav");
         }
     }
+    // Microphone (MIC_LEVEL_PLAN.md): only while the SET tab is visible, and
+    // never during a sound; a failed start retries after 2 s.
+    static uint32_t captureRetryAt = 0;
+    const bool wantCapture = gGraphics.micMeterWanted() && !gAudio.isPlaying();
+    if (wantCapture && !gAudio.capturing() &&
+        static_cast<int32_t>(millis() - captureRetryAt) >= 0 && !gAudio.startCapture()) {
+        Serial0.println("[es3] microphone capture failed to start; retrying in 2 s");
+        captureRetryAt = millis() + 2000;
+    } else if (!wantCapture && gAudio.capturing()) {
+        gAudio.stopCapture();
+    }
+    gGraphics.setMicLevel(gAudio.capturing() ? gAudio.micLevel()
+                          : (gAudio.isPlaying() ? es3settings::kMicPaused : es3settings::kNoMicLevel));
     gAudio.update();
     static uint32_t lastReport = 0;
     static es3video::VideoState::Stats previous;
