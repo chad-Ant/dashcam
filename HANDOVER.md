@@ -95,7 +95,9 @@ This file has three parts:
    (the section is absent there, so the preview stays off until added) and soak at 10 fps, then 15 fps.
 10. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
    boot alert, tap-test touch, cover/uncover the LDR (it read ~980 in the room and held the backlight at 32/255).
-11. **Android connector** (`connector/README.md`, `connector/VALIDATION.md`; 2026-10-29 log section): install the host
+11. **Android connector** (`connector/README.md`, `connector/VALIDATION.md`; 2026-10-29 log section). **2026-11-20:
+    the agent is deployed (systemd, real data) and the web client passed on the laptop; see that log section. Left:
+    camera video with the UGREEN, Android pairing (new pin), mDNS, two-viewer load.** Original list: install the host
     agent (venv, `service.py init`, `service.env` with `LAN_ADDRESS` and the host footage path), enable
     `dashcam-monitor.service` (sudo), add `--volume /run/dashcam-monitor:/run/dashcam-monitor` to the v0.4 launcher and
     `<MonitoringEnabled>true</MonitoringEnabled>` to the deployed config, pair the phone and tablet. Then the physical
@@ -411,6 +413,44 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-11-20 (Jetson, bench): connector web interface tested; agent deployed for real data
+
+Laptop Firefox 158 (Windows 10, the CA already in Firefox's Authorities) against the agent, first simulated, then
+real. Logs and the deploy backup: `~/drive_logs/connector_web_20261120/` (not in the repo).
+
+- **Address:** the Jetson is now **192.168.0.138** (DHCP; the user reserves it on the router). The leaf was
+  re-issued with `service.py cert --san 192.168.0.138` (same CA, so the laptop needed no new import; the old leaf
+  is backed up as `~/drive_logs/es3c28p_bench_20261120/cert_192.168.0.15_backup.pem`). The pin changed: any Android
+  device must pair again. Pairing links: `~/dashcam-pairing.txt` (0600; delete after use).
+- **Simulator round (all passed, user):** no certificate warning (Firefox: "Verified by Dashcam Connect"; the
+  "does not recognize this issuer" note is normal for an imported CA), pairing, Live/Vehicle/System/Connection,
+  test-card video 640x360 at 9.9 fps, phone width, reload, agent freeze (SIGSTOP 15 s: blank then recovery) and
+  stop/restart (reconnects without pairing again).
+- **Deployed (real data):** `python3.10-venv` installed, venv `~/.local/share/dashcam-monitor/venv` (pinned
+  requirements; 46 agent tests pass in it), `~/.config/dashcam-monitor/service.env` (LAN_ADDRESS=192.168.0.138,
+  FOOTAGE_PATH=/media/jetson/backup/footage), `dashcam-monitor.service` installed and enabled, the v0.4 launcher
+  mounts `/run/dashcam-monitor`, and the deployed `dashcam.xml` gained `<Network>` with MonitoringEnabled,
+  MonitoringSocket and MonitoringVideoEnabled (previous file: `deploy/dashcam.xml.before`). Firefox shows real host
+  health (CPU, GPU, RAM, 386 GB free of 1 TB on the backup drive, six thermal zones), the recorder as not recording
+  and empty vehicle values (no camera, no C3 attached).
+- **Review before the sudo steps** (workflow, 3 lenses, a skeptic per finding; 4 of 7 confirmed):
+  - **ufw has never been enabled** (`/etc/ufw/ufw.conf` ENABLED=no; `systemctl is-active ufw` only reports the init
+    script's clean exit). Rules added with `ufw allow` are saved, not loaded. The agent therefore bound 0.0.0.0:8443 on
+    every interface (incl. the USB device-mode network 192.168.55.1). The unit now limits peers itself:
+    `IPAddressDeny=any`, `IPAddressAllow=localhost 192.168.0.0/24 224.0.0.251` (verified with `systemctl show`).
+  - The agent inherited jetson's `docker`/`jtop` groups: the unit hides `/run/docker.sock` and `/run/jtop.sock`
+    (`InaccessiblePaths`) and sets `PrivateDevices=yes`; it also hides `ca-key.pem`, which only the manual `cert`
+    command uses.
+  - The planned restart would not have exercised shutdown with monitoring active, so it was tested separately.
+- **Graceful exit with monitoring on:** an isolated run (private socket dir, a kept-fresh demand file so the preview
+  converter is active) exits 0 under `timeout --preserve-status -s TERM`; the real `systemctl stop` took 0.45 s,
+  `ExecMainStatus=0`, no SIGKILL, and the next start logged `monitor preview: on`.
+- **Known noise, not new:** every v0.4 start logs `(Argus) Error FileOperationFailed: Connecting to nvargus-daemon
+  failed` (also with the 2026-10-29 build): the container does not see the host's `/tmp/argus_socket`. v0.4 records
+  USB only, so it is harmless.
+- **Still open:** camera video and recording FPS/CPU with viewers (needs the UGREEN), the Android app (pair again),
+  mDNS on the router, enabling ufw (optional; add SSH and 5353/udp rules first).
+
 ## 2026-11-20 (Jetson, bench): v0.4 bridge discovery no longer probes the ES3C28P display
 
 With the display attached, `dashcam-v04` opened `/dev/ttyACM0` (the display) every 2 s: the C3 link had no device
@@ -549,7 +589,9 @@ results: `connector/VALIDATION.md`.
   links in `~/dashcam-pairing.txt`, mode 0600 — delete it after use), started without systemd and on the validation
   copy's Python packages (`python3.10-venv` is missing, so the README's venv step needs `sudo apt install
   python3.10-venv` first). `ufw` is active: inbound 8443 needs `sudo ufw allow from 192.168.0.0/24 to any port 8443
-  proto tcp`. The agent stops at reboot; stop it by hand before installing the systemd unit.
+  proto tcp`. **Correction 2026-11-20:** ufw was never enabled (`/etc/ufw/ufw.conf` ENABLED=no), so that rule
+  is saved but not loaded; the installed unit now limits peers itself (2026-11-20 log section). The agent stops at
+  reboot; stop it by hand before installing the systemd unit.
 
 ## 2026-10-29 (Jetson): connector browser client with a local CA
 

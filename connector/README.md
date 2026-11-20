@@ -115,6 +115,9 @@ sudo systemctl enable --now dashcam-monitor
 ```
 
 The example service assumes user/group `jetson` and checkout `~/dashcam`.
+It also limits peers to localhost, `192.168.0.0/24` and mDNS (`IPAddressAllow=`):
+edit that line for another LAN. It does not rely on ufw, which is not enabled on
+the rig, and hides the Docker/jtop sockets and the CA key from the agent.
 Adjust these if your installation differs. Allow inbound TCP 8443 and mDNS
 UDP 5353 on the LAN if a host firewall is enabled. No router port forwarding.
 

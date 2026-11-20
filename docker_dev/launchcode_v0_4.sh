@@ -60,6 +60,7 @@ exec docker run $TTY_FLAGS --rm --name "$CONTAINER_NAME" --stop-timeout 20 \
     -v $MEDIA_DIR/footage:/user/output/footage \
     -v $MEDIA_DIR/logs:/user/output/logs \
     -v $MEDIA_DIR/navcache:/user/output/navcache \
+    -v /run/dashcam-monitor:/run/dashcam-monitor \
     -v /etc/localtime:/etc/localtime:ro \
     -v /etc/timezone:/etc/timezone:ro \
     $IMAGE_NAME bash -c '

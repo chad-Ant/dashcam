@@ -23,6 +23,18 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Network scope: the agent binds 0.0.0.0, so limit peers here instead of relying on
+# a host firewall (ufw is not enabled on the rig). Edit the LAN to match yours.
+# 224.0.0.251 keeps mDNS working. Other interfaces (USB device-mode network
+# 192.168.55.0/24, docker0, a later Wi-Fi) cannot reach the agent.
+IPAddressDeny=any
+IPAddressAllow=localhost 192.168.0.0/24 224.0.0.251
+# The agent needs none of jetson's supplementary groups: hide the sockets that
+# would turn a compromise into root (docker) or system control (jtop), and the
+# CA private key, which only the manual "cert" command uses.
+InaccessiblePaths=-/run/docker.sock -/run/jtop.sock
+InaccessiblePaths=-/home/jetson/.config/dashcam-monitor/ca-key.pem
+PrivateDevices=yes
 
 [Install]
 WantedBy=multi-user.target
