@@ -599,3 +599,46 @@ connected, including four camera viewers and a stalled one (no recorder frame
 drops; the camera preview stops about 3 s after the last viewer leaves). These checks must be distinguished from simulated/software results.
 
 See [VALIDATION.md](VALIDATION.md) for the checks performed for this implementation.
+
+## Cloud uplink library (Plan A)
+
+For native Jetson integration, [libclouduplink](../lib/libclouduplink/README.md)
+provides the C++17 static library, event-loop contract and build instructions.
+
+The [on-demand uplink core](cloud_on_demand.py) implements the Jetson-side
+control lifecycle from [Plan A](CLOUD_ON_DEMAND_PLAN.md). It uses Python 3.10+
+and the standard library. Firestore sign-in/listening, relay transport and local
+media subscriptions are adapter responsibilities. The current LAN agent runs
+independently.
+
+Create one `OnDemandUplink(device_id, on_change)` per device on its asyncio
+loop. Pass `ControlSnapshot.from_document(path, fields)` to `apply_control`
+with the listener's trusted `server_confirmed` flag. Use the actual document
+path and snapshot metadata from the authenticated listener. For SDK callbacks
+on another thread, dispatch onto the owning loop. Control fields are
+`desiredMode`, `configVersion`, `demandGeneration`, `channels` (a list
+containing `telemetry` and/or `video`), and `expiresAt` (timezone-aware
+timestamp or Unix seconds). Empty demand may omit expiry.
+
+The callback receives the complete desired `RelayTarget`. Schedule I/O from
+the callback and serialize reconciliation against the latest target:
+
+1. A new attempt requests one authenticated relay socket. Register the listed
+   generation and channels. Open local readers only after `relay_confirmed`
+   grants them for that attempt and generation.
+2. Follow `active_channels` for the existing local `/v1/stream` and
+   `/v1/video` readers. An idle target releases all readers and the relay.
+   Check the current target before publishing an asynchronous result.
+3. Report `relay_lost(attempt)` on disconnect. After backoff, reconcile a
+   fresh authoritative snapshot. A rejected generation stays idle until demand
+   advances. Lease renewal with the same generation and a later expiry keeps
+   a healthy grant alive; silent expiry releases it automatically.
+4. Call `close()` on shutdown, deletion of the enrolled device's control
+   document, or credential revocation. A future mode supervisor owns the
+   handoff to Ready while powered.
+
+Run the offline lifecycle tests from the repository root:
+
+```sh
+python3 -m unittest discover -s connector -p test_cloud_on_demand.py -v
+```

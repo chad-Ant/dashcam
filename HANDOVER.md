@@ -416,6 +416,13 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-11-20 — Remote dashboard plans, Plan A libraries and Firebase setup
+
+- Documented two selectable cloud modes for up to two Jetsons and five clients. [Plan A](connector/CLOUD_ON_DEMAND_PLAN.md) opens the relay on viewer demand. [Plan B](connector/CLOUD_READY_WHILE_POWERED_PLAN.md) connects at Jetson startup for faster viewer access. The [shared design](connector/CLOUD_MONITORING_PLAN.md) describes the per-vehicle toggle. Both modes keep recording locally and send video only on request.
+- Added the Plan A session lifecycle in Python under `connector/` and as a C++17 static library under [lib/libclouduplink](lib/libclouduplink/README.md). The Firestore and relay adapters, client authentication flow and mode toggle remain implementation work. No relay was deployed.
+- Recorded the [Google Cloud setup procedure](connector/GOOGLE_CLOUD_SETUP.md). Cloud Shell confirmed that the default Firestore database uses Native mode, Standard edition in `asia-southeast1`, and that the five required APIs are enabled. The Firebase web and Android apps were registered, Google sign-in was enabled, and the billing alert was configured. The Android Gradle files now include the Google services plugin and Firebase dependencies. Each Android build machine needs its own local copy of the ignored client configuration.
+- All 56 Python connector tests passed. The native Jetson lifecycle tests passed in the regular build and with AddressSanitizer and UndefinedBehaviorSanitizer. Android Gradle verification is pending on a machine with a JDK.
+
 ## 2026-11-20 (Jetson, bench): local tests with the UGREEN, C3 and display; display session-reset fix
 
 All on the Jetson itself (it was on Wi-Fi 192.168.1.x, so no phone or laptop): v0.4 deployed service, the UGREEN on

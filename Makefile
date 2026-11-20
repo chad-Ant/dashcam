@@ -288,6 +288,12 @@ deadreckoning:
 deadreckoning_test:
 	$(MAKE) -C lib/libdeadreckoning check
 
+.PHONY: clouduplink clouduplink_test
+clouduplink:
+	$(MAKE) -C lib/libclouduplink all
+clouduplink_test:
+	$(MAKE) -C lib/libclouduplink check
+
 # Convenience alias so `make commlink_test` works without the build-dir prefix.
 commlink_test: $(BUILD_DIR)/commlink_test | $(BUILD_DIR)/logs
 	@echo "Built commlink_test in $(BUILD_DIR)/"
