@@ -112,6 +112,28 @@ std::vector<std::string> CommLink::enumerate(const std::string& idMatch,
     return out;
 }
 
+std::vector<std::string> CommLink::withoutExcluded(std::vector<std::string> candidates,
+                                                   const std::vector<std::string>& exclude) {
+    // Resolved each scan: an alias can appear, vanish or move to another node
+    // on a replug.  An exclusion that does not resolve excludes nothing.
+    std::vector<std::string> nodes;
+    for (const std::string& path : exclude) {
+        std::error_code ec;
+        const fs::path real = fs::canonical(path, ec);
+        if (!ec) nodes.push_back(real.string());
+    }
+    if (nodes.empty()) return candidates;
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                    [&nodes](const std::string& candidate) {
+                                        std::error_code ec;
+                                        const fs::path real = fs::canonical(candidate, ec);
+                                        const std::string node = ec ? candidate : real.string();
+                                        return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
+                                    }),
+                     candidates.end());
+    return candidates;
+}
+
 // ─── lifecycle ────────────────────────────────────────────────────────────────
 
 bool CommLink::open(const CommLinkConfig& cfg, const dashcam::log::LogCallback& log) {
@@ -183,7 +205,8 @@ bool CommLink::openPortLocked(std::string& opened) {
 
     std::vector<std::string> candidates;
     if (!m_cfg.device.empty()) candidates.push_back(m_cfg.device);
-    else candidates = enumerate(m_cfg.idMatch, m_cfg.allowAcmFallback, m_cfg.devRoot);
+    else candidates = withoutExcluded(enumerate(m_cfg.idMatch, m_cfg.allowAcmFallback, m_cfg.devRoot),
+                                      m_cfg.excludeDevices);
 
     // A changed list (a replug, a node appearing or vanishing) restarts the
     // rotation at its head, i.e. at the by-id matches.  A cursor advanced by

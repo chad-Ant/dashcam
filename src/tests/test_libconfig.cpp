@@ -169,6 +169,7 @@ static bool test_roundtrip() {
     src.network.ntpRetries          = 4;
     src.network.clockSetEnabled     = false;
     src.network.gpsTimeFallback     = false;
+    src.bridge.device               = "/dev/dashcam-bridge";
     src.network.streamEnabled       = true;
     src.network.streamPort          = 9000;
     src.network.streamMaxClients    = 8;
@@ -326,6 +327,8 @@ static bool test_roundtrip() {
     check(dst.network.ntpRetries == 4,                   "network.ntpRetries round-trip");
     check(!dst.network.clockSetEnabled,                  "network.clockSetEnabled round-trip");
     check(!dst.network.gpsTimeFallback,                  "network.gpsTimeFallback round-trip");
+    check(dst.bridge.device == "/dev/dashcam-bridge",    "bridge.device round-trip");
+    check(AppConfig{}.bridge.device == "",               "bridge.device defaults to auto-discovery");
     check(dst.network.streamEnabled == true,             "network.streamEnabled round-trip");
     check(dst.network.streamPort == 9000,                "network.streamPort round-trip");
     check(dst.network.streamMaxClients == 8,             "network.streamMaxClients round-trip");

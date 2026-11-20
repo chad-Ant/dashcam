@@ -92,6 +92,14 @@ struct CommLinkConfig {
     std::string idMatch = "USB_JTAG";
 
     /**
+     * Nodes auto-discovery never probes: device paths or symlinks, compared
+     * after resolving both sides (an entry that does not exist is ignored).
+     * The ES3C28P display has the C3's VID:PID and a "USB_JTAG" by-id name;
+     * pass its udev alias here.  Ignored when @c device is set.
+     */
+    std::vector<std::string> excludeDevices;
+
+    /**
      * Also probe bare /dev/ttyACM* nodes, after the by-id matches.
      *
      * The by-id matches are tried first, and again first whenever the
@@ -299,6 +307,10 @@ public:
     static std::vector<std::string> enumerate(const std::string& idMatch = "USB_JTAG",
                                               bool includeAcmFallback = true,
                                               const std::string& devRoot = "/dev");
+
+    /** @p candidates minus every node an entry of @p exclude resolves to. */
+    static std::vector<std::string> withoutExcluded(std::vector<std::string> candidates,
+                                                    const std::vector<std::string>& exclude);
 
 private:
     void rxLoop();

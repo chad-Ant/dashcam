@@ -349,6 +349,11 @@ static void parseDriverScore(pugi::xml_node node, DriverScoreConfig& s,
     readVar(node, s.noFaceFreezes,      log);
 }
 
+static void parseBridge(pugi::xml_node node, BridgeConfig& b,
+                        const dashcam::log::LogCallback& log) {
+    readVar(node, b.device, log);
+}
+
 static void parseDisplayPreview(pugi::xml_node node, DisplayPreviewConfig& p,
                                 const dashcam::log::LogCallback& log) {
     readVar(node, p.enabled,            log);
@@ -589,6 +594,11 @@ static void writeNavigation(pugi::xml_node parent, const NavigationConfig& c) {
     writeVar(n, c.panJpegQuality);
 }
 
+static void writeBridge(pugi::xml_node parent, const BridgeConfig& b) {
+    pugi::xml_node n = parent.append_child("Bridge");
+    writeVar(n, b.device);
+}
+
 static void writeDisplayPreview(pugi::xml_node parent, const DisplayPreviewConfig& p) {
     pugi::xml_node n = parent.append_child("DisplayPreview");
     writeVar(n, p.enabled);
@@ -639,6 +649,7 @@ bool ConfigReader::load(const std::string& filePath, AppConfig& config,
         parseDriverScore(ds, config.driverScore, log);
     if (auto lg  = root.child("Log"))       parseLog      (lg,  config.log,       log);
     if (auto net = root.child("Network"))   parseNetwork  (net, config.network,   log);
+    if (auto br  = root.child("Bridge"))    parseBridge   (br,  config.bridge,    log);
     if (auto dp  = root.child("DisplayPreview"))
         parseDisplayPreview(dp, config.displayPreview, log);
     if (auto nv  = root.child("Navigation"))
@@ -679,6 +690,7 @@ bool ConfigReader::save(const std::string& filePath, const AppConfig& config,
     writeDriverScore(root, config.driverScore);
     writeLog(root, config.log);
     writeNetwork(root, config.network);
+    writeBridge(root, config.bridge);
     writeDisplayPreview(root, config.displayPreview);
     writeNavigation(root, config.navigation);
 

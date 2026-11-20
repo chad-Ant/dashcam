@@ -1865,6 +1865,15 @@ int main(int argc, char* argv[]) {
         });
     {
         dashcam::commlink::CommLinkConfig bcfg;          // by-id discovery, auto-stream
+        // <Bridge><Device> pins the C3; empty = discover it, never probing the
+        // ES3C28P display (same VID:PID and "USB_JTAG" by-id name).
+        bcfg.device = (std::string)cfg.bridge.device;
+        const std::string displayDevice = (std::string)cfg.displayPreview.device;
+        if (!displayDevice.empty()) bcfg.excludeDevices.push_back(displayDevice);
+        log(LogLevel::INFO, bcfg.device.empty()
+                ? "telemetry bridge: auto-discovery, skipping the display at " +
+                      (displayDevice.empty() ? std::string("(none)") : displayDevice)
+                : "telemetry bridge: pinned to " + bcfg.device);
         auto bridgeLog = quietRepeats(recLog);
         if (!bridge.open(bcfg, bridgeLog))
             bridgeLog(LogLevel::INFO, "telemetry bridge (ESP32-C3) not present — retrying in the background");

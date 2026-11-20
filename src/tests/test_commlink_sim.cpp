@@ -713,6 +713,27 @@ static void testDiscovery() {
           "auto-discovery skips the silent candidate and connects to the bridge");
     check(log.has(silent.slave() + " did not identify itself"), "... after logging the one it skipped");
     link.close();
+
+    // The ES3C28P display shares the C3's by-id name: excluded through its udev
+    // alias (a symlink elsewhere in /dev), it is never opened or sent CMD_HELLO.
+    dev.link("dashcam-display", silent.slave());
+    const std::vector<std::string> both{silent.slave(), bridge.slave()};
+    check(CommLink::withoutExcluded(both, {(dev.path / "dashcam-display").string()}) ==
+              std::vector<std::string>{bridge.slave()},
+          "withoutExcluded(): the alias resolves to the display's node, which is dropped");
+    check(CommLink::withoutExcluded(both, {(dev.path / "absent-alias").string(), ""}) == both,
+          "withoutExcluded(): an exclusion that does not resolve drops nothing");
+    const int hellosBefore = silent.count(hostproto::CMD_HELLO);
+    LogSink excludedLog;
+    CommLink excluded;
+    cfg.excludeDevices = {(dev.path / "dashcam-display").string()};
+    excluded.open(cfg, excludedLog.callback());
+    excluded.start();
+    check(waitFor([&] { return excluded.isConnected() && excluded.devicePath() == bridge.slave(); }, 3000),
+          "auto-discovery with the display excluded connects to the bridge");
+    check(silent.count(hostproto::CMD_HELLO) == hellosBefore && !excludedLog.has(silent.slave()),
+          "... and never opens or greets the excluded display");
+    excluded.close();
 }
 
 /// The rig of 2026-09-28 in fallback mode: the C3 (by-id match, ttyACM1) and the

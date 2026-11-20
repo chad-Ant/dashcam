@@ -411,6 +411,28 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-11-20 (Jetson, bench): v0.4 bridge discovery no longer probes the ES3C28P display
+
+With the display attached, `dashcam-v04` opened `/dev/ttyACM0` (the display) every 2 s: the C3 link had no device
+configured and its by-id auto-discovery matches any "USB_JTAG" name, which the display shares with the C3
+(same 303a:1001). The display rejected the C3 HELLO, but the service kept grabbing the port.
+
+- **`<Bridge><Device>`** (new `BridgeConfig`, `lib/libconfig`): empty (default) = auto-discovery; a path = only that
+  path is opened.
+- **`CommLinkConfig::excludeDevices`** (`lib/libcommlink`): auto-discovery drops any candidate that an excluded
+  path resolves to (re-resolved every scan; an alias that does not exist excludes nothing). v0.4 passes
+  `<DisplayPreview><Device>` (`/dev/dashcam-display`) and logs `telemetry bridge: auto-discovery, skipping the
+  display at /dev/dashcam-display`.
+- **Why not pin `/dev/dashcam-bridge` now:** the C3's udev rule is not installed; a pinned config would not find a C3
+  plugged in before that, and a drive would record without telemetry. The deployed config is unchanged.
+  **Once `lib/libcommlink/99-dashcam-bridge.rules` is installed with the C3's serial** (all rules matching that
+  serial only), set `<Bridge><Device>/dev/dashcam-bridge</Device></Bridge>` in `/user/output/configs/dashcam.xml`.
+- **Tests:** plain `make` (`bin/build_20261120_065113`, no warnings); `config_test` (bridge.device round trip and
+  default) and `commlink_sim_test` (alias dropped, missing alias drops nothing, discovery connects to the bridge
+  without opening or greeting the excluded display) pass. SIGINT -> exit 0 (`timeout --preserve-status`).
+- **Live:** service restarted by the user on this build at 13:56; no `/dev/ttyACM0` opens since, and the display
+  answers `es3_display.py status` while v0.4 runs.
+
 ## 2026-11-20 (Jetson, bench): ES3C28P microphone level for the SET tab MIC IN indicator
 
 Plan, hardware facts and measurements: `peripherals/es3c28p/MIC_LEVEL_PLAN.md`. User decisions: playback and

@@ -472,6 +472,17 @@ struct NetworkConfig {
 };
 
 /**
+ * @brief ESP32-C3 telemetry bridge link (libcommlink).
+ * XML section: @c \<Bridge\>
+ *
+ * The ES3C28P display shares the C3's USB VID:PID and "USB_JTAG" by-id name, so
+ * auto-discovery always skips the display's own device (DisplayPreview Device).
+ */
+struct BridgeConfig {
+    ConfigVar<std::string> device {"Device", "", "The C3 bridge's tty. Empty = auto-discover it under /dev/serial/by-id (skipping the ES3C28P display's DisplayPreview Device). Set /dev/dashcam-bridge once lib/libcommlink/99-dashcam-bridge.rules is installed with the C3's serial: then only that path is opened"};
+};
+
+/**
  * @brief Live preview of the recording camera on the ES3C28P display over USB.
  * XML section: @c \<DisplayPreview\>
  *
@@ -605,6 +616,7 @@ struct AppConfig {
     DriverScoreConfig         driverScore;
     LogConfig                 log;
     NetworkConfig             network;
+    BridgeConfig              bridge;
     DisplayPreviewConfig      displayPreview;
     NavigationConfig          navigation;
 };
