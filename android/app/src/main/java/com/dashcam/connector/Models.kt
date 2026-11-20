@@ -3,6 +3,7 @@ package com.dashcam.connector
 import androidx.compose.ui.graphics.ImageBitmap
 import org.json.JSONObject
 import java.net.URI
+import java.net.URISyntaxException
 import java.net.URLDecoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -18,7 +19,12 @@ data class DeviceProfile(
         fun fromJson(j: JSONObject) = DeviceProfile(j.getString("id"), j.getString("name"),
             j.getString("host"), j.getInt("port"), j.getString("pin"), j.getString("token"))
         fun parse(link: String): DeviceProfile {
-            val uri = URI(link.trim())
+            // Terminals and messengers wrap long lines. Whitespace is never part of a
+            // valid link (every value is hex, base64url, digits or %/+ encoded), so drop it.
+            val compact = link.filterNot { it.isWhitespace() }
+            val uri = try { URI(compact) } catch (_: URISyntaxException) {
+                throw IllegalArgumentException("Paste a dashcam://pair link")
+            }
             require(uri.scheme == "dashcam" && uri.host == "pair") { "Paste a dashcam://pair link" }
             val args = (uri.rawQuery ?: "").split('&').associate { part ->
                 val bits = part.split('=', limit = 2)

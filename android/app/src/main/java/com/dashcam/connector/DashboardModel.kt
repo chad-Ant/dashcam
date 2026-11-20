@@ -19,13 +19,19 @@ class DashboardModel(app: Application) : AndroidViewModel(app) {
     val discovery = Discovery(app)
     init { repository.select(saved.value.firstOrNull()) }
     fun pair(link: String): Boolean {
+        val profile = try {
+            DeviceProfile.parse(link)
+        } catch (e: IllegalArgumentException) {
+            // A bad link is not a storage problem: say what is wrong with it.
+            error.value = "Pairing link not accepted: ${e.message ?: "invalid link"}."
+            return false
+        }
         return try {
-            val profile = DeviceProfile.parse(link)
             val next = (saved.value.filterNot { it.id == profile.id } + profile).takeLast(8)
             store.save(next); saved.value = next; select(profile.id); error.value = ""
             true
         } catch (_: Exception) {
-            error.value = "Could not save pairing. Check the link and device storage."
+            error.value = "Could not save the pairing on this device (storage or keystore error)."
             false
         }
     }

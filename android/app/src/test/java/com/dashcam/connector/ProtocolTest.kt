@@ -12,6 +12,18 @@ class ProtocolTest {
         assertEquals(8443, profile.port)
         assertEquals(profile, DeviceProfile.fromJson(profile.toJson()))
     }
+    @Test fun wrappedLinkIsAccepted() {
+        // A terminal wrapped the link: a leading space and line breaks inside values.
+        val link = pair()
+        val wrapped = " " + link.chunked(65).joinToString("\n") + "\r\n"
+        assertEquals(DeviceProfile.parse(link), DeviceProfile.parse(wrapped))
+        assertEquals(DeviceProfile.parse(link), DeviceProfile.parse(link.replace("&", "\t&")))
+    }
+    @Test fun notALinkIsRejectedAsInvalidArgument() {
+        for (text in listOf("", "   ", "dashcam://pair?host=[bad", "hello world")) {
+            assertThrows(IllegalArgumentException::class.java) { DeviceProfile.parse(text) }
+        }
+    }
     @Test fun malformedCredentialsAreRejected() {
         for (link in listOf(pair().replace("8443", "0"), pair().replace("dashcam://", "http://"),
                             pair().replace("a".repeat(64), "abc"), pair().replace("192.168.0.9", "foo/path"))) {

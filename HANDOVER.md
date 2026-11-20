@@ -448,8 +448,16 @@ real. Logs and the deploy backup: `~/drive_logs/connector_web_20261120/` (not in
 - **Known noise, not new:** every v0.4 start logs `(Argus) Error FileOperationFailed: Connecting to nvargus-daemon
   failed` (also with the 2026-10-29 build): the container does not see the host's `/tmp/argus_socket`. v0.4 records
   USB only, so it is harmless.
-- **Still open:** camera video and recording FPS/CPU with viewers (needs the UGREEN), the Android app (pair again),
-  mDNS on the router, enabling ufw (optional; add SSH and 5353/udp rules first).
+- **mDNS through the router:** works. The laptop resolved `dashcam-372d29b6.local` to 192.168.0.138 (no client
+  isolation); the agent advertises `_dashcam._tcp` with only the device ID and schema.
+- **Android (S25 Ultra):** built on Windows (`assembleDebug testDebugUnitTest lintDebug` successful; Gradle reported
+  the tasks up to date). Pairing failed with "Could not save pairing. Check the link and device storage." because the
+  link copied from the terminal was wrapped (a leading space and line breaks): `DeviceProfile.parse()` only trimmed
+  the ends, `java.net.URI` threw, and `DashboardModel.pair()` reported every exception as storage. Pairing worked with
+  the line breaks removed by hand. Fixed in the app (not yet compiled: needs the Windows build): the parser drops all
+  whitespace, invalid links say "Pairing link not accepted: <reason>", and three unit tests cover wrapped links.
+- **Still open:** camera video and recording FPS/CPU with viewers (needs the UGREEN), the Android acceptance checks,
+  enabling ufw (optional; add SSH and 5353/udp rules first).
 
 ## 2026-11-20 (Jetson, bench): v0.4 bridge discovery no longer probes the ES3C28P display
 
