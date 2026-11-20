@@ -22,7 +22,7 @@ import time
 import uuid
 from urllib.parse import quote, urlencode
 
-from aiohttp import web, WSMsgType
+from aiohttp import web, WSCloseCode, WSMsgType
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -49,6 +49,7 @@ CA_NETWORKS = [ipaddress.ip_network(n) for n in (
 CA_DOMAINS = ['local', 'lan', 'home.arpa', 'localhost']
 LABEL = re.compile(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?')
 COOKIE = '__Host-dcsession'
+SESSION_EXPIRY = web.RequestKey('session_expiry', int)  # browser socket deadline (Unix seconds)
 COOKIE_VALUE = re.compile(r'v1\.([0-9]{1,12})\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})')
 SECURITY_HEADERS = {
     'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; "
@@ -441,10 +442,17 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     def sign(body):
         return b64(hmac.new(key, body.encode(), hashlib.sha256).digest())
 
-    def valid_cookie(value):
+    def cookie_expiry(value):
+        """The session's expiry (Unix seconds) for a valid, unexpired cookie, else None."""
         match = COOKIE_VALUE.fullmatch(value or '')
-        return bool(match and hmac.compare_digest(match[3], sign(value.rsplit('.', 1)[0]))
-                    and time.time() < int(match[1]))
+        if match and hmac.compare_digest(match[3], sign(value.rsplit('.', 1)[0])) and time.time() < int(match[1]):
+            return int(match[1])
+        return None
+
+    def session_expired(request):
+        # Browser sockets carry their cookie's expiry; Android (bearer) sockets have none.
+        expiry = request.get(SESSION_EXPIRY)
+        return expiry is not None and time.time() >= expiry
 
     def bearer_ok(request):
         expected = 'Bearer ' + state.identity['token']
@@ -487,11 +495,13 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     async def authenticate(request, handler):
         if request.match_info.handler in (static, create_session, delete_session) or bearer_ok(request):
             return await handler(request)  # those check for themselves; bearer = Android, unchanged
-        if valid_cookie(request.cookies.get(COOKIE)):
+        expiry = cookie_expiry(request.cookies.get(COOKIE))
+        if expiry is not None:
             # Browser session: only for our own origin, and never a cross-site WebSocket.
             needs_origin = 'Origin' in request.headers or request.match_info.handler in (stream, video)
             if not browser_host(request) or (needs_origin and not same_origin(request)):
                 raise web.HTTPForbidden(text='Same-origin browser request required')
+            request[SESSION_EXPIRY] = expiry  # the stream handlers close the socket when it passes
             return await handler(request)
         raise web.HTTPUnauthorized(text='Device credential required')
 
@@ -521,6 +531,9 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
             reader = asyncio.create_task(refuse_messages(ws))
             try:
                 while not ws.closed and not reader.done():
+                    if session_expired(request):
+                        await ws.close(code=WSCloseCode.POLICY_VIOLATION, message=b'Session expired')
+                        break
                     await asyncio.wait_for(ws.send_str(encode(state.snapshot())), timeout=2)
                     await asyncio.sleep(.2)
             finally:
@@ -546,6 +559,9 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
             try:
                 shown, sent_at = 0, -math.inf
                 while not ws.closed and not reader.done():
+                    if session_expired(request):
+                        await ws.close(code=WSCloseCode.POLICY_VIOLATION, message=b'Session expired')
+                        break
                     frame, now = state.video, time.monotonic()
                     # Only the newest frame, never queued: a slow viewer skips frames.
                     if frame and frame['seq'] != shown and now - sent_at >= VIDEO_MIN_INTERVAL:
@@ -644,6 +660,34 @@ async def bind_datagram(path, protocol):
     return transport
 
 
+async def advertise(address, port, identity):
+    """Best-effort mDNS: returns (zeroconf, info), or None when it cannot start.
+
+    mDNS only helps clients find the address; pairing and serving never depend on
+    it. A missing address (the Jetson moved to another network, or DHCP has not
+    assigned it yet) used to make zeroconf raise ENODEV and stop the whole agent.
+    """
+    from zeroconf import IPVersion, ServiceInfo
+    from zeroconf.asyncio import AsyncZeroconf
+    zc = None
+    try:
+        ip = ipaddress.IPv4Address(address)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind((str(ip), 0))   # EADDRNOTAVAIL before zeroconf opens (and leaks) its sockets
+        info = ServiceInfo('_dashcam._tcp.local.', identity['id'] + '._dashcam._tcp.local.',
+                           addresses=[ip.packed], port=port, properties={'id': identity['id'], 'schema': '1'},
+                           server='dashcam-' + identity['id'][:8] + '.local.')
+        zc = AsyncZeroconf(interfaces=[str(ip)], ip_version=IPVersion.V4Only)
+        await zc.async_register_service(info)
+        return zc, info
+    except Exception as error:  # noqa: BLE001 - any mDNS failure leaves the agent serving
+        print(f'mDNS advertisement off ({type(error).__name__}: {error}); '
+              f'is {address} assigned to this host? Manual pairing still works.', flush=True)
+        if zc is not None:
+            await asyncio.gather(zc.async_close(), return_exceptions=True)
+        return None
+
+
 async def run(args, identity):
     state = State(identity, args.storage, video_demand=None if args.simulate else args.video_demand)
     endpoints, advertisement = [], None
@@ -666,16 +710,7 @@ async def run(args, identity):
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(args.state_dir / 'cert.pem', args.state_dir / 'key.pem')
         if args.advertise_address:
-            from zeroconf import IPVersion, ServiceInfo
-            from zeroconf.asyncio import AsyncZeroconf
-            address = ipaddress.IPv4Address(args.advertise_address)
-            info = ServiceInfo('_dashcam._tcp.local.', identity['id'] + '._dashcam._tcp.local.',
-                               addresses=[address.packed], port=args.port,
-                               properties={'id': identity['id'], 'schema': '1'},
-                               server='dashcam-' + identity['id'][:8] + '.local.')
-            zc = AsyncZeroconf(interfaces=[str(address)], ip_version=IPVersion.V4Only)
-            await zc.async_register_service(info)
-            advertisement = zc, info
+            advertisement = await advertise(args.advertise_address, args.port, identity)
         app = create_app(state, port=args.port, web_dir=args.web_dir, session_days=args.browser_session_days)
         runner = web.AppRunner(app, access_log=None, keepalive_timeout=10,
                                shutdown_timeout=3)

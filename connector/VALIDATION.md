@@ -106,8 +106,35 @@ mDNS; Docker/jtop sockets and the CA key hidden), v0.4 publishing through the `/
 - **Graceful exit with monitoring on:** isolated `timeout --preserve-status -s TERM` run exits 0 with the preview
   converter active; real `systemctl stop` 0.45 s, `ExecMainStatus=0`.
 
+## Vehicle map and review fixes — 2026-11-20 (software)
+
+A Map card on the Vehicle page of the web client and the Android app, above GNSS position (`README.md`, Vehicle map):
+OSM tiles fetched by the phone/browser itself, follow mode, free pan/zoom, Recentre, last known position.
+
+- **Web, headless Firefox against the simulator** (Marionette harness, 22 checks, all pass): no tiles or OSM requests
+  before a fix or off the Vehicle page, card position and width, tiles load with `strict-origin-when-cross-origin`,
+  fresh marker with heading, attribution, drag/free mode/Recentre, +/− and wheel zoom, phone width without page
+  scroll, touch drag and pinch, requests only to the agent and `tile.openstreetmap.org` (Referer, no Cookie),
+  bounded tile volume, no console errors or CSP violations, stale data keeps a grey "Last known position". The bench
+  router blocks openstreetmap.org DNS, so the harness used DNS over HTTPS.
+- **Review of the map change and the clients** (6 findings, all confirmed, all fixed):
+  - Web: a link pasted into Connection → Pair for another host:port is refused before the token is sent (harness:
+    0 requests for three wrong-target links, 1 for a wrapped link for this page).
+  - Agent: open browser telemetry/video sockets close with 1008 when the session cookie expires; Android (bearer)
+    sockets are unaffected (new agent test).
+  - Android: forgetting a device that is not shown no longer switches or reconnects the shown one; video frames are
+    stamped on receipt and dropped as stale before and after decode (`VIDEO_STALE_MS`).
+  - Web: a failed tile is transparent, so tiles cached from nearby zooms stay visible; the marker uses the shortest
+    wrapped distance across ±180° (harness: one world width of panning at zoom 3 returns the marker to its pixel).
+- **Agent crash loop found on the bench:** with the Jetson on another network, 192.168.0.138 was not assigned and
+  zeroconf raised ENODEV at start, so the unit restarted 435 times. mDNS is now best-effort (an address probe before
+  zeroconf; the agent logs "mDNS advertisement off" and serves). New agent test; the deployed agent recovered.
+- 48 agent tests pass. The Android map and fixes are **not compiled** here (no JDK/Android SDK): build and run
+  `:app:assembleDebug :app:testDebugUnitTest :app:lintDebug` on the Windows machine (adds `TileMathTest`).
+
 ## Remaining physical acceptance
 
+- Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.
 - Tab S10 FE (app and browser); browsers on the phone/tablet (CA install). The S25 Ultra app and laptop Firefox
   passed on 2026-11-20 (above), as did mDNS on the router.
 - CAN/GNSS source-loss transitions, reconnect after router/Jetson reboot and
@@ -116,5 +143,5 @@ mDNS; Docker/jtop sockets and the CA key hidden), v0.4 publishing through the `/
 - Enable the monitoring socket directory mount and XML settings in the deployed
   recording launcher, then verify with live vehicle telemetry.
 
-ADAS, maps, camera preview, remote commands, background monitoring and a
+ADAS, remote commands, background monitoring and a
 distribution signing key are outside this first connector release.

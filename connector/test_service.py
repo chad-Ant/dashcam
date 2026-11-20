@@ -21,7 +21,7 @@ import time
 import unittest
 from unittest import mock
 
-from aiohttp import ClientSession, DummyCookieJar, Fingerprint, WSServerHandshakeError
+from aiohttp import ClientSession, DummyCookieJar, Fingerprint, WSMsgType, WSServerHandshakeError
 from aiohttp.test_utils import TestClient, TestServer
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
@@ -605,6 +605,31 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.clients, set())
         self.assertEqual(self.state.video_clients, set())
 
+    async def test_open_browser_sockets_close_when_the_session_expires(self):
+        # The cookie is checked at the handshake; an open socket must not outlive it.
+        cookie = forge(TOKEN, int(time.time()) + 2)
+        self.state.accept_video(video_frame())
+        stream = await self.client.ws_connect('/v1/stream', headers=self.cookie(cookie), origin=self.origin)
+        video = await self.client.ws_connect('/v1/video', headers=self.cookie(cookie), origin=self.origin)
+        android = await self.client.ws_connect('/v1/stream', headers=self.bearer)
+        self.assertEqual((await stream.receive_json(timeout=2))['type'], 'snapshot')
+
+        async def drain_until_closed(ws):   # read like a browser: continuously, both sockets at once
+            deadline = time.monotonic() + 5
+            while True:
+                message = await ws.receive(timeout=max(.1, deadline - time.monotonic()))
+                if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING):
+                    return ws.close_code
+                self.assertLess(time.monotonic(), deadline, 'socket outlived its session')
+
+        self.assertEqual(await asyncio.gather(drain_until_closed(stream), drain_until_closed(video)), [1008, 1008])
+        # A bearer (Android) socket has no session expiry and keeps streaming.
+        while (await android.receive(timeout=2)).type == WSMsgType.TEXT and not android.closed:
+            if time.time() > int(cookie.split('.')[1]) + .5:
+                break
+        self.assertFalse(android.closed)
+        await android.close()
+
     async def test_bad_cookies_rejected(self):
         value = await self.login()
         version, expiry, nonce, mac = value.split('.')
@@ -813,6 +838,21 @@ class VideoStateTests(unittest.TestCase):
         card = Path(service.__file__).parent / 'testcard.jpg'
         if card.exists():
             self.assertEqual(jpeg_size(card.read_bytes()), (640, 360))
+
+
+class AdvertiseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unassigned_address_disables_mdns_instead_of_stopping(self):
+        try:
+            import zeroconf  # noqa: F401
+        except ImportError:
+            self.skipTest('zeroconf not installed')
+        from service import advertise
+        # 192.0.2.1 (TEST-NET-1) is never assigned here: the multicast join fails (ENODEV).
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            result = await advertise('192.0.2.1', 8443, {'id': '12345678-aaaa-bbbb-cccc-1234567890ab'})
+        self.assertIsNone(result)
+        self.assertIn('mDNS advertisement off', out.getvalue())
+        self.assertIn('Manual pairing still works', out.getvalue())
 
 
 class VideoIpcTests(unittest.IsolatedAsyncioTestCase):

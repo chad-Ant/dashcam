@@ -274,7 +274,8 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                     // Agent sequence is an unsigned 64-bit counter starting at 1.
                     if (java.lang.Long.compareUnsigned(header.sequence, sequence) <= 0) return
                     sequence = header.sequence
-                    frames.trySend(EncodedFrame(header, data))
+                    // Receipt time, taken before decoding: a slow decode must not make an old frame look new.
+                    frames.trySend(EncodedFrame(header, data, SystemClock.elapsedRealtime()))
                 }
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null) }
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -296,7 +297,9 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         var lastAt = 0L
         var interval = 0.0
         for (frame in frames) {
+            if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue
             val bitmap = decodeJpeg(frame.bytes, frame.header.headerLength) ?: continue
+            if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue   // decode stalled
             bitmap.prepareToDraw()
             val image = bitmap.asImageBitmap()
             val now = SystemClock.elapsedRealtime()
@@ -308,7 +311,8 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             }
             lastAt = now
             val fps = if (interval > 0) 1000.0 / interval else null
-            val shown = VideoFrame(image, frame.header.width, frame.header.height, frame.header.ageMs, now, fps)
+            val shown = VideoFrame(image, frame.header.width, frame.header.height, frame.header.ageMs,
+                frame.receivedAtMs, fps)
             videoMutable.update { previous ->
                 // A decode that finishes after its socket closed is not shown.
                 if (videoGeneration.get() != epoch || !previous.connected) previous
@@ -328,7 +332,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             BitmapFactory.decodeByteArray(data, offset, length, BitmapFactory.Options().apply { inSampleSize = sample })
         } catch (_: Exception) { null }
     }
-    private class EncodedFrame(val header: VideoHeader, val bytes: ByteArray)
+    private class EncodedFrame(val header: VideoHeader, val bytes: ByteArray, val receivedAtMs: Long)
     private class VideoHttpFailure(val code: Int) : IOException()
     private class AuthenticationFailure : IOException()
 }

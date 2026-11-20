@@ -59,6 +59,9 @@ class DashboardModel(app: Application) : AndroidViewModel(app) {
         try {
             val next = saved.value.filterNot { it.id == id }
             store.save(next); saved.value = next
+            // Removing another device must not switch or reconnect the one being watched.
+            if (selected.value != id) return
+            map.forget()   // the last known position belonged to the removed device
             selected.value = next.firstOrNull()?.id
             repository.select(next.firstOrNull())
         } catch (_: Exception) { error.value = "Could not remove saved device" }

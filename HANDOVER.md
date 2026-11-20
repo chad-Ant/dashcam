@@ -96,8 +96,9 @@ This file has three parts:
 10. **CYD** (2026-10-12 log section): dashboard app flashed 2026-10-13 and boots clean. At the board: listen for the
    boot alert, tap-test touch, cover/uncover the LDR (it read ~980 in the room and held the backlight at 32/255).
 11. **Android connector** (`connector/README.md`, `connector/VALIDATION.md`; 2026-10-29 log section). **2026-11-20:
-    the agent is deployed (systemd, real data) and the web client passed on the laptop; see that log section. Left:
-    camera video with the UGREEN, Android pairing (new pin), mDNS, two-viewer load.** Original list: install the host
+    the agent is deployed (systemd, real data); the web client passed on the laptop and the app on the S25 Ultra;
+    the Vehicle page gained a map (web harness-tested, Android uncompiled); see those log sections. Left: Android map
+    build and test on Windows, map with real tiles on the laptop, camera video with the UGREEN, two-viewer load.** Original list: install the host
     agent (venv, `service.py init`, `service.env` with `LAN_ADDRESS` and the host footage path), enable
     `dashcam-monitor.service` (sudo), add `--volume /run/dashcam-monitor:/run/dashcam-monitor` to the v0.4 launcher and
     `<MonitoringEnabled>true</MonitoringEnabled>` to the deployed config, pair the phone and tablet. Then the physical
@@ -412,6 +413,27 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-20 (Jetson, bench): connector Vehicle map; client review fixes; agent mDNS crash loop
+
+- **Map** on the Vehicle page above GNSS position, web client and Android app (`connector/README.md`, Vehicle map):
+  OSM tiles straight from `tile.openstreetmap.org` by the phone/browser (needs its internet; the agent's CSP adds
+  that origin to `img-src` only), follow mode by default, free pan/zoom with Recentre, +/− zoom 3–19 (default 16),
+  "Last known position" in grey when the data is stale (memory only). Android: `MapCard.kt`, `TileLoader.kt`
+  (own OkHttp client, platform trust, 50 MB cache), `TileMath.kt` + `TileMathTest`.
+- **Web tested** in headless Firefox against the simulator (22 checks pass; harness and screenshots in
+  `~/drive_logs/connector_map_20261120/`, not in the repo). The bench router blocks openstreetmap.org DNS: the
+  harness used DNS over HTTPS. **Android not compiled** (no SDK here).
+- **Review** (pasted, 6 findings, all confirmed and fixed; details in `connector/VALIDATION.md`): browser paste of
+  another Jetson's link sent its token here; browser sockets outlived the session; Android forget switched the shown
+  device; Android stamped video frames after decode; web failed tiles hid cached ones; web marker lost across ±180°.
+- **Crash loop:** the Jetson was on another network (Wi-Fi 192.168.1.x), so `LAN_ADDRESS=192.168.0.138` was not
+  assigned; zeroconf raised ENODEV and the unit restarted 435 times. mDNS is now best-effort and the agent serves
+  without it. The network config stays as is: the car setup uses 192.168.0.138. Restart the agent once that address
+  is back so mDNS is advertised again (`sudo systemctl restart dashcam-monitor`).
+- 48 agent tests pass. `dashcam-v04` was stopped at 19:00 and is still stopped.
+- **Next:** on Windows `git pull`, `.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`,
+  install, and check the map on the S25 Ultra; the web map with real tiles on the laptop.
 
 ## 2026-11-20 (Jetson, bench): connector web interface tested; agent deployed for real data
 

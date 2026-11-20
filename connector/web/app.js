@@ -486,7 +486,18 @@
     input.setAttribute('autocapitalize', 'off');
     const label = h('label', 'field-label', 'Pairing link (browser or Android link)');
     label.htmlFor = 'pair-link';
-    const submit = () => { const token = extractToken(input.value); input.value = ''; pair(token); };
+    const submit = () => {
+      const link = extractToken(input.value);
+      input.value = '';
+      // A link for another Jetson must never send its credential here: this page's
+      // own agent would receive another device's token.
+      if (link.target && link.target !== location.host.toLowerCase()) {
+        say('This link is for ' + link.target + ', but this page is ' + location.host +
+            '. Nothing was sent: open the link on that address instead.', true);
+        return;
+      }
+      pair(link.token);
+    };
     input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
     message = h('p', 'message');
     message.setAttribute('aria-live', 'polite');
@@ -516,14 +527,22 @@
     message.textContent = text;
     message.classList.toggle('error', !!error);
   }
+  // The token and the host[:port] the link was made for ('' when unknown or not a link).
   function extractToken(text) {
-    text = text.trim();
+    text = text.replace(/\s+/g, '');   // terminals wrap long links; whitespace is never part of one
     const at = text.indexOf('#pair=');
-    if (/^https:\/\//i.test(text) && at >= 0) return safeDecode(text.slice(at + 6));
-    if (/^dashcam:\/\/pair\?/i.test(text)) {
-      return new URLSearchParams(text.slice(text.indexOf('?') + 1).split('#')[0]).get('token') || '';
+    if (/^https:\/\//i.test(text) && at >= 0) {
+      let target = '';
+      try { target = new URL(text).host.toLowerCase(); } catch (_) { return { token: '', target: '' }; }
+      return { token: safeDecode(text.slice(at + 6)), target };
     }
-    return '';
+    if (/^dashcam:\/\/pair\?/i.test(text)) {
+      const q = new URLSearchParams(text.slice(text.indexOf('?') + 1).split('#')[0]);
+      const host = (q.get('host') || '').toLowerCase(), port = q.get('port') || '443';
+      const shown = host.includes(':') ? '[' + host + ']' : host;   // as location.host writes IPv6
+      return { token: q.get('token') || '', target: host ? (port === '443' ? shown : shown + ':' + port) : '' };
+    }
+    return { token: '', target: '' };
   }
 
   // ---- pairing and session -------------------------------------------------

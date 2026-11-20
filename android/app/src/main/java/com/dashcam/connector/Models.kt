@@ -96,6 +96,9 @@ data class VideoHeader(val headerLength: Int, val sequence: Long, val ageMs: Lon
     }
 }
 
+/** A camera frame older than this since it was received is never shown. */
+const val VIDEO_STALE_MS = 2000L
+
 // Not a data class: every decoded frame is a distinct value for StateFlow.
 class VideoFrame(val image: ImageBitmap, val width: Int, val height: Int, val ageMs: Long,
                  val receivedAtMs: Long, val fps: Double?)
@@ -105,5 +108,5 @@ class VideoFrame(val image: ImageBitmap, val width: Int, val height: Int, val ag
 data class VideoState(val status: String = "Video paused", val frame: VideoFrame? = null, val nowMs: Long = 0,
                       val connected: Boolean = false) {
     // Receipt time on the elapsed-realtime clock; an old picture is never shown.
-    val stale get() = frame?.let { nowMs - it.receivedAtMs > 2000 } == true
+    val stale get() = frame?.let { nowMs - it.receivedAtMs > VIDEO_STALE_MS } == true
 }

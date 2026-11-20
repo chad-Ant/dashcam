@@ -179,7 +179,10 @@ browser devices again.
 Optional mDNS advertises `_dashcam._tcp` with device ID and schema only. The app
 can update a paired device's address from discovery; it keeps its original pin
 and credential. Discovery does not grant trust. Manual pairing works if multicast
-is blocked. Browsers do not use this discovery. Android 17 requests
+is blocked. The advertisement is best-effort: if the advertised address is not
+assigned to the Jetson (another network, DHCP not done yet), the agent logs
+`mDNS advertisement off (...)` and keeps serving; restart it once the address is
+back to advertise again. Browsers do not use this discovery. Android 17 requests
 local-network permission; denial has a recovery button. No GPS, microphone or
 camera permission is needed.
 
@@ -479,7 +482,9 @@ line. The page removes it from the address bar immediately and exchanges it
 once (`POST /v1/session` with the Bearer header) for a session cookie
 `__Host-dcsession` (`Secure; HttpOnly; SameSite=Strict`, 30 days by default).
 The script never stores the token. Alternatively open `https://<host>:8443/`
-and paste either link into **Connection → Pair**. The pasted link may remain in
+and paste either link into **Connection → Pair**. A pasted link made for another
+address (its host:port differs from the page's) is refused before anything is
+sent, so this agent never receives another Jetson's token. The pasted link may remain in
 the clipboard or the address-bar history of that device: clear them on shared
 devices. Bookmark `https://<host>:8443/` afterwards.
 
@@ -489,7 +494,9 @@ restarts keep them and a copied cookie stays valid until it expires; only a new
 identity revokes all browser sessions (and all Android pairings). Expiry is
 checked against the Jetson's wall clock: if it is set wrong at sign-in, or later
 jumps, sessions can expire early or last longer than 30 days. An expired or
-revoked session shows the "not paired" state with instructions.
+revoked session shows the "not paired" state with instructions. A page left open
+does not outlive its session: the agent closes its telemetry and video sockets
+(WebSocket close 1008, "Session expired") when the cookie's expiry passes.
 
 ### Browser security
 
