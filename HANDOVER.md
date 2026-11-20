@@ -456,7 +456,13 @@ real. Logs and the deploy backup: `~/drive_logs/connector_web_20261120/` (not in
   the ends, `java.net.URI` threw, and `DashboardModel.pair()` reported every exception as storage. Pairing worked with
   the line breaks removed by hand. Fixed in the app (not yet compiled: needs the Windows build): the parser drops all
   whitespace, invalid links say "Pairing link not accepted: <reason>", and three unit tests cover wrapped links.
-- **Still open:** camera video and recording FPS/CPU with viewers (needs the UGREEN), the Android acceptance checks,
+  The fix was then built on Windows and installed.
+- **Android acceptance (S25 Ultra, all passed, user's screenshots):** Live/Vehicle/System/Connection with real data,
+  landscape, background/foreground, Wi-Fi off/on, "Find Jetsons" (mDNS), local-network permission deny/regrant, and an
+  outage run: agent frozen 15 s ("Data stale"), then SIGKILL ("Connection lost · retrying"); systemd restarted it
+  after 3 s and the app went back to Live by itself; v0.4's telemetry reached the new agent without a v0.4 restart.
+  Details: `connector/VALIDATION.md` (2026-11-20).
+- **Still open:** camera video and recording FPS/CPU with viewers (needs the UGREEN), the tablet (optional),
   enabling ufw (optional; add SSH and 5353/udp rules first).
 
 ## 2026-11-20 (Jetson, bench): v0.4 bridge discovery no longer probes the ES3C28P display

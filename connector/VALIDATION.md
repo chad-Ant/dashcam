@@ -81,10 +81,35 @@ changed. Test processes were stopped after validation.
 - The Android camera card (`MainActivity.kt`, `MonitorRepository.kt`, `Models.kt`) was reviewed but **not compiled**:
   this Jetson has no JDK/Android SDK. Build and run `:app:testDebugUnitTest :app:lintDebug` on the Windows machine.
 
+## Deployed agent, browser and Android on real devices — 2026-11-20
+
+Agent installed as `dashcam-monitor.service` (venv, hardened unit: peers limited to localhost, 192.168.0.0/24 and
+mDNS; Docker/jtop sockets and the CA key hidden), v0.4 publishing through the `/run/dashcam-monitor` mount. Jetson at
+192.168.0.138 (leaf re-issued for it, same CA). No camera and no C3 attached: recorder not recording, vehicle stale.
+
+- **Firefox 158, Windows 10 laptop** (CA in Firefox's Authorities): no certificate warning, pairing, all four tabs,
+  phone width, reload; simulator round with test-card video (640x360, 9.9 fps) and agent freeze/stop recovery; then
+  real host health and recorder state.
+- **mDNS on the real router:** the laptop resolved `dashcam-372d29b6.local` to 192.168.0.138 (no client isolation).
+- **Samsung S25 Ultra**, debug APK built on Windows (`assembleDebug testDebugUnitTest lintDebug` successful):
+  - Pairing from a terminal-copied link failed ("Could not save pairing ... device storage") because the copy was
+    wrapped; it worked with the line breaks removed. Fixed in `3d3d177` (whitespace dropped, link errors reported as
+    such, three unit tests); the rebuilt APK is installed.
+  - Live (status, Camera "No video · Waiting for camera frames", speed "Waiting for a fresh vehicle source"),
+    Vehicle (all values "–"), System (CPU, GPU, uptime, RAM 1.99/7.43 GiB, footage disk 359.1/936.4 GiB free,
+    six thermal zones about 51 °C, ADAS "Not available"), Connection (paired "Car Jetson" 192.168.0.138:8443).
+  - Agent frozen 15 s: "Data stale · waiting for Jetson"; agent SIGKILL: "Connection lost · retrying" (video card
+    too), systemd restarted it in 3 s (`Restart=on-failure`) and the app returned to Live without pairing again;
+    recorder telemetry fresh again without restarting v0.4 (the kept `/run/dashcam-monitor` works).
+  - Landscape, background/foreground (stays connected), Wi-Fi off ("Waiting for Wi-Fi") and on (reconnects),
+    "Find Jetsons" (1 device found by mDNS), local-network permission removed and granted again.
+- **Graceful exit with monitoring on:** isolated `timeout --preserve-status -s TERM` run exits 0 with the preview
+  converter active; real `systemctl stop` 0.45 s, `ExecMainStatus=0`.
+
 ## Remaining physical acceptance
 
-- Installation and pairing on the actual Samsung S25 Ultra and Tab S10 FE (app and browser, after installing the CA).
-- mDNS discovery on the actual router, including client-isolation behavior.
+- Tab S10 FE (app and browser); browsers on the phone/tablet (CA install). The S25 Ultra app and laptop Firefox
+  passed on 2026-11-20 (above), as did mDNS on the router.
 - CAN/GNSS source-loss transitions, reconnect after router/Jetson reboot and
   accurate storage-path configuration on the deployed system.
 - Compare recording FPS/CPU/memory before and during two physical viewers.
