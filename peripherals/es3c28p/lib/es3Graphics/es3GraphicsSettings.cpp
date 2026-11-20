@@ -1,6 +1,7 @@
 /** @file es3GraphicsSettings.cpp - SET tab: sliders, buttons and persistence. */
 
 #include "GraphicsInternal.h"
+#include <Adafruit_GFX.h>
 #include "es3Board.h"
 #include <cstdio>
 #include <cstdlib>
@@ -143,26 +144,52 @@ void Es3Graphics::drawSlider(uint8_t slider)
     const uint8_t value = values[slider];
     const Box zone = sliderZone(slider);
     const int labelTop = labelY(slider);
-
-    panel.fillRect(zone.x, labelTop - 1, zone.w, zone.y - labelTop + 1, ILI9341_BLACK);
-    panel.setTextSize(1);
-    panel.setTextColor(ILI9341_CYAN);
-    panel.setCursor(kTrackLeft, labelTop);
-    if (slider == VolumeSlider && value == 0) {
-        panel.printf("%s  MUTED", kSliderNames[slider]);
-    } else {
-        panel.printf("%s  %u%%", kSliderNames[slider], value);
-    }
-
     const int y = trackCenterY(slider);
     const int knob = knobX(value);
-    panel.fillRect(zone.x, zone.y, zone.w, zone.h, ILI9341_BLACK);
-    panel.fillRoundRect(kTrackLeft, y - 3, kTrackRight - kTrackLeft + 1, 7, 3, ILI9341_DARKGREY);
-    if (knob > kTrackLeft) {
-        panel.fillRoundRect(kTrackLeft, y - 3, knob - kTrackLeft + 1, 7, 3, kSliderColours[slider]);
+    const uint16_t colour = kSliderColours[slider];
+
+    // Compose the label line and the track strip off screen, then send each to
+    // the panel in one write. Clearing on the panel first made every drag step
+    // flash black (visible flicker of the text and the bar).
+    static GFXcanvas16 labelCanvas(242, 8);                  // one text line
+    static GFXcanvas16 trackCanvas(242, 2 * kKnobRadius + 1); // knob height
+    char text[32];
+    if (slider == VolumeSlider && value == 0) {
+        snprintf(text, sizeof(text), "%s  MUTED", kSliderNames[slider]);
+    } else {
+        snprintf(text, sizeof(text), "%s  %u%%", kSliderNames[slider], value);
     }
-    panel.fillCircle(knob, y, kKnobRadius, ILI9341_WHITE);
-    panel.drawCircle(knob, y, kKnobRadius, kSliderColours[slider]);
+    if (labelCanvas.getBuffer() == nullptr || trackCanvas.getBuffer() == nullptr ||
+        zone.w > labelCanvas.width()) {
+        // No canvas memory: draw directly (flickers while dragging, still correct).
+        panel.fillRect(zone.x, labelTop - 1, zone.w, zone.y - labelTop + 1, ILI9341_BLACK);
+        panel.setTextSize(1);
+        panel.setTextColor(ILI9341_CYAN);
+        panel.setCursor(kTrackLeft, labelTop);
+        panel.print(text);
+        panel.fillRect(zone.x, y - kKnobRadius, zone.w, 2 * kKnobRadius + 1, ILI9341_BLACK);
+        panel.fillRoundRect(kTrackLeft, y - 3, kTrackRight - kTrackLeft + 1, 7, 3, ILI9341_DARKGREY);
+        if (knob > kTrackLeft) panel.fillRoundRect(kTrackLeft, y - 3, knob - kTrackLeft + 1, 7, 3, colour);
+        panel.fillCircle(knob, y, kKnobRadius, ILI9341_WHITE);
+        panel.drawCircle(knob, y, kKnobRadius, colour);
+    } else {
+        labelCanvas.fillScreen(ILI9341_BLACK);
+        labelCanvas.setTextSize(1);
+        labelCanvas.setTextColor(ILI9341_CYAN);
+        labelCanvas.setCursor(kTrackLeft - zone.x, 0);
+        labelCanvas.print(text);
+        panel.drawRGBBitmap(zone.x, labelTop, labelCanvas.getBuffer(), zone.w, labelCanvas.height());
+
+        const int cy = kKnobRadius;   // track centre inside the canvas
+        const int left = kTrackLeft - zone.x, right = kTrackRight - zone.x, k = knob - zone.x;
+        trackCanvas.fillScreen(ILI9341_BLACK);
+        trackCanvas.fillRoundRect(left, cy - 3, right - left + 1, 7, 3, ILI9341_DARKGREY);
+        if (k > left) trackCanvas.fillRoundRect(left, cy - 3, k - left + 1, 7, 3, colour);
+        trackCanvas.fillCircle(k, cy, kKnobRadius, ILI9341_WHITE);
+        trackCanvas.drawCircle(k, cy, kKnobRadius, colour);
+        panel.drawRGBBitmap(zone.x, y - kKnobRadius, trackCanvas.getBuffer(), zone.w, trackCanvas.height());
+    }
+    // The live level bar sits below the knob rows and is not touched above.
     if (slider == MicSlider) drawMicLevelBar(true);
 }
 
