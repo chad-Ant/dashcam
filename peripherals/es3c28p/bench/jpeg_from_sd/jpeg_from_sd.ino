@@ -28,7 +28,8 @@ void setup() {
     if (!jpeg || !pixels || file.read(jpeg,jpegBytes)!=jpegBytes) { jpegBytes=0; return; }
     file.close();
     spi.begin(Es3Board::tftClock, Es3Board::tftMiso, Es3Board::tftMosi, Es3Board::tftCs);
-    tft.begin(40000000);es3ConfigureIpsPanel(tft);tft.setRotation(1);
+    tft.begin(40000000);
+    es3ConfigureIpsPanel(tft);
     pinMode(Es3Board::backlight,OUTPUT);digitalWrite(Es3Board::backlight,HIGH);
     tft.fillScreen(ILI9341_BLACK);
 }

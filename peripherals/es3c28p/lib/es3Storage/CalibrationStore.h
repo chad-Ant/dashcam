@@ -5,9 +5,10 @@
 #include <string.h>
 
 namespace es3storage {
-constexpr char kCalibrationFile[] = "/es3c28p_touch.cal";
-constexpr char kCalibrationBackup[] = "/es3c28p_touch.cal.bak";
-constexpr char kCalibrationTemporary[] = "/es3c28p_touch.cal.tmp";
+// Calibrations for the previous mirrored orientation use a different path.
+constexpr char kCalibrationFile[] = "/es3c28p_touch_ips.cal";
+constexpr char kCalibrationBackup[] = "/es3c28p_touch_ips.cal.bak";
+constexpr char kCalibrationTemporary[] = "/es3c28p_touch_ips.cal.tmp";
 constexpr size_t kCalibrationBytes = 96;
 
 inline bool whitespace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }

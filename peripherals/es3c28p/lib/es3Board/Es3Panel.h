@@ -39,5 +39,11 @@ inline void es3ConfigureIpsPanel(Adafruit_ILI9341& panel)
     panel.sendCommand(0xe0, data16, sizeof(data16));
     uint8_t data17[] = {0x0, 0xa, 0xf, 0x4, 0x11, 0x8, 0x36, 0x58, 0x4d, 0x7, 0x10, 0xc, 0x32, 0x34, 0xf};
     panel.sendCommand(0xe1, data17, sizeof(data17));
+
+    // Set the library's 320x240 bounds, then apply LCDWiki's landscape
+    // MADCTL value (MX | MV | BGR) for this panel's mounting.
+    panel.setRotation(1);
+    uint8_t landscape = 0x68;
+    panel.sendCommand(ILI9341_MADCTL, &landscape, sizeof(landscape));
 }
 

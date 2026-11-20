@@ -169,7 +169,6 @@ bool Es3Graphics::begin()
     gTftSpi.begin(kTftSclk, kTftMiso, kTftMosi, kTftCs);
     panel.begin();
     es3ConfigureIpsPanel(panel);
-    panel.setRotation(1);
 
     if (!Es3Board::beginI2c()) {
         return false;

@@ -113,7 +113,8 @@ On first boot, tap and release each of the twelve calibration targets, then
 use the touch-check screen to verify the mapping and choose SAVE. Although
 capacitive coordinates are already pixels, this preserves the CYD's wizard
 and learns the panel's orientation. The record lives at
-`/es3c28p_touch.cal`, independently of the classic CYD's calibration file.
+`/es3c28p_touch_ips.cal`. Cards with the earlier `/es3c28p_touch.cal` record
+need one fresh calibration for the corrected display orientation.
 Saving verifies a temporary record before replacing the primary and retains
 `.cal.bak` for recovery; boot falls back to that backup if the primary is invalid.
 This protects against failed writes/renames, not every SD power-loss failure.

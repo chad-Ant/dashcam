@@ -30,7 +30,7 @@ public:
     uint32_t busFrequencyHz() const;
     bool exists(const char* path) const;
 
-    /** Reads /es3c28p_touch.cal. Returns false for absent, malformed, or bad data. */
+    /** Reads /es3c28p_touch_ips.cal. Returns false for absent, malformed, or bad data. */
     bool loadTouchCalibration(Es3TouchCalibrationRecord& record) const;
 
     /** Verifies a temporary record, retains a backup, then promotes it. */
