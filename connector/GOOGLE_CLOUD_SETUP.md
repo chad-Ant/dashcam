@@ -8,8 +8,8 @@ Use this guide to take one paired Jetson from a working Wi-Fi connection to a te
 |---|---|
 | Google Cloud | The pilot project is `jetson-dashcam-handler`. Cloud Shell confirmed the `(default)` Firestore Native, Standard database in Singapore (`asia-southeast1`) and all five APIs listed in step 5. Reuse this project. Steps 1–5 are also a reference for a fresh installation. |
 | Firebase and billing | Web and Android apps are registered. The console showed Google sign-in enabled, and the owner completed a monthly billing alert. Confirm billing linkage in step 2 before the first deployment. |
-| Android sign-in | The local configuration matches the pilot project and `com.dashcam.connector`. The copy inspected on this Jetson lacks an Android OAuth client entry for the package. Check the signing certificate and refresh the file on the APK build machine in step 6. |
-| Jetson and phone | The LAN connector answered locally. The current phone test is in progress. Record its result in step 7. The Python and native C++ Plan A lifecycle tests passed locally. |
+| Android build preparation | The owner confirmed step 6 is complete on the Windows APK build machine. The debug signing report succeeded. Interactive Google sign-in will be tested with the cloud-enabled app in step 8. |
+| Jetson and phone | The owner confirmed the Android phone connects to the Jetson over the LAN. Both Jetson services reported active. All eight Python Plan A tests and the native C++ lifecycle tests passed on the Jetson. |
 | Remote viewing | Device enrollment, the Firestore listener, authenticated relay, dashboard sign-in and cloud transports still need implementation. A remote URL and a cloud-enabled APK are deliverables of step 8. |
 
 ## Prerequisites on your side
@@ -20,7 +20,7 @@ Use this guide to take one paired Jetson from a working Wi-Fi connection to a te
 | Before building the Android pilot | The computer and signing keystore used for the test APK, Android Studio or an equivalent command-line build environment, a compatible Gradle JDK (JDK 17 is the project baseline), and Android SDK Platform 37. Use the repository's Gradle wrapper. | Open the checkout's `android/` project and complete step 6 on that computer. A different machine may use a different debug keystore. |
 | Before testing a real Jetson | Shell access to one powered Jetson, its existing local pairing, a working recorder for the live-data test, and a network with outbound DNS and TLS on TCP 443. The device clock must be accurate for certificates and expiring requests. | Finish the Wi-Fi test in step 7. On the Jetson, `timedatectl status` shows clock and synchronization state. |
 | Before first deployment | A deployer who can build and deploy the relay and attach its runtime service account, and an administrator who can grant the build and runtime identities their required access. Cloud Shell is sufficient for the administrator. | Identify who manages project IAM. Use the source-deployment permissions for the chosen build identity. Give the relay a dedicated runtime identity with the Firestore access it needs. [Cloud Run source deployment](https://docs.cloud.google.com/run/docs/deploying-source-code) |
-| Before the first external viewing session | One Google account to invite to one vehicle, an Android phone with mobile data and Google sign-in, and a browser with internet access for the web test. | Keep the Jetson on its own internet connection. The phone should be able to turn off Wi-Fi and still reach the internet. The second Jetson and remaining viewers can join after the first test passes. |
+| Before the first external viewing session | One Google account to invite to one vehicle, an Android phone with mobile data and Google sign-in, and a browser with internet access for the web test. | Keep the Jetson on its own internet connection. The phone should be able to turn off Wi-Fi and still reach the internet. One physical Jetson is sufficient for the phone and browser pilot. |
 
 Keep the APK signing key and its password on the build machine. The LAN pairing link contains a reusable local credential. Record the test result without copying that link into an issue or log. Enrollment will issue a separate device credential. The phone and Jetson never need a cloud administrator key.
 
@@ -107,33 +107,83 @@ systemctl is-active dashcam-monitor.service
 systemctl is-active dashcam-v04.service
 ```
 
-To check the Plan A libraries offline, run the following from the repository root on a machine with Python 3.10+, GNU Make and a C++17 compiler. These tests use simulated control events and can run alongside the phone test.
+To check both Plan A libraries offline on the pilot Jetson, change to the checkout first. Adjust the first line if you cloned it elsewhere. These tests use Python 3.10+, GNU Make and a C++17 compiler and can run alongside the phone test.
 
 ```bash
+cd ~/Documents/github_repos/dashcam
 python3 -m unittest discover -s connector -p 'test_cloud_on_demand.py' -v
 make -C lib/libclouduplink check
+```
+
+For an optional Windows Python check, open PowerShell in the checkout’s `connector` directory and run the following. The `-s .` argument starts discovery in the current directory. Use `-s connector` only from its parent directory.
+
+```powershell
+python -m unittest discover -s . -p 'test_cloud_on_demand.py' -v
 ```
 
 **Pass condition.** The Python suite reports `OK` and the native test reports `Plan A uplink lifecycle tests passed`. Record LAN results and library results separately. Neither test opens a Google Cloud session.
 
 ## 8. Implement and verify the remote path
 
-This section is for the developer. The current checkout has the lifecycle libraries. Use the following milestones to produce the staging service, enrollment procedure, cloud-enabled APK and dashboard URL. The owner can complete the preceding steps independently.
+**Your starting point.** You have completed Android build preparation and verified phone-to-Jetson connectivity over Wi-Fi. Step 8 builds the software that carries that same read-only telemetry over the internet. The existing Python and C++ tests cover how the Jetson reacts to demand. They run without Firebase. The first new test below exercises a real listener against the local Firestore emulator.
 
-| Milestone | Work | Evidence before advancing |
+| Who and where | First action | What you should receive |
 |---|---|---|
-| 1. Device identity and wake-up | Use simulated devices, then the ARM64 Jetson. Enroll each device with a short-lived code and a revocable identity. Let each read its own `vehicles/{id}/control/current`. Have the authorized server write demand. Exercise token refresh and reconnect. | The device receives its initial state and a new request. Another device cannot read that document. Cached or expired demand starts no upload. |
-| 2. Authenticated telemetry relay | Verify the viewer’s Firebase identity and vehicle membership. Aggregate demand across viewers, initially renewing every 10 seconds with a 30-second lease. Once the relay confirms demand, the separate Jetson uplink subscribes to the existing local `/v1/stream`. | An invited viewer receives fresh simulated telemetry. An unassigned user is denied. A second viewer shares the same upstream. Losing the final viewer releases it, including on silent disconnect after timeout and lease expiry. |
-| 3. Pilot deployment and clients | Deploy one staging Cloud Run service in Singapore, with request-based billing, minimum zero instances and a pilot maximum of one. Publish its HTTPS URL, configure its Firebase authorized domain and invite one viewer by Firebase UID. Wire the browser and Android cloud connection to the authenticated relay. Install the cloud-enabled APK and enroll the real Jetson. | Both clients can sign in, see only their assigned vehicle and cancel a pending connection. A powered-off vehicle times out. The Jetson continues local recording during relay loss. |
-| 4. Camera and the second mode | Forward the existing local preview on explicit camera demand. Then implement **Ready while powered** and the owner’s per-vehicle mode selection. Plan B holds one control connection per powered Jetson with a 60-second heartbeat. | Closing the final camera viewer releases preview while a remaining telemetry viewer continues. In Plan B the heartbeat continues while idle, and silent loss marks the Jetson offline after the planned 150-second timeout. Changing one vehicle’s mode leaves the other vehicle’s session intact. |
+| Developer, on the development PC | Build the emulator test in 8.1, then the listener, enrollment flow and relay. | A repeatable test run showing an authorized wake-up, access denied for the other identity, and automatic release on expiry. |
+| You, on the PC and in Firebase | When staging is ready, choose the Google account to invite. The developer or project administrator sets the staging hostname and grants that account access to vehicle A. | An HTTPS dashboard URL, a cloud-enabled debug APK, and the vehicle label to select. |
+| You and the developer, on the Jetson | When the uplink is ready, enroll the Jetson once using the supplied command and a short-lived code. Keep the existing LAN pairing. | An enrolled vehicle that keeps recording locally while awaiting a viewer. |
+| You, on the phone | After the staging handoff in 8.4, use mobile data for the telemetry checks in step 9. | Fresh samples from the enrolled Jetson in the browser and Android app. Camera and the mode toggle follow in 8.5. |
 
-An open WebSocket can keep a Cloud Run instance billable. For this occasional-use pilot, start with Plan A, record relay time and outgoing bytes, and compare them with the billing report before expanding to five viewers. Scale-to-zero and a budget alert do not guarantee a zero bill. [Cloud Run WebSockets and billing](https://docs.cloud.google.com/run/docs/triggering/websockets)
+### 8.1 Prove the wake-up and permissions on the development PC
 
-The detailed designs cover enrollment and permissions, the lease format, mode changes during a session, and recovery after a relay restart. [Shared architecture](CLOUD_MONITORING_PLAN.md) · [Plan A](CLOUD_ON_DEMAND_PLAN.md) · [Plan B](CLOUD_READY_WHILE_POWERED_PLAN.md)
+1. **Create the local test environment.** The developer adds a Firebase Emulator Suite configuration for Authentication and Firestore, explicit Firestore rules, a small data setup script, and an automated listener test. Use a demo project ID such as `demo-dashcam` throughout the test. Run the emulators on loopback. Keep emulator settings confined to the test process. Once those files and the Firebase CLI are in place, the developer can start both emulators from the directory containing `firebase.json` with `firebase emulators:start --only auth,firestore --project demo-dashcam`. [Firebase emulator setup](https://firebase.google.com/docs/emulator-suite/connect_firestore)
+2. **Represent two vehicles with two processes.** Give simulated A and B distinct authenticated device identities. Give the test viewer access to A. Use a trusted test writer to create the control documents. Make all device reads through the rules-enforced client path. Firestore server libraries use IAM and bypass these rules, so an administrator read cannot establish device isolation. [Firestore authorization](https://firebase.google.com/docs/firestore/security/get-started)
+3. **Start at idle.** A subscribes to `vehicles/A/control/current`. Its initial server-confirmed snapshot has `desiredMode=on_demand`, `configVersion=1`, `demandGeneration=0`, `channels=[]`, and `expiresAt=null`. The listener should stay connected with zero relay attempts and zero media readers.
+4. **Request telemetry once.** The test writer advances the generation to 1, sets `channels=["telemetry"]` and writes a Firestore timestamp 30 seconds in the future. The listener supplies the actual document path, fields and snapshot metadata to the lifecycle library. Expect one outbound connection attempt. Use a simulated relay acknowledgement for this test. Only after it confirms the same attempt and generation should the telemetry reader become active. Video stays idle.
+5. **Prove release and isolation.** First withhold renewal and verify that the reader and relay attempt end at the local lease deadline. Then send a fresh request and explicitly clear demand by advancing the generation and emptying the channel list. Verify immediate release. B must successfully read B’s document and receive permission denied for A’s document. Reject a device write to its own demand record as well. Reconnect A after a lease expires and verify that cached or expired demand leaves it idle.
+
+**Evidence to keep:** the observed generation, connection attempts, active reader counts, permission results and the time to release. A single local run should reproduce all of them. The developer should deliver the test command with the emulator configuration. This milestone uses synthetic data and needs no phone or cloud deployment.
+
+### 8.2 Enroll the Jetson and connect the native lifecycle library
+
+1. Implement an owner-issued, single-use enrollment code with a short expiry. Exchange it over TLS for a revocable identity bound to vehicle A. Store the device credential in a file readable only by the uplink service account. Document how to recover if the exchange succeeds but the Jetson loses the reply.
+2. Run the uplink as a separate host process. Its cloud connection uses outbound TLS. For local telemetry it uses the already-paired connector and verifies its certificate. Keep the recorder and LAN connector running normally. Install the cloud uplink on the pilot Jetson when a staging enrollment endpoint is available in 8.4.
+3. Feed device-scoped listener events into the C++ controller on its owning event loop. Follow the target it returns to open or close the socket and readers. Arm its monotonic deadline even while the network handshake is pending. Refresh credentials, reconnect with backoff, and obtain a current server snapshot before resuming. [Native adapter interface](../lib/libclouduplink/README.md)
+
+**Pass on ARM64:** with synthetic demand, observe one wake-up after a current update. Reconnect after an expired request and observe zero readers. Revoke the test identity and verify that access ends. Repeat enrollment with a new credential before the live pilot.
+
+### 8.3 Build the relay and connect the two clients
+
+The relay links a signed-in viewer’s request to the enrolled Jetson. The following are proposed interfaces to implement. They become usable once the developer supplies the staging build.
+
+| Event | What the implementation must do | Observable result |
+|---|---|---|
+| Sign in and list vehicles | Verify Firebase identity and look up vehicle membership by UID. Serve the browser from the relay origin with a secure session cookie. The Android app uses a short-lived ID token and the default network for cloud traffic. | The invited account sees A. An account with no grant sees no vehicle and cannot subscribe by supplying A’s ID. [Firebase token verification](https://firebase.google.com/docs/auth/admin/verify-id-tokens) |
+| Tap Connect | Create a bounded viewer session. In a transaction, aggregate unexpired demand for A and update its control document. Renew active leases initially every 10 seconds for a 30-second lifetime. | Firestore wakes A as soon as demand changes. The UI shows **Connecting**. Cancelling an offline request releases the pending session. |
+| Device registers | Authenticate A on the proposed `/v1/uplink` socket and recheck current demand and generation. Open one authenticated local `/v1/stream` reader only after confirmation. Fan its snapshots out to authorized viewers. | Two viewers on A receive advancing sequence numbers from one upstream. Show **Live** when recorder data is fresh. A powered Jetson with an idle recorder can report that separately. |
+| Leave, lose connectivity or lose access | On explicit leave, remove only that viewer’s demand. On silent loss, bound upload by viewer timeout plus the remaining lease. Recheck authorization for open sessions and close revoked ones. | Closing the browser keeps the phone live. Closing the final viewer releases A’s telemetry reader and Plan A relay socket. Local recording continues. |
+
+For a failure, follow one request ID from the tap through authorization, Firestore write, device receipt, relay confirmation and first fresh sample. Record elapsed time on one clock for the user-visible measurement. Keep tokens, location and frame contents out of the logs.
+
+### 8.4 Deploy one staging relay and hand it over for the phone test
+
+1. **Developer and cloud administrator:** package the tested relay, Firestore rules, client configuration and uplink. Target the existing project `jetson-dashcam-handler`, default database and region `asia-southeast1`. Use a dedicated runtime service account. Bind vehicle access in the application before making the dashboard reachable from the internet.
+2. **Developer:** deploy one staging Cloud Run service with request-based billing, minimum zero instances and a pilot maximum of one. Configure the WebSocket request timeout and test reconnection across timeout or a new revision. An open WebSocket keeps an instance active for billing. Record relay time and outgoing bytes during the trial. [Cloud Run WebSockets and billing](https://docs.cloud.google.com/run/docs/triggering/websockets)
+3. **Firebase administrator:** add the actual staging hostname under **Authentication → Settings → Authorized domains**. Have the selected user sign in, then grant its Firebase UID the intended role for A using the implemented invitation or grant procedure. Confirm that the same account sees its vehicle on both clients.
+4. **Developer and owner:** enroll A using the delivered uplink, install the cloud-enabled APK signed with the certificate registered in step 6, and open the staging URL in the browser. Test an offline request and cancellation, then bring the uplink online and verify delivery from the real recorder. Use the local dashboard for comparison if samples appear stale.
+5. **Handoff:** provide the exact HTTPS URL, APK build identifier, Jetson enrollment and uplink stop instructions, pilot vehicle label and staged relay revision. These values come from the actual deployment. With both clients able to select A, run the mobile-data telemetry checks in step 9.
+
+**Pass for the first remote session:** with phone Wi-Fi off, both the Android app and browser can receive a fresh recorder sample from A. After the last viewer exits, monitor ten idle minutes. Plan A should have zero telemetry/video uploads, a closed device relay socket and only control-listener or configured presence traffic. If the trial needs to stop, stop the separate uplink, remove the temporary grant and verify the LAN connection.
+
+### 8.5 Add video and the selectable second mode
+
+- **Camera.** Open the existing local `/v1/video` reader on the first explicit camera request. Share one upstream across viewers. Close the reader after the last camera viewer leaves, even if someone is still watching telemetry. Verify first-frame latency separately and confirm the Jetson records through a cloud disconnect. [Local video protocol](README.md#video-protocol)
+- **Ready while powered.** Add the owner setting after Plan A telemetry works. The device opens its control socket on boot or network recovery, sends a 60-second heartbeat and becomes offline after the planned 150-second silent-loss deadline. Keep media readers closed until requested. Test switching during viewing and again with zero viewers.
+- **Pilot capacity.** Use the real Jetson for recording, LTE and timing. Use a second authenticated simulator for vehicle B. Split up to five viewer sessions across A and B, change A’s mode, and confirm that B’s subscriptions and data stay independent. Compare first-sample latency and billable relay time before choosing a per-vehicle default. [Shared architecture](CLOUD_MONITORING_PLAN.md) · [Plan A](CLOUD_ON_DEMAND_PLAN.md) · [Plan B](CLOUD_READY_WHILE_POWERED_PLAN.md)
 
 ## 9. First mobile-data acceptance test
 
-Run the telemetry checks once the developer supplies the staging URL, cloud-enabled APK, enrolled vehicle and viewer grant from milestone 3. Use a parked Jetson with working local telemetry. The same Google account can test the app and the web client.
+Run the telemetry checks once the developer supplies the staging URL, cloud-enabled APK, enrolled vehicle and viewer grant from step 8.4. Use a parked Jetson with working local telemetry. The same Google account can test the app and the web client.
 
 1. Leave the Jetson online. Turn off Wi-Fi on the phone and confirm mobile data works. Open the cloud-enabled app, sign in, select the invited vehicle and tap **Connect**. Repeat in the phone browser using the staging HTTPS URL.
 2. Record elapsed time from each tap to the first **fresh recorder sample**. An authenticated vehicle list proves sign-in and access. A fresh sample proves the full path through the relay to the Jetson. Measure the first cold connection separately from a repeat connection. The pilot targets p95 within three seconds across repeated trials.

@@ -18,7 +18,7 @@ Design for two enrolled Jetsons, five simultaneous viewer sessions in total, and
 | Users | First owner identity, up to five invited test users or sessions, and a record of which users may view or administer each Jetson. Use a stable authentication UID for permissions. |
 | Vehicles | Shell access to provision each Jetson once, its existing connector identity and trusted local TLS configuration, working local telemetry, power, correct time and outbound DNS/HTTPS. Enable the existing monitoring preview for video. A cellular router behind NAT is suitable. |
 | Clients | A browser on an external network, an Android phone with cellular data, and an Android build environment compatible with the repository's Gradle wrapper and SDK. Use a test APK with its own registered sign-in configuration. |
-| Field validation | Access to both Jetsons, permission to simulate connectivity loss while parked, and a way to check footage and frame counters afterwards. Decide what monthly spend and typical viewer-hours are acceptable. |
+| Field validation | One physical Jetson for LAN, LTE and recording checks, permission to simulate connectivity loss while parked, and a way to check footage and frame counters afterwards. A separately authenticated simulator can represent the other vehicle for access-control and routing tests. Decide what monthly spend and typical viewer-hours are acceptable. |
 
 Both clients present **Connection → Cloud → vehicle → Connection mode** to the owner. Show the two labels above with a short explanation of responsiveness and billable uptime. A viewer can connect, leave, and request camera preview. Only an owner can change policy. Distinguish **Last seen**, **Connecting**, **Live**, and **Offline**. A one-minute heartbeat is evidence of device presence. Only fresh samples make telemetry or video live. A mode change is independent of the local/cloud selection and camera button.
 
@@ -73,7 +73,7 @@ Choose one serial writer or Firestore transaction per vehicle for demand changes
 1. Build the relay, common state machine, enrollment, and two simulated Jetsons. Exercise both mode transitions and stale-generation handling before adding media. Run against isolated local/emulated services where possible.
 2. Deploy staging. Prove each mode separately with one Jetson and an authenticated browser. Capture control timestamps and time to first fresh telemetry and first decoded frame on real LTE. Progress from telemetry to video.
 3. Add the owner toggle and readiness indicators to both clients. Perform the tests in each mode plan and the mixed-mode tests below. Estimate monthly charges from observed regional usage. [Cloud Run pricing](https://cloud.google.com/run/pricing) · [Firestore pricing](https://firebase.google.com/docs/firestore/pricing)
-4. Enroll the second vehicle. Roll out to the five invited viewers after the shared acceptance checks pass. For rollback, stop the cloud uplink, revoke its cloud credential if appropriate, and revert the remote deployment. Verify the LAN dashboard and on-disk recording locally.
+4. When a second physical vehicle becomes available, enroll it and repeat the two-vehicle field checks. For the one-vehicle pilot, roll out to the five invited viewers after the shared acceptance checks pass. For rollback, stop the cloud uplink, revoke its cloud credential if appropriate, and revert the remote deployment. Verify the LAN dashboard and on-disk recording locally.
 
 | Shared acceptance test | Evidence to capture |
 |---|---|
