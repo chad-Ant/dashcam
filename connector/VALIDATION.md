@@ -166,6 +166,37 @@ window; reload is off again; the picture has `pointer-events: none` and is not d
 matching socket count and no console errors. Android: static review plus `LiveViewTest` (7 JUnit tests), **not
 compiled yet**.
 
+## Client review fixes — 2026-11-21 (`CLIENT_REVIEW_2026-11-21.md`)
+
+**Web (C2, C3, P1, P2)**, headless Firefox 157 against a controllable fixture (identity hold/status/device,
+telemetry 5 Hz, DCV1 video 10 Hz with 401/503 rejection), 22/22 passed; the same fixture fails 17 checks against
+the previous client. C2: identity held 2 s after a hide/show, 0 video requests in 5 runs; released as the same
+device it resumes, as another device / unpaired / no video / expired deadline it does not. C3: video 401 + identity
+401 resets the toggle in 1.15 s with no further handshakes; identity 200 + video 503 keeps retrying and recovers in
+the window; one identity check in flight when telemetry and video fail together. P1: full renders per 5 s 94 → 44
+with the same 49 frames. P2: camera box out of the viewport closes video at 2.00 s and reopens in 0.06 s; quick
+out-and-back keeps it; expiry while offscreen stays off. The earlier live-view suite still passes; no console errors.
+
+**Android on the A54** (build `4c8cfea`, debug; built on Windows: assembleDebug, unit tests, lint passed;
+installed and driven over adb from the Jetson). Opens with live view off (no video socket until Start). P2: card
+scrolled out closes video ~2 s after it left the screen (1.77 s after the swipe ended), back reopens at once, a
+sub-second out-and-back keeps it, the window keeps counting. C4: a 7 s `iptables` TCP reset on the phone's port-8443
+packets: both sockets reconnected by themselves ~3 s after the rule was removed, banner back to Live, no certificate
+warning (the app logs no exception types, so the SSLException branch itself is inferred, not observed).
+
+**Android rendering, A54, 60 s on Live with video (debug builds):**
+
+| | Before (`d68f3ee`) | After (`4c8cfea`) | After, live view off |
+|---|---:|---:|---:|
+| Frames | 939 | 748 | 74 in 30 s |
+| Janky | 88.6 % | 94.3 % | 93.2 % |
+| Median / p90 frame | 18 / 23 ms | 22 / 25 ms | 24 / 29 ms |
+| App CPU | 57 % of a core | 62 % | 16 % |
+
+Fewer frames (snapshots no longer redraw unchanged cards) but each frame is slower. Phase breakdown with live view
+off (framestats, median): recomposition 7.3 ms, draw recording 5.8 ms, GPU command issue 4.1 ms, measure/layout
+0.2 ms. Both builds are `DEBUGGABLE`; a non-debuggable `benchmark` build type was added to measure properly.
+
 ## Remaining physical acceptance
 
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.

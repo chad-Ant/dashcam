@@ -472,6 +472,14 @@ establish bitmap ownership, so the pool was removed again (C1, fresh bitmap per 
 also retries telemetry after an ordinary TLS error (C4: only a verified certificate failure is terminal; a
 superseded connection's late failure no longer changes the status) and pauses video while the camera card is
 scrolled out of the list for 2 s (P2; the 10-min window keeps running). Web fixes C2, C3, P1, P2 follow separately.
+**Afternoon:** web fixes committed (one current-attempt identity check gates every video open; a failed video
+upgrade revalidates over HTTP; frames update only the camera card; offscreen pause) after 22/22 fixture checks.
+The A54 is now on a Jetson USB-A port with `adb` (Ubuntu's adb 28.0.2; the USB-C port is device mode) and was
+driven from the Jetson: live view off at start, P2 and C4 passed on the phone (`connector/VALIDATION.md`). **The
+rendering rework did not lower frame time on the A54** (debug builds: median 18 → 22 ms, frames 15.7/s → 12.5/s,
+CPU 57 → 62 %); per frame, recomposition ~7 ms and draw recording ~6 ms even when only the banner changes. Next:
+measure non-debuggable builds (`benchmark` build type, baseline branch `perf-baseline` = `d68f3ee` + that build
+type), then per-card drawing layers if the draw phase still dominates.
 
 **Next:** build and test on Windows (`.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`),
 install on the A54, then `adb shell dumpsys gfxinfo com.dashcam.connector reset`, a minute on Live with live view on,

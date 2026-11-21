@@ -11,16 +11,24 @@
   const $ = id => document.getElementById(id);
 
   let identity = null, unpaired = false;      // identity = {id, name, capabilities}
+  // Each connection attempt (start(), a stop, a failed video upgrade) verifies the identity
+  // afresh: video opens only once /v1/identity has answered for the current attempt, and an
+  // answer from an older attempt is dropped before it touches identity.
+  let verified = false, idGen = 0, idCheck = null;
   let ws = null, snap = null, lastMs = 0, openedMs = 0, lastSession = '', lastSeq = -1;
   let status = 'Starting', attempt = 0, retryTimer = 0, epoch = 0;
   let wakeWanted = false, wakeLock = null, wakeBusy = false;
   let message = null, wakeNote = null, page = 'live', signingOut = false;
   const binds = [];
-  // Camera video (/v1/video): open only while live view is on, paired, on Live and visible.
+  // Camera video (/v1/video): open only while live view is on, paired and verified, on Live,
+  // the page visible and the camera box on screen.
   const VIDEO_STALE_MS = 2000, VIDEO_MAGIC = [0x44, 0x43, 0x56, 0x31];   // "DCV1"
   let vws = null, vAttempt = 0, vTimer = 0, vOpenedMs = 0, vMsgMs = 0, vLastSeq = 0;
   let vImg = null, vUrl = null, vLoadingUrl = null, vLoading = null, vPending = null;
   let vMeta = null, vShownMs = 0, vTimes = [];
+  // Video also pauses while the camera box is scrolled fully out of view (after a short grace).
+  const OFFSCREEN_GRACE_MS = 2000;
+  let vOnScreen = true, vOffTimer = 0, updateCamera = () => {};
   // Live view starts off on every load and is never stored, so video only streams on demand
   // (a cloud relay bills by the byte); it stops by itself LIVE_VIEW_MAX_MS after the tap.
   const LIVE_VIEW_MAX_MS = 10 * 60 * 1000;
@@ -102,18 +110,25 @@
     const caption = h('p', 'hint video-caption', '—');
     const toggle = button('Start live view', 'btn', toggleLiveView), actions = h('div', 'actions');
     actions.append(toggle);
-    binds.push(v => {
+    // A decoded frame refreshes only this card; everything else waits for render().
+    updateCamera = (now = performance.now()) => {
       const open = vws !== null && vws.readyState === WebSocket.OPEN;
-      const showing = open && vUrl !== null && vMeta !== null && v.now - vShownMs <= VIDEO_STALE_MS;
+      const showing = open && vUrl !== null && vMeta !== null && now - vShownMs <= VIDEO_STALE_MS;
       if (vImg.hidden === showing) vImg.hidden = !showing;   // never keep showing a stale picture
       note.hidden = showing;
       setText(note, canVideo() && !liveView ? 'Live view off' : open && vShownMs > 0 ? 'Video stale' : 'No video');
-      setText(caption, videoCaption(v.now, open, showing));
+      setText(caption, videoCaption(now, open, showing));
       setText(toggle, liveView ? 'Stop live view' : 'Start live view');
       toggle.setAttribute('aria-pressed', String(liveView));
       toggle.classList.toggle('secondary', liveView);
       toggle.disabled = !canVideo();
-    });
+    };
+    binds.push(v => updateCamera(v.now));
+    // Any visible pixel counts as on screen; without IntersectionObserver the camera is always on screen.
+    if (typeof IntersectionObserver === 'function') {
+      new IntersectionObserver(entries => setOnScreen(entries[entries.length - 1].isIntersecting),
+        { threshold: 0 }).observe(box);
+    }
     return card('Camera', box, caption, actions);
   }
   function videoCaption(now, open, showing) {
@@ -602,45 +617,66 @@
     setStatus('Not paired');
     showPage('connection');
   }
-  async function checkIdentity() {
+  // Reads /v1/identity without touching shared state: {result: ok|unpaired|error, identity}.
+  async function fetchIdentity() {
     let r;
     try {
       r = await fetch('/v1/identity', { credentials: 'same-origin', cache: 'no-store', signal: deadline() });
-    } catch (_) { return 'error'; }
-    if (r.status === 401 || r.status === 403) { identity = null; unpaired = true; return 'unpaired'; }
-    if (!r.ok) return 'error';
+    } catch (_) { return { result: 'error' }; }
+    if (r.status === 401 || r.status === 403) return { result: 'unpaired' };
+    if (!r.ok) return { result: 'error' };
     let j;
-    try { j = await r.json(); } catch (_) { return 'error'; }
-    if (!isObj(j) || typeof j.id !== 'string' || !/^[A-Fa-f0-9-]{36}$/.test(j.id)) return 'error';
-    identity = { id: j.id, name: typeof j.name === 'string' && j.name.trim() ? j.name.slice(0, 80) : 'Jetson dashcam',
-      capabilities: isObj(j.capabilities) ? j.capabilities : {} };
-    unpaired = false;
-    return 'ok';
+    try { j = await r.json(); } catch (_) { return { result: 'error' }; }
+    if (!isObj(j) || typeof j.id !== 'string' || !/^[A-Fa-f0-9-]{36}$/.test(j.id)) return { result: 'error' };
+    return { result: 'ok', identity: { id: j.id,
+      name: typeof j.name === 'string' && j.name.trim() ? j.name.slice(0, 80) : 'Jetson dashcam',
+      capabilities: isObj(j.capabilities) ? j.capabilities : {} } };
+  }
+  function newAttempt() { idGen += 1; idCheck = null; verified = false; }
+  // One in-flight check per attempt, shared by telemetry and video; it resolves to 'stale' (and
+  // changes nothing) once a newer attempt has started.
+  function checkIdentity() {
+    if (idCheck) return idCheck;
+    const gen = idGen;
+    verified = false;
+    idCheck = fetchIdentity().then(({ result, identity: confirmed }) => {
+      if (gen !== idGen) return 'stale';
+      idCheck = null;
+      if (result === 'unpaired') { identity = null; unpaired = true; }
+      else if (result === 'ok') { identity = confirmed; unpaired = false; verified = true; }
+      return result;
+    });
+    return idCheck;
   }
 
   // ---- stream --------------------------------------------------------------
-  async function start() {
+  // A telemetry retry joins a check still in flight: it began after the last start()/stop(), so
+  // it belongs to this attempt, and two failing sockets then share one /v1/identity request.
+  async function start(fromRetry) {
     const e = ++epoch;
     clearTimeout(retryTimer); retryTimer = 0;
+    if (fromRetry && idCheck) verified = false;
+    else newAttempt();
     if (document.hidden) return setStatus('Disconnected');
     if (!ws) setStatus(identity ? 'Connecting' : 'Checking pairing');
     const result = await checkIdentity();
     if (e !== epoch) return;
-    syncVideo();
     if (result === 'ok') openSocket();
     else if (result === 'unpaired') { closeSocket(); setStatus('Not paired'); showPage('connection'); }
     else { closeSocket(); retryLater(e, 'Jetson unreachable · retrying'); }
+    syncVideo();   // after retryLater, so video waits for telemetry's next check instead of starting one
   }
   function retryLater(e, text) {
     setStatus(text);
     const delay = DELAYS[Math.min(attempt, DELAYS.length - 1)];
     attempt += 1;
     clearTimeout(retryTimer);
-    retryTimer = setTimeout(() => { retryTimer = 0; if (e === epoch) start(); }, delay * 1000);
+    retryTimer = setTimeout(() => { retryTimer = 0; if (e === epoch) start(true); }, delay * 1000);
   }
   function stop(text) {
     epoch += 1;
     clearTimeout(retryTimer); retryTimer = 0;
+    newAttempt();
     closeSocket();
     setStatus(text);
   }
@@ -706,7 +742,18 @@
   // u16 width, u16 height (all little-endian), then the JPEG.
   const canVideo = () => identity !== null && identity.capabilities.video === true;
   function videoWanted() {
-    return liveView && canVideo() && page === 'live' && !document.hidden && !signingOut;
+    return liveView && canVideo() && page === 'live' && !document.hidden && !signingOut && vOnScreen;
+  }
+  // Leaving the viewport pauses video only after OFFSCREEN_GRACE_MS; coming back reopens at
+  // once. Live view, its button and its 10-minute deadline are untouched either way.
+  function setOnScreen(visible) {
+    if (visible) {
+      clearTimeout(vOffTimer); vOffTimer = 0;
+      if (!vOnScreen) { vOnScreen = true; syncVideo(); updateCamera(); }
+    } else if (vOnScreen && !vOffTimer) {
+      vOffTimer = setTimeout(() => { vOffTimer = 0; vOnScreen = false; syncVideo(); updateCamera(); },
+        OFFSCREEN_GRACE_MS);
+    }
   }
   function toggleLiveView() {
     if (liveView) liveView = false;
@@ -736,7 +783,23 @@
       if (vws) closeVideo();
       return;
     }
-    if (!vws && !vTimer) openVideo();
+    if (vws || vTimer) return;
+    if (verified) openVideo();      // only for the current attempt's confirmed identity
+    else revalidate();
+  }
+  // A failed video upgrade carries no readable HTTP status, so /v1/identity decides: a rejected
+  // session ends live view, a device without video clears it (syncLiveView), and a confirmed
+  // device keeps the bounded backoff. A pending or scheduled telemetry check is shared instead.
+  function revalidate() {
+    verified = false;
+    if (!videoWanted() || idCheck || retryTimer) return;
+    checkIdentity().then(result => {
+      if (result === 'stale') return;   // a newer attempt decides
+      if (result === 'unpaired') { resetLiveView(); stop('Not paired'); showPage('connection'); return; }
+      if (result === 'error' && !vTimer) retryVideo();
+      syncVideo();
+      render();
+    });
   }
   function retryVideo() {
     clearTimeout(vTimer); vTimer = 0;
@@ -788,9 +851,11 @@
     });
     sock.addEventListener('close', () => {
       if (vws !== sock) return;
+      const delivered = vMsgMs > 0;
       vws = null;
       resetVideoFrames();
       retryVideo();
+      if (!delivered) revalidate();                 // failed upgrade or closed before any frame
       render();
     });
   }
@@ -815,7 +880,7 @@
     const next = vPending;
     vPending = null;
     if (next) loadFrame(next);
-    render();
+    updateCamera();
   }
 
   // ---- wake lock -----------------------------------------------------------
