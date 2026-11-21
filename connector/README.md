@@ -602,6 +602,8 @@ See [VALIDATION.md](VALIDATION.md) for the checks performed for this implementat
 
 ## Cloud uplink library (Plan A)
 
+For the pilot prerequisites, Firebase setup, Android signing configuration and first mobile-data test, see the [Google Cloud integration guide](GOOGLE_CLOUD_SETUP.md).
+
 For native Jetson integration, [libclouduplink](../lib/libclouduplink/README.md)
 provides the C++17 static library, event-loop contract and build instructions.
 
