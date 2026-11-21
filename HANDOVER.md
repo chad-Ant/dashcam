@@ -484,7 +484,11 @@ video 948 → 757 frames/min and 53.4 → 50.1 % CPU; System tab 204 → 107 fra
 (`connector/VALIDATION.md`); "janky" is against 120 Hz and only 1–4 vsyncs/min were missed. Each video frame still
 cost ~19 ms of UI-thread Compose work, so the next commit draws video in a `SurfaceView` (`CameraSurface.kt`, plain
 `AndroidView`, not `AndroidExternalSurface`, whose reusable view stops drawing after LazyColumn item reuse in
-foundation 1.9) from a background collector; frame metadata reaches the caption at ~2 Hz. Uncompiled when pushed.
+foundation 1.9) from a background collector; frame metadata reaches the caption at ~2 Hz. Uncompiled when pushed;
+**then built on Windows and measured on the A54:** Live with video 53.5 → **40.2 % CPU**, median frame 18 → **6 ms**
+against the baseline (non-debuggable, alternating); visual checks passed (rounded corners, scroll away/back x3,
+banner overlap, Stop clears). Left for the Android side: decode cost (hardware bitmaps, or `inBitmap` only if the
+surface is shown to have finished with a frame before reuse), the agent's dead-socket linger and reconnect-on-network-available.
 
 **Next:** build and test on Windows (`.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`),
 install on the A54, then `adb shell dumpsys gfxinfo com.dashcam.connector reset`, a minute on Live with live view on,

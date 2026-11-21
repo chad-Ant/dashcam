@@ -218,6 +218,23 @@ so the cost is CPU (battery, heat), not visible stutter. The debug builds had ex
 cost. Per-card state halves redraws and cuts CPU by a third on telemetry pages; on Live each video frame still costs
 ~19 ms of UI-thread Compose work, which the SurfaceView change after this addresses.
 
+**SurfaceView video (`c3a8b85`), same benchmark, alternating with the baseline, 60 s on Live with video:**
+
+| | Baseline (`perf-baseline`) | `c3a8b85` |
+|---|---:|---:|
+| App CPU | 53.3 %, 53.7 % | **40.2 %, 40.3 %** |
+| Median frame | 18 ms | **6 ms** |
+| "Janky" (120 Hz) | 88.2 %, 88.3 % | 23.7 %, 23.8 % |
+| Frames / 60 s | 943, 943 | 799, 791 |
+
+Video frames no longer go through Compose (the remaining frame count includes the surface's own hardware-canvas
+draws, ~6 ms each). Screenshots on the A54: the picture streams with rounded corners; scrolling the card away and
+back three times closed and reopened video each time and the picture returned every time (the LazyColumn reuse
+case that rules out `AndroidExternalSurface`); the sticky banner covers the picture when it scrolls under it; Stop
+clears the picture to the "Live view off" box. The remaining ~40 % is mostly JPEG decode, TLS/WebSocket and GC.
+(Play Protect's "send app for a security check?" dialog can appear on an adb install and cover the app; benchmark
+runs must check the focused window.)
+
 ## Remaining physical acceptance
 
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.
