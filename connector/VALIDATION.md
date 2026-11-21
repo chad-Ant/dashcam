@@ -140,6 +140,32 @@ while someone watches (one shared converter), memory unchanged (29 MB); agent 1 
 fps (15 kB) and 5 snapshots/s. With the ES3C28P display preview also on (15 fps): recording 30.0 fps, v0.4 57.5 %
 CPU with two viewers. Details: HANDOVER, 2026-11-20 local tests.
 
+## Two-client soak on the Jetson — 2026-11-21 (A54 app + laptop browser)
+
+2 h (09:27–11:30), Galaxy A54 (Android 16) on Live and the laptop's Firefox on Live, v0.4 with the UGREEN,
+C3 and the ES3C28P preview at 15 fps; 10 s samples. Data: `~/drive_logs/connector_soak_20261121/` (not in git).
+
+| Check | Result |
+|---|---|
+| Agent | one process; CPU 3.0 % mean, max 3.8 %; RSS 49 → 42 MB; fds back to baseline after each disconnect; journal empty |
+| v0.4 | CPU 48.5 % mean (display + 2 viewers); RSS 36–41 MB; recording 220,235 frames (30 fps = 220,260); 45 segments 179–180 s apart |
+| Display | one session, 0 resets |
+| A54 | ~111 min connected; video 78 KiB/s mean; disconnects only from leaving Wi-Fi and one Home gesture |
+| Laptop | ~120 min connected; video 80 KiB/s mean, min 69; no stalls; reconnects only when the tab was hidden or covered |
+
+Open: dead client sockets linger ~2¾ min on the agent after a silent loss; the app does not reconnect as soon as
+Wi-Fi returns; Android rendering is heavy (A54 `gfxinfo`: median 19 ms, 89 % janky), reworked in the same commit
+as this section and not yet measured.
+
+## Live view toggle — 2026-11-21 (software)
+
+Web, headless Firefox 157 against a simulator agent, all passed twice: off on load (no `/v1/video` for 15 s);
+Start opens video with "· stops in 10 min"; Stop closes it in 0.02 s and clears the picture; tab switch closes and
+reopens; clock advanced 10 min + 1 s stops it with the "stopped after 10 min" caption, and Start gives a fresh
+window; reload is off again; the picture has `pointer-events: none` and is not draggable; 20 rapid taps leave the
+matching socket count and no console errors. Android: static review plus `LiveViewTest` (7 JUnit tests), **not
+compiled yet**.
+
 ## Remaining physical acceptance
 
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.

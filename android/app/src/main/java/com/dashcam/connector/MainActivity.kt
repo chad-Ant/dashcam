@@ -21,14 +21,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import org.json.JSONObject
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -71,15 +73,17 @@ private val marks = listOf("◉", "↗", "▥", "⌁")
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onPermission: () -> Unit) {
-    val state by model.repository.state.collectAsStateWithLifecycle()
+    // Handed to the cards unread: a snapshot (5 Hz) or clock tick (2 Hz) recomposes
+    // only the cards whose values change, never the whole page.
+    val state = model.repository.state.collectAsStateWithLifecycle()
     val profiles by model.profiles.collectAsStateWithLifecycle()
     val selected by model.selected.collectAsStateWithLifecycle()
-    val video by model.repository.video.collectAsStateWithLifecycle()
     var page by remember { mutableIntStateOf(if (profiles.isEmpty()) 3 else 0) }
     var awake by remember { mutableStateOf(false) }
-    LaunchedEffect(awake, state.active) { onKeepAwake(awake && state.active) }
-    // Camera frames stream only while Live is shown; foreground and device
-    // selection are gated by the repository (setActive from onStart/onStop).
+    val connected = state.derive { active }
+    LaunchedEffect(awake, connected) { onKeepAwake(awake && connected) }
+    // Camera frames stream only while Live is shown; foreground, device
+    // selection and the live view toggle are gated by the repository.
     DisposableEffect(page) {
         model.repository.setVideoWanted(page == 0)
         onDispose { model.repository.setVideoWanted(false) }
@@ -110,63 +114,33 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     stickyHeader { Box(Modifier.background(MaterialTheme.colorScheme.background).padding(bottom = 4.dp)) { ConnectionBanner(state) } }
-                    if (page == 3) {
-                        item { ConnectionPanel(model, onPermission) }
-                        item { SurfaceCard("Display") {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Keep screen on while connected", Modifier.weight(1f))
-                                Switch(checked = awake, onCheckedChange = { awake = it })
-                            }
-                            Hint("Monitoring pauses when the app is in the background.")
-                        } }
-                    } else {
-                        val runtime = state.snapshot?.runtime?.takeIf { state.runtimeFresh }
-                        val vehicle = state.snapshot?.vehicle?.takeIf { state.runtimeFresh }
-                        val system = state.snapshot?.system?.takeIf { state.transportFresh }
-                        when (page) {
-                            0 -> {
-                                item { CameraCard(video) }
-                                item { SpeedCard(vehicle, runtime) }
-                                item { AdaptivePair(wide, {
-                                    SurfaceCard("Recording") {
-                                        BigValue(when { runtime == null -> "Unavailable"; runtime.optBoolean("recording") -> "Recording"; else -> "Waiting" })
-                                        Metric("Actual frame rate", runtime.finite("fps"), "fps", 1)
-                                        Metric("Frames in session", runtime.finite("frames"), "", 0)
-                                    }
-                                }, { AdasCard() }) }
-                                item { AdaptivePair(wide, { PositionCard(vehicle) }, { HealthSummary(system) }) }
-                            }
-                            1 -> {
-                                item { SpeedCard(vehicle, runtime) }
-                                item { MapCard(model.map, model.tiles) }
-                                item { AdaptivePair(wide, { SurfaceCard("Powertrain") {
-                                    Metric("Engine speed", vehicle.finite("rpm"), "rpm", 0)
-                                    Metric("Coolant", vehicle.finite("coolant_c"), "°C", 1)
-                                    Metric("Fuel level", vehicle.finite("fuel_percent"), "%", 1)
-                                    Metric("Throttle", vehicle.finite("throttle_percent"), "%", 1)
-                                    Metric("Engine load", vehicle.finite("engine_load_percent"), "%", 1)
-                                } }, { PositionCard(vehicle) }) }
-                                item { SurfaceCard("Telemetry link") {
-                                    BigValue(when { runtime == null -> "Runtime unavailable"; runtime.optBoolean("bridge_fresh") -> "Fresh"; else -> "No fresh bridge data" })
-                                    Metric("Bridge sample age", runtime.finite("bridge_age_ms"), "ms", 0)
-                                    Hint("Missing or stale sensor readings display as —.")
-                                } }
-                            }
-                            2 -> {
-                                item { AdaptivePair(wide, { HealthSummary(system) }, { SurfaceCard("Memory & storage") {
-                                    Metric("RAM used", system.finite("ram_used_bytes")?.div(1073741824), "GiB", 2)
-                                    Metric("RAM total", system.finite("ram_total_bytes")?.div(1073741824), "GiB", 2)
-                                    Metric("Swap used", system.finite("swap_used_bytes")?.div(1073741824), "GiB", 2)
-                                    Metric("Footage disk free", system.finite("storage_free_bytes")?.div(1073741824), "GiB", 1)
-                                    Metric("Footage disk total", system.finite("storage_total_bytes")?.div(1073741824), "GiB", 1)
-                                } }) }
-                                item { SurfaceCard("Temperatures") {
-                                    val temperatures = system?.optJSONObject("temperatures_c")
-                                    if (temperatures == null || temperatures.length() == 0) Hint("Temperature sensors unavailable")
-                                    else temperatures.keys().asSequence().sorted().take(64).forEach { Metric(it, temperatures.finite(it), "°C", 1) }
-                                } }
-                                item { AdasCard() }
-                            }
+                    when (page) {
+                        0 -> {
+                            item { CameraCard(model.repository) }
+                            item { SpeedCard(state) }
+                            item { AdaptivePair(wide, { RecordingCard(state) }, { AdasCard() }) }
+                            item { AdaptivePair(wide, { PositionCard(state) }, { HealthSummary(state) }) }
+                        }
+                        1 -> {
+                            item { SpeedCard(state) }
+                            item { MapCard(model.map, model.tiles) }
+                            item { AdaptivePair(wide, { PowertrainCard(state) }, { PositionCard(state) }) }
+                            item { TelemetryLinkCard(state) }
+                        }
+                        2 -> {
+                            item { AdaptivePair(wide, { HealthSummary(state) }, { MemoryCard(state) }) }
+                            item { TemperaturesCard(state) }
+                            item { AdasCard() }
+                        }
+                        3 -> {
+                            item { ConnectionPanel(model, onPermission) }
+                            item { SurfaceCard("Display") {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Keep screen on while connected", Modifier.weight(1f))
+                                    Switch(checked = awake, onCheckedChange = { awake = it })
+                                }
+                                Hint("Monitoring pauses when the app is in the background.")
+                            } }
                         }
                     }
                     item { Spacer(Modifier.height(8.dp)) }
@@ -176,15 +150,40 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     }
 }
 
-@Composable private fun ConnectionBanner(state: MonitorState) {
-    val color = if (state.transportFresh) MaterialTheme.colorScheme.primary else Color(0xFFFFCA80)
+// derivedStateOf: the caller recomposes only when the computed value changes,
+// not on every new snapshot or clock tick. calc must return a value with
+// structural equality (strings, numbers, data classes, lists), never a JSONObject.
+@Composable private fun <S, T> State<S>.derive(calc: S.() -> T): T =
+    remember(this, calc) { derivedStateOf { value.calc() } }.value
+
+// Freshness gating for the cards: recorder values only while the runtime is
+// fresh, host health while the transport is.
+private val MonitorState.freshRuntime get() = snapshot?.runtime?.takeIf { runtimeFresh }
+private val MonitorState.freshVehicle get() = snapshot?.vehicle?.takeIf { runtimeFresh }
+private val MonitorState.freshSystem get() = snapshot?.system?.takeIf { transportFresh }
+
+// Holds the formatted text, not the raw Double: a row recomposes only when what it shows changes.
+private data class MetricValue(val label: String, val text: String) {
+    constructor(label: String, value: Double?, unit: String, decimals: Int) :
+        this(label, if (value == null) "—" else String.format(Locale.US, "%.${decimals}f", value) + if (unit.isBlank()) "" else " $unit")
+}
+private data class StatusUi(val headline: String, val rows: List<MetricValue>)
+private data class SpeedUi(val speed: String, val source: String, val acceleration: MetricValue)
+private data class BannerUi(val fresh: Boolean, val title: String, val detail: String?)
+
+@Composable private fun ConnectionBanner(state: State<MonitorState>) {
+    val ui = state.derive {
+        BannerUi(transportFresh,
+            if (active && lastReceiveMs > 0 && !transportFresh) "Data stale · waiting for Jetson" else status,
+            if (!transportFresh) null
+            else if (runtimeFresh) "Updated ${((nowMs - lastReceiveMs).coerceAtLeast(0) / 1000.0).let { "%.1f".format(Locale.US, it) }} s ago"
+            else "System health available; recorder data has expired")
+    }
+    val color = if (ui.fresh) MaterialTheme.colorScheme.primary else Color(0xFFFFCA80)
     Surface(color = color.copy(alpha = .1f), shape = RoundedCornerShape(16.dp)) {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Text("●  " + if (state.active && state.lastReceiveMs > 0 && !state.transportFresh) "Data stale · waiting for Jetson" else state.status,
-                color = color, fontWeight = FontWeight.SemiBold)
-            if (state.transportFresh) Text(
-                if (state.runtimeFresh) "Updated ${((state.nowMs - state.lastReceiveMs).coerceAtLeast(0) / 1000.0).let { "%.1f".format(Locale.US, it) }} s ago"
-                else "System health available; recorder data has expired", style = MaterialTheme.typography.bodySmall)
+            Text("●  " + ui.title, color = color, fontWeight = FontWeight.SemiBold)
+            ui.detail?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
     }
 }
@@ -203,55 +202,168 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
 }
 @Composable private fun BigValue(value: String) { Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold) }
 @Composable internal fun Hint(value: String) { Text(value, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
-@Composable private fun Metric(label: String, value: Double?, unit: String, decimals: Int = 1) {
+@Composable private fun Metric(label: String, text: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(label, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(if (value == null) "—" else String.format(Locale.US, "%.${decimals}f", value) + if (unit.isBlank()) "" else " $unit", fontWeight = FontWeight.Medium)
+        Text(text, fontWeight = FontWeight.Medium)
     }
 }
-@Composable private fun SpeedCard(vehicle: JSONObject?, runtime: JSONObject?) {
+// Each Metric skips unless its own row changed.
+@Composable private fun Metrics(rows: List<MetricValue>) { rows.forEach { Metric(it.label, it.text) } }
+@Composable private fun SpeedCard(state: State<MonitorState>) {
+    val ui = state.derive {
+        val vehicle = freshVehicle
+        SpeedUi(vehicle.finite("speed_kmh")?.let { "%.1f".format(Locale.US, it) } ?: "—",
+            if (vehicle != null) "Source: ${vehicle.optString("speed_source", "Unavailable")}" else if (freshRuntime == null) "Waiting for recorder telemetry" else "Waiting for a fresh vehicle source",
+            MetricValue("Acceleration", vehicle.finite("acceleration_ms2"), "m/s²", 2))
+    }
     SurfaceCard("Vehicle speed") {
         Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(vehicle.finite("speed_kmh")?.let { "%.1f".format(Locale.US, it) } ?: "—",
-                fontSize = 64.sp, fontWeight = FontWeight.Light, color = MaterialTheme.colorScheme.primary)
+            Text(ui.speed, fontSize = 64.sp, fontWeight = FontWeight.Light, color = MaterialTheme.colorScheme.primary)
             Text("km/h", Modifier.padding(bottom = 12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Hint(if (vehicle != null) "Source: ${vehicle.optString("speed_source", "Unavailable")}" else if (runtime == null) "Waiting for recorder telemetry" else "Waiting for a fresh vehicle source")
-        Metric("Acceleration", vehicle.finite("acceleration_ms2"), "m/s²", 2)
+        Hint(ui.source)
+        Metric(ui.acceleration.label, ui.acceleration.text)
     }
 }
-@Composable private fun CameraCard(video: VideoState) { SurfaceCard("Camera") {
-    val frame = video.frame?.takeUnless { video.stale }
-    Box(Modifier.align(Alignment.CenterHorizontally).widthIn(max = 720.dp).fillMaxWidth().aspectRatio(16f / 9f)
-        .clip(RoundedCornerShape(14.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
-        if (frame != null) Image(bitmap = frame.image, contentDescription = "Dashcam camera",
-            modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-        else Text(if (video.frame != null) "Video stale" else "No video",
-            color = Color(0xFFFFCA80), fontWeight = FontWeight.SemiBold)
+@Composable private fun RecordingCard(state: State<MonitorState>) {
+    val ui = state.derive {
+        val runtime = freshRuntime
+        StatusUi(when { runtime == null -> "Unavailable"; runtime.optBoolean("recording") -> "Recording"; else -> "Waiting" },
+            listOf(MetricValue("Actual frame rate", runtime.finite("fps"), "fps", 1),
+                MetricValue("Frames in session", runtime.finite("frames"), "", 0)))
     }
+    SurfaceCard("Recording") {
+        BigValue(ui.headline)
+        Metrics(ui.rows)
+    }
+}
+@Composable private fun TelemetryLinkCard(state: State<MonitorState>) {
+    val ui = state.derive {
+        val runtime = freshRuntime
+        StatusUi(when { runtime == null -> "Runtime unavailable"; runtime.optBoolean("bridge_fresh") -> "Fresh"; else -> "No fresh bridge data" },
+            listOf(MetricValue("Bridge sample age", runtime.finite("bridge_age_ms"), "ms", 0)))
+    }
+    SurfaceCard("Telemetry link") {
+        BigValue(ui.headline)
+        Metrics(ui.rows)
+        Hint("Missing or stale sensor readings display as —.")
+    }
+}
+@Composable private fun PowertrainCard(state: State<MonitorState>) {
+    val rows = state.derive {
+        val vehicle = freshVehicle
+        listOf(MetricValue("Engine speed", vehicle.finite("rpm"), "rpm", 0),
+            MetricValue("Coolant", vehicle.finite("coolant_c"), "°C", 1),
+            MetricValue("Fuel level", vehicle.finite("fuel_percent"), "%", 1),
+            MetricValue("Throttle", vehicle.finite("throttle_percent"), "%", 1),
+            MetricValue("Engine load", vehicle.finite("engine_load_percent"), "%", 1))
+    }
+    SurfaceCard("Powertrain") { Metrics(rows) }
+}
+@Composable private fun MemoryCard(state: State<MonitorState>) {
+    val rows = state.derive {
+        val system = freshSystem
+        listOf(MetricValue("RAM used", system.finite("ram_used_bytes")?.div(1073741824), "GiB", 2),
+            MetricValue("RAM total", system.finite("ram_total_bytes")?.div(1073741824), "GiB", 2),
+            MetricValue("Swap used", system.finite("swap_used_bytes")?.div(1073741824), "GiB", 2),
+            MetricValue("Footage disk free", system.finite("storage_free_bytes")?.div(1073741824), "GiB", 1),
+            MetricValue("Footage disk total", system.finite("storage_total_bytes")?.div(1073741824), "GiB", 1))
+    }
+    SurfaceCard("Memory & storage") { Metrics(rows) }
+}
+@Composable private fun TemperaturesCard(state: State<MonitorState>) {
+    val rows = state.derive {
+        val temperatures = freshSystem?.optJSONObject("temperatures_c")
+        if (temperatures == null || temperatures.length() == 0) emptyList<MetricValue>()
+        else temperatures.keys().asSequence().sorted().take(64).map { MetricValue(it, temperatures.finite(it), "°C", 1) }.toList()
+    }
+    SurfaceCard("Temperatures") {
+        if (rows.isEmpty()) Hint("Temperature sensors unavailable") else Metrics(rows)
+    }
+}
+@Composable private fun CameraCard(repository: MonitorRepository) {
+    // Collected here, not in Dashboard: frames (~10 Hz) and the countdown reach only this card.
+    val video = repository.video.collectAsStateWithLifecycle()
+    val live = repository.liveView.collectAsStateWithLifecycle()
+    SurfaceCard("Camera") {
+        CameraPicture(video, live, Modifier.align(Alignment.CenterHorizontally))
+        CameraHint(video, live)
+        LiveViewButton(live) { repository.setLiveView(it) }
+    }
+}
+private fun shownFrame(video: VideoState, live: LiveViewState) = video.frame?.takeUnless { video.stale }?.takeIf { live.on }
+@Composable private fun CameraPicture(video: State<VideoState>, live: State<LiveViewState>, modifier: Modifier) {
+    val frame by remember(video, live) { derivedStateOf { shownFrame(video.value, live.value) } }
+    val placeholder by remember(video, live) { derivedStateOf {
+        val v = video.value
+        val l = live.value
+        when { !l.available -> "No video"; !l.on -> "Live view off"; v.frame != null -> "Video stale"; else -> "No video" }
+    } }
+    Box(modifier.widthIn(max = 720.dp).fillMaxWidth().aspectRatio(16f / 9f)
+        .clip(RoundedCornerShape(14.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
+        val shown = frame
+        // Image already paints in its own clipToBounds layer; this one makes that isolation explicit
+        // (a new frame re-records only the picture) instead of relying on Image internals.
+        if (shown != null) Image(bitmap = shown.image, contentDescription = "Dashcam camera",
+            modifier = Modifier.fillMaxSize().graphicsLayer {}, contentScale = ContentScale.Fit)
+        else Text(placeholder, color = Color(0xFFFFCA80), fontWeight = FontWeight.SemiBold)
+    }
+}
+@Composable private fun CameraHint(video: State<VideoState>, live: State<LiveViewState>) {
+    val text by remember(video, live) { derivedStateOf { cameraHint(video.value, live.value) } }
+    Hint(text)
+}
+private fun cameraHint(video: VideoState, live: LiveViewState): String {
+    val frame = shownFrame(video, live)
     val lastFrame = video.frame
-    Hint(if (frame == null) {
+    return when {
+        !live.available -> video.status   // no Jetson selected, no video, or credential/certificate rejected
+        !live.on -> if (live.stoppedByTimer) "Live view stopped after ${LIVE_VIEW_MAX_MS / 60_000} min · tap Start live view to resume"
+            else "Live view off · tap Start live view to watch"
         // Stale on an open socket: say so rather than repeating "Live".
-        if (lastFrame != null) "No camera frames for ${(video.nowMs - lastFrame.receivedAtMs) / 1000} s" else video.status
-    } else buildString {
-        append("${frame.width}×${frame.height}")
-        frame.fps?.let { append(String.format(Locale.US, " · %.1f fps", it)) }
-        append(" · ${frame.ageMs} ms old")
-    })
-} }
-@Composable private fun PositionCard(vehicle: JSONObject?) { SurfaceCard("GNSS position") {
-    Metric("Latitude", vehicle.finite("latitude"), "°", 6)
-    Metric("Longitude", vehicle.finite("longitude"), "°", 6)
-    Metric("Heading", vehicle.finite("heading_deg"), "°", 1)
-    Metric("Altitude", vehicle.finite("altitude_m"), "m", 1)
-    Metric("Satellites", vehicle.finite("satellites"), "", 0)
-} }
-@Composable private fun HealthSummary(system: JSONObject?) { SurfaceCard("Jetson health") {
-    Metric("CPU utilization", system.finite("cpu_percent"), "%", 1)
-    Metric("GPU utilization", system.finite("gpu_percent"), "%", 1)
-    Metric("Uptime", system.finite("uptime_s")?.div(3600), "h", 1)
-    Hint("Host measurements · unsupported counters display as —")
-} }
+        frame == null -> (if (lastFrame != null) "No camera frames for ${(video.nowMs - lastFrame.receivedAtMs) / 1000} s" else video.status) +
+            " · ${liveViewRemaining(live.remainingMs)}"
+        else -> buildString {
+            append("${frame.width}×${frame.height}")
+            frame.fps?.let { append(String.format(Locale.US, " · %.1f fps", it)) }
+            append(" · ${frame.ageMs} ms old")
+            append(" · ${liveViewRemaining(live.remainingMs)}")
+        }
+    }
+}
+@Composable private fun LiveViewButton(live: State<LiveViewState>, onLiveView: (Boolean) -> Unit) {
+    // The countdown ticks every second; the button changes only with on/available.
+    val isOn = live.derive { on }
+    val canStart = live.derive { available }
+    OutlinedButton(onClick = { onLiveView(!isOn) }, enabled = canStart,
+        modifier = Modifier.semantics { stateDescription = if (isOn) "Live view on" else "Live view off" }) {
+        Text(if (isOn) "Stop live view" else "Start live view")
+    }
+}
+@Composable private fun PositionCard(state: State<MonitorState>) {
+    val rows = state.derive {
+        val vehicle = freshVehicle
+        listOf(MetricValue("Latitude", vehicle.finite("latitude"), "°", 6),
+            MetricValue("Longitude", vehicle.finite("longitude"), "°", 6),
+            MetricValue("Heading", vehicle.finite("heading_deg"), "°", 1),
+            MetricValue("Altitude", vehicle.finite("altitude_m"), "m", 1),
+            MetricValue("Satellites", vehicle.finite("satellites"), "", 0))
+    }
+    SurfaceCard("GNSS position") { Metrics(rows) }
+}
+@Composable private fun HealthSummary(state: State<MonitorState>) {
+    val rows = state.derive {
+        val system = freshSystem
+        listOf(MetricValue("CPU utilization", system.finite("cpu_percent"), "%", 1),
+            MetricValue("GPU utilization", system.finite("gpu_percent"), "%", 1),
+            MetricValue("Uptime", system.finite("uptime_s")?.div(3600), "h", 1))
+    }
+    SurfaceCard("Jetson health") {
+        Metrics(rows)
+        Hint("Host measurements · unsupported counters display as —")
+    }
+}
 @Composable private fun AdasCard() { SurfaceCard("ADAS") {
     BigValue("Not available")
     Hint("Lane detection and driver monitoring are unavailable on this Jetson.")

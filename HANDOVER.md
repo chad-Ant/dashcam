@@ -100,7 +100,10 @@ This file has three parts:
     the agent is deployed (systemd, real data); the web client passed on the laptop and the app on the S25 Ultra;
     the Vehicle page gained a map (web harness-tested, Android uncompiled); see those log sections. Left: Android map
     build and test on Windows, map with real tiles on the laptop; two physical viewers (phone + laptop) on the car network.
-    Camera video with the UGREEN and a two-viewer load passed locally on the Jetson (2026-11-20 local tests).** Original list: install the host
+    Camera video with the UGREEN and a two-viewer load passed locally on the Jetson (2026-11-20 local tests).
+    2026-11-21: a 2-hour soak with the A54 app and the laptop browser passed on the Jetson side; live view toggle
+    (10-min auto-stop) and an Android rendering rework added, Android not compiled yet: build/test on Windows and
+    compare `gfxinfo` on the A54 (2026-11-21 log section).** Original list: install the host
     agent (venv, `service.py init`, `service.env` with `LAN_ADDRESS` and the host footage path), enable
     `dashcam-monitor.service` (sudo), add `--volume /run/dashcam-monitor:/run/dashcam-monitor` to the v0.4 launcher and
     `<MonitoringEnabled>true</MonitoringEnabled>` to the deployed config, pair the phone and tablet. Then the physical
@@ -415,6 +418,61 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-21 (Jetson, bench): two-client soak; live view toggle; Android rendering
+
+**Soak, 09:27–11:30** (agent `dashcam-monitor` from the working tree at `d68f3ee`, v0.4 with the UGREEN 1080p30,
+C3 bridge, `<DisplayPreview>` 15 fps). Clients: Galaxy A54 (Android 16, app on Live) at 192.168.0.107 and the
+laptop's Firefox (Live tab) at 192.168.0.165. A monitor sampled every 10 s: agent and v0.4 CPU/RSS/threads/fds,
+bytes acknowledged per client socket (`ss -ti`), snapshot freshness, recording fps, temperature. Data, timeline of
+user actions and results: `~/drive_logs/connector_soak_20261121/` (`soak.jsonl`, `NOTES.txt`, `soak_monitor.py`).
+- **Jetson side clean:** agent one process, CPU 3.0 % mean (max 3.8), RSS 49→42 MB, fds back to baseline after each
+  disconnect, nothing in its journal; v0.4 CPU 48.5 % mean (display 15 fps + 2 viewers), RSS 36–41 MB; recording
+  220,235 frames against 220,260 for 30 fps, 45 segments 179–180 s apart; display one session, 0 resets (the
+  2026-11-20 HWCDC fix holds); tj 49.6–50.5 °C.
+- **Clients:** A54 connected ~111 of 120 min, video 78 KiB/s mean; laptop ~120 min, 80 KiB/s, never below 69, no
+  stalls. Every disconnect had a user-side cause: the browser closes both sockets when the tab is hidden, and on
+  Windows a fully covered window counts as hidden; the A54 left Wi-Fi once (Samsung Intelligent Wi-Fi switched to
+  mobile data, 09:40–09:44); a Home gesture backgrounded the app once (events log `startDockOrHome`,
+  `userLeaving=true`; `exit-info` shows no process death, so not a crash).
+- **Found, not fixed yet:** (1) after a client vanishes without closing, the agent's dead sockets stayed ESTABLISHED
+  ~2¾ min (`transport.close()` waits for unsent data; abort instead). (2) The Android app retries on its 1–15 s
+  backoff and does not reconnect as soon as Wi-Fi returns (25–30 s here). (3) On the car network (no internet) Samsung
+  may prefer mobile data: check in the car that the app still reaches 192.168.0.138 over Wi-Fi.
+- **Android rendering, measured on the A54:** `gfxinfo` 109,883 frames, 89 % janky, median 19 ms, 97,566 slow UI
+  thread (GPU ~4 ms); about half a CPU core; ~15 full-window redraws/s (10 video frames + 5 snapshots, plus the 2 Hz
+  clock tick), because `Dashboard` collected state, video and live view at the top and cards took `JSONObject`s.
+  Memory 292 MB PSS streaming (179 Bitmaps / 80 MB, ~106 MB GL) and 90 MB / 2 Bitmaps in the background: churn,
+  not a leak.
+
+**Live view toggle (web + Android), uncommitted at the time of writing, then committed with this section.** For a
+low or zero cloud bill, video streams only on explicit demand: a **Start/Stop live view** button on the Camera card,
+off on every page load / app process, never persisted, and **auto-stop 10 min after the tap** (monotonic clock checked
+on the tick; web also counts device sleep via the wall clock). Video additionally needs the Live tab and a visible
+page / foreground app, as before; telemetry is unaffected; it turns off on device change, sign-out/unpair and on a
+rejected credential (401), no video (404) or a certificate failure (Android also disables the button with the
+reason). Web: the live picture no longer offers Save/Copy Image or dragging (`pointer-events: none`,
+`draggable = false`; Firefox offers Save Image on a canvas too, so no canvas). Web verified end to end in headless
+Firefox 157 against a simulator agent (8 checks, two full runs; test kept in the session scratchpad only). Android:
+static review only (no JDK on the Jetson) plus `LiveViewTest` (7 JUnit tests).
+
+**Android rendering rework (same commit):** `Dashboard` passes the `State` objects down without reading them, and
+each card derives the text it shows (`State.derive` = `derivedStateOf`, rows hold formatted strings), so a card
+recomposes only when its displayed text changes; `CameraCard` collects video and live view itself (picture,
+caption and button in separate scopes). Expected when parked with live view on: `Dashboard` 0/s, the picture ~10/s,
+the connection banner up to ~7/s ("Updated x.x s ago"), other cards only on a visible change. Decoded frames use a
+3-buffer `inBitmap` pool (`FramePool` in `MonitorRepository.kt`): a buffer is reused only 100 ms after a newer frame
+replaced it on screen, otherwise a fresh bitmap is allocated; size change drops the pool (never `recycle()`); a
+failed reuse falls back to a plain decode. Reviewed statically in three passes (compiler/Compose, rendering and
+pool safety, text parity with the old cards); two real findings fixed (a frame burst could overwrite the
+on-screen bitmap; rows compared raw numbers). Not compiled. If the picture ever tears, raise `REUSE_AFTER_MS`
+or the pool size.
+
+**Next:** build and test on Windows (`.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`),
+install on the A54, then `adb shell dumpsys gfxinfo com.dashcam.connector reset`, a minute on Live with live view on,
+and `dumpsys gfxinfo` again to compare with the numbers above; right-click the web picture once on the laptop;
+controlled tests with the Jetson watching (phone Wi-Fi off/on, lock vs Home, router WAN unplugged); then fix (1) and
+(2) above.
 
 ## 2026-11-20 — Remote dashboard plans, Plan A libraries and Firebase setup
 

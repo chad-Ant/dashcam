@@ -31,6 +31,13 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     val state = mutable.asStateFlow()
     private val videoMutable = MutableStateFlow(VideoState())
     val video = videoMutable.asStateFlow()
+    private val liveMutable = MutableStateFlow(LiveViewState())
+    val liveView = liveMutable.asStateFlow()
+    private val liveSession = LiveViewSession()
+    private var liveTicker: Job? = null
+    // Why live view cannot work with the selected device (no video, rejected
+    // credential, certificate mismatch); null while it can. Cleared on select.
+    private var videoUnavailable: String? = null
     private var task: Job? = null
     private var socket: WebSocket? = null
     private var videoTask: Job? = null
@@ -60,7 +67,12 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             }
         }
     }
-    fun select(profile: DeviceProfile?) { desired = profile; restart() }
+    fun select(profile: DeviceProfile?) {
+        // Another device or credential never inherits the previous live view.
+        if (profile != desired) endLiveView()
+        videoUnavailable = null
+        desired = profile; restart()
+    }
     fun setActive(value: Boolean) {
         active = value
         if (value && !registered) {
@@ -80,12 +92,44 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         videoWanted = value
         restartVideo()
     }
+    // The user's Start/Stop: video additionally needs this, inside its window.
+    fun setLiveView(on: Boolean) {
+        endLiveView()
+        if (on && desired != null && videoUnavailable == null) {
+            liveSession.start(SystemClock.elapsedRealtime())
+            // Runs only while live view is on; refreshes the remaining time and
+            // ends the window by the clock, however late a tick runs.
+            liveTicker = scope.launch {
+                while (isActive) {
+                    delay(1000)
+                    val now = SystemClock.elapsedRealtime()
+                    if (liveSession.isOn(now)) publishLiveView(now)
+                    else { liveTicker = null; restartVideo(); return@launch }
+                }
+            }
+        }
+        restartVideo()
+    }
+    private fun endLiveView() { liveTicker?.cancel(); liveTicker = null; liveSession.stop() }
+    // Live view cannot work until another device or credential is selected: off, video closed, and the button disabled.
+    private fun disableLiveView(reason: String) {
+        videoUnavailable = reason; endLiveView(); restartVideo()
+    }
+    // A pin/validity check that failed (trust manager or hostname verifier). Conscrypt also
+    // reports ordinary resets and roams as SSLException, which must not count as a lost identity.
+    private fun SSLException.isCertificateFailure() = this is SSLPeerUnverifiedException ||
+        generateSequence<Throwable>(this) { it.cause }.any { it is java.security.cert.CertificateException }
+    private fun publishLiveView(now: Long) {
+        val remaining = liveSession.remainingMs(now)
+        liveMutable.value = LiveViewState(remaining > 0, liveSession.stoppedByTimer, remaining, desired != null && videoUnavailable == null)
+    }
     fun close() {
         active = false
         generation.incrementAndGet()
         videoGeneration.incrementAndGet()
         task?.cancel(); socket?.cancel()
         videoTask?.cancel(); videoSocket?.cancel()
+        liveTicker?.cancel()
         if (registered) connectivity.unregisterNetworkCallback(callback)
     }
     private fun restart() {
@@ -110,8 +154,9 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                     mutable.value = mutable.value.copy(status = "Connection lost · retrying", lastReceiveMs = 0)
                     backoff = 1
                 } catch (e: CancellationException) { throw e
-                } catch (_: SSLException) {
+                } catch (e: SSLException) {
                     mutable.value = mutable.value.copy(status = "Certificate mismatch or expired certificate. Check pairing.", lastReceiveMs = 0)
+                    if (e.isCertificateFailure() && generation.get() == epoch) disableLiveView("Certificate mismatch or expired certificate. Check pairing.")
                     return@launch
                 } catch (_: SecurityException) {
                     mutable.value = mutable.value.copy(status = "Allow local network access in Android settings", lastReceiveMs = 0)
@@ -119,7 +164,10 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                 } catch (e: Exception) {
                     // Never show raw URLs/headers/exceptions containing credentials.
                     mutable.value = mutable.value.copy(status = if (e is AuthenticationFailure) "Pairing rejected. Check device credential." else "Connection lost · retrying", lastReceiveMs = 0)
-                    if (e is AuthenticationFailure) return@launch
+                    if (e is AuthenticationFailure) {
+                        if (generation.get() == epoch) disableLiveView("Pairing rejected. Check device credential.")
+                        return@launch
+                    }
                 }
                 delay(backoff * 1000)
                 backoff = (backoff * 2).coerceAtMost(15)
@@ -210,14 +258,21 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         videoTask?.cancel(); videoSocket?.cancel(); videoTask = null; videoSocket = null
         val device = desired
         val network = wifi
+        val now = SystemClock.elapsedRealtime()
+        val live = liveSession.isOn(now)
+        val unavailable = videoUnavailable
+        if (!live) { liveTicker?.cancel(); liveTicker = null }
+        publishLiveView(now)
         // Dropping the frame here means a closed feed never shows an old picture.
         videoMutable.value = VideoState(status = when {
             !active || !videoWanted -> "Video paused"
             device == null -> "Choose or pair a Jetson"
+            unavailable != null -> unavailable
+            !live -> "Live view off"
             network == null -> "Waiting for Wi-Fi"
             else -> "Connecting"
-        }, nowMs = SystemClock.elapsedRealtime())
-        if (!active || !videoWanted || device == null || network == null) return
+        }, nowMs = now)
+        if (!active || !videoWanted || !live || device == null || network == null) return
         videoTask = scope.launch {
             // Conflated: while a JPEG is decoding only the newest pending frame is kept.
             val frames = Channel<EncodedFrame>(Channel.CONFLATED)
@@ -231,22 +286,30 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                         videoStatus(epoch, "Video connection lost · retrying")
                         backoff = 1
                     } catch (e: CancellationException) { throw e
-                    } catch (_: SSLException) {
-                        videoStatus(epoch, "Certificate mismatch or expired certificate. Check pairing.")
-                        return@launch
+                    } catch (e: SSLException) {
+                        if (e.isCertificateFailure()) {
+                            // A failure can still be delivered after this task was cancelled: only the current one disables.
+                            if (videoGeneration.get() == epoch) disableLiveView("Certificate mismatch or expired certificate. Check pairing.")
+                            return@launch
+                        }
+                        videoStatus(epoch, "Video connection lost · retrying")
                     } catch (_: SecurityException) {
                         videoStatus(epoch, "Allow local network access in Android settings")
                         return@launch
                     } catch (e: Exception) {
                         // Never show raw URLs/headers/exceptions containing credentials.
                         val code = (e as? VideoHttpFailure)?.code
-                        videoStatus(epoch, when (code) {
+                        val reason = when (code) {
                             401 -> "Pairing rejected. Check device credential."
                             404 -> "This Jetson's connector has no video"
                             503 -> "Too many video viewers · retrying"
                             else -> "Video connection lost · retrying"
-                        })
-                        if (code == 401 || code == 404) return@launch
+                        }
+                        if (code == 401 || code == 404) {
+                            if (videoGeneration.get() == epoch) disableLiveView(reason)
+                            return@launch
+                        }
+                        videoStatus(epoch, reason)
                     }
                     delay(backoff * 1000)
                     backoff = (backoff * 2).coerceAtMost(15)
@@ -296,9 +359,10 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     private suspend fun decodeFrames(frames: Channel<EncodedFrame>, epoch: Int) {
         var lastAt = 0L
         var interval = 0.0
+        val pool = FramePool()
         for (frame in frames) {
             if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue
-            val bitmap = decodeJpeg(frame.bytes, frame.header.headerLength) ?: continue
+            val bitmap = decodeJpeg(frame.bytes, frame.header.headerLength, pool) ?: continue
             if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue   // decode stalled
             bitmap.prepareToDraw()
             val image = bitmap.asImageBitmap()
@@ -313,14 +377,17 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             val fps = if (interval > 0) 1000.0 / interval else null
             val shown = VideoFrame(image, frame.header.width, frame.header.height, frame.header.ageMs,
                 frame.receivedAtMs, fps)
+            var published = false
             videoMutable.update { previous ->
                 // A decode that finishes after its socket closed is not shown.
-                if (videoGeneration.get() != epoch || !previous.connected) previous
+                published = videoGeneration.get() == epoch && previous.connected
+                if (!published) previous
                 else previous.copy(status = "Live", frame = shown, nowMs = now)
             }
+            if (published) pool.advance()
         }
     }
-    private fun decodeJpeg(data: ByteArray, offset: Int): Bitmap? {
+    private fun decodeJpeg(data: ByteArray, offset: Int, pool: FramePool): Bitmap? {
         val length = data.size - offset
         if (length < 4 || data[offset] != 0xFF.toByte() || data[offset + 1] != 0xD8.toByte()) return null
         return try {
@@ -329,8 +396,46 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             if (bounds.outWidth !in 1..4096 || bounds.outHeight !in 1..4096) return null
             var sample = 1
             while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1280) sample *= 2
-            BitmapFactory.decodeByteArray(data, offset, length, BitmapFactory.Options().apply { inSampleSize = sample })
+            // Mutable, so the result can be decoded into again.
+            fun options(into: Bitmap?) = BitmapFactory.Options().apply { inSampleSize = sample; inMutable = true; inBitmap = into }
+            val reuse = pool.take(bounds.outWidth, bounds.outHeight)
+            val decoded = reuse?.let {
+                try { BitmapFactory.decodeByteArray(data, offset, length, options(it)) } catch (_: IllegalArgumentException) { null }
+            } ?: BitmapFactory.decodeByteArray(data, offset, length, options(null))
+            decoded?.also { pool.keep(it) }
         } catch (_: Exception) { null }
+    }
+    // Decode buffers of one video socket epoch, used only by its decode coroutine.
+    // Three rotate: the bitmap on screen and the one an in-flight RenderThread
+    // frame may still draw are never decoded into; the third takes the next frame.
+    // Rotation alone is not enough: a burst after a Wi-Fi stall can publish all three
+    // within one UI frame, so a slot is reused only once it has been superseded for
+    // REUSE_AFTER_MS; until then a fresh bitmap replaces it.
+    private class FramePool {
+        private val slots = arrayOfNulls<Bitmap>(3)
+        private val supersededAt = LongArray(3)
+        private var next = 0
+        private var latest = -1
+        private var sourceWidth = 0
+        private var sourceHeight = 0
+        /** The free buffer for a source of this size, or null to allocate one. */
+        fun take(width: Int, height: Int): Bitmap? {
+            if (width != sourceWidth || height != sourceHeight) {
+                // Never recycle(): a dropped bitmap may still be on screen; the GC frees it.
+                slots.fill(null); next = 0; latest = -1; sourceWidth = width; sourceHeight = height
+            }
+            if (SystemClock.elapsedRealtime() - supersededAt[next] < REUSE_AFTER_MS) return null
+            return slots[next]
+        }
+        /** The free slot now holds this bitmap (reused or newly allocated). */
+        fun keep(bitmap: Bitmap) { slots[next] = bitmap }
+        /** The kept bitmap was published; the one it replaces on screen starts its reuse delay. */
+        fun advance() {
+            if (latest >= 0) supersededAt[latest] = SystemClock.elapsedRealtime()
+            latest = next
+            next = (next + 1) % slots.size
+        }
+        private companion object { const val REUSE_AFTER_MS = 100L }
     }
     private class EncodedFrame(val header: VideoHeader, val bytes: ByteArray, val receivedAtMs: Long)
     private class VideoHttpFailure(val code: Int) : IOException()

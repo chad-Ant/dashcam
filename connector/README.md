@@ -245,10 +245,17 @@ start failure logs a warning and recording continues. The agent keeps only the
 latest frame and never queues frames for a viewer: a slow viewer skips frames,
 and a send that takes over 2 s closes that viewer.
 
-**Clients stream only while Live is visible.** The web client opens
-`/v1/video` only while it is paired, the Live page is shown and the tab is
-visible; the Android app only while a device is selected, the Live page is
-selected and the app is in the foreground. Leaving Live, hiding the tab or
+**Clients stream only on demand, while Live is visible.** Video starts only
+when the user taps **Start live view** on the Camera card. It is off on every
+page load and app start (never remembered) and stops by itself **10 minutes
+after the tap** ("Live view stopped after 10 min · tap Start live view to
+resume"), so a phone left on the dashboard cannot stream for hours; a future
+cloud relay bills for that traffic. Telemetry is not affected. While live
+view is on, the web client opens `/v1/video` only while it is paired, the
+Live page is shown and the tab is visible; the Android app only while a
+device is selected, the Live page is selected and the app is in the
+foreground. Live view turns off when the device changes, on sign-out or
+unpairing, and when the Jetson rejects the credential or has no video. Leaving Live, hiding the tab or
 backgrounding the app, signing out or losing the pairing closes it; reconnects
 use the 1, 2, 4, 8, 15 s backoff. Both clients decode off the main path and
 keep only the newest pending frame while one is still decoding.

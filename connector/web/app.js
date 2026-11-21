@@ -16,11 +16,15 @@
   let wakeWanted = false, wakeLock = null, wakeBusy = false;
   let message = null, wakeNote = null, page = 'live', signingOut = false;
   const binds = [];
-  // Camera video (/v1/video): open only while paired, on Live and visible.
+  // Camera video (/v1/video): open only while live view is on, paired, on Live and visible.
   const VIDEO_STALE_MS = 2000, VIDEO_MAGIC = [0x44, 0x43, 0x56, 0x31];   // "DCV1"
   let vws = null, vAttempt = 0, vTimer = 0, vOpenedMs = 0, vMsgMs = 0, vLastSeq = 0;
   let vImg = null, vUrl = null, vLoadingUrl = null, vLoading = null, vPending = null;
   let vMeta = null, vShownMs = 0, vTimes = [];
+  // Live view starts off on every load and is never stored, so video only streams on demand
+  // (a cloud relay bills by the byte); it stops by itself LIVE_VIEW_MAX_MS after the tap.
+  const LIVE_VIEW_MAX_MS = 10 * 60 * 1000;
+  let liveView = false, liveStartMs = 0, liveStartWall = 0, liveExpired = false, liveDevice = null;
 
   // ---- helpers -------------------------------------------------------------
   function h(tag, cls, text) {
@@ -91,31 +95,46 @@
     vImg = h('img');
     vImg.alt = 'Dashcam camera';
     vImg.hidden = true;
+    vImg.draggable = false;   // with pointer-events: none, the context menu and drags target the box, not the picture
     vImg.addEventListener('load', () => frameDone(true));
     vImg.addEventListener('error', () => frameDone(false));
     box.append(vImg, note);
     const caption = h('p', 'hint video-caption', '—');
+    const toggle = button('Start live view', 'btn', toggleLiveView), actions = h('div', 'actions');
+    actions.append(toggle);
     binds.push(v => {
       const open = vws !== null && vws.readyState === WebSocket.OPEN;
       const showing = open && vUrl !== null && vMeta !== null && v.now - vShownMs <= VIDEO_STALE_MS;
       if (vImg.hidden === showing) vImg.hidden = !showing;   // never keep showing a stale picture
       note.hidden = showing;
-      setText(note, open && vShownMs > 0 ? 'Video stale' : 'No video');
+      setText(note, canVideo() && !liveView ? 'Live view off' : open && vShownMs > 0 ? 'Video stale' : 'No video');
       setText(caption, videoCaption(v.now, open, showing));
+      setText(toggle, liveView ? 'Stop live view' : 'Start live view');
+      toggle.setAttribute('aria-pressed', String(liveView));
+      toggle.classList.toggle('secondary', liveView);
+      toggle.disabled = !canVideo();
     });
-    return card('Camera', box, caption);
+    return card('Camera', box, caption, actions);
   }
   function videoCaption(now, open, showing) {
     if (showing) {
       const span = vTimes.length > 1 ? vTimes[vTimes.length - 1] - vTimes[0] : 0;
       const fps = span > 0 ? fmt((vTimes.length - 1) * 1000 / span, 1, 'fps') : '— fps';
-      return vMeta.width + '×' + vMeta.height + ' · ' + fps + ' · ' + vMeta.ageMs + ' ms old';
+      return vMeta.width + '×' + vMeta.height + ' · ' + fps + ' · ' + vMeta.ageMs + ' ms old' + stopsIn(now);
     }
     if (!identity) return 'Pair this browser to see the recording camera';
     if (identity.capabilities.video !== true) return 'This Jetson does not offer camera video';
-    if (!open) return vAttempt > 0 ? 'Video connection lost · retrying' : 'Connecting to the camera';
-    if (vShownMs > 0) return 'Last frame ' + (Math.max(0, now - vShownMs) / 1000).toFixed(1) + ' s ago';
-    return 'Waiting for frames · the Jetson must have MonitoringVideoEnabled set';
+    if (!liveView) {
+      return liveExpired ? 'Live view stopped after ' + LIVE_VIEW_MAX_MS / 60000 + ' min · tap Start live view to resume'
+        : 'Live view off · tap Start live view to watch';
+    }
+    if (!open) return (vAttempt > 0 ? 'Video connection lost · retrying' : 'Connecting to the camera') + stopsIn(now);
+    if (vShownMs > 0) return 'Last frame ' + (Math.max(0, now - vShownMs) / 1000).toFixed(1) + ' s ago' + stopsIn(now);
+    return 'Waiting for frames · the Jetson must have MonitoringVideoEnabled set' + stopsIn(now);
+  }
+  function stopsIn(now) {
+    const left = LIVE_VIEW_MAX_MS - liveElapsed(now);
+    return ' · stops in ' + (left < 60000 ? '< 1 min' : Math.ceil(left / 60000) + ' min');
   }
   function speedCard() {
     const row = h('div', 'speed');
@@ -548,6 +567,7 @@
   // ---- pairing and session -------------------------------------------------
   async function pair(token) {
     if (!TOKEN.test(token)) { say('That is not a Dashcam Connect pairing link.', true); return start(); }
+    resetLiveView(); syncVideo();
     say('Pairing…', false);
     let r = null;
     try {
@@ -566,6 +586,7 @@
   }
   async function signOut() {
     stop('Signing out');
+    resetLiveView();
     signingOut = true; syncVideo();
     let ok = false;
     try {
@@ -683,11 +704,33 @@
   // ---- camera video --------------------------------------------------------
   // Binary message: "DCV1", u32 header length (>= 24), u64 sequence, u32 age_ms,
   // u16 width, u16 height (all little-endian), then the JPEG.
+  const canVideo = () => identity !== null && identity.capabilities.video === true;
   function videoWanted() {
-    return identity !== null && identity.capabilities.video === true && page === 'live' &&
-      !document.hidden && !signingOut;
+    return liveView && canVideo() && page === 'live' && !document.hidden && !signingOut;
+  }
+  function toggleLiveView() {
+    if (liveView) liveView = false;
+    else if (canVideo()) {
+      liveView = true; liveExpired = false; liveDevice = identity.id;
+      liveStartMs = performance.now(); liveStartWall = Date.now();
+    }
+    syncVideo();
+    render();
+  }
+  function resetLiveView() { liveView = false; liveExpired = false; liveDevice = null; }
+  // performance.now() pauses while some devices sleep; the wall clock also counts that time,
+  // and a wall-clock jump can only end the window early, which is the cheap direction.
+  function liveElapsed(now = performance.now()) {
+    return Math.max(now - liveStartMs, Date.now() - liveStartWall);
+  }
+  // Runs on every tick against the monotonic clock instead of one 10-minute timer, which a
+  // background tab may throttle; reopening after a hidden spell checks it first.
+  function syncLiveView() {
+    if (liveDevice !== null && (!canVideo() || identity.id !== liveDevice)) resetLiveView();
+    else if (liveView && liveElapsed() >= LIVE_VIEW_MAX_MS) { liveView = false; liveExpired = true; }
   }
   function syncVideo() {
+    syncLiveView();
     if (!videoWanted()) {
       clearTimeout(vTimer); vTimer = 0; vAttempt = 0;
       if (vws) closeVideo();
