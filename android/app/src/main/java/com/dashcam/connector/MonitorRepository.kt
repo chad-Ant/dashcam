@@ -85,8 +85,8 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         }
         restart()
     }
-    // The camera feed streams only while the Live page is shown; together with
-    // setActive (foreground) and a selected device this gates /v1/video.
+    // The camera feed streams only while the Live page is shown with its camera card on
+    // screen; together with setActive (foreground) and a selected device this gates /v1/video.
     fun setVideoWanted(value: Boolean) {
         if (videoWanted == value) return
         videoWanted = value
@@ -155,17 +155,26 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                     backoff = 1
                 } catch (e: CancellationException) { throw e
                 } catch (e: SSLException) {
-                    mutable.value = mutable.value.copy(status = "Certificate mismatch or expired certificate. Check pairing.", lastReceiveMs = 0)
-                    if (e.isCertificateFailure() && generation.get() == epoch) disableLiveView("Certificate mismatch or expired certificate. Check pairing.")
-                    return@launch
+                    // A superseded connection's late failure never changes the new device's status.
+                    if (generation.get() != epoch) return@launch
+                    // Only a verified pin/validity failure is terminal; any other TLS error is
+                    // ordinary connection loss and retries with the backoff below.
+                    if (e.isCertificateFailure()) {
+                        mutable.value = mutable.value.copy(status = "Certificate mismatch or expired certificate. Check pairing.", lastReceiveMs = 0)
+                        disableLiveView("Certificate mismatch or expired certificate. Check pairing.")
+                        return@launch
+                    }
+                    mutable.value = mutable.value.copy(status = "Connection lost · retrying", lastReceiveMs = 0)
                 } catch (_: SecurityException) {
+                    if (generation.get() != epoch) return@launch
                     mutable.value = mutable.value.copy(status = "Allow local network access in Android settings", lastReceiveMs = 0)
                     return@launch
                 } catch (e: Exception) {
+                    if (generation.get() != epoch) return@launch
                     // Never show raw URLs/headers/exceptions containing credentials.
                     mutable.value = mutable.value.copy(status = if (e is AuthenticationFailure) "Pairing rejected. Check device credential." else "Connection lost · retrying", lastReceiveMs = 0)
                     if (e is AuthenticationFailure) {
-                        if (generation.get() == epoch) disableLiveView("Pairing rejected. Check device credential.")
+                        disableLiveView("Pairing rejected. Check device credential.")
                         return@launch
                     }
                 }
@@ -359,10 +368,9 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     private suspend fun decodeFrames(frames: Channel<EncodedFrame>, epoch: Int) {
         var lastAt = 0L
         var interval = 0.0
-        val pool = FramePool()
         for (frame in frames) {
             if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue
-            val bitmap = decodeJpeg(frame.bytes, frame.header.headerLength, pool) ?: continue
+            val bitmap = decodeJpeg(frame.bytes, frame.header.headerLength) ?: continue
             if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue   // decode stalled
             bitmap.prepareToDraw()
             val image = bitmap.asImageBitmap()
@@ -377,17 +385,16 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             val fps = if (interval > 0) 1000.0 / interval else null
             val shown = VideoFrame(image, frame.header.width, frame.header.height, frame.header.ageMs,
                 frame.receivedAtMs, fps)
-            var published = false
             videoMutable.update { previous ->
                 // A decode that finishes after its socket closed is not shown.
-                published = videoGeneration.get() == epoch && previous.connected
-                if (!published) previous
+                if (videoGeneration.get() != epoch || !previous.connected) previous
                 else previous.copy(status = "Live", frame = shown, nowMs = now)
             }
-            if (published) pool.advance()
         }
     }
-    private fun decodeJpeg(data: ByteArray, offset: Int, pool: FramePool): Bitmap? {
+    // A fresh bitmap per frame: one already published may still be drawn (including
+    // an in-flight RenderThread frame), so it is never decoded into again; the GC frees it.
+    private fun decodeJpeg(data: ByteArray, offset: Int): Bitmap? {
         val length = data.size - offset
         if (length < 4 || data[offset] != 0xFF.toByte() || data[offset + 1] != 0xD8.toByte()) return null
         return try {
@@ -396,46 +403,8 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             if (bounds.outWidth !in 1..4096 || bounds.outHeight !in 1..4096) return null
             var sample = 1
             while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1280) sample *= 2
-            // Mutable, so the result can be decoded into again.
-            fun options(into: Bitmap?) = BitmapFactory.Options().apply { inSampleSize = sample; inMutable = true; inBitmap = into }
-            val reuse = pool.take(bounds.outWidth, bounds.outHeight)
-            val decoded = reuse?.let {
-                try { BitmapFactory.decodeByteArray(data, offset, length, options(it)) } catch (_: IllegalArgumentException) { null }
-            } ?: BitmapFactory.decodeByteArray(data, offset, length, options(null))
-            decoded?.also { pool.keep(it) }
+            BitmapFactory.decodeByteArray(data, offset, length, BitmapFactory.Options().apply { inSampleSize = sample })
         } catch (_: Exception) { null }
-    }
-    // Decode buffers of one video socket epoch, used only by its decode coroutine.
-    // Three rotate: the bitmap on screen and the one an in-flight RenderThread
-    // frame may still draw are never decoded into; the third takes the next frame.
-    // Rotation alone is not enough: a burst after a Wi-Fi stall can publish all three
-    // within one UI frame, so a slot is reused only once it has been superseded for
-    // REUSE_AFTER_MS; until then a fresh bitmap replaces it.
-    private class FramePool {
-        private val slots = arrayOfNulls<Bitmap>(3)
-        private val supersededAt = LongArray(3)
-        private var next = 0
-        private var latest = -1
-        private var sourceWidth = 0
-        private var sourceHeight = 0
-        /** The free buffer for a source of this size, or null to allocate one. */
-        fun take(width: Int, height: Int): Bitmap? {
-            if (width != sourceWidth || height != sourceHeight) {
-                // Never recycle(): a dropped bitmap may still be on screen; the GC frees it.
-                slots.fill(null); next = 0; latest = -1; sourceWidth = width; sourceHeight = height
-            }
-            if (SystemClock.elapsedRealtime() - supersededAt[next] < REUSE_AFTER_MS) return null
-            return slots[next]
-        }
-        /** The free slot now holds this bitmap (reused or newly allocated). */
-        fun keep(bitmap: Bitmap) { slots[next] = bitmap }
-        /** The kept bitmap was published; the one it replaces on screen starts its reuse delay. */
-        fun advance() {
-            if (latest >= 0) supersededAt[latest] = SystemClock.elapsedRealtime()
-            latest = next
-            next = (next + 1) % slots.size
-        }
-        private companion object { const val REUSE_AFTER_MS = 100L }
     }
     private class EncodedFrame(val header: VideoHeader, val bytes: ByteArray, val receivedAtMs: Long)
     private class VideoHttpFailure(val code: Int) : IOException()

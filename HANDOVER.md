@@ -466,7 +466,12 @@ replaced it on screen, otherwise a fresh bitmap is allocated; size change drops 
 failed reuse falls back to a plain decode. Reviewed statically in three passes (compiler/Compose, rendering and
 pool safety, text parity with the old cards); two real findings fixed (a frame burst could overwrite the
 on-screen bitmap; rows compared raw numbers). Not compiled. If the picture ever tears, raise `REUSE_AFTER_MS`
-or the pool size.
+or the pool size. **Superseded the same day:** the client review (`connector/CLIENT_REVIEW_2026-11-21.md`, which
+also confirmed that `f0d00d2` compiles: assembleDebug, 24 JVM tests, lint 0 errors) showed a time delay cannot
+establish bitmap ownership, so the pool was removed again (C1, fresh bitmap per frame). The Android commit after it
+also retries telemetry after an ordinary TLS error (C4: only a verified certificate failure is terminal; a
+superseded connection's late failure no longer changes the status) and pauses video while the camera card is
+scrolled out of the list for 2 s (P2; the 10-min window keeps running). Web fixes C2, C3, P1, P2 follow separately.
 
 **Next:** build and test on Windows (`.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`),
 install on the A54, then `adb shell dumpsys gfxinfo com.dashcam.connector reset`, a minute on Live with live view on,

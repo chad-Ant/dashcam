@@ -13,6 +13,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -31,6 +32,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -69,6 +72,9 @@ class MainActivity : ComponentActivity() {
 
 private val pages = listOf("Live", "Vehicle", "System", "Connection")
 private val marks = listOf("◉", "↗", "▥", "⌁")
+private const val CAMERA_ITEM = "camera"
+/** Scrolled-away camera keeps its video socket this long, so a brief scroll never reopens TLS. */
+private const val CAMERA_OFFSCREEN_GRACE_MS = 2000L
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -82,12 +88,23 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     var awake by remember { mutableStateOf(false) }
     val connected = state.derive { active }
     LaunchedEffect(awake, connected) { onKeepAwake(awake && connected) }
-    // Camera frames stream only while Live is shown; foreground, device
-    // selection and the live view toggle are gated by the repository.
-    DisposableEffect(page) {
-        model.repository.setVideoWanted(page == 0)
-        onDispose { model.repository.setVideoWanted(false) }
+    val list = rememberLazyListState()
+    // Camera frames stream only while Live is shown with the camera card on screen;
+    // foreground, device selection and the live view toggle are gated by the repository.
+    // Any part of the card laid out in the viewport counts as on screen. Leaving the
+    // viewport closes video only after the grace (cancelled if the card returns first);
+    // coming back reopens it as soon as layout shows it. Another page closes it at once.
+    // The live view window keeps running throughout. Applied straight from the layout
+    // change, so a grace that ends in the background never waits for a frame.
+    LaunchedEffect(list, page) {
+        if (page != 0) { model.repository.setVideoWanted(false); return@LaunchedEffect }
+        snapshotFlow { list.layoutInfo.visibleItemsInfo.any { it.key == CAMERA_ITEM } }
+            .collectLatest { onScreen ->
+                if (!onScreen) delay(CAMERA_OFFSCREEN_GRACE_MS)
+                model.repository.setVideoWanted(onScreen)
+            }
     }
+    DisposableEffect(Unit) { onDispose { model.repository.setVideoWanted(false) } }
     BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding()) {
         val wide = maxWidth >= 840.dp
         Scaffold(containerColor = MaterialTheme.colorScheme.background,
@@ -103,7 +120,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                     pages.forEachIndexed { i, name -> NavigationRailItem(selected = page == i, onClick = { page = i },
                         icon = { Text(marks[i], fontSize = 24.sp) }, label = { Text(name) }) }
                 }
-                LazyColumn(Modifier.weight(1f).fillMaxHeight(), contentPadding = PaddingValues(20.dp),
+                LazyColumn(Modifier.weight(1f).fillMaxHeight(), state = list, contentPadding = PaddingValues(20.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     item {
                         Text("DASHCAM CONNECT", letterSpacing = 2.sp, color = MaterialTheme.colorScheme.primary,
@@ -116,7 +133,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                     stickyHeader { Box(Modifier.background(MaterialTheme.colorScheme.background).padding(bottom = 4.dp)) { ConnectionBanner(state) } }
                     when (page) {
                         0 -> {
-                            item { CameraCard(model.repository) }
+                            item(key = CAMERA_ITEM) { CameraCard(model.repository) }
                             item { SpeedCard(state) }
                             item { AdaptivePair(wide, { RecordingCard(state) }, { AdasCard() }) }
                             item { AdaptivePair(wide, { PositionCard(state) }, { HealthSummary(state) }) }
