@@ -22,6 +22,11 @@ android {
     lint { abortOnError = true }
 }
 dependencies {
+    constraints {
+        implementation("androidx.fragment:fragment:1.8.9") {
+            because("The permission launcher requires Fragment 1.3.0 or later")
+        }
+    }
     implementation(platform("androidx.compose:compose-bom:2025.08.01"))
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.compose.material3:material3")
@@ -37,7 +42,7 @@ dependencies {
     androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     // Import the Firebase BoM
-    implementation(platform("com.google.firebase:firebase-bom:35.2.0"))
+    implementation(platform("com.google.firebase:firebase-bom:34.7.0"))
     // TODO: Add the dependencies for Firebase products you want to use
     // When using the BoM, don't specify versions in Firebase dependencies
     implementation("com.google.firebase:firebase-analytics")

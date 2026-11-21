@@ -680,6 +680,10 @@ async def advertise(address, port, identity):
         zc = AsyncZeroconf(interfaces=[str(ip)], ip_version=IPVersion.V4Only)
         await zc.async_register_service(info)
         return zc, info
+    except asyncio.CancelledError:
+        if zc is not None:
+            await zc.async_close()
+        raise
     except Exception as error:  # noqa: BLE001 - any mDNS failure leaves the agent serving
         print(f'mDNS advertisement off ({type(error).__name__}: {error}); '
               f'is {address} assigned to this host? Manual pairing still works.', flush=True)
@@ -688,9 +692,27 @@ async def advertise(address, port, identity):
         return None
 
 
+async def maintain_advertisement(address, port, identity):
+    delay = 2
+    while True:
+        advertisement = await advertise(address, port, identity)
+        if advertisement:
+            break
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
+    zc, info = advertisement
+    try:
+        await asyncio.Event().wait()
+    finally:
+        try:
+            await zc.async_unregister_service(info)
+        finally:
+            await zc.async_close()
+
+
 async def run(args, identity):
     state = State(identity, args.storage, video_demand=None if args.simulate else args.video_demand)
-    endpoints, advertisement = [], None
+    endpoints = []
     try:
         if args.simulate:
             identity['name'] += ' [SIMULATOR]'
@@ -709,14 +731,14 @@ async def run(args, identity):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(args.state_dir / 'cert.pem', args.state_dir / 'key.pem')
-        if args.advertise_address:
-            advertisement = await advertise(args.advertise_address, args.port, identity)
         app = create_app(state, port=args.port, web_dir=args.web_dir, session_days=args.browser_session_days)
         runner = web.AppRunner(app, access_log=None, keepalive_timeout=10,
                                shutdown_timeout=3)
         await runner.setup()
         try:
             await web.TCPSite(runner, args.bind, args.port, ssl_context=context).start()
+            if args.advertise_address:
+                state.tasks.append(asyncio.create_task(maintain_advertisement(args.advertise_address, args.port, identity)))
             print(f'Dashcam monitor listening on {args.bind}:{args.port}; read-only; simulator={args.simulate}', flush=True)
             await asyncio.Event().wait()
         finally:
@@ -728,10 +750,6 @@ async def run(args, identity):
         for transport, path in endpoints:
             transport.close()
             path.unlink(missing_ok=True)
-        if advertisement:
-            zc, info = advertisement
-            await zc.async_unregister_service(info)
-            await zc.async_close()
 
 
 def pair(args, identity):
