@@ -40,12 +40,21 @@ ReceiptTime ReceiptTime::now() {
     return {steady, unixTime.count()};
 }
 
-OnDemandUplink::OnDemandUplink(std::string_view deviceId) {
+OnDemandUplink::OnDemandUplink(std::string_view deviceId, bool manageReady) : manageReady_(manageReady) {
     if (deviceId.empty() || deviceId.find('/') != std::string_view::npos)
         throw std::invalid_argument("Expected a single vehicle document ID");
     controlPath_ = "vehicles/";
     controlPath_.append(deviceId);
     controlPath_ += "/control/current";
+}
+
+void OnDemandUplink::releaseReaders(std::int64_t generation) {
+    if (ready_) {
+        const auto attempt = target_.attempt ? target_.attempt : nextAttempt_++;
+        target_ = {attempt, generation, {}, {}};
+    } else {
+        target_ = {};
+    }
 }
 
 UpdateResult OnDemandUplink::applyControl(std::string_view path, bool serverConfirmed,
@@ -59,8 +68,9 @@ UpdateResult OnDemandUplink::applyControl(std::string_view path, bool serverConf
     const bool newLease = !last_ || s.demandGeneration != last_->demandGeneration ||
                           s.expiresAtUnixSeconds != last_->expiresAtUnixSeconds;
     last_ = s;
+    ready_ = manageReady_ && s.desiredMode == ConnectionMode::ReadyWhilePowered;
     if (s.channels.empty()) {
-        target_ = {};
+        releaseReaders(s.demandGeneration);
         return UpdateResult::Accepted;
     }
 
@@ -69,10 +79,10 @@ UpdateResult OnDemandUplink::applyControl(std::string_view path, bool serverConf
     const auto candidate = received.monotonic + remaining;
     // Re-reading an identical lease after a wall-clock step cannot extend it.
     deadline_ = newLease ? candidate : std::min(deadline_, candidate);
-    if (s.desiredMode != ConnectionMode::OnDemand || deadline_ <= received.monotonic ||
+    if ((!ready_ && s.desiredMode != ConnectionMode::OnDemand) || deadline_ <= received.monotonic ||
         deniedGeneration_ == s.demandGeneration) {
-        target_ = {};
-    } else if (target_.attempt == 0 || target_.demandGeneration != s.demandGeneration) {
+        releaseReaders(s.demandGeneration);
+    } else if (target_.attempt == 0 || target_.demandGeneration != s.demandGeneration || !(target_.requested == s.channels)) {
         // Reuse the socket for channel changes, but require a fresh grant.
         const auto attempt = target_.attempt ? target_.attempt : nextAttempt_++;
         target_ = {attempt, s.demandGeneration, s.channels, {}};
@@ -87,9 +97,9 @@ UpdateResult OnDemandUplink::relayConfirmed(std::uint64_t attempt, std::int64_t 
         return UpdateResult::Ignored;
     if ((granted.telemetry && !target_.requested.telemetry) || (granted.video && !target_.requested.video))
         return UpdateResult::Invalid;
-    if (granted.empty()) {
+    if (granted.empty() && !target_.requested.empty()) {
         deniedGeneration_ = generation;
-        target_ = {};
+        releaseReaders(generation);
     } else {
         target_.active = granted;
     }
@@ -106,7 +116,8 @@ void OnDemandUplink::close() {
 }
 
 void OnDemandUplink::expire(SteadyClock::time_point now) {
-    if (target_.attempt && now >= deadline_) target_ = {};
+    if (target_.attempt && !target_.requested.empty() && now >= deadline_)
+        releaseReaders(target_.demandGeneration);
 }
 
 RelayTarget OnDemandUplink::target(SteadyClock::time_point now) {
@@ -115,7 +126,7 @@ RelayTarget OnDemandUplink::target(SteadyClock::time_point now) {
 }
 
 std::optional<SteadyClock::time_point> OnDemandUplink::nextDeadline() const {
-    if (!target_.attempt) return std::nullopt;
+    if (!target_.attempt || target_.requested.empty()) return std::nullopt;
     return deadline_;
 }
 

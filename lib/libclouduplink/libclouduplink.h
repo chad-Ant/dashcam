@@ -52,7 +52,7 @@ struct RelayTarget {
 // When it fires, reconcile again even if no network events have arrived.
 class OnDemandUplink {
 public:
-    explicit OnDemandUplink(std::string_view deviceId);
+    explicit OnDemandUplink(std::string_view deviceId, bool manageReady = false);
     OnDemandUplink(const OnDemandUplink&) = delete;
     OnDemandUplink& operator=(const OnDemandUplink&) = delete;
 
@@ -69,6 +69,7 @@ public:
     std::optional<SteadyClock::time_point> nextDeadline() const;
 
 private:
+    void releaseReaders(std::int64_t generation);
     void expire(SteadyClock::time_point now);
 
     std::string controlPath_;
@@ -77,6 +78,8 @@ private:
     std::optional<std::int64_t> deniedGeneration_;
     std::uint64_t nextAttempt_ = 1;
     RelayTarget target_{};
+    bool manageReady_;
+    bool ready_ = false;
     bool closed_ = false;
 };
 

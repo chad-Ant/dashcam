@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!requirements.txt
+!store.py
+!relay.py
+!web/
+!web/**

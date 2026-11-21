@@ -1,0 +1,23 @@
+[Unit]
+Description=Dashcam cloud uplink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dashcam-uplink
+Group=dashcam-uplink
+StateDirectory=dashcam-uplink
+StateDirectoryMode=0700
+UMask=0077
+WorkingDirectory=/opt/dashcam-uplink
+ExecStart=/opt/dashcam-uplink/venv/bin/python uplink.py run --state /var/lib/dashcam-uplink/device.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

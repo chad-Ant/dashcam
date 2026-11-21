@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dashcam Connect</title><link rel="stylesheet" href="/style.css"></head>
+<body><main><h1>Dashcam Connect</h1>
+<button id="login">Sign in with Google</button><button id="logout" hidden>Sign out</button>
+<section id="fleet" hidden><h2>Vehicles</h2><select aria-label="Vehicle" id="vehicle"></select>
+<button id="connect">Connect</button><button id="leave" disabled>Disconnect</button>
+<label><input id="camera" type="checkbox" disabled> Camera</label>
+<div id="owner" hidden><label>Connection mode <select id="mode"><option value="on_demand">On demand</option><option value="ready_while_powered">Ready while powered</option></select></label>
+<button id="save">Apply mode</button><button id="issue">Issue enrollment code</button><output id="code"></output></div>
+</section><p id="status" role="status"></p><small id="request"></small><p id="timing"></p><p id="summary"></p><details><summary>Sample details</summary><pre id="sample"></pre></details><img id="frame" hidden alt="Camera preview"></main>
+<script type="module" src="/app.js"></script></body></html>

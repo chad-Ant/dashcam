@@ -6,6 +6,7 @@
         android:icon="@drawable/ic_launcher" android:dataExtractionRules="@xml/data_extraction_rules"
         android:supportsRtl="true" android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity android:name=".CloudActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

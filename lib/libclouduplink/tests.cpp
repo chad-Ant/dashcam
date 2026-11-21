@@ -135,6 +135,33 @@ void reconnectAndClose() {
     f.uplink.close();
     check(f.apply() == ignored && !f.target().attempt && !f.uplink.nextDeadline(), "terminal close");
 }
+
+void readyModeLease() {
+    OnDemandUplink uplink{"A", true};
+    ReceiptTime now{SteadyClock::time_point{}, 1000};
+    ControlSnapshot control{ConnectionMode::ReadyWhilePowered, 1, 0, {}, std::nullopt};
+    check(uplink.applyControl(path, true, control, now) == accepted, "ready mode applied");
+    const auto attempt = uplink.target(now.monotonic).attempt;
+    check(attempt && !uplink.nextDeadline(), "ready control socket starts without media");
+
+    control.demandGeneration = 1;
+    control.channels = both;
+    control.expiresAtUnixSeconds = 1005;
+    check(uplink.applyControl(path, true, control, now) == accepted, "ready demand received");
+    check(uplink.target(now.monotonic).active.empty(), "ready media waits for confirmation");
+    check(uplink.relayConfirmed(attempt, 1, both, now.monotonic) == accepted, "ready grant");
+    now.monotonic += 5s;
+    now.unixSeconds += 5;
+    const auto expired = uplink.target(now.monotonic);
+    check(expired.attempt == attempt && expired.active.empty() && expired.requested.empty() &&
+          !uplink.nextDeadline(), "lease expiry releases both readers and keeps ready control");
+    check(uplink.relayConfirmed(attempt, 1, both, now.monotonic) == invalid, "late grant cannot revive readers");
+
+    control.configVersion++;
+    control.desiredMode = ConnectionMode::OnDemand;
+    check(uplink.applyControl(path, true, control, now) == accepted && !uplink.target(now.monotonic).attempt,
+          "return to on demand releases expired ready connection");
+}
 } // namespace
 
 int main() {
@@ -142,5 +169,6 @@ int main() {
     validateControl();
     renewalAndExpiry();
     reconnectAndClose();
+    readyModeLease();
     std::cout << "Plan A uplink lifecycle tests passed\n";
 }

@@ -45,7 +45,7 @@ consumer objects. The top-level aliases are `make clouduplink` and
    authoritative demand before retrying. A relay refusal keeps that generation
    idle. A newer generation can request another attempt. A policy change to
    `ReadyWhilePowered` releases the Plan A target; the shared supervisor owns
-   the future Plan B handoff.
+   the Plan B handoff. The shipped host adapter enables the optional ready-mode lifecycle in the constructor. In that mode a zero-channel target keeps a control socket open, including after media lease expiry. It hands control back to a fresh listener snapshot when the relay delivers a change to on-demand mode.
 5. On shutdown, revocation or document deletion, call `close()`, reconcile
    the idle target, and cancel/drain callbacks before destroying the
    controller. Route completions to the controller that opened the socket.

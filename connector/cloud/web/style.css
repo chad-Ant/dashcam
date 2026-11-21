@@ -1,0 +1,5 @@
+:root{color-scheme:dark;font:1rem/1.5 system-ui,sans-serif;background:#0b121b;color:#e6eef5}
+main{max-width:54rem;margin:auto;padding:2rem 1rem} section{background:#15212d;padding:1rem;border-radius:.6rem}
+button,select{font:inherit;padding:.45rem .8rem;margin:.3rem} button:enabled{cursor:pointer}
+h1,h2{line-height:1.2} #status,output{color:#5ce0c6} pre{white-space:pre-wrap;overflow-wrap:anywhere}
+img{max-width:100%} output{display:block}

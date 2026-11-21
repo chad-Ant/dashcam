@@ -7,6 +7,9 @@ android {
     namespace = "com.dashcam.connector"
     compileSdk = 37
     defaultConfig {
+        val relay = providers.gradleProperty("dashcamRelayOrigin").orElse("").get()
+        require(relay.isEmpty() || relay.matches(Regex("https://[A-Za-z0-9.-]+"))) { "Expected HTTPS relay origin" }
+        resValue("string", "cloud_relay_origin", relay)
         applicationId = "com.dashcam.connector"
         minSdk = 28
         targetSdk = 37
@@ -25,7 +28,10 @@ android {
             matchingFallbacks += listOf("release")
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        resValues = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -54,7 +60,11 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     // Import the Firebase BoM
     implementation(platform("com.google.firebase:firebase-bom:34.7.0"))
-    // TODO: Add the dependencies for Firebase products you want to use
+    implementation("com.google.firebase:firebase-auth")
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.10.2")
     // When using the BoM, don't specify versions in Firebase dependencies
     implementation("com.google.firebase:firebase-analytics")
     // Add the dependencies for any other desired Firebase products

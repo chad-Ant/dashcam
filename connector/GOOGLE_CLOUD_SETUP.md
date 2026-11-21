@@ -10,7 +10,7 @@ Use this guide to take one paired Jetson from a working Wi-Fi connection to a te
 | Firebase and billing | Web and Android apps are registered. The console showed Google sign-in enabled, and the owner completed a monthly billing alert. Confirm billing linkage in step 2 before the first deployment. |
 | Android build preparation | The owner confirmed step 6 is complete on the Windows APK build machine. The debug signing report succeeded. Interactive Google sign-in will be tested with the cloud-enabled app in step 8. |
 | Jetson and phone | The owner confirmed the Android phone connects to the Jetson over the LAN. Both Jetson services reported active. All eight Python Plan A tests and the native C++ lifecycle tests passed on the Jetson. |
-| Remote viewing | Device enrollment, the Firestore listener, authenticated relay, dashboard sign-in and cloud transports still need implementation. A remote URL and a cloud-enabled APK are deliverables of step 8. |
+| Remote viewing | The remote-path implementation is in the checkout. ARM64 emulator tests exercised two devices, five viewer sockets, telemetry, camera release and switching modes. Staging deployment, the registered APK and the mobile-data trial are pending. [Build and deployment commands](cloud/README.md) |
 
 ## Prerequisites on your side
 
@@ -75,7 +75,7 @@ gcloud services list --enabled --project="$DASHCAM_PROJECT_ID" \
   --format='value(config.name)'
 ```
 
-Check the database location and `FIRESTORE_NATIVE`, all five service names, and **Google — Enabled** in Firebase Authentication. Keep the project ID and region for deployment. The current checkout has Jetson-side lifecycle libraries. A public dashboard URL and vehicle enrollment become available after the authenticated relay, the Firestore adapter and the client sign-in integration are implemented. At that stage, attach a dedicated Cloud Run runtime service account, set minimum instances to zero, and add the actual relay hostname to Firebase Authentication's authorized domains. [Cloud implementation plan](CLOUD_MONITORING_PLAN.md)
+Check the database location and `FIRESTORE_NATIVE`, all five service names, and **Google — Enabled** in Firebase Authentication. Keep the project ID and region for deployment. The checkout includes the staging relay and Jetson adapter. Deployment produces the public dashboard URL and enrollment endpoint. At that stage, attach a dedicated Cloud Run runtime service account, set minimum instances to zero, and add the actual relay hostname to Firebase Authentication's authorized domains. [Cloud implementation plan](CLOUD_MONITORING_PLAN.md)
 
 ## 6. Prepare the Android build machine
 
@@ -125,6 +125,8 @@ python -m unittest discover -s . -p 'test_cloud_on_demand.py' -v
 
 ## 8. Implement and verify the remote path
 
+**Implementation and commands.** The [step 8 runbook](cloud/README.md) covers the emulator test, vehicle grants, staging deployment, Jetson enrollment, Windows APK build and rollback. On the ARM64 development Jetson the emulator demonstrated one telemetry attempt, a 30.05-second silent release, a 0.06-second explicit release, denial of cross-vehicle reads and device writes, and loss of access after identity rotation. The TLS integration test used the existing LAN connector with synthetic recorder data. Live staging and LTE acceptance still require the project deployer, registered Windows signing key and phone.
+
 **Your starting point.** You have completed Android build preparation and verified phone-to-Jetson connectivity over Wi-Fi. Step 8 builds the software that carries that same read-only telemetry over the internet. The existing Python and C++ tests cover how the Jetson reacts to demand. They run without Firebase. The first new test below exercises a real listener against the local Firestore emulator.
 
 | Who and where | First action | What you should receive |
@@ -154,7 +156,7 @@ python -m unittest discover -s . -p 'test_cloud_on_demand.py' -v
 
 ### 8.3 Build the relay and connect the two clients
 
-The relay links a signed-in viewer’s request to the enrolled Jetson. The following are proposed interfaces to implement. They become usable once the developer supplies the staging build.
+The relay links a signed-in viewer’s request to the enrolled Jetson. The implementation exposes the following paths. A staging deployment is required for the phone trial.
 
 | Event | What the implementation must do | Observable result |
 |---|---|---|

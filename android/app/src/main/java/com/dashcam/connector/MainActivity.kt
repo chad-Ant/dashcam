@@ -153,6 +153,12 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                             item { AdasCard() }
                         }
                         3 -> {
+                            item {
+                                val context = androidx.compose.ui.platform.LocalContext.current
+                                Button(onClick = { context.startActivity(android.content.Intent(context, CloudActivity::class.java)) }) {
+                                    Text("Cloud vehicles")
+                                }
+                            }
                             item { ConnectionPanel(model, onPermission) }
                             item { SurfaceCard("Display") {
                                 Row(verticalAlignment = Alignment.CenterVertically) {

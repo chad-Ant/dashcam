@@ -28,6 +28,7 @@ This file has three parts:
 
 | Workstream | Commits | State | Next |
 |---|---|---|---|
+| Dashcam Connect cloud pilot | Step 8 | Two simulated Jetsons and five viewers passed the ARM64 integration test. The relay image built locally. | Deploy staging from an authenticated project shell, enroll the pilot Jetson, build the APK on Windows and run the mobile-data trial. See the [step 8 handover](#2026-11-21-dashcam-connect-cloud-pilot). |
 | v0.4 recorder (UGREEN) | `7293abe` and earlier | Segmented MJPEG passthrough, auto night mode, fixed focus, every telemetry field in the `.ass` and in CSV. The 2026-10-03 night drive recorded cleanly; the overlay matches the telemetry and every segment has its `.ass`. | Start the service before a drive. |
 | UGREEN image | — | Fixed 690 is verified, and autofocus also works (parked). Night blur is exposure (33–50 ms at 20 fps), not focus. 45% of night driving frames are below luma 35. The camera has no `exposure_dynamic_framerate` control, so the proposed A/B with it is impossible; v0.4's frame-rate-priority loop is the existing way to cap exposure (`libcamera_exposure.h`). | Autofocus while driving is untested. |
 | CSI IMX296 | — (driver and ISP files live outside the repo) | c8_sh15 is clean indoors. At night it is gain-limited by the device tree: noisy and banded on unlit roads, 18.3 MB/s. **The mount is loose: 23 pose changes in 91 min**, mostly on road shocks. Candidates for the gain/exposure caps and the debug flood are staged. | Re-mount rigidly; install cand1 and A/B (sudo); then the debug-off module. |
@@ -418,6 +419,19 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-21 Dashcam Connect cloud pilot
+
+The ARM64 emulator tests passed for device isolation, enrollment and revocation. With synthetic recorder data, five TLS viewers shared one upstream reader per requested channel per vehicle. Telemetry stopped after 30.07 seconds without renewal and after 0.06 seconds on explicit leave. All 56 connector tests and the native sanitizer tests passed. Both the LAN connector and recorder services were active after testing.
+
+| Outstanding item | Owner and completion evidence |
+|---|---|
+| Deploy staging | A project deployer with access to `jetson-dashcam-handler` checks billing, configures the dedicated runtime identity, reviews the default Firestore rules and deploys the relay in `asia-southeast1`. Record the HTTPS origin and Cloud Run revision. This Jetson had no authenticated deployer. |
+| Grant vehicle A and enroll it | The Firebase administrator adds the staging hostname to authorized domains. The pilot owner signs in once. The administrator takes that account’s UID from **Authentication → Users** and grants it the owner role for A. Record the chosen vehicle label. Use the owner-issued code to enroll the parked Jetson and start its separate uplink service. |
+| Build and install the pilot APK | Use the prepared Windows machine, its registered debug signing key and the deployed HTTPS origin. Record the APK SHA-256 and confirm that the owner can select A on both clients. The Jetson build stopped at the license checks for SDK Platform 37 and Build Tools 36. |
+| Run the field trial | With phone Wi-Fi off, cancel an offline request, then verify fresh recorder samples in Android and the browser. Measure telemetry and camera startup separately. Close one viewer while the other stays live, then close the last and verify ten idle minutes with zero media uploads and a closed on-demand relay socket. Check both mode switches, reconnection across a timeout or revision, saved footage, LAN access and relay usage. |
+
+Keep the URL, revision, APK hash, vehicle label, timings and counters with the trial result. Keep enrollment codes, pairing links and tokens out of the record. [Deployment, enrollment, build and rollback commands](connector/cloud/README.md) · [Mobile-data acceptance criteria](connector/GOOGLE_CLOUD_SETUP.md#9-first-mobile-data-acceptance-test)
 
 ## 2026-11-21 (Jetson, bench): two-client soak; live view toggle; Android rendering
 

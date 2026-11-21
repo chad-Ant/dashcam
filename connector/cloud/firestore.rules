@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /vehicles/{vehicle}/control/current {
+      allow get: if request.auth != null &&
+        resource.data.deviceUid == request.auth.uid;
+    }
+  }
+}
