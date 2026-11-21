@@ -1,6 +1,5 @@
 package com.dashcam.connector
 
-import androidx.compose.ui.graphics.ImageBitmap
 import org.json.JSONObject
 import java.net.URI
 import java.net.URISyntaxException
@@ -99,12 +98,16 @@ data class VideoHeader(val headerLength: Int, val sequence: Long, val ageMs: Lon
 /** A camera frame older than this since it was received is never shown. */
 const val VIDEO_STALE_MS = 2000L
 
+// Metadata of the newest decoded frame; the picture itself goes through
+// MonitorRepository.picture, which Compose never observes as state.
 // Not a data class: every decoded frame is a distinct value for StateFlow.
-class VideoFrame(val image: ImageBitmap, val width: Int, val height: Int, val ageMs: Long,
+class VideoFrame(val width: Int, val height: Int, val ageMs: Long,
                  val receivedAtMs: Long, val fps: Double?)
 
 // connected: the /v1/video socket of this state is open; a closed or retrying
-// connection never carries a frame, so it shows "No video".
+// connection never carries a frame, so it shows "No video". frame is published
+// at once for the first frame after a (re)connect or a stall, otherwise by the
+// 500 ms clock tick (publishFrameNow), so the caption changes at 2 Hz.
 data class VideoState(val status: String = "Video paused", val frame: VideoFrame? = null, val nowMs: Long = 0,
                       val connected: Boolean = false) {
     // Receipt time on the elapsed-realtime clock; an old picture is never shown.

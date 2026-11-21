@@ -1,6 +1,7 @@
 package com.dashcam.connector
 
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -10,7 +11,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -22,8 +22,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -33,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import java.util.Locale
 
@@ -75,6 +77,7 @@ private val marks = listOf("◉", "↗", "▥", "⌁")
 private const val CAMERA_ITEM = "camera"
 /** Scrolled-away camera keeps its video socket this long, so a brief scroll never reopens TLS. */
 private const val CAMERA_OFFSCREEN_GRACE_MS = 2000L
+private val CameraCorner = 14.dp
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -300,30 +303,32 @@ private data class BannerUi(val fresh: Boolean, val title: String, val detail: S
     }
 }
 @Composable private fun CameraCard(repository: MonitorRepository) {
-    // Collected here, not in Dashboard: frames (~10 Hz) and the countdown reach only this card.
+    // Collected here, not in Dashboard: video status and frame metadata (2 Hz) and the
+    // countdown reach only this card. The pictures themselves never go through Compose.
     val video = repository.video.collectAsStateWithLifecycle()
     val live = repository.liveView.collectAsStateWithLifecycle()
     SurfaceCard("Camera") {
-        CameraPicture(video, live, Modifier.align(Alignment.CenterHorizontally))
+        CameraPicture(video, live, repository.picture, Modifier.align(Alignment.CenterHorizontally))
         CameraHint(video, live)
         LiveViewButton(live) { repository.setLiveView(it) }
     }
 }
 private fun shownFrame(video: VideoState, live: LiveViewState) = video.frame?.takeUnless { video.stale }?.takeIf { live.on }
-@Composable private fun CameraPicture(video: State<VideoState>, live: State<LiveViewState>, modifier: Modifier) {
-    val frame by remember(video, live) { derivedStateOf { shownFrame(video.value, live.value) } }
+@Composable private fun CameraPicture(video: State<VideoState>, live: State<LiveViewState>,
+                                      pictures: StateFlow<Bitmap?>, modifier: Modifier) {
+    // Recomposes only when the picture appears or goes; new frames are drawn by the surface.
+    val showing by remember(video, live) { derivedStateOf { shownFrame(video.value, live.value) != null } }
     val placeholder by remember(video, live) { derivedStateOf {
         val v = video.value
         val l = live.value
         when { !l.available -> "No video"; !l.on -> "Live view off"; v.frame != null -> "Video stale"; else -> "No video" }
     } }
     Box(modifier.widthIn(max = 720.dp).fillMaxWidth().aspectRatio(16f / 9f)
-        .clip(RoundedCornerShape(14.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
-        val shown = frame
-        // Image already paints in its own clipToBounds layer; this one makes that isolation explicit
-        // (a new frame re-records only the picture) instead of relying on Image internals.
-        if (shown != null) Image(bitmap = shown.image, contentDescription = "Dashcam camera",
-            modifier = Modifier.fillMaxSize().graphicsLayer {}, contentScale = ContentScale.Fit)
+        .clip(RoundedCornerShape(CameraCorner)).background(Color.Black)
+        .then(if (showing) Modifier.semantics { contentDescription = "Dashcam camera"; role = Role.Image } else Modifier),
+        contentAlignment = Alignment.Center) {
+        // Not composed while no frame should be shown: a stale or closed feed shows the placeholder.
+        if (showing) CameraSurface(pictures, MaterialTheme.colorScheme.surface, CameraCorner, Modifier.fillMaxSize())
         else Text(placeholder, color = Color(0xFFFFCA80), fontWeight = FontWeight.SemiBold)
     }
 }

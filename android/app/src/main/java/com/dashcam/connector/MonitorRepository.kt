@@ -8,7 +8,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.SystemClock
-import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +30,17 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     val state = mutable.asStateFlow()
     private val videoMutable = MutableStateFlow(VideoState())
     val video = videoMutable.asStateFlow()
+    // The newest decoded picture of the open /v1/video connection, null while there is none.
+    // Collected by the camera surface off the main thread, never as Compose state: a new
+    // frame costs no recomposition. Cleared with every connection change, like VideoState.frame.
+    private val pictureMutable = MutableStateFlow<Bitmap?>(null)
+    val picture = pictureMutable.asStateFlow()
+    // Guards videoMutable, pictureMutable and latestFrame together, so a connection change
+    // and a decode finishing on Dispatchers.Default never interleave. Held only briefly.
+    private val videoLock = Any()
+    // Metadata of the newest shown frame; the 500 ms tick copies it into VideoState.
+    // Null exactly when VideoState.frame and picture are (cleared on every connection change).
+    private var latestFrame: VideoFrame? = null
     private val liveMutable = MutableStateFlow(LiveViewState())
     val liveView = liveMutable.asStateFlow()
     private val liveSession = LiveViewSession()
@@ -60,10 +70,11 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     init {
         scope.launch {
             while (isActive) {
-                delay(500)
+                delay(VIDEO_METADATA_TICK_MS)
                 val now = SystemClock.elapsedRealtime()
                 mutable.update { it.copy(nowMs = now) }
-                videoMutable.update { it.copy(nowMs = now) }
+                // Also carries the newest frame's metadata: the caption changes at 2 Hz, not per frame.
+                synchronized(videoLock) { videoMutable.value = videoMutable.value.copy(nowMs = now, frame = latestFrame) }
             }
         }
     }
@@ -256,10 +267,14 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         continuation.invokeOnCancellation { ws.cancel(); cleanup() }
     }
     // Every status change is a connection change (connecting, open, closed, failed):
-    // the previous connection's frame is dropped so it is never shown as current.
+    // the previous connection's frame and picture are dropped so they are never shown as current.
     private fun videoStatus(epoch: Int, text: String, connected: Boolean = false) {
-        videoMutable.update { previous ->
-            if (videoGeneration.get() != epoch) previous else previous.copy(status = text, frame = null, connected = connected)
+        synchronized(videoLock) {
+            if (videoGeneration.get() == epoch) {
+                latestFrame = null
+                pictureMutable.value = null
+                videoMutable.value = videoMutable.value.copy(status = text, frame = null, connected = connected)
+            }
         }
     }
     private fun restartVideo() {
@@ -273,14 +288,18 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         if (!live) { liveTicker?.cancel(); liveTicker = null }
         publishLiveView(now)
         // Dropping the frame here means a closed feed never shows an old picture.
-        videoMutable.value = VideoState(status = when {
-            !active || !videoWanted -> "Video paused"
-            device == null -> "Choose or pair a Jetson"
-            unavailable != null -> unavailable
-            !live -> "Live view off"
-            network == null -> "Waiting for Wi-Fi"
-            else -> "Connecting"
-        }, nowMs = now)
+        synchronized(videoLock) {
+            latestFrame = null
+            pictureMutable.value = null
+            videoMutable.value = VideoState(status = when {
+                !active || !videoWanted -> "Video paused"
+                device == null -> "Choose or pair a Jetson"
+                unavailable != null -> unavailable
+                !live -> "Live view off"
+                network == null -> "Waiting for Wi-Fi"
+                else -> "Connecting"
+            }, nowMs = now)
+        }
         if (!active || !videoWanted || !live || device == null || network == null) return
         videoTask = scope.launch {
             // Conflated: while a JPEG is decoding only the newest pending frame is kept.
@@ -373,7 +392,6 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             val bitmap = decodeJpeg(frame.bytes, frame.header.headerLength) ?: continue
             if (SystemClock.elapsedRealtime() - frame.receivedAtMs > VIDEO_STALE_MS) continue   // decode stalled
             bitmap.prepareToDraw()
-            val image = bitmap.asImageBitmap()
             val now = SystemClock.elapsedRealtime()
             val gap = (now - lastAt).toDouble()
             interval = when {
@@ -383,17 +401,24 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             }
             lastAt = now
             val fps = if (interval > 0) 1000.0 / interval else null
-            val shown = VideoFrame(image, frame.header.width, frame.header.height, frame.header.ageMs,
+            val shown = VideoFrame(frame.header.width, frame.header.height, frame.header.ageMs,
                 frame.receivedAtMs, fps)
-            videoMutable.update { previous ->
+            synchronized(videoLock) {
+                val previous = videoMutable.value
                 // A decode that finishes after its socket closed is not shown.
-                if (videoGeneration.get() != epoch || !previous.connected) previous
-                else previous.copy(status = "Live", frame = shown, nowMs = now)
+                if (videoGeneration.get() == epoch && previous.connected) {
+                    // The picture goes to the camera surface every frame; the metadata (and so the
+                    // caption) only when nothing current is shown, else with the next 500 ms tick.
+                    latestFrame = shown
+                    pictureMutable.value = bitmap
+                    if (publishFrameNow(previous.frame?.receivedAtMs, now))
+                        videoMutable.value = previous.copy(status = "Live", frame = shown, nowMs = now)
+                }
             }
         }
     }
     // A fresh bitmap per frame: one already published may still be drawn (including
-    // an in-flight RenderThread frame), so it is never decoded into again; the GC frees it.
+    // an in-flight surface draw), so it is never decoded into again; the GC frees it.
     private fun decodeJpeg(data: ByteArray, offset: Int): Bitmap? {
         val length = data.size - offset
         if (length < 4 || data[offset] != 0xFF.toByte() || data[offset + 1] != 0xD8.toByte()) return null

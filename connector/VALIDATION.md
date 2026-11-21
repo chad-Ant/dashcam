@@ -197,6 +197,27 @@ Fewer frames (snapshots no longer redraw unchanged cards) but each frame is slow
 off (framestats, median): recomposition 7.3 ms, draw recording 5.8 ms, GPU command issue 4.1 ms, measure/layout
 0.2 ms. Both builds are `DEBUGGABLE`; a non-debuggable `benchmark` build type was added to measure properly.
 
+**Real-time auto-stop on the A54:** live view started during the P2 run stopped by itself ~10 min later (14:14:04)
+with "Live view stopped after 10 min · tap Start live view to resume"; the phone's video socket closed, telemetry
+stayed; the P2 pause and the C4 reconnect inside the window did not reset it.
+
+**Non-debuggable `benchmark` builds, A54 (120 Hz display), alternating installs, 2 runs each on Live:**
+
+| | Baseline (`perf-baseline`) | `778467d` |
+|---|---:|---:|
+| Live with video, frames / 60 s | 951, 945 | 765, 748 |
+| Live with video, app CPU | 53.5 %, 53.3 % | 50.1 %, 50.1 % |
+| Live, median / p90 frame | 18 / 22 ms | 19 / 22 ms |
+| Live, per frame recompose / draw / GPU (median) | 4.0 / 5.2 / 2.7 ms | 5.1 / 6.5 / 2.7 ms |
+| System tab, frames / 30 s | 204 | 107 |
+| System tab, app CPU | 23.7 % | 15.3 % |
+| System tab, PSS / graphics | 116 / 37 MB | 88 / 17 MB |
+
+"Janky" counts (85–96 %) are against the 120 Hz 8.3 ms deadline; only 1–4 vsyncs were actually missed per minute,
+so the cost is CPU (battery, heat), not visible stutter. The debug builds had exaggerated the new code's per-frame
+cost. Per-card state halves redraws and cuts CPU by a third on telemetry pages; on Live each video frame still costs
+~19 ms of UI-thread Compose work, which the SurfaceView change after this addresses.
+
 ## Remaining physical acceptance
 
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.

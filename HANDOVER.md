@@ -479,7 +479,12 @@ driven from the Jetson: live view off at start, P2 and C4 passed on the phone (`
 rendering rework did not lower frame time on the A54** (debug builds: median 18 → 22 ms, frames 15.7/s → 12.5/s,
 CPU 57 → 62 %); per frame, recomposition ~7 ms and draw recording ~6 ms even when only the banner changes. Next:
 measure non-debuggable builds (`benchmark` build type, baseline branch `perf-baseline` = `d68f3ee` + that build
-type), then per-card drawing layers if the draw phase still dominates.
+type), then per-card drawing layers if the draw phase still dominates. **Measured (non-debuggable, A54):** Live with
+video 948 → 757 frames/min and 53.4 → 50.1 % CPU; System tab 204 → 107 frames/30 s and 23.7 → 15.3 % CPU
+(`connector/VALIDATION.md`); "janky" is against 120 Hz and only 1–4 vsyncs/min were missed. Each video frame still
+cost ~19 ms of UI-thread Compose work, so the next commit draws video in a `SurfaceView` (`CameraSurface.kt`, plain
+`AndroidView`, not `AndroidExternalSurface`, whose reusable view stops drawing after LazyColumn item reuse in
+foundation 1.9) from a background collector; frame metadata reaches the caption at ~2 Hz. Uncompiled when pushed.
 
 **Next:** build and test on Windows (`.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`),
 install on the A54, then `adb shell dumpsys gfxinfo com.dashcam.connector reset`, a minute on Live with live view on,
