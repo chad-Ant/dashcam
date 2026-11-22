@@ -38,6 +38,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import java.util.Locale
 
+internal val DashcamColors = darkColorScheme(
+    primary = Color(0xFF5CE0C6), background = Color(0xFF0B121B), surface = Color(0xFF15212D),
+    secondaryContainer = Color(0xFF23443F), onSecondaryContainer = Color(0xFF5CE0C6),
+    onSurface = Color(0xFFE6EEF5), onSurfaceVariant = Color(0xFFA2B3C3)
+)
+
 class MainActivity : ComponentActivity() {
     private val model: DashboardModel by viewModels()
     private var foreground = false
@@ -47,11 +53,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(
-                primary = Color(0xFF5CE0C6), background = Color(0xFF0B121B), surface = Color(0xFF15212D),
-                secondaryContainer = Color(0xFF23443F), onSecondaryContainer = Color(0xFF5CE0C6),
-                onSurface = Color(0xFFE6EEF5), onSurfaceVariant = Color(0xFFA2B3C3)
-            )) {
+            MaterialTheme(colorScheme = DashcamColors) {
                 Dashboard(model, onKeepAwake = { enabled ->
                     if (enabled) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
