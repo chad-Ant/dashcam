@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
@@ -83,7 +84,7 @@ class CloudActivity : ComponentActivity() {
 
     private fun demand() = if (camera) """{"channels":["telemetry","video"]}""" else """{"channels":["telemetry"]}"""
 
-    private suspend fun stream(vehicle: Vehicle, status: (String) -> Unit, sample: (String) -> Unit,
+    private suspend fun stream(vehicle: Vehicle, status: (String) -> Unit, sample: (Snapshot?, Long) -> Unit,
                                picture: (Bitmap?) -> Unit) {
         val start = SystemClock.elapsedRealtime()
         var latency: Long? = null
@@ -121,7 +122,7 @@ class CloudActivity : ComponentActivity() {
                             val fresh = s.optBoolean("runtime_fresh")
                             if (fresh && latency == null) latency = it.time - start
                             status(if (fresh) "Live · first fresh sample " + latency + " ms" else "Online · recorder data unavailable")
-                            sample(s.toString(2))
+                            sample(Snapshot(s), it.time)
                         }
                     }
                     frame.getAndSet(null)?.takeIf { camera }?.let {
@@ -139,7 +140,7 @@ class CloudActivity : ComponentActivity() {
                         }
                     }
                     if (lastSample > 0 && now - lastSample > 2000) {
-                        sample(""); status("Waiting for fresh telemetry"); lastSample = 0
+                        sample(null, 0); status("Waiting for fresh telemetry"); lastSample = 0
                     }
                     if (!camera || now - lastFrame > VIDEO_STALE_MS) picture(null)
                     delay(100)
@@ -149,7 +150,7 @@ class CloudActivity : ComponentActivity() {
             } finally {
                 ws.close(1000, null)
                 if (socket === ws) socket = null
-                sample(""); picture(null)
+                sample(null, 0); picture(null)
             }
             if (watching) { status("Reconnecting"); delay(2000) }
         }
@@ -174,10 +175,19 @@ class CloudActivity : ComponentActivity() {
         var selected by remember { mutableStateOf<Vehicle?>(null) }
         var policy by remember { mutableStateOf<JSONObject?>(null) }
         var status by remember { mutableStateOf("") }
-        var sample by remember { mutableStateOf("") }
+        val monitor = remember { mutableStateOf(MonitorState()) }
+        var dashboard by remember { mutableStateOf(false) }
         var showDetails by remember { mutableStateOf(false) }
         var image by remember { mutableStateOf<Bitmap?>(null) }
         val scope = rememberCoroutineScope()
+        fun setCamera(enabled: Boolean) {
+            if (camera == enabled) return
+            camera = enabled
+            cameraStart = SystemClock.elapsedRealtime()
+            frameLatency = null
+            socket?.send(demand())
+            if (!enabled) image = null
+        }
         suspend fun attempt(block: suspend () -> Unit) {
             try { block() } catch (e: CancellationException) { throw e }
             catch (e: Exception) { status = e.localizedMessage ?: "Connection failed" }
@@ -199,9 +209,58 @@ class CloudActivity : ComponentActivity() {
         }
         LaunchedEffect(watching, selected) {
             if (watching) selected?.let {
-                try { attempt { stream(it, { s -> status = s }, { s -> sample = s }, { b -> image = b }) } }
-                finally { watching = false; camera = false }
+                try {
+                    attempt {
+                        stream(it, { text ->
+                            status = text
+                            monitor.value = monitor.value.copy(status = text)
+                        }, { snapshot, received ->
+                            monitor.value = MonitorState(status, snapshot, received, SystemClock.elapsedRealtime(), snapshot != null)
+                        }, { bitmap -> image = bitmap })
+                    }
+                } finally {
+                    dashboard = false; watching = false; camera = false; image = null
+                    monitor.value = MonitorState()
+                }
             }
+        }
+        val vehicle = selected
+        if (dashboard && watching && vehicle != null) {
+            val map = remember(vehicle.id) { MapViewState() }
+            val tiles = remember { TileLoader(applicationContext, scope) }
+            DisposableEffect(tiles) { onDispose { tiles.close() } }
+            LaunchedEffect(map) {
+                snapshotFlow {
+                    val state = monitor.value
+                    val fix = state.snapshot?.vehicle?.takeIf { state.runtimeFresh }
+                    TileMath.fix(fix.finite("latitude"), fix.finite("longitude"), fix.finite("heading_deg"))
+                }.collect { map.update(it) }
+            }
+            LaunchedEffect(Unit) {
+                while (true) {
+                    delay(500)
+                    monitor.value = monitor.value.copy(nowMs = SystemClock.elapsedRealtime())
+                    if (camera && SystemClock.elapsedRealtime() - cameraStart >= LIVE_VIEW_MAX_MS) setCamera(false)
+                }
+            }
+            BackHandler { dashboard = false }
+            DashboardLayout(state = monitor, deviceName = vehicle.label, initialPage = 0,
+                onKeepAwake = { window.decorView.keepScreenOn = it },
+                onVideoWanted = { visible -> if (!visible) setCamera(false) },
+                cameraCard = {
+                    SurfaceCard("Camera") {
+                        val frame = image
+                        if (camera && frame != null) Image(frame.asImageBitmap(), "Camera preview",
+                            Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+                        else Hint(if (camera) "Waiting for camera frames" else "Live view off")
+                        OutlinedButton(onClick = { setCamera(!camera) }) {
+                            Text(if (camera) "Stop live view" else "Start live view")
+                        }
+                    }
+                }, mapCard = { MapCard(map, tiles) }) {
+                item { Button(onClick = { dashboard = false }) { Text("Cloud vehicles") } }
+            }
+            return
         }
         Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp),
                verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -215,12 +274,11 @@ class CloudActivity : ComponentActivity() {
                     Button(onClick = { watching = !watching; if (!watching) status = "Disconnected" }) {
                         Text(if (watching) "Disconnect" else "Connect to " + v.label)
                     }
+                    if (watching && monitor.value.snapshot != null) {
+                        Button(onClick = { dashboard = true }) { Text("Open dashboard") }
+                    }
                     if (watching) Row {
-                        Checkbox(checked = camera, onCheckedChange = { camera = it
-                            cameraStart = SystemClock.elapsedRealtime()
-                            frameLatency = null
-                            socket?.send(demand())
-                            if (!it) image = null })
+                        Checkbox(checked = camera, onCheckedChange = { setCamera(it) })
                         Text("Camera")
                     }
                     policy?.takeIf { v.owner }?.let { p ->
@@ -243,9 +301,8 @@ class CloudActivity : ComponentActivity() {
             if (watching && requestId.isNotEmpty()) Text("Request " + requestId)
             if (watching && camera) frameLatency?.let { Text("First camera frame " + it + " ms") }
             if (camera && watching) image?.let { Image(it.asImageBitmap(), "Camera preview", Modifier.fillMaxWidth()) }
-            if (watching && sample.isNotEmpty()) {
-                val json = remember(sample) { JSONObject(sample) }
-                val snapshot = Snapshot(json)
+            if (watching) monitor.value.snapshot?.let { snapshot ->
+                val json = snapshot.json
                 val speed = snapshot.vehicle.finite("speed_kmh")
                 Text(listOfNotNull("Sample " + json.optLong("seq"),
                     speed?.let { "%.0f km/h".format(it) },
@@ -254,7 +311,7 @@ class CloudActivity : ComponentActivity() {
                 TextButton(onClick = { showDetails = !showDetails }) {
                     Text(if (showDetails) "Hide sample details" else "Show sample details")
                 }
-                if (showDetails) Text(sample)
+                if (showDetails) Text(json.toString(2))
             }
         }
     }

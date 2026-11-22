@@ -12,6 +12,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -89,7 +90,31 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     val state = model.repository.state.collectAsStateWithLifecycle()
     val profiles by model.profiles.collectAsStateWithLifecycle()
     val selected by model.selected.collectAsStateWithLifecycle()
-    var page by remember { mutableIntStateOf(if (profiles.isEmpty()) 3 else 0) }
+    DashboardLayout(
+        state = state, deviceName = profiles.find { it.id == selected }?.name ?: "Your Jetson, at a glance",
+        initialPage = if (profiles.isEmpty()) 3 else 0, onKeepAwake = onKeepAwake,
+        onVideoWanted = model.repository::setVideoWanted, cameraCard = { CameraCard(model.repository) },
+        mapCard = { MapCard(model.map, model.tiles) }
+    ) {
+        item {
+            val context = androidx.compose.ui.platform.LocalContext.current
+            Button(onClick = { context.startActivity(android.content.Intent(context, CloudActivity::class.java)) }) {
+                Text("Cloud vehicles")
+            }
+        }
+        item { ConnectionPanel(model, onPermission) }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun DashboardLayout(
+    state: State<MonitorState>, deviceName: String, initialPage: Int, onKeepAwake: (Boolean) -> Unit,
+    onVideoWanted: (Boolean) -> Unit, cameraCard: @Composable () -> Unit,
+    mapCard: @Composable () -> Unit, connectionItems: LazyListScope.() -> Unit
+) {
+    val videoWanted by rememberUpdatedState(onVideoWanted)
+    var page by remember { mutableIntStateOf(initialPage) }
     var awake by remember { mutableStateOf(false) }
     val connected = state.derive { active }
     LaunchedEffect(awake, connected) { onKeepAwake(awake && connected) }
@@ -102,14 +127,14 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     // The live view window keeps running throughout. Applied straight from the layout
     // change, so a grace that ends in the background never waits for a frame.
     LaunchedEffect(list, page) {
-        if (page != 0) { model.repository.setVideoWanted(false); return@LaunchedEffect }
+        if (page != 0) { videoWanted(false); return@LaunchedEffect }
         snapshotFlow { list.layoutInfo.visibleItemsInfo.any { it.key == CAMERA_ITEM } }
             .collectLatest { onScreen ->
                 if (!onScreen) delay(CAMERA_OFFSCREEN_GRACE_MS)
-                model.repository.setVideoWanted(onScreen)
+                videoWanted(onScreen)
             }
     }
-    DisposableEffect(Unit) { onDispose { model.repository.setVideoWanted(false) } }
+    DisposableEffect(Unit) { onDispose { videoWanted(false); onKeepAwake(false) } }
     BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding()) {
         val wide = maxWidth >= 840.dp
         Scaffold(containerColor = MaterialTheme.colorScheme.background,
@@ -132,20 +157,20 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                             style = MaterialTheme.typography.labelMedium)
                         Spacer(Modifier.height(8.dp))
                         Text(pages[page], style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.SemiBold)
-                        Text(profiles.find { it.id == selected }?.name ?: "Your Jetson, at a glance",
+                        Text(deviceName,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     stickyHeader { Box(Modifier.background(MaterialTheme.colorScheme.background).padding(bottom = 4.dp)) { ConnectionBanner(state) } }
                     when (page) {
                         0 -> {
-                            item(key = CAMERA_ITEM) { CameraCard(model.repository) }
+                            item(key = CAMERA_ITEM) { cameraCard() }
                             item { SpeedCard(state) }
                             item { AdaptivePair(wide, { RecordingCard(state) }, { AdasCard() }) }
                             item { AdaptivePair(wide, { PositionCard(state) }, { HealthSummary(state) }) }
                         }
                         1 -> {
                             item { SpeedCard(state) }
-                            item { MapCard(model.map, model.tiles) }
+                            item { mapCard() }
                             item { AdaptivePair(wide, { PowertrainCard(state) }, { PositionCard(state) }) }
                             item { TelemetryLinkCard(state) }
                         }
@@ -155,13 +180,7 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
                             item { AdasCard() }
                         }
                         3 -> {
-                            item {
-                                val context = androidx.compose.ui.platform.LocalContext.current
-                                Button(onClick = { context.startActivity(android.content.Intent(context, CloudActivity::class.java)) }) {
-                                    Text("Cloud vehicles")
-                                }
-                            }
-                            item { ConnectionPanel(model, onPermission) }
+                            connectionItems()
                             item { SurfaceCard("Display") {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text("Keep screen on while connected", Modifier.weight(1f))
