@@ -94,16 +94,32 @@ class Resources:
         self.version = -1
         self.failure = asyncio.get_running_loop().create_future()
 
-    def task(self, coro):
+    def task(self, coro, wanted=None):
+        """wanted() says whether the task's work is still current when it ends; None means always."""
         task = asyncio.create_task(coro)
         self.tasks.add(task)
-        task.add_done_callback(self.finished)
+        task.add_done_callback(lambda done: self.finished(done, wanted))
         return task
 
-    def finished(self, task):
+    def finished(self, task, wanted=None):
         self.tasks.discard(task)
-        if not task.cancelled() and not self.failure.done():
-            self.failure.set_result(task.exception() or ConnectionError('Stream ended'))
+        for bit, reader in list(self.readers.items()):
+            if reader is task:
+                del self.readers[bit]   # a later demand for this channel starts a fresh reader
+        if task.cancelled():
+            return
+        error = task.exception()
+        # A task whose attempt or channel was released ended because the session did: the
+        # normal end of an on-demand view. Only work that is still wanted restarts the uplink
+        # (with backoff); otherwise the watcher keeps running and sees the next request at once.
+        if wanted is not None and not wanted():
+            return
+        if not self.failure.done():
+            self.failure.set_result(error or ConnectionError('Stream ended'))
+
+    def current(self, attempt, bit=0):
+        state = self.core.state()
+        return state.attempt == attempt and self.attempt == attempt and (not bit or bool(state.active & bit))
 
     def reconcile(self, state):
         if state.attempt != self.attempt:
@@ -112,7 +128,8 @@ class Resources:
             self.socket = None
             self.attempt = state.attempt
             self.registration = None
-            self.connection = self.task(self.connect(state.attempt)) if state.attempt else None
+            attempt = state.attempt
+            self.connection = self.task(self.connect(attempt), lambda: self.current(attempt)) if attempt else None
         report = (state.attempt, state.active)
         if report != self.last_report:
             self.last_report = report
@@ -125,7 +142,8 @@ class Resources:
             self.register.set()
         for bit, route in ((1, 'stream'), (2, 'video')):
             if state.active & bit and bit not in self.readers:
-                self.readers[bit] = self.task(self.read(bit, route, state.attempt))
+                self.readers[bit] = self.task(self.read(bit, route, state.attempt),
+                                              lambda b=bit, a=state.attempt: self.current(a, b))
             elif not state.active & bit and bit in self.readers:
                 self.readers.pop(bit).cancel()
 
@@ -172,7 +190,7 @@ class Resources:
             if self.core.state().attempt != attempt:
                 return
             self.socket = ws
-            sender = self.task(self.register_loop(ws, attempt))
+            sender = self.task(self.register_loop(ws, attempt), lambda: self.current(attempt))
             try:
                 while True:
                     msg = await ws.receive(timeout=150)
