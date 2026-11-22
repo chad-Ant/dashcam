@@ -299,10 +299,16 @@ def application(store, config):
     async def static(request):
         return web.FileResponse(WEB / (request.match_info.get('name') or 'index.html'),
                                 headers={'X-Frame-Options': 'DENY'})
+    async def dashboard(request):
+        name = request.match_info.get('name', 'index.html')
+        return web.FileResponse(WEB.parent.parent / 'web' / name, headers={'X-Frame-Options': 'DENY'})
+
     async def configuration(request):
         return web.json_response(config)
     app.router.add_get('/', static)
-    app.router.add_get('/{name:app.js|style.css}', static)
+    app.router.add_get(r'/{name:fleet\.js|style\.css}', static)
+    app.router.add_get('/dashboard', dashboard)
+    app.router.add_get(r'/{name:app\.js|app\.css|icon\.svg}', dashboard)
     app.router.add_get('/v1/config', configuration)
     app.router.add_post('/v1/session', relay.session)
     app.router.add_delete('/v1/session', relay.session)

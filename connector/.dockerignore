@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!web/
+!web/**
+!cloud/
+cloud/*
+!cloud/requirements.txt
+!cloud/store.py
+!cloud/relay.py
+!cloud/web/
+!cloud/web/**

@@ -37,6 +37,15 @@ gcloud iam service-accounts add-iam-policy-binding "$account" --project="$projec
   --member="serviceAccount:$account" --role=roles/iam.serviceAccountTokenCreator
 ```
 
+The staging source build uses a separate service account to read its uploaded sources, write build logs and push the image. For a new project, provision it once. The deployer needs permission to attach both service accounts. [Cloud Run build service accounts](https://docs.cloud.google.com/run/docs/configuring/services/build-service-account)
+
+```sh
+builder=dashcam-relay-build@"$project".iam.gserviceaccount.com
+gcloud iam service-accounts create dashcam-relay-build --project="$project"
+gcloud projects add-iam-policy-binding "$project" \
+  --member="serviceAccount:$builder" --role=roles/run.builder
+```
+
 From `connector/cloud`, run `./stage.sh` after comparing the current default-database rules with `firestore.rules`. The deployment publishes that ruleset for the entire default database. Preserve any separately managed rules if the project is shared. The script checks billing, deploys the single-instance relay, then prints the actual service URL and revision. The pilot uses an in-memory connection registry, one active revision receiving all traffic, and one instance. Stop old sessions before shifting revisions. Cloud Run terminates TLS at its ingress.
 
 Add the printed hostname to **Firebase Authentication → Settings → Authorized domains**. Open the printed URL and sign in once with the chosen Google account. A new account sees an empty vehicle list. In **Authentication → Users**, copy that account's **User UID**. This identifies the person who can view vehicle A and issue its enrollment code. The label below is the name displayed to that person. Run the grant from an administrator Python environment with the relay requirements installed and application default credentials for the pilot project.

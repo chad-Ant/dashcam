@@ -2,15 +2,15 @@
 
 Use this guide to take one paired Jetson from a working Wi-Fi connection to a telemetry session on a phone using mobile data. Start with **Plan A (On demand)**. The powered Jetson listens for requests in Firestore. When an invited viewer connects, the Jetson opens an outbound connection to the Cloud Run relay. It sends camera frames only if a viewer requests the camera. The planned browser dashboard uses HTTPS and the Android app uses its own cloud connection. Neither client needs a VPN installation or router port forwarding.
 
-## Where this pilot stands — 21 November 2026
+## Where this pilot stands — 22 November 2026
 
 | Item | Evidence and next action |
 |---|---|
 | Google Cloud | The pilot project is `jetson-dashcam-handler`. Cloud Shell confirmed the `(default)` Firestore Native, Standard database in Singapore (`asia-southeast1`) and all five APIs listed in step 5. Reuse this project. Steps 1–5 are also a reference for a fresh installation. |
-| Firebase and billing | Web and Android apps are registered. The console showed Google sign-in enabled, and the owner completed a monthly billing alert. Confirm billing linkage in step 2 before the first deployment. |
+| Firebase and billing | Web and Android apps are registered, Google sign-in is enabled and the owner completed a monthly billing alert. The project billing link and the staging dashboard's Firebase authorized domain were verified on 22 November. |
 | Android build preparation | The owner confirmed step 6 is complete on the Windows APK build machine. The debug signing report succeeded. Interactive Google sign-in will be tested with the cloud-enabled app in step 8. |
 | Jetson and phone | The owner confirmed the Android phone connects to the Jetson over the LAN. Both Jetson services reported active. All eight Python Plan A tests and the native C++ lifecycle tests passed on the Jetson. |
-| Remote viewing | The remote-path implementation is in the checkout. ARM64 emulator tests exercised two devices, five viewer sockets, telemetry, camera release and switching modes. Staging deployment, the registered APK and the mobile-data trial are pending. [Build and deployment commands](cloud/README.md) |
+| Remote viewing | The [staging dashboard](https://dashconnect.cloud.run) is live in Singapore. The signed pilot APK uses the original Cloud Run URL for the same service. ARM64 emulator tests exercised two devices, five viewer sockets, telemetry, camera release and switching modes. Vehicle A is enrolled, and the physical Jetson runs the uplink alongside the LAN monitor. The mobile-data trial is pending. [Pilot handover and APK hash](../HANDOVER.md#2026-11-21-dashcam-connect-cloud-pilot) |
 
 ## Prerequisites on your side
 

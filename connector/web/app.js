@@ -10,6 +10,10 @@
   const WAKE_HINT = 'Monitoring pauses while this page is in the background.';
   const $ = id => document.getElementById(id);
 
+  const cloud = location.pathname === '/dashboard';
+  const vehicleKey = cloud ? new URLSearchParams(location.search).get('vehicle') : null;
+  let nextRenewal = 0, requestId = '', firstSampleMs = null, firstFrameMs = null, videoRequestedMs = 0;
+
   let identity = null, unpaired = false;      // identity = {id, name, capabilities}
   // Each connection attempt (start(), a stop, a failed video upgrade) verifies the identity
   // afresh: video opens only once /v1/identity has answered for the current attempt, and an
@@ -137,6 +141,7 @@
       const fps = span > 0 ? fmt((vTimes.length - 1) * 1000 / span, 1, 'fps') : '— fps';
       return vMeta.width + '×' + vMeta.height + ' · ' + fps + ' · ' + vMeta.ageMs + ' ms old' + stopsIn(now);
     }
+    if (!identity && cloud) return 'Connecting to the vehicle';
     if (!identity) return 'Pair this browser to see the recording camera';
     if (identity.capabilities.video !== true) return 'This Jetson does not offer camera video';
     if (!liveView) {
@@ -493,6 +498,36 @@
   }
 
   // ---- connection page -----------------------------------------------------
+  function deviceCard() {
+    return card('This Jetson',
+      metric('Device name', () => identity ? identity.name : '—'),
+      metric('Device ID', v => (cloud ? v.s?.device_id : identity?.id)?.slice(0, 8) || '—'),
+      metric('Connection', v => stateText(v)),
+      metric('Last message', v => (ws && lastMs > 0 ? (Math.max(0, v.now - lastMs) / 1000).toFixed(1) + ' s ago' : '—')),
+      metric('Invalid packets', v => fmt(v.s?.invalid_packets, 0, '')),
+      metric('Session', v => (typeof v.s?.session === 'string' ? v.s.session.slice(0, 16) : '—')));
+  }
+  function displayCard() {
+    const box = h('input');
+    Object.assign(box, { type: 'checkbox', id: 'wake' });
+    box.setAttribute('role', 'switch');
+    const toggle = h('label', 'switch');
+    toggle.htmlFor = 'wake';
+    toggle.append(h('span', null, 'Keep screen on'), box);
+    wakeNote = hint(WAKE_HINT);
+    if (!('wakeLock' in navigator)) { box.disabled = true; wakeNote.textContent = 'Keeping the screen on is not supported by this browser.'; }
+    box.addEventListener('change', () => { wakeWanted = box.checked; syncWake(); });
+    return card('Display', toggle, wakeNote);
+  }
+  function cloudConnectionPage() {
+    const actions = h('div', 'actions');
+    actions.append(button('Disconnect', 'btn secondary', () => { stop('Disconnected'); location.replace('/'); }));
+    return [deviceCard(), card('Cloud connection',
+      metric('Vehicle', () => identity?.name || vehicleKey || '—'),
+      metric('Request ID', () => requestId || '—'),
+      metric('First fresh sample', () => fmt(firstSampleMs, 0, 'ms')),
+      metric('First camera frame', () => fmt(firstFrameMs, 0, 'ms')), actions), displayCard()];
+  }
   function connectionPage() {
     const steps = h('ol', 'steps');
     const step = (...parts) => {
@@ -507,13 +542,7 @@
     const notPaired = card('This browser is not paired', hint('Browser access needs a session from the Jetson.'), steps);
     binds.push(() => { notPaired.hidden = !unpaired; });
 
-    const device = card('This Jetson',
-      metric('Device name', () => identity ? identity.name : '—'),
-      metric('Device ID', () => identity ? identity.id.slice(0, 8) : '—'),
-      metric('Connection', v => stateText(v)),
-      metric('Last message', v => (ws && lastMs > 0 ? (Math.max(0, v.now - lastMs) / 1000).toFixed(1) + ' s ago' : '—')),
-      metric('Invalid packets', v => fmt(v.s?.invalid_packets, 0, '')),
-      metric('Session', v => (typeof v.s?.session === 'string' ? v.s.session.slice(0, 16) : '—')));
+    const device = deviceCard();
 
     const input = h('input', 'field');
     Object.assign(input, { id: 'pair-link', type: 'password', autocomplete: 'off', spellcheck: false, maxLength: 4096 });
@@ -546,16 +575,7 @@
       signOutActions);
     binds.push(() => { signOutCard.hidden = !identity; });
 
-    const box = h('input');
-    Object.assign(box, { type: 'checkbox', id: 'wake' });
-    box.setAttribute('role', 'switch');
-    const toggle = h('label', 'switch');
-    toggle.htmlFor = 'wake';
-    toggle.append(h('span', null, 'Keep screen on'), box);
-    wakeNote = hint(WAKE_HINT);
-    if (!('wakeLock' in navigator)) { box.disabled = true; wakeNote.textContent = 'Keeping the screen on is not supported by this browser.'; }
-    box.addEventListener('change', () => { wakeWanted = box.checked; syncWake(); });
-    return [notPaired, device, pairCard, signOutCard, card('Display', toggle, wakeNote)];
+    return [notPaired, device, pairCard, signOutCard, displayCard()];
   }
   function say(text, error) {
     message.textContent = text;
@@ -619,6 +639,16 @@
   }
   // Reads /v1/identity without touching shared state: {result: ok|unpaired|error, identity}.
   async function fetchIdentity() {
+    if (cloud) {
+      try {
+        const r = await fetch('/v1/vehicles', { cache: 'no-store', signal: deadline() });
+        if (r.status === 401 || r.status === 403) return { result: 'unpaired' };
+        if (!r.ok) return { result: 'error' };
+        const vehicle = (await r.json()).find(v => v.id === vehicleKey);
+        return vehicle ? { result: 'ok', identity: { id: vehicle.id, name: vehicle.label, capabilities: { video: true } } }
+          : { result: 'unpaired' };
+      } catch (_) { return { result: 'error' }; }
+    }
     let r;
     try {
       r = await fetch('/v1/identity', { credentials: 'same-origin', cache: 'no-store', signal: deadline() });
@@ -658,10 +688,11 @@
     if (fromRetry && idCheck) verified = false;
     else newAttempt();
     if (document.hidden) return setStatus('Disconnected');
-    if (!ws) setStatus(identity ? 'Connecting' : 'Checking pairing');
+    if (!ws) setStatus(identity || cloud ? 'Connecting' : 'Checking pairing');
     const result = await checkIdentity();
     if (e !== epoch) return;
     if (result === 'ok') openSocket();
+    else if (result === 'unpaired' && cloud) { stop('Disconnected'); location.replace('/'); return; }
     else if (result === 'unpaired') { closeSocket(); setStatus('Not paired'); showPage('connection'); }
     else { closeSocket(); retryLater(e, 'Jetson unreachable · retrying'); }
     syncVideo();   // after retryLater, so video waits for telemetry's next check instead of starting one
@@ -683,13 +714,18 @@
   function closeSocket() {
     const sock = ws;
     ws = null; snap = null; lastMs = 0;
+    if (cloud && vws) closeVideo();
     if (sock) sock.close(1000);
   }
   function parseSnapshot(text) {
     if (typeof text !== 'string' || text.length > 65536 || !identity) return null;
     let j;
     try { j = JSON.parse(text); } catch (_) { return null; }
-    if (!isObj(j) || j.schema !== 1 || j.type !== 'snapshot' || j.device_id !== identity.id) return null;
+    if (!isObj(j)) return null;
+    if (cloud && j.type === 'connecting' && typeof j.requestId === 'string') return j;
+    if (j.schema !== 1 || j.type !== 'snapshot') return null;
+    // The relay authenticates the selected vehicle; its LAN recorder has a separate UUID.
+    if (cloud ? typeof j.device_id !== 'string' || !/^[a-f0-9-]{36}$/i.test(j.device_id) : j.device_id !== identity.id) return null;
     if (!Number.isSafeInteger(j.seq) || j.seq < 0 || typeof j.session !== 'string' || !j.session.trim()) return null;
     return j;
   }
@@ -698,14 +734,26 @@
     lastSession = ''; lastSeq = -1;
     let sock;
     try {
-      sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v1/stream');
+      const path = cloud ? '/v1/view/' + encodeURIComponent(vehicleKey) : '/v1/stream';
+      sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path);
     } catch (_) { return retryLater(epoch, 'Connection lost · retrying'); }
     ws = sock; openedMs = performance.now();
+    if (cloud) {
+      sock.binaryType = 'arraybuffer';
+      nextRenewal = 0; requestId = ''; firstSampleMs = null;
+      sock.addEventListener('open', () => { if (ws === sock) syncVideo(); });
+    }
     setStatus('Connecting');
     sock.addEventListener('message', ev => {
       if (ws !== sock) return;
+      if (cloud && ev.data instanceof ArrayBuffer) {
+        if (vws === sock) receiveFrame(ev.data);
+        return;
+      }
       const data = parseSnapshot(ev.data);
       if (!data) { closeSocket(); return retryLater(epoch, 'Unsupported or invalid monitoring data · retrying'); }
+      if (cloud && data.type === 'connecting') { requestId = data.requestId; return; }
+      if (cloud && firstSampleMs === null && data.runtime_fresh) firstSampleMs = performance.now() - openedMs;
       if (data.session === lastSession && data.seq <= lastSeq) return;
       lastSession = data.session; lastSeq = data.seq;
       snap = data; lastMs = performance.now(); attempt = 0;
@@ -713,7 +761,7 @@
     });
     sock.addEventListener('close', () => {
       if (ws !== sock) return;
-      ws = null; snap = null; lastMs = 0;
+      closeSocket();
       retryLater(epoch, 'Connection lost · retrying');   // start() re-checks /v1/identity first
     });
   }
@@ -729,7 +777,7 @@
     // A silent video socket is normal while video is disabled on the Jetson; it only counts as
     // a dead peer when the telemetry stream is not fresh either.
     const telemetryFresh = ws !== null && lastMs > 0 && now - lastMs <= 2000;
-    if (vws && !telemetryFresh && now - (vMsgMs || vOpenedMs) > LIVENESS_MS) {
+    if (!cloud && vws && !telemetryFresh && now - (vMsgMs || vOpenedMs) > LIVENESS_MS) {
       closeVideo();
       retryVideo();
     }
@@ -778,6 +826,18 @@
   }
   function syncVideo() {
     syncLiveView();
+    if (cloud) {
+      if (ws?.readyState !== WebSocket.OPEN) return;
+      const now = performance.now(), wanted = videoWanted();
+      if (wanted !== Boolean(vws) || now >= nextRenewal) {
+        if (wanted && !vws) {
+          vws = ws; videoRequestedMs = now; firstFrameMs = null;
+        } else if (!wanted && vws) closeVideo();
+        ws.send(JSON.stringify({ channels: wanted ? ['telemetry', 'video'] : ['telemetry'] }));
+        nextRenewal = now + 10000;
+      }
+      return;
+    }
     if (!videoWanted()) {
       clearTimeout(vTimer); vTimer = 0; vAttempt = 0;
       if (vws) closeVideo();
@@ -812,7 +872,7 @@
     const sock = vws;
     vws = null;
     resetVideoFrames();
-    if (sock) sock.close(1000);
+    if (sock && !cloud) sock.close(1000);
   }
   function resetVideoFrames() {
     vPending = null; vLoading = null; vMeta = null; vShownMs = 0; vTimes = []; vLastSeq = 0;
@@ -842,12 +902,7 @@
     resetVideoFrames();
     sock.addEventListener('message', ev => {
       if (vws !== sock) return;
-      const frame = parseFrame(ev.data);
-      if (!frame) { closeVideo(); return retryVideo(); }
-      if (frame.seq <= vLastSeq) return;            // replayed or out of order
-      vLastSeq = frame.seq; vMsgMs = frame.recvMs; vAttempt = 0;
-      if (vLoadingUrl) vPending = frame;            // still decoding: keep only the newest
-      else loadFrame(frame);
+      if (!receiveFrame(ev.data)) { closeVideo(); retryVideo(); }
     });
     sock.addEventListener('close', () => {
       if (vws !== sock) return;
@@ -858,6 +913,16 @@
       if (!delivered) revalidate();                 // failed upgrade or closed before any frame
       render();
     });
+  }
+  function receiveFrame(data) {
+    const frame = parseFrame(data);
+    if (!frame) return false;
+    if (frame.seq <= vLastSeq || (cloud && frame.ageMs > VIDEO_STALE_MS)) return true;
+    vLastSeq = frame.seq; vMsgMs = frame.recvMs; vAttempt = 0;
+    if (cloud && firstFrameMs === null) firstFrameMs = frame.recvMs - videoRequestedMs;
+    if (vLoadingUrl) vPending = frame;
+    else loadFrame(frame);
+    return true;
   }
   function loadFrame(frame) {
     vLoading = frame;
@@ -925,7 +990,7 @@
     $('page-live').append(cameraCard(), speedCard(), duo(recordingCard(), adasCard()), duo(positionCard(), healthCard()));
     $('page-vehicle').append(speedCard(), mapCard(), duo(powertrainCard(), positionCard()), linkCard());
     $('page-system').append(duo(healthCard(), memoryCard()), temperaturesCard(), adasCard());
-    $('page-connection').append(...connectionPage());
+    $('page-connection').append(...(cloud ? cloudConnectionPage() : connectionPage()));
     const banner = $('banner'), statusLine = $('status'), detail = $('detail'), subtitle = $('subtitle');
     binds.push(v => {
       setText(statusLine, stateText(v));
@@ -943,9 +1008,10 @@
       syncVideo();
       syncWake();
     });
-    window.addEventListener('hashchange', pairFromHash);
+    if (!cloud) window.addEventListener('hashchange', pairFromHash);
+    if (cloud) window.addEventListener('pagehide', () => stop('Disconnected'));
     setInterval(tick, 250);
-    if (!pairFromHash()) start();
+    if (cloud || !pairFromHash()) start();
   }
   init();
 })();
