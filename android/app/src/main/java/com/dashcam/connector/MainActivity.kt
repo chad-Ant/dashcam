@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
@@ -23,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -34,9 +36,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 internal val DashcamColors = darkColorScheme(
@@ -48,11 +52,15 @@ internal val DashcamColors = darkColorScheme(
 class MainActivity : ComponentActivity() {
     private val model: DashboardModel by viewModels()
     private var foreground = false
+    private var lanAllowed = false
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-        model.repository.setActive(it && foreground)
+        lanAllowed = it; updateLan()
     }
+    // The LAN connection idles while a cloud session is shown in its place.
+    private fun updateLan() = model.repository.setActive(foreground && lanAllowed && CloudSession.vehicle.value == null)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        lifecycleScope.launch { CloudSession.vehicle.collect { updateLan() } }
         setContent {
             MaterialTheme(colorScheme = DashcamColors) {
                 Dashboard(model, onKeepAwake = { enabled ->
@@ -65,11 +73,12 @@ class MainActivity : ComponentActivity() {
     private fun ensurePermission() {
         if (Build.VERSION.SDK_INT >= 37 && checkSelfPermission("android.permission.ACCESS_LOCAL_NETWORK") != PackageManager.PERMISSION_GRANTED)
             permission.launch("android.permission.ACCESS_LOCAL_NETWORK")
-        else model.repository.setActive(foreground)
+        else { lanAllowed = true; updateLan() }
     }
-    override fun onStart() { super.onStart(); foreground = true; ensurePermission() }
+    override fun onStart() { super.onStart(); foreground = true; CloudSession.activityStarted(); ensurePermission() }
     override fun onStop() {
         foreground = false; model.repository.setActive(false); model.discovery.stop(); model.tiles.pause()
+        CloudSession.activityStopped()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
@@ -85,6 +94,12 @@ private val CameraCorner = 14.dp
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onPermission: () -> Unit) {
+    // A connected cloud session takes the LAN dashboard's place until Disconnect.
+    val cloud by CloudSession.vehicle.collectAsStateWithLifecycle()
+    cloud?.let { vehicle ->
+        key(vehicle.id) { CloudDashboard(vehicle, model.tiles, onKeepAwake) }
+        return
+    }
     // Handed to the cards unread: a snapshot (5 Hz) or clock tick (2 Hz) recomposes
     // only the cards whose values change, never the whole page.
     val state = model.repository.state.collectAsStateWithLifecycle()
@@ -103,6 +118,57 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
             }
         }
         item { ConnectionPanel(model, onPermission) }
+    }
+}
+
+@Composable
+private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake: (Boolean) -> Unit) {
+    val state = CloudSession.state.collectAsStateWithLifecycle()
+    val map = remember { MapViewState() }
+    LaunchedEffect(map) {
+        CloudSession.state.collect { s ->
+            val fix = s.snapshot?.vehicle?.takeIf { s.runtimeFresh }
+            map.update(TileMath.fix(fix.finite("latitude"), fix.finite("longitude"), fix.finite("heading_deg")))
+        }
+    }
+    DashboardLayout(
+        state = state, deviceName = vehicle.label + " · cloud", initialPage = 0, onKeepAwake = onKeepAwake,
+        onVideoWanted = CloudSession::setDashboardVideo,
+        cameraCard = { CloudCameraCard() }, mapCard = { MapCard(map, tiles) }
+    ) {
+        item { CloudSessionCard(vehicle) }
+    }
+}
+
+@Composable private fun CloudCameraCard() {
+    val camera by CloudSession.camera.collectAsStateWithLifecycle()
+    val picture by CloudSession.picture.collectAsStateWithLifecycle()
+    SurfaceCard("Camera") {
+        val frame = picture
+        if (camera && frame != null) Image(frame.asImageBitmap(), "Dashcam camera",
+            Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(CameraCorner)))
+        else Hint(if (camera) "Waiting for camera frames" else "Live view off")
+        OutlinedButton(onClick = { CloudSession.setCamera(!camera) }) {
+            Text(if (camera) "Stop live view" else "Start live view")
+        }
+    }
+}
+
+@Composable private fun CloudSessionCard(vehicle: CloudVehicle) {
+    val status by CloudSession.status.collectAsStateWithLifecycle()
+    val requestId by CloudSession.requestId.collectAsStateWithLifecycle()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    SurfaceCard("Cloud session") {
+        Text(vehicle.label, fontWeight = FontWeight.SemiBold)
+        if (status.isNotEmpty()) Hint(status)
+        if (requestId.isNotEmpty()) Hint("Request $requestId")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { context.startActivity(android.content.Intent(context, CloudActivity::class.java)) }) {
+                Text("Cloud vehicles")
+            }
+            OutlinedButton(onClick = { CloudSession.disconnect() }) { Text("Disconnect") }
+        }
+        Hint("Disconnect to use a paired Jetson on Wi-Fi.")
     }
 }
 
