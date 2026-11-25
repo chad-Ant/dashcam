@@ -63,6 +63,7 @@ h1 { font-size: 2rem; font-weight: 600; line-height: 1.2; }
 .banner.ok .status { color: var(--accent); }
 .banner.bad { background: var(--danger-bg); }
 .banner.bad .status { color: var(--danger); }
+.banner .btn { margin-top: 8px; }
 .status::before { content: "\25CF\00A0\00A0"; }
 .detail { font-size: .875rem; margin-top: 2px; }
 .detail:empty { display: none; }

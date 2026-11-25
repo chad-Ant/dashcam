@@ -18,6 +18,7 @@ from store import Conflict, Store, vehicle_id
 WEB = Path(__file__).parent / 'web'
 COOKIE = '__Host-dashcam'
 MAX_PACKET = 262144 + 24
+VEHICLE_FULL = 1013   # viewer close code: every lease slot is taken; retry later
 
 
 def trace(event, **fields):
@@ -203,7 +204,11 @@ class Relay:
                     trace('demand_committed', requestId=v.request_id, generation=doc['demandGeneration'])
                 v.channels = channels
                 await self.push_control(key, doc)
-        except (PermissionError, Conflict, ValueError, KeyError, TypeError, asyncio.TimeoutError):
+        except Conflict:
+            # A viewer update conflicts only when the vehicle's lease set is full. That is
+            # retryable (1013 Try Again Later), unlike the access failures below (1008).
+            await ws.close(code=VEHICLE_FULL)
+        except (PermissionError, ValueError, KeyError, TypeError, asyncio.TimeoutError):
             await ws.close(code=1008)
         finally:
             self.viewers.discard(v)

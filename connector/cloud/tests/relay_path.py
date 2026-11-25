@@ -164,8 +164,47 @@ async def run():
             assert viewers[3].close_code == 1008
             await viewers[4].close()
             await eventual(lambda: not resources['tlsB'].attempt and not states['tlsB'].clients)
+            # A full vehicle closes the next viewer with 1013 (retryable), not 1008 (access),
+            # and a freed slot admits it again with the same credentials.
+            async def leases():
+                return len((await store.vehicle('tlsA').get()).get('leases') or {})
+            for _ in range(100):
+                if await leases() == 0:
+                    break
+                await asyncio.sleep(.05)
+            else:
+                raise AssertionError('Earlier tlsA leases were not released')
+            async def viewer():
+                ws = await stack.enter_async_context(http.ws_connect(url+'/v1/view/tlsA',headers=headers))
+                assert (await ws.receive_json(timeout=3))['type'] == 'connecting'
+                await ws.send_json(dict(channels=['telemetry']))
+                return ws
+            full = []
+            for _ in range(5):
+                ws = await viewer()
+                assert (await ws.receive_json(timeout=8))['device_id'] == 'tlsA-local'   # lease committed
+                full.append(ws)
+            sixth = await viewer()
+            while (await sixth.receive(timeout=5)).type != aiohttp.WSMsgType.CLOSE:
+                pass
+            assert sixth.close_code == 1013, sixth.close_code
+            await full[0].close()
+            for _ in range(100):
+                if await leases() < 5:
+                    break
+                await asyncio.sleep(.05)
+            else:
+                raise AssertionError('Closed viewer kept its lease')
+            again = await viewer()
+            while True:
+                item = await again.receive(timeout=8)
+                assert item.type == aiohttp.WSMsgType.TEXT, item.type
+                if '"snapshot"' in item.data:
+                    break
+            for ws in full[1:] + [again]:
+                await ws.close()
             print('Five TLS viewers, two vehicles, one reader per requested channel, camera release, '
-                  'mode handoff and open-session revocation passed')
+                  'mode handoff, open-session revocation and full-vehicle retry passed')
 
 
 if __name__=='__main__':

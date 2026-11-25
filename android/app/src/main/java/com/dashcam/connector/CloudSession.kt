@@ -11,12 +11,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.tasks.await
 import okhttp3.*
 import okio.ByteString
-import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicReference
 
 internal data class CloudVehicle(val id: String, val label: String, val owner: Boolean)
-private data class Received<T>(val data: T, val time: Long = SystemClock.elapsedRealtime())
 
 /** The app may be in the background this long before the relay socket closes (covers activity switches and rotation). */
 private const val BACKGROUND_GRACE_MS = 1000L
@@ -162,6 +160,11 @@ internal object CloudSession {
         // on every connect; a forced refresh costs 2-5 s on mobile data. A rejected session
         // retries once with a forced refresh before it ends.
         var forceRefresh = false
+        // Until the vehicle first answers, the request (renewed every 10 s) has a deadline across
+        // reconnects; a vehicle coming online later must not start streaming to a viewer who left.
+        // A full vehicle holds no lease for this viewer, so time spent waiting for a slot is not counted.
+        var waitStart = start
+        var answered = false
         try {
             while (current()) {
                 requestIdMutable.value = ""
@@ -170,13 +173,16 @@ internal object CloudSession {
                     "Sign in again"
                 }
                 if (!current()) return
-                val latest = AtomicReference<Received<String>?>()
+                val inbox = RelayInbox(SystemClock::elapsedRealtime)
                 val frame = AtomicReference<Received<ByteString>?>()
                 val closed = CompletableDeferred<Int>()
+                var full = false
                 val ws = http.newWebSocket(Request.Builder().url(origin + "/v1/view/" + vehicle.id)
                     .header("Authorization", "Bearer " + token).build(), object : WebSocketListener() {
-                    override fun onMessage(webSocket: WebSocket, text: String) { latest.set(Received(text)) }
-                    override fun onMessage(webSocket: WebSocket, bytes: ByteString) { frame.set(Received(bytes)) }
+                    override fun onMessage(webSocket: WebSocket, text: String) { inbox.offer(text) }
+                    override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                        frame.set(Received(bytes, SystemClock.elapsedRealtime()))
+                    }
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                         webSocket.close(1000, null)
                         closed.complete(code)
@@ -194,13 +200,17 @@ internal object CloudSession {
                 try {
                     while (current() && !closed.isCompleted && SystemClock.elapsedRealtime() < reconnectAt) {
                         val now = SystemClock.elapsedRealtime()
+                        if (!answered && now - waitStart >= CONNECT_DEADLINE_MS)
+                            throw IOException("The vehicle did not answer within " + CONNECT_DEADLINE_MS / 1000 + " s. Tap Connect to try again.")
+                        if (inbox.invalid) throw IOException("Unsupported data from the relay")
                         if (now >= renew) { ws.send(demand()); renew = now + 10000 }
                         if (cameraMutable.value && now - cameraStart >= LIVE_VIEW_MAX_MS) setCamera(false)
-                        latest.getAndSet(null)?.let {
-                            val s = JSONObject(it.data)
-                            if (s.optString("type") == "connecting") requestIdMutable.value = s.getString("requestId")
+                        inbox.takeRequestId()?.let { requestIdMutable.value = it }
+                        inbox.takeSnapshot()?.let {
+                            val s = it.data
                             if (s.optString("type") == "snapshot") {
                                 lastSample = it.time
+                                answered = true
                                 forceRefresh = false
                                 val fresh = s.optBoolean("runtime_fresh")
                                 if (fresh && latency == null) latency = it.time - start
@@ -233,17 +243,27 @@ internal object CloudSession {
                         if (!videoOn() || now - lastFrame > VIDEO_STALE_MS) pictureMutable.value = null
                         delay(100)
                     }
-                    if (closed.isCompleted && closed.await() in listOf(401, 403, 1008)) {
-                        if (forceRefresh) throw IOException("Session ended. Check vehicle access and sign in again.")
-                        forceRefresh = true   // perhaps a stale cached token: retry at once with a fresh one
-                        continue
+                    val code = if (closed.isCompleted) closed.await() else 0
+                    when (relayClose(code)) {
+                        RelayClose.REJECTED -> {
+                            if (forceRefresh) throw IOException("Session ended. Check vehicle access and sign in again.")
+                            forceRefresh = true   // perhaps a stale cached token: retry at once with a fresh one
+                            continue
+                        }
+                        RelayClose.FULL -> full = true
+                        RelayClose.OTHER -> {}
                     }
                 } finally {
                     ws.close(1000, null)
                     if (socket === ws) socket = null
                     if (current()) { stateMutable.value = MonitorState(stateMutable.value.status); pictureMutable.value = null }
                 }
-                if (current()) { publishStatus("Reconnecting"); delay(2000) }
+                if (!current()) break
+                if (full) {
+                    publishStatus("All viewer slots for this vehicle are in use · retrying")
+                    delay(5000)
+                    waitStart = SystemClock.elapsedRealtime()
+                } else { publishStatus("Reconnecting"); delay(2000) }
             }
         } catch (e: CancellationException) {
             throw e

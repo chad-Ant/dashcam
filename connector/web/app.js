@@ -13,6 +13,11 @@
   const cloud = location.pathname === '/dashboard';
   const vehicleKey = cloud ? new URLSearchParams(location.search).get('vehicle') : null;
   let nextRenewal = 0, requestId = '', firstSampleMs = null, firstFrameMs = null, videoRequestedMs = 0;
+  // Until the vehicle first answers, a cloud request has CONNECT_DEADLINE_MS across retries
+  // (parity with Android); then it stops until Retry, so a vehicle coming online later never
+  // streams to an abandoned page. waitSince is 0 once a snapshot arrived.
+  const CONNECT_DEADLINE_MS = 30000, VEHICLE_FULL = 1013;
+  let waitSince = 0, gaveUp = false;
 
   let identity = null, unpaired = false;      // identity = {id, name, capabilities}
   // Each connection attempt (start(), a stop, a failed video upgrade) verifies the identity
@@ -683,11 +688,13 @@
   // A telemetry retry joins a check still in flight: it began after the last start()/stop(), so
   // it belongs to this attempt, and two failing sockets then share one /v1/identity request.
   async function start(fromRetry) {
+    if (cloud && gaveUp) return;   // only Retry starts again
     const e = ++epoch;
     clearTimeout(retryTimer); retryTimer = 0;
     if (fromRetry && idCheck) verified = false;
     else newAttempt();
     if (document.hidden) return setStatus('Disconnected');
+    if (cloud && !fromRetry) waitSince = performance.now();
     if (!ws) setStatus(identity || cloud ? 'Connecting' : 'Checking pairing');
     const result = await checkIdentity();
     if (e !== epoch) return;
@@ -710,6 +717,14 @@
     newAttempt();
     closeSocket();
     setStatus(text);
+  }
+  function giveUp() {
+    gaveUp = true; waitSince = 0;
+    stop('The vehicle did not answer within ' + CONNECT_DEADLINE_MS / 1000 + ' s · tap Retry');
+  }
+  function retryCloud() {
+    gaveUp = false; attempt = 0;
+    start();
   }
   function closeSocket() {
     const sock = ws;
@@ -754,15 +769,23 @@
       if (!data) { closeSocket(); return retryLater(epoch, 'Unsupported or invalid monitoring data · retrying'); }
       if (cloud && data.type === 'connecting') { requestId = data.requestId; return; }
       if (cloud && firstSampleMs === null && data.runtime_fresh) firstSampleMs = performance.now() - openedMs;
+      if (cloud) waitSince = 0;
       if (data.session === lastSession && data.seq <= lastSeq) return;
+      // A new recorder session restarts the agent's video sequence at 1; on the relay socket,
+      // frames below the old counter would otherwise be dropped until it caught up.
+      if (cloud && lastSession && data.session !== lastSession) resetVideoFrames();
       lastSession = data.session; lastSeq = data.seq;
       snap = data; lastMs = performance.now(); attempt = 0;
       render();
     });
-    sock.addEventListener('close', () => {
+    sock.addEventListener('close', ev => {
       if (ws !== sock) return;
       closeSocket();
-      retryLater(epoch, 'Connection lost · retrying');   // start() re-checks /v1/identity first
+      // A full vehicle holds no request for this viewer, so waiting for a slot is not counted.
+      const full = cloud && ev.code === VEHICLE_FULL;
+      if (full && waitSince) waitSince = performance.now();
+      retryLater(epoch, full ? 'All viewer slots for this vehicle are in use · retrying'
+        : 'Connection lost · retrying');   // start() re-checks /v1/identity first
     });
   }
 
@@ -770,6 +793,7 @@
   // socket OPEN; a silent socket is closed and retried like a lost connection.
   function tick() {
     const now = performance.now();
+    if (cloud && waitSince && !gaveUp && !document.hidden && now - waitSince >= CONNECT_DEADLINE_MS) giveUp();
     if (ws && now - (lastMs || openedMs) > LIVENESS_MS) {
       closeSocket();
       retryLater(epoch, 'Connection lost · retrying');
@@ -999,11 +1023,18 @@
       banner.classList.toggle('bad', !v.fresh && unpaired);
       setText(subtitle, identity ? identity.name : 'Your Jetson, at a glance');
     });
+    if (cloud) {
+      const retry = button('Retry', 'btn', retryCloud);
+      retry.hidden = true;
+      banner.append(retry);
+      binds.push(() => { retry.hidden = !gaveUp; });
+    }
     for (const tab of document.querySelectorAll('.tab')) {
       tab.addEventListener('click', () => { showPage(tab.dataset.page); window.scrollTo(0, 0); });
     }
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) stop('Disconnected');
+      if (cloud && gaveUp) { /* stays stopped, keeping its message, until Retry */ }
+      else if (document.hidden) stop('Disconnected');
       else { attempt = 0; start(); }
       syncVideo();
       syncWake();
