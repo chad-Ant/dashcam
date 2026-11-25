@@ -15,9 +15,11 @@
   let nextRenewal = 0, requestId = '', firstSampleMs = null, firstFrameMs = null, videoRequestedMs = 0;
   // Until the vehicle first answers, a cloud request has CONNECT_DEADLINE_MS across retries
   // (parity with Android); then it stops until Retry, so a vehicle coming online later never
-  // streams to an abandoned page. waitSince is 0 once a snapshot arrived.
+  // streams to an abandoned page. waitSince is 0 once a snapshot arrived. A full vehicle holds no
+  // request for this viewer, so the deadline is paused (waitPaused) for the backoff after a 1013
+  // close and restarts in full when the retry begins.
   const CONNECT_DEADLINE_MS = 30000, VEHICLE_FULL = 1013;
-  let waitSince = 0, gaveUp = false;
+  let waitSince = 0, waitPaused = false, gaveUp = false;
 
   let identity = null, unpaired = false;      // identity = {id, name, capabilities}
   // Each connection attempt (start(), a stop, a failed video upgrade) verifies the identity
@@ -25,7 +27,7 @@
   // answer from an older attempt is dropped before it touches identity.
   let verified = false, idGen = 0, idCheck = null;
   let ws = null, snap = null, lastMs = 0, openedMs = 0, lastSession = '', lastSeq = -1;
-  let status = 'Starting', attempt = 0, retryTimer = 0, epoch = 0;
+  let status = 'Starting', attempt = 0, fullAttempt = 0, retryTimer = 0, epoch = 0;
   let wakeWanted = false, wakeLock = null, wakeBusy = false;
   let message = null, wakeNote = null, page = 'live', signingOut = false;
   const binds = [];
@@ -694,7 +696,7 @@
     if (fromRetry && idCheck) verified = false;
     else newAttempt();
     if (document.hidden) return setStatus('Disconnected');
-    if (cloud && !fromRetry) waitSince = performance.now();
+    if (cloud && (!fromRetry || waitPaused)) { waitSince = performance.now(); waitPaused = false; }
     if (!ws) setStatus(identity || cloud ? 'Connecting' : 'Checking pairing');
     const result = await checkIdentity();
     if (e !== epoch) return;
@@ -704,10 +706,12 @@
     else { closeSocket(); retryLater(e, 'Jetson unreachable · retrying'); }
     syncVideo();   // after retryLater, so video waits for telemetry's next check instead of starting one
   }
-  function retryLater(e, text) {
+  // A full vehicle (1013) backs off on its own counter: its retries must not leave the next
+  // ordinary reconnect, once a slot is free, waiting out the longest delay.
+  function retryLater(e, text, full) {
     setStatus(text);
-    const delay = DELAYS[Math.min(attempt, DELAYS.length - 1)];
-    attempt += 1;
+    const delay = DELAYS[Math.min(full ? fullAttempt : attempt, DELAYS.length - 1)];
+    if (full) fullAttempt += 1; else attempt += 1;
     clearTimeout(retryTimer);
     retryTimer = setTimeout(() => { retryTimer = 0; if (e === epoch) start(true); }, delay * 1000);
   }
@@ -723,7 +727,7 @@
     stop('The vehicle did not answer within ' + CONNECT_DEADLINE_MS / 1000 + ' s · tap Retry');
   }
   function retryCloud() {
-    gaveUp = false; attempt = 0;
+    gaveUp = false; attempt = 0; fullAttempt = 0;
     start();
   }
   function closeSocket() {
@@ -775,17 +779,17 @@
       // frames below the old counter would otherwise be dropped until it caught up.
       if (cloud && lastSession && data.session !== lastSession) resetVideoFrames();
       lastSession = data.session; lastSeq = data.seq;
-      snap = data; lastMs = performance.now(); attempt = 0;
+      snap = data; lastMs = performance.now(); attempt = 0; fullAttempt = 0;
       render();
     });
     sock.addEventListener('close', ev => {
       if (ws !== sock) return;
       closeSocket();
-      // A full vehicle holds no request for this viewer, so waiting for a slot is not counted.
+      // A full vehicle holds no request for this viewer: the backoff before the retry is not counted.
       const full = cloud && ev.code === VEHICLE_FULL;
-      if (full && waitSince) waitSince = performance.now();
+      if (full && waitSince) { waitSince = 0; waitPaused = true; }
       retryLater(epoch, full ? 'All viewer slots for this vehicle are in use · retrying'
-        : 'Connection lost · retrying');   // start() re-checks /v1/identity first
+        : 'Connection lost · retrying', full);   // start() re-checks /v1/identity first
     });
   }
 
@@ -1035,7 +1039,7 @@
     document.addEventListener('visibilitychange', () => {
       if (cloud && gaveUp) { /* stays stopped, keeping its message, until Retry */ }
       else if (document.hidden) stop('Disconnected');
-      else { attempt = 0; start(); }
+      else { attempt = 0; fullAttempt = 0; start(); }
       syncVideo();
       syncWake();
     });
