@@ -2,7 +2,7 @@
 # lane_run.sh — orchestrates a lane test run (plan P5a + P5b, section 12): the
 # per-camera lane_drive containers, the MKR raw-CAN logger, can_live.py (live
 # CAN state + clip triggers), lane_supervisor.py (restarts, degrade ladder,
-# status.json), the CYD / ES3C28P status display (lane_status), sysmon.py and
+# status.json), the ES3C28P status display (lane_status), sysmon.py and
 # tegrastats.
 #
 #   tools/lane_eval/lane_run.sh start [--minutes N] [--cams csi,usb] [--no-can] [--expect-can]
@@ -23,9 +23,9 @@
 # exit codes recorded in run_end.json.
 #
 # --plan night: CSI review at 3 fps q70 (plan 12.8).  --expect-can: the car is
-# on, so no CAN frames is an alert.  --display auto: the CYD's CH340 by-id
-# port when present.  --idle-lead S: sysmon/tegrastats S seconds before the
-# cameras start (B0's idle phase).
+# on, so no CAN frames is an alert.  --display auto: the ES3C28P's udev alias
+# (/dev/dashcam-display) when present.  --idle-lead S: sysmon/tegrastats S
+# seconds before the cameras start (B0's idle phase).
 
 set -u
 REPO="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -34,7 +34,7 @@ CURRENT="$ROOT/.current"
 IMAGE=l4t-ml-gpio
 UGREEN=/dev/v4l/by-id/usb-Image+_UGREEN_Camera_4K_LL-0000000001-video-index0
 MKR_GLOB="/dev/serial/by-id/usb-Arduino_LLC_Arduino_MKRZero_*"
-CYD=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+ES3_DISPLAY=/dev/dashcam-display   # peripherals/es3c28p/host/99-dashcam-display.rules
 CANSTREAM="$REPO/peripherals/mkr_zero/tools/canstream"
 CONTAINERS="lane_csi lane_usb lane_mkr lane_disp"
 
@@ -135,7 +135,7 @@ cmd_start() {
     DISPLAY_DEV=""
     case "$DISPLAY_ARG" in
         none) ;;
-        auto) [ -e "$CYD" ] && DISPLAY_DEV="$CYD" ;;
+        auto) [ -e "$ES3_DISPLAY" ] && DISPLAY_DEV="$ES3_DISPLAY" ;;
         *)    DISPLAY_DEV="$DISPLAY_ARG" ;;
     esac
     [ -f "$CURRENT" ] && die "a run is active: $(cat "$CURRENT") (lane_run.sh stop)"

@@ -23,8 +23,8 @@ The board also supports panning: a retained background up to 512x384, separate
 status/attribution images and small pose updates for local cropping and marker
 drawing. Whole-frame mode remains available if panning memory cannot be allocated.
 
-ESP32-S3 port of `../cyd`, for the LCDWiki **ES3C28P N16R8** capacitive-touch
-board (16 MB flash, 8 MB OPI PSRAM). The existing CYD firmware remains separate.
+Dashboard firmware for the LCDWiki **ES3C28P N16R8** capacitive-touch board
+(ESP32-S3, 16 MB flash, 8 MB OPI PSRAM).
 The dashboard has Live, Trip, Camera, System, Settings and Map tabs,
 320 x 224 SD splash above the tab strip, touch calibration with SD persistence,
 brightness controls, and streamed notification WAV playback. Page values are
@@ -51,7 +51,7 @@ lib/es3Map/                map/camera surface binding and shared six-tab geometr
 bench/                     USB sink and JPEG-from-SD feasibility sketches
 host/es3_display.py        Jetson USB client and command-line tool (stdlib only)
 host/99-dashcam-display.rules serial-specific persistent-device rule template
-assets/                    same splash.rgb565, splash.bmp, alert.wav as CYD
+assets/                    splash.rgb565, splash.bmp, alert.wav
 tools/bmp24_to_rgb565.py   320 x 224 BMP to wire-order RGB565 converter
 tests/calibration_test.cpp host checks for invalid calibration records
 BuildAndUpload.cmd         Windows Arduino CLI build/upload
@@ -97,8 +97,8 @@ Use a FAT32 microSD card. Copy `assets/splash.rgb565` and `assets/alert.wav`
 to its root. The image is 143,360 bytes, big-endian RGB565, 320 x 224 pixels.
 The old 24-bit `splash.bmp` is supported when the RGB565 file is absent.
 The optional boot tone is PCM WAV, mono, unsigned 8-bit, 8--16 kHz;
-`playWav()`, `stop()` and `setVolume(0..100)` provide the same notification API
-as the CYD component. The supplied tone uses 8 kHz.
+`playWav()`, `stop()` and `setVolume(0..100)` provide the notification API.
+The supplied tone uses 8 kHz.
 
 SDMMC tries 20 MHz, then 10 MHz, without formatting on failure. Insert the
 card before boot; avoid swapping it during playback or image rendering.
@@ -111,7 +111,7 @@ remain supported.
 
 On first boot, tap and release each of the twelve calibration targets, then
 use the touch-check screen to verify the mapping and choose SAVE. Although
-capacitive coordinates are already pixels, this preserves the CYD's wizard
+capacitive coordinates are already pixels, this keeps the calibration wizard
 and learns the panel's orientation. The record lives at
 `/es3c28p_touch_ips.cal`. Cards with the earlier `/es3c28p_touch.cal` record
 need one fresh calibration for the corrected display orientation.
@@ -128,7 +128,7 @@ This board has **no onboard LDR**. By default, the Settings BRIGHTNESS
 slider sets the manual PWM brightness (8..255), saved in `/settings.xml`.
 The lower limit keeps the controls visible.
 
-For CYD-style automatic brightness, connect a 3.3 V LDR voltage divider to
+For automatic brightness, connect a 3.3 V LDR voltage divider to
 GPIO2 and enable `kAutoBrightness` in `src/DashboardConfig.h`. Measure the
 divider's dark and bright ADC readings, then set `kBrightness.darkRaw`,
 `brightRaw`, and

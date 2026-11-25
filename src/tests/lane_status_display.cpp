@@ -1,6 +1,6 @@
 // lane_status — the lane test's status display (plan P5b, section 12.4 alert
 // channel): shows RUN_DIR/status.json (written at 1 Hz by
-// tools/lane_eval/lane_supervisor.py) on the CYD / ES3C28P over libes3display.
+// tools/lane_eval/lane_supervisor.py) on the ES3C28P over libes3display.
 //
 //   lane_status --device DEV --status-file RUN/status.json [--page 0] [--alert-volume 80] [--minutes N]
 //
@@ -9,7 +9,7 @@
 // carries it: a PAGE update when the text changes (and every 5 s), and an
 // ALERT (the board's /alert.wav) on entering RED and every 60 s while RED.  A
 // status file older than 5 s shows as RED "NO STATUS".  Controls only (no
-// video), so it works with both boards' firmware.
+// video).
 //
 // A separate binary from lane_drive on purpose: libes3display pulls in libjpeg
 // (libvideopreview), and a libjpeg in lane_drive's global symbol scope breaks
@@ -118,10 +118,6 @@ int main(int argc, char** argv) {
     es3::DisplayLinkConfig dc;
     dc.device = dev;
     dc.video = false;
-    // Slow reconnects: opening the CYD's CH340 port can toggle the ESP32's
-    // auto-reset lines, and a board without the ES3 protocol (the CYD's
-    // dashboard firmware of 2026-10-13) never answers HELLO.
-    dc.reconnectMs = 10000;
     es3::Es3DisplayLink link;
     auto log = [](dashcam::log::LogLevel lvl, const std::string& msg) {
         if (lvl != dashcam::log::LogLevel::DEBUG) std::fprintf(stderr, "[lane_status] %s\n", msg.c_str());

@@ -143,15 +143,12 @@ RUN for i in 1 2 3; do arduino-cli core update-index && break; sleep 10; done \
        done \
     && rm /tmp/install_samd_aarch64.py
 
-# CYD (ESP32-2432S028R "Cheap Yellow Display") dashboard tooling: build and
-# flash peripherals/cyd from the Jetson (peripherals/cyd/build_and_upload.sh).
-# The CYD is a classic ESP32: the esp32 core above already carries its Xtensa
-# toolchain.  It uploads over a CH340 USB-serial chip, whose host driver the
-# Tegra kernel does not ship (peripherals/cyd/README.md: build it with
-# host/ch341_module.sh).  Adafruit ILI9341 is pinned to the version the
-# bring-up sketch was verified with (2026-10-12); --no-deps skips the
-# touch-controller libraries only its examples use.  GFX/BusIO come from the
-# MKR layer.
+# ES3C28P display firmware libraries (peripherals/es3c28p/build_and_upload.sh
+# and its JPEGDEC decoder tests, which read /root/Arduino/libraries/JPEGDEC).
+# The esp32 core above already carries the toolchain.  Adafruit ILI9341 1.6.4
+# and JPEGDEC 1.8.4 match peripherals/es3c28p/platformio.ini; --no-deps skips
+# the touch-controller libraries only the ILI9341 examples use.  GFX/BusIO
+# come from the MKR layer.
 RUN for i in 1 2 3; do \
            arduino-cli lib update-index && arduino-cli lib install --no-deps "Adafruit ILI9341@1.6.4" "JPEGDEC@1.8.4" && break; \
            echo "library install attempt $i failed; retrying"; sleep 10; \

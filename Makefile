@@ -227,7 +227,7 @@ LANE_DRIVE_OBJS := $(call make_objs,   $(LIBLOG_SRCS) $(LIBCAM_SRCS) $(LIBCAM_EX
                                         $(LIBCFG_SRCS) $(LIBLANE_SRCS) src/tests/test_lanedetector_drive.cpp) \
                    $(call make_cu_objs, $(LIBLANE_CU_SRCS))
 
-# lane_status: the lane test's status pages + alerts on the CYD / ES3C28P (libes3display)
+# lane_status: the lane test's status pages + alerts on the ES3C28P (libes3display)
 LANE_STATUS_OBJS := $(call make_objs, $(LIBLOG_SRCS) $(LIBUART_SRCS) $(LIBPREVIEW_SRCS) $(LIBES3_SRCS) \
                                        $(LIBNAV_SRCS) src/tests/lane_status_display.cpp)
 

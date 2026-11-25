@@ -1,7 +1,7 @@
 # Lane test drive — operator sheet (P5a + P5b)
 
 Harness: `lane_drive` (one container per camera) + MKR raw-CAN logger + `can_live.py` (live CAN state and
-clip triggers) + `lane_supervisor.py` (restarts, degrade ladder, `status.json`) + `lane_status` (CYD / ES3C28P
+clip triggers) + `lane_supervisor.py` (restarts, degrade ladder, `status.json`) + `lane_status` (ES3C28P
 pages and alert beeps) + `sysmon.py` + tegrastats, orchestrated by `tools/lane_eval/lane_run.sh`.
 Output: `/media/jetson/backup/lane_tests/run_NNN/`. Never copy run data into the repo (it is public).
 
@@ -53,7 +53,7 @@ or the disk has less than 20 GB per planned hour free.
   are on. After the drive `python3 tools/lane_eval/sync_check.py RUN_DIR` reports the UGREEN − CSI offset; PASS
   = SD ≤ 33 ms.
 - `--plan night`: CSI review at 3 fps q70. `--display none` runs without the status display; `--display DEV`
-  names another board (default `auto` = the CYD's CH340 port).
+  names another tty (default `auto` = the ES3C28P's `/dev/dashcam-display` alias, when present).
 
 ## During the drive
 
@@ -131,7 +131,6 @@ the Jetson after each drive (`review/` too if space allows).
   Builds from 2026-10-27 floor the CSI gain at `gainrange="4 12.5"` in `Camera_CSI`, which lowers but does not
   remove it: a midday bench soak still reset about every 5 min. The restart path recovers each reset in ~25 s, so
   expect CSI gaps on a sunny drive.
-- The CYD's current firmware does not answer the display link (no HELLO): flash the navigation firmware
-  (`peripherals/cyd`) or use the ES3C28P for the status display; the run carries on without it.
+- The ES3C28P is the only supported status display; without it the run carries on.
 - No GNSS logger, VP-based mount check, or B1b neutrality test yet.
 - The production rate gate default is still `kLegacy`; lane_drive uses `--rate-gate pts` (exactly 20 Hz).

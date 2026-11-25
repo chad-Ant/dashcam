@@ -343,7 +343,6 @@ struct FakeCounters {
 class FakeDisplay {
 public:
     // Knobs (set by the tests at any time).
-    std::atomic<bool>    cydIdentity{false};
     std::atomic<int>     capsMode{0};        ///< 0 video, 1 BadCommand, 2 NotReady, 3 unusable reply.
     std::atomic<int>     devMaxChunk{4096};
     std::atomic<int>     devMaxJpeg{65536};
@@ -701,8 +700,7 @@ private:
             lastRequestMs_ = now;
             endVideoLocked();
             ++c_.hello;
-            const bool cyd = cydIdentity.load();
-            reply(f, reinterpret_cast<const uint8_t*>(cyd ? "CYD" : "ES3C28P"), cyd ? 3 : 7);
+            reply(f, reinterpret_cast<const uint8_t*>("ES3C28P"), 7);
             return;
         }
         if (!session_) {
@@ -2065,21 +2063,20 @@ static std::vector<Jpeg> mapFrames() {
     return {makeJpeg(320, 224, gradient(7), 80), makeJpeg(320, 224, gradient(8), 80)};
 }
 
-static void testCydMapFallback() {
-    std::printf("\n[25] original CYD identity and whole-map fallback\n");
+static void testWholeMapFallback() {
+    std::printf("\n[25] panning not supported: whole-map fallback with a 32 KiB limit\n");
     Rig r;
-    r.fake.cydIdentity = true;
     r.fake.mapMode = 1;
     r.fake.devMaxJpeg = 32768;
     r.fake.devMaxChunk = 1024;
     auto c = r.cfg(); c.map = true; c.mapPan = true;
     c.assemblyTimeoutMs = 5000; c.mapStaleAfterMs = 5000; c.mapPlaceholderAfterMs = 10000;
-    check(r.up(c), "CYD negotiated");
+    check(r.up(c), "negotiated (map firmware without panning)");
     check(waitFor([&] { return r.link.stats().mapSupported && r.fake.counters().panCaps >= 1; }, 1500),
           "map capabilities known, panning declined");
-    check(r.link.stats().identity == "CYD" && !r.link.stats().panSupported, "identity retained and whole frames selected");
+    check(!r.link.stats().panSupported, "whole frames selected");
     r.fake.setPage(5);
-    check(waitFor([&] { return r.link.mapSink().demand().active; }, 2000), "CYD map active");
+    check(waitFor([&] { return r.link.mapSink().demand().active; }, 2000), "map active");
     const auto demand = r.link.mapSink().demand();
     check(demand.canvasW == 320 && demand.canvasH == 224 && demand.maxJpegBytes == 32768,
           "320x224 map, 32 KiB compressed limit");
@@ -2616,8 +2613,8 @@ static int runFakeMapBoard(const std::string& path, bool pan) {
 }
 
 int main(int argc, char** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--cyd-map") == 0) {
-        testCydMapFallback(); return g_fails ? 1 : 0;
+    if (argc == 2 && std::strcmp(argv[1], "--map-fallback") == 0) {
+        testWholeMapFallback(); return g_fails ? 1 : 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--streaming-regressions") == 0) {
         testStreamingRegressions();
@@ -2653,7 +2650,7 @@ int main(int argc, char** argv) {
     testRequests();
     testFirmwareCompatibility();
     testMapSurface();
-    testCydMapFallback();
+    testWholeMapFallback();
     testPanSurface();
     testPanEndToEnd();
     testPanReconnect();
