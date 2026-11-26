@@ -181,6 +181,8 @@ constexpr size_t   kHdChunkBytes    = 61440;     ///< JPEG bytes per datagram.
 constexpr size_t   kHdMaxJpegBytes  = 1048576;   ///< = the agent's limit; larger frames are counted, not sent.
 constexpr uint32_t kHdMaxDimension  = 4096;
 constexpr int      kHdFrameBudgetMs = 100;       ///< Longest the worker waits on a full queue for one frame.
+constexpr int      kHdRetryPauseMs  = 2;         ///< Shortest gap between two sends after EAGAIN: no spin.
+constexpr int      kHdRetryPollMs   = 20;        ///< Longest single poll() while waiting for room.
 
 /// The 32-byte chunk header into @p out (at least kHdHeaderBytes).
 inline void writeHdChunkHeader(uint8_t* out, uint64_t captureMonotonicUs, uint32_t sequence, uint16_t width,
@@ -338,10 +340,16 @@ private:
             msg.msg_iovlen  = 2;
             ssize_t n = ::sendmsg(fd_, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
             while (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline - std::chrono::steady_clock::now()).count();
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) break;
+                // POLLOUT on this unconnected socket covers only our own send buffer.  A full
+                // receive queue on the agent's side does not show in it, so poll can return at
+                // once while every send still fails: never retry sooner than kHdRetryPauseMs.
+                const auto pauseUntil = now + std::chrono::milliseconds(kHdRetryPauseMs);
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
                 pollfd p{fd_, POLLOUT, 0};
-                if (left <= 0 || ::poll(&p, 1, static_cast<int>(left)) <= 0) break;
+                (void)::poll(&p, 1, static_cast<int>(std::min<long long>(left, kHdRetryPollMs)));
+                if (std::chrono::steady_clock::now() < pauseUntil) std::this_thread::sleep_until(std::min(pauseUntil, deadline));
                 n = ::sendmsg(fd_, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
             }
             if (n == static_cast<ssize_t>(kHdHeaderBytes + chunk)) continue;

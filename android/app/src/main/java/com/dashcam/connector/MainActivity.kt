@@ -439,6 +439,9 @@ private data class BannerUi(val fresh: Boolean, val title: String, val detail: S
     val live = repository.liveView.collectAsStateWithLifecycle()
     val quality by repository.quality.collectAsStateWithLifecycle()
     val note by repository.qualityNote.collectAsStateWithLifecycle()
+    val capabilities by repository.capabilities.collectAsStateWithLifecycle()
+    // HD only when this Jetson's identity says so explicitly (an older agent answers quality=hd with SD).
+    val hdOk = capabilities?.videoHd == true
     val isOn = live.derive { on }
     var fullscreen by rememberSaveable { mutableStateOf(false) }
     // Live view off (Stop, the 10-minute window, another device) leaves fullscreen too.
@@ -448,15 +451,15 @@ private data class BannerUi(val fresh: Boolean, val title: String, val detail: S
         if (fullscreen) FullscreenPlaceholder(Modifier.align(Alignment.CenterHorizontally))
         else CameraPicture(video, live, repository.picture, Modifier.align(Alignment.CenterHorizontally))
         CameraHint(video, live)
-        QualitySelector(quality, hdAllowed = true, onSelect = repository::setQuality)
-        Hint(note ?: qualityHint(quality))
+        QualitySelector(quality, hdAllowed = hdOk, onSelect = repository::setQuality)
+        Hint(note ?: if (capabilities?.videoHd == false) "This Jetson's connector offers SD only" else qualityHint(quality))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             LiveViewButton(live) { repository.setLiveView(it) }
             OutlinedButton(onClick = { fullscreen = true }, enabled = isOn) { Text("Fullscreen") }
         }
     }
     if (fullscreen) FullscreenCamera(onExit = { fullscreen = false },
-        controls = { QualitySelector(quality, hdAllowed = true, onSelect = repository::setQuality) },
+        controls = { QualitySelector(quality, hdAllowed = hdOk, onSelect = repository::setQuality) },
         caption = { CameraHint(video, live) }) {
         FullscreenPicture(video, live, repository.picture)
     }

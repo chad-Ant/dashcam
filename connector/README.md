@@ -311,10 +311,16 @@ on.
   frame byte-exact, none dropped. Not yet measured with the real camera or Wi-Fi.
 - **Recording is never affected.** As for SD: nonblocking sends, a worker that
   waits at most 100 ms per frame for the agent to drain its queue, and counted
-  drops (`monitor HD: … frames taken, … sent` at shutdown).
-- **Fallback.** If no original frame arrives within 5 s (HD off in v0.4, or a
-  recorder without HD), the agent closes the HD socket with **4001**. Both
-  clients then switch to SD and say "HD is not offered by this Jetson".
+  drops (`monitor HD: … frames taken, … sent` at shutdown). While it waits it
+  retries at most every 2 ms: `POLLOUT` on the unconnected socket does not see a
+  full agent-side queue, so a poll-only loop would spin. Measured with the queue
+  held full: the frame is given up after 101 ms using 2.4 ms of CPU.
+- **Fallback.** If no fresh original frame has been sent for 5 s, the agent closes the HD socket with **4001**.
+  That covers the start (HD off in v0.4, or a recorder without HD: reason `HD not offered`) and any later
+  stop (reason `HD stopped`). Both clients then switch to SD and say which it was. A shorter gap keeps HD.
+- **Capability.** Clients offer HD only when the Jetson's `/v1/identity` has `video_hd: true`; an older agent
+  omits it while answering `quality=hd` with SD frames. Android resets the choice to SD when another Jetson
+  is selected.
 - **Fullscreen.** Android: its own window, landscape, system bars hidden, the
   SD/HD choice and **Exit fullscreen** on top (a tap hides or shows them; Back
   exits). Web: the browser's Fullscreen API with a landscape lock where allowed,

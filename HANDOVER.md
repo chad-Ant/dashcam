@@ -11,7 +11,7 @@ This file has three parts:
 ## Outstanding work brief (updated 2026-11-26)
 
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
-- **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. Four review findings are open. Address the HD sender retry loop and recovery from a stalled HD stream first. [Findings and regression checks](#2026-11-26-live-view-review)
+- **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. The four review findings are fixed and regression-tested, but not deployed yet. [Findings](#2026-11-26-live-view-review) · [Fixes](#2026-11-26-live-view-review-fixes-not-deployed)
 - **Recordings on the LAN (2026-11-26, not deployed).** Both clients can now list, play (with telemetry captions, seek and fullscreen) and download v0.4's recorded segments over a direct LAN connection. The client decodes the video; the Jetson only serves files. It is built and tested on real footage in a browser. Not deployed; the Android player has not run on a phone yet. [Log](#2026-11-26-recordings-on-the-lan-not-deployed)
 - **Connector field checks.** Exercise the Android token-refresh retry after rejection and mobile data on the A54. On the car network, check CAN/GNSS source loss and recovery, reconnect after a router or Jetson reboot, and recording performance with a phone and laptop watching. Tablet and local-browser CA checks remain. The S25 mobile-data trial, two-phone viewing and ten idle minutes already passed. [Pilot results](#2026-11-21-dashcam-connect-cloud-pilot) · [Physical checklist](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Next drive.** Secure the CSI mount, verify the connected devices and stock CSI driver, then calibrate the lane crops while parked. The IMX296 still resets in bright sun despite the gain floor. Run the parked raw-CAN loss test and collect day and night lane data. The recorder service and lane harness require separate runs. [Drive preparation](#open-work-in-priority-order)
@@ -439,6 +439,37 @@ compile-checked from these parts:
   Wi-Fi, a download to Download/Dashcam opening in VLC with captions, and the web page in a visible browser.
   Cloud recordings (H.264 clips through Cloud Storage) are a separate phase. The live view review findings
   below are not addressed by this work.
+
+## 2026-11-26 live view review fixes (not deployed)
+
+All four findings below are fixed. Each regression check was first run against the old code, where it failed,
+and then against the fix:
+
+- **High, HD sender spin** (`src/monitoring_video.h`). After `EAGAIN` the worker retries at most every 2 ms
+  (`kHdRetryPauseMs`) within the 100 ms frame budget, polling at most 20 ms at a time.
+  - New test `testHdQueueFullDoesNotSpin`: other sockets fill the receiver's queue until a fresh socket is
+    refused, which reproduces the trap where `POLLOUT` reports ready while every send fails. The old sender
+    tripped the CPU assertion. The fix gives the frame up after 101 ms of wall time using 2.4 ms of CPU, counts
+    one drop, then delivers a fresh complete frame once the reader drains the queue.
+  - Run on the Jetson in the container; `--self-test` also passes.
+- **Medium, HD fallback only at the start** (`connector/service.py`). `HD_SILENCE_SECONDS` (5 s) now counts from
+  the last fresh HD frame sent, not just from the open. After 5 s without one, the agent closes with 4001: reason
+  `HD not offered` if no frame was ever sent, `HD stopped` otherwise. Both clients show which one and switch to SD.
+  - New tests: HD that stops (with a simultaneous SD viewer, which keeps getting fresh SD), and a 0.3 s gap
+    against a 0.6 s timeout that keeps HD. The old agent left the socket open. 64 agent tests pass.
+- **Medium, Android HD on older agents.** Each connection reads `/v1/identity` over the pinned client.
+  `Capabilities.parse` accepts only an explicit `true` for `video_hd`, and both selectors use it. HD is refused
+  (and dropped back to SD) when the capability is not true, and a device switch resets the choice to SD.
+  `CapabilitiesTest` covers absent, `false`, `true`, and non-boolean values. 52 unit tests and lint pass.
+- **Medium, late fullscreen fallback** (`connector/web/app.js`). The current request is tracked: any exit makes
+  it stale and cancels the 1 s timer, and the timer or a promise rejection reopens CSS fullscreen only for the
+  current request.
+  - Checked in the browser pane with a fake Fullscreen API: enter then exit within 1 s; a never-settling request
+    (CSS fallback), exit, then a late rejection; an immediate failure (CSS fallback).
+  - The old client ended scenario A back in CSS fullscreen with scrolling locked. The fixed client stays inline
+    and scrolls in all three.
+
+Still needed on the rig: worker CPU with a real stalled agent, and an HD stop and resume while the S25 watches.
 
 ## 2026-11-26 live view review
 

@@ -50,6 +50,9 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     // Why HD fell back to SD (this Jetson sends no original frames); null otherwise.
     private val qualityNoteMutable = MutableStateFlow<String?>(null)
     val qualityNote = qualityNoteMutable.asStateFlow()
+    // The selected Jetson's capabilities (null until its identity has been read): HD only on an explicit true.
+    private val capabilitiesMutable = MutableStateFlow<Capabilities?>(null)
+    val capabilities = capabilitiesMutable.asStateFlow()
     private val liveSession = LiveViewSession()
     private var liveTicker: Job? = null
     // Why live view cannot work with the selected device (no video, rejected
@@ -86,8 +89,12 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         }
     }
     fun select(profile: DeviceProfile?) {
-        // Another device or credential never inherits the previous live view.
-        if (profile != desired) endLiveView()
+        // Another device or credential never inherits the previous live view, its HD choice or its capabilities.
+        if (profile != desired) {
+            endLiveView()
+            capabilitiesMutable.value = null
+            qualityMutable.value = VideoQuality.SD
+        }
         videoUnavailable = null
         qualityNoteMutable.value = null
         desired = profile; restart()
@@ -114,6 +121,10 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     // A new quality reconnects the video socket; the live view window keeps running.
     fun setQuality(value: VideoQuality) {
         qualityNoteMutable.value = null
+        if (value == VideoQuality.HD && capabilitiesMutable.value?.videoHd != true) {
+            qualityNoteMutable.value = SD_ONLY
+            return
+        }
         if (qualityMutable.value == value) return
         qualityMutable.value = value
         restartVideo()
@@ -176,6 +187,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             while (isActive) {
                 try {
                     mutable.value = mutable.value.copy(status = "Connecting", lastReceiveMs = 0)
+                    if (capabilitiesMutable.value == null) loadCapabilities(device, network, epoch)
                     connect(device, network, epoch)
                     mutable.value = mutable.value.copy(status = "Connection lost · retrying", lastReceiveMs = 0)
                     backoff = 1
@@ -207,6 +219,30 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                 delay(backoff * 1000)
                 backoff = (backoff * 2).coerceAtMost(15)
             }
+        }
+    }
+    // The selected device's /v1/identity over the pinned client. A TLS failure propagates like the
+    // stream's own (a certificate failure is terminal); any other failure leaves the capabilities
+    // unknown (no HD) and is retried with the next connection attempt.
+    private suspend fun loadCapabilities(device: DeviceProfile, network: Network, epoch: Int) {
+        val caps = withContext(Dispatchers.IO) {
+            val client = pinnedClient(device, network)
+            try {
+                val url = HttpUrl.Builder().scheme("https").host(device.host).port(device.port).addPathSegments("v1/identity").build()
+                client.newCall(Request.Builder().url(url).header("Authorization", "Bearer ${device.token}").build()).execute().use { r ->
+                    if (r.isSuccessful) Capabilities.parse(org.json.JSONObject(r.body!!.string())) else null
+                }
+            } catch (e: SSLException) { throw e
+            } catch (_: IOException) { null
+            } catch (_: org.json.JSONException) { null
+            } finally { client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown() }
+        } ?: return
+        if (generation.get() != epoch) return
+        capabilitiesMutable.value = caps
+        if (!caps.videoHd && qualityMutable.value == VideoQuality.HD) {
+            qualityMutable.value = VideoQuality.SD
+            qualityNoteMutable.value = SD_ONLY
+            restartVideo()
         }
     }
     /**
@@ -353,11 +389,11 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                     } catch (_: SecurityException) {
                         videoStatus(epoch, "Allow local network access in Android settings")
                         return@launch
-                    } catch (_: HdUnavailable) {
-                        // This Jetson sends no original frames (HD off in v0.4, or an older recorder): show SD.
+                    } catch (e: HdUnavailable) {
+                        // No original frames (HD off in v0.4, an older recorder), or they stopped: show SD.
                         if (videoGeneration.get() == epoch) {
                             qualityMutable.value = VideoQuality.SD
-                            qualityNoteMutable.value = "HD is not offered by this Jetson · showing SD"
+                            qualityNoteMutable.value = if (e.stopped) "HD stopped · showing SD" else "HD is not offered by this Jetson · showing SD"
                             restartVideo()
                         }
                         return@launch
@@ -410,7 +446,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     cleanup()
                     if (!continuation.isActive) return
-                    if (code == HD_UNAVAILABLE_CLOSE_CODE) continuation.resumeWith(Result.failure(HdUnavailable()))
+                    if (code == HD_UNAVAILABLE_CLOSE_CODE) continuation.resumeWith(Result.failure(HdUnavailable(reason == "HD stopped")))
                     else continuation.resume(Unit)
                 }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -473,6 +509,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     }
     private class EncodedFrame(val header: VideoHeader, val bytes: ByteArray, val receivedAtMs: Long)
     private class VideoHttpFailure(val code: Int) : IOException()
-    private class HdUnavailable : IOException()
+    private class HdUnavailable(val stopped: Boolean) : IOException()
+    private companion object { const val SD_ONLY = "This Jetson's connector offers SD only" }
     private class AuthenticationFailure : IOException()
 }

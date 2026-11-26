@@ -1203,12 +1203,46 @@ class HdApiTests(unittest.IsolatedAsyncioTestCase):
             await ws.close()
 
     async def test_no_hd_frames_closes_with_4001(self):
-        with mock.patch.object(service, 'HD_FIRST_FRAME_SECONDS', .3):
+        with mock.patch.object(service, 'HD_SILENCE_SECONDS', .3):
             ws = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
             message = await ws.receive(timeout=2)
         self.assertEqual(message.type, WSMsgType.CLOSE)
-        self.assertEqual(ws.close_code, service.HD_UNAVAILABLE)
+        self.assertEqual((ws.close_code, message.extra), (service.HD_UNAVAILABLE, 'HD not offered'))
         await wait_for(lambda: not self.state.video_hd_clients)
+
+    async def test_hd_that_stops_closes_with_4001_and_sd_takes_over(self):
+        # Review finding: one HD frame used to disable the check for the rest of the socket's life.
+        with mock.patch.object(service, 'HD_SILENCE_SECONDS', .4):
+            sd = await self.client.ws_connect('/v1/video', headers=self.headers)   # a simultaneous SD viewer
+            hd = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+            self.feed_hd()
+            self.assertEqual((await hd.receive_bytes(timeout=2))[24:], HD_JPEG)
+            start = time.monotonic()
+            closed = None
+            while time.monotonic() - start < 2 and closed is None:   # HD stops; SD keeps coming
+                self.state.accept_video(video_frame(seq=self.state.video_seq + 1))
+                with contextlib.suppress(asyncio.TimeoutError):
+                    message = await hd.receive(timeout=.1)
+                    if message.type == WSMsgType.CLOSE:
+                        closed = (time.monotonic() - start, hd.close_code, message.extra)
+            self.assertIsNotNone(closed)
+            self.assertEqual(closed[1:], (service.HD_UNAVAILABLE, 'HD stopped'))
+            self.assertGreaterEqual(closed[0], .3)
+            self.assertEqual((await sd.receive_bytes(timeout=2))[24:], JPEG)   # fresh SD for the fallback
+            await sd.close()
+
+    async def test_short_hd_gap_keeps_hd(self):
+        with mock.patch.object(service, 'HD_SILENCE_SECONDS', .6):
+            hd = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+            for _ in range(3):   # gaps of 0.3 s, each shorter than the timeout
+                self.feed_hd()
+                self.assertEqual(await hd.receive_bytes(timeout=2) is not None, True)
+                await asyncio.sleep(.3)
+            self.feed_hd()
+            message = await hd.receive(timeout=2)
+            self.assertEqual(message.type, WSMsgType.BINARY)
+            self.assertFalse(hd.closed)
+            await hd.close()
 
     async def test_simulator_serves_hd_while_watched(self):
         card = sof_jpeg(640, 360)

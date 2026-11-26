@@ -8,6 +8,20 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 
+/**
+ * What a Jetson's connector offers, from its authenticated /v1/identity. A feature counts only when its
+ * capability is an explicit JSON true: an older agent omits `video_hd` while accepting (and ignoring)
+ * `quality=hd`, so a missing or non-boolean value means no.
+ */
+data class Capabilities(val videoHd: Boolean, val recordings: Boolean) {
+    companion object {
+        fun parse(identity: JSONObject?): Capabilities {
+            val caps = identity?.optJSONObject("capabilities")
+            return Capabilities(caps?.opt("video_hd") == true, caps?.opt("recordings") == true)
+        }
+    }
+}
+
 data class DeviceProfile(
     val id: String, val name: String, val host: String, val port: Int,
     val pin: String, val token: String

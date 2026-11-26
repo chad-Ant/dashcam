@@ -50,8 +50,8 @@ HD_HEADER = struct.Struct('<4sIQIHHII')
 MAX_HD_JPEG = 1048576
 MAX_HD_VIEWERS = 2  # one 1080p30 viewer is 16-56 Mbit/s
 VIDEO_HD_MIN_INTERVAL = .025  # never limits a 30 fps camera
-HD_FIRST_FRAME_SECONDS = 5.0  # no HD frame by then: v0.4 does not offer HD
-HD_UNAVAILABLE = 4001  # close code: this Jetson sends no HD frames; the client falls back to Low
+HD_SILENCE_SECONDS = 5.0  # no fresh HD frame sent for this long (from the start, or after frames stopped): close
+HD_UNAVAILABLE = 4001  # close code, reason "HD not offered" or "HD stopped"; the client falls back to SD
 # Recorded segments (direct LAN): v0.4's dashcam_<seq>_<YYYYmmdd>_<HHMMSS>.mkv plus its .ass captions, read only.
 # A segment modified this recently is still being written (no Cues yet) and is neither listed nor served.
 RECORDING_FILE = re.compile(r'(dashcam_(\d{6})_(\d{8})_(\d{6}))\.(mkv|ass)')
@@ -695,7 +695,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
         try:
             await ws.prepare(request)
             state.touch_demand(hd)  # start the conversion now, not at the next demand tick
-            opened = time.monotonic()
+            last_hd = time.monotonic()   # an HD viewer's last fresh frame (the open counts as one)
             reader = asyncio.create_task(refuse_messages(ws))
             try:
                 shown, sent_at = 0, -math.inf
@@ -709,10 +709,12 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
                         shown = frame['seq']
                         age = now - frame['capture_mono_s']
                         if age <= VIDEO_SEND_MAX_AGE:
-                            sent_at = now
+                            sent_at = last_hd = now
                             await asyncio.wait_for(ws.send_bytes(video_message(frame, age)), timeout=2)
-                    if hd and sent_at < 0 and now - opened >= HD_FIRST_FRAME_SECONDS:
-                        await ws.close(code=HD_UNAVAILABLE, message=b'HD not offered')
+                    # Not only before the first frame: HD that stops (HD turned off, v0.4 restarted without
+                    # it, the HD stream stalled) also hands the viewer back to SD. A shorter gap keeps HD.
+                    if hd and now - last_hd >= HD_SILENCE_SECONDS:
+                        await ws.close(code=HD_UNAVAILABLE, message=b'HD not offered' if sent_at < 0 else b'HD stopped')
                         break
                     await asyncio.sleep(tick)
             finally:

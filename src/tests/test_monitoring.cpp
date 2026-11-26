@@ -320,6 +320,85 @@ void testHd() {
     assert(::unlink(sockPath.c_str()) == 0);
     assert(::unlink(demandPath.c_str()) == 0);
 }
+double processCpuMs() {
+    timespec t{};
+    ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+// Review finding (2026-11-26): with the agent's receive queue full but the sender's own buffer
+// empty, POLLOUT is ready at once while every send fails, so a poll-and-retry loop spins a core for
+// the whole frame budget.  The worker must instead pause between retries, give up at the deadline,
+// count the drop, and deliver a complete fresh frame once the reader drains the queue.
+void testHdQueueFullDoesNotSpin() {
+    const std::string base = "/tmp/dashcam-monitor-hdfull-test-" + std::to_string(::getpid());
+    const std::string sockPath = base + ".sock", demandPath = base + ".demand";
+    const int receiver = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    assert(receiver >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, sockPath.c_str(), sockPath.size() + 1);
+    assert(::bind(receiver, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    FILE* f = std::fopen(demandPath.c_str(), "w");
+    assert(f != nullptr);
+    std::fclose(f);
+
+    // Fill the receiver's queue with tiny datagrams from other sockets until a fresh socket (empty
+    // send buffer, like the HD sender's) is refused: the queue, not the sender, is now the limit.
+    std::vector<int> fillers;
+    auto refusedFromFreshSocket = [&] {
+        const int probe = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        const char b = 0;
+        const bool refused = ::sendto(probe, &b, 1, MSG_DONTWAIT, reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address)) < 0 && errno == EAGAIN;
+        ::close(probe);
+        return refused;
+    };
+    while (!refusedFromFreshSocket()) {
+        assert(fillers.size() < 256);
+        const int s = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        fillers.push_back(s);
+        const char b = 1;
+        while (::sendto(s, &b, 1, MSG_DONTWAIT, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 1) {}
+    }
+    pollfd p{0, POLLOUT, 0};
+    {
+        const int fresh = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        p.fd = fresh;
+        assert(::poll(&p, 1, 0) == 1 && (p.revents & POLLOUT));   // the trap: "writable", yet every send fails
+        ::close(fresh);
+    }
+
+    std::vector<uint8_t> jpeg(150001, 0x5A);
+    jpeg[0] = 0xFF; jpeg[1] = 0xD8; jpeg[jpeg.size() - 2] = 0xFF; jpeg[jpeg.size() - 1] = 0xD9;
+    mon::MonitorHdSender hd;
+    assert(hd.open(sockPath, demandPath) && hd.pollDemand());
+    const double cpu0 = processCpuMs();
+    const auto wall0 = std::chrono::steady_clock::now();
+    hd.submit(jpeg.data(), jpeg.size(), 1920, 1080, 1000, 1);
+    for (int i = 0; i < 100 && hd.stats().dropBusy == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const auto wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
+    const double cpuMs = processCpuMs() - cpu0;   // this thread sleeps: almost all of it is the worker
+    std::printf("  queue full: frame given up after %.0f ms wall, %.1f ms CPU (a spin would use ~%d ms)\n",
+                wallMs, cpuMs, mon::kHdFrameBudgetMs);
+    assert(hd.stats().dropBusy == 1 && hd.stats().sent == 0);
+    assert(wallMs >= mon::kHdFrameBudgetMs * 0.8 && wallMs < mon::kHdFrameBudgetMs + 400);   // bounded by the deadline
+    assert(cpuMs < mon::kHdFrameBudgetMs * 0.3);                                            // no spin
+
+    // The reader catches up: a fresh frame arrives complete.
+    std::vector<uint8_t> rx(mon::kHdHeaderBytes + mon::kHdChunkBytes + 16);
+    while (::recv(receiver, rx.data(), rx.size(), MSG_DONTWAIT) >= 0) {}
+    for (int s : fillers) ::close(s);
+    jpeg[100] = 0x11;
+    hd.submit(jpeg.data(), jpeg.size(), 1920, 1080, 2000, 2);
+    assert(receiveHdFrame(receiver, 2000, 2, 1920, 1080) == jpeg);
+    for (int i = 0; i < 100 && hd.stats().sent < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    assert(hd.stats().sent == 1);
+    hd.stop();
+    ::close(receiver);
+    assert(::unlink(sockPath.c_str()) == 0);
+    assert(::unlink(demandPath.c_str()) == 0);
+}
 } // namespace
 
 int main() {
@@ -366,6 +445,7 @@ int main() {
     std::puts("monitoring video: header layout, demand file freshness, missing/stalled/refused agent and "
               "byte-exact delivery, camera JPEG -> SD 720x404 datagram on demand passed");
     testHd();
+    testHdQueueFullDoesNotSpin();
     std::puts("monitoring HD: chunk header layout, demand gate, byte-exact chunked delivery, size limits and "
               "a stalled agent never blocking the camera thread passed");
 }

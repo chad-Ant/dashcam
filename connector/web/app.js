@@ -207,37 +207,52 @@
   function isFullscreen(box) {
     return (document.fullscreenElement || document.webkitFullscreenElement) === box || box.classList.contains('pseudo-fs');
   }
+  // The current fullscreen request. Any exit (Exit, Esc, live view off) makes it stale, so a late
+  // promise rejection or the 1 s fallback timer can never reopen fullscreen after the viewer left it.
+  let fsRequest = 0, fsTimer = 0;
+  const nativeFullscreen = box => (document.fullscreenElement || document.webkitFullscreenElement) === box;
   function setFullscreen(box, on) {
     if (on === isFullscreen(box)) return;
     const request = box.requestFullscreen || box.webkitRequestFullscreen;
     if (on) {
+      const req = ++fsRequest;
+      clearTimeout(fsTimer);
       box.classList.remove('controls-hidden');
+      const fallback = () => {   // only for this request, while the viewer still wants fullscreen
+        if (req !== fsRequest || nativeFullscreen(box)) return;
+        clearTimeout(fsTimer);
+        box.classList.add('pseudo-fs'); lockScroll(true); updateCamera();
+      };
       if (request) {
         Promise.resolve(request.call(box)).then(() => {
+          if (req !== fsRequest) return;
+          clearTimeout(fsTimer);
           // Phones: landscape while fullscreen; desktops and refusals are fine as they are.
           screen.orientation?.lock?.('landscape').catch(() => {});
-        }, () => { box.classList.add('pseudo-fs'); lockScroll(true); updateCamera(); });
+        }, fallback);
         // Some embedded browsers never settle the request: cover the window with CSS instead.
-        setTimeout(() => {
-          if ((document.fullscreenElement || document.webkitFullscreenElement) !== box) {
-            box.classList.add('pseudo-fs'); lockScroll(true); updateCamera();
-          }
-        }, 1000);
+        fsTimer = setTimeout(fallback, 1000);
         return;   // fullscreenchange refreshes the card
       }
       box.classList.add('pseudo-fs'); lockScroll(true);
-    } else if (box.classList.contains('pseudo-fs')) leftFullscreen(box);
-    else {
-      // Asynchronous: until fullscreenchange, isFullscreen() stays true, so no updateCamera() here
-      // (it would call this again).
-      Promise.resolve((document.exitFullscreen || document.webkitExitFullscreen).call(document)).catch(() => {});
-      return;
+    } else {
+      fsRequest += 1;
+      clearTimeout(fsTimer);
+      if (box.classList.contains('pseudo-fs')) leftFullscreen(box);
+      else {
+        // Asynchronous: until fullscreenchange, isFullscreen() stays true, so no updateCamera() here
+        // (it would call this again).
+        Promise.resolve((document.exitFullscreen || document.webkitExitFullscreen).call(document)).catch(() => {});
+        return;
+      }
     }
     updateCamera();
   }
   // The page behind the CSS fullscreen must not scroll (or show its scrollbar).
   function lockScroll(on) { document.documentElement.style.overflow = on ? 'hidden' : ''; }
   function leftFullscreen(box) {
+    fsRequest += 1;
+    clearTimeout(fsTimer);
     box.classList.remove('pseudo-fs', 'controls-hidden');
     lockScroll(false);
     try { screen.orientation?.unlock?.(); } catch (_) { /* not locked */ }
@@ -1038,8 +1053,9 @@
       const delivered = vMsgMs > 0;
       vws = null;
       resetVideoFrames();
-      if (ev.code === HD_UNAVAILABLE) {   // no original frames from this Jetson: Low, at once
-        vQuality = 'low'; vQualityNote = 'HD is not offered by this Jetson · showing SD';
+      if (ev.code === HD_UNAVAILABLE) {   // no original frames, or they stopped for 5 s: SD, at once
+        vQuality = 'low';
+        vQualityNote = ev.reason === 'HD stopped' ? 'HD stopped · showing SD' : 'HD is not offered by this Jetson · showing SD';
         vAttempt = 0;
         syncVideo();
         render();
