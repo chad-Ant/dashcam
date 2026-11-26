@@ -149,6 +149,8 @@ class Resources:
 
     async def read(self, bit, route, attempt):
         local = self.cfg['local']
+        # Always the Low preview (no quality=hd): original HD frames (16-56 Mbit/s) stay on the LAN;
+        # mobile uplink and relay egress cannot carry them (connector/README.md, "HD").
         url = URL.build(scheme='wss', host=local['host'], port=int(local['port']), path='/v1/' + route)
         async with self.http.ws_connect(url, ssl=aiohttp.Fingerprint(bytes.fromhex(local['pin'])),
                                         headers={'Authorization': 'Bearer ' + local['token']},

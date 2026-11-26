@@ -223,6 +223,103 @@ void testPreviewToAgent() {
     ::close(receiver);
     assert(::unlink(sockPath.c_str()) == 0);
 }
+
+// One HD frame as the agent would reassemble it from DCH1 chunks; empty on any gap.
+std::vector<uint8_t> receiveHdFrame(int receiver, uint64_t wantCapture, uint32_t wantSeq, uint16_t w, uint16_t h) {
+    std::vector<uint8_t> frame, rx(mon::kHdHeaderBytes + mon::kHdChunkBytes + 16);
+    for (;;) {
+        pollfd p{receiver, POLLIN, 0};
+        if (::poll(&p, 1, 2000) != 1) return {};
+        const auto got = ::recv(receiver, rx.data(), rx.size(), 0);
+        assert(got > static_cast<ssize_t>(mon::kHdHeaderBytes));
+        auto le = [&](size_t at, size_t bytes) {
+            uint64_t v = 0;
+            for (size_t i = 0; i < bytes; ++i) v |= static_cast<uint64_t>(rx[at + i]) << (8 * i);
+            return v;
+        };
+        assert(std::memcmp(rx.data(), "DCH1", 4) == 0 && le(4, 4) == mon::kHdHeaderBytes);
+        assert(le(8, 8) == wantCapture && le(16, 4) == wantSeq && le(20, 2) == w && le(22, 2) == h);
+        const size_t total = le(24, 4), offset = le(28, 4);
+        const size_t chunk = static_cast<size_t>(got) - mon::kHdHeaderBytes;
+        assert(chunk <= mon::kHdChunkBytes && offset == frame.size() && offset + chunk <= total);
+        frame.insert(frame.end(), rx.begin() + mon::kHdHeaderBytes, rx.begin() + got);
+        if (frame.size() == total) return frame;
+    }
+}
+
+void testHd() {
+    uint8_t header[mon::kHdHeaderBytes];
+    mon::writeHdChunkHeader(header, 0x0102030405060708ULL, 0xA1B2C3D4u, 1920, 1080, 0x00030201u, 0x0000F000u);
+    const uint8_t expected[mon::kHdHeaderBytes] = {
+        'D', 'C', 'H', '1', 32, 0, 0, 0,
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0xD4, 0xC3, 0xB2, 0xA1, 0x80, 0x07, 0x38, 0x04,
+        0x01, 0x02, 0x03, 0x00, 0x00, 0xF0, 0x00, 0x00};
+    assert(std::memcmp(header, expected, sizeof(expected)) == 0);
+
+    const std::string base = "/tmp/dashcam-monitor-hd-test-" + std::to_string(::getpid());
+    const std::string sockPath = base + ".sock", demandPath = base + ".demand";
+    const int receiver = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    assert(receiver >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, sockPath.c_str(), sockPath.size() + 1);
+    assert(::bind(receiver, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+
+    std::vector<uint8_t> jpeg(150001);   // a typical 1080p MJPEG frame: three chunks, the last one short
+    for (size_t i = 0; i < jpeg.size(); ++i) jpeg[i] = static_cast<uint8_t>(i * 131u + 3u);
+    jpeg[0] = 0xFF; jpeg[1] = 0xD8; jpeg[jpeg.size() - 2] = 0xFF; jpeg[jpeg.size() - 1] = 0xD9;
+
+    mon::MonitorHdSender hd;
+    assert(hd.open(sockPath, demandPath));
+    assert(!hd.open(sockPath, demandPath));   // once
+
+    // No demand: nothing is copied or sent.
+    assert(!hd.pollDemand());
+    hd.submit(jpeg.data(), jpeg.size(), 1920, 1080, 1000, 1);
+    pollfd p{receiver, POLLIN, 0};
+    assert(::poll(&p, 1, 200) == 0 && hd.stats().submitted == 0);
+
+    // Demand: the original bytes arrive in order, reassembled byte for byte.
+    FILE* f = std::fopen(demandPath.c_str(), "w");
+    assert(f != nullptr);
+    std::fclose(f);
+    assert(hd.pollDemand() && hd.demanded());
+    const uint64_t captureUs = 987654321012ULL;
+    const auto start = std::chrono::steady_clock::now();
+    hd.submit(jpeg.data(), jpeg.size(), 1920, 1080, captureUs, (1ULL << 32) + 9);   // sequence truncated to 9
+    assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50));   // a copy, not the send
+    assert(receiveHdFrame(receiver, captureUs, 9, 1920, 1080) == jpeg);
+    for (int i = 0; i < 100 && hd.stats().sent < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    assert(hd.stats().sent == 1 && hd.stats().submitted == 1 && hd.stats().dropped() == 0);
+
+    // Rejected before the copy: empty, oversized, absurd geometry.
+    hd.submit(jpeg.data(), 0, 1920, 1080, captureUs, 10);
+    std::vector<uint8_t> huge(mon::kHdMaxJpegBytes + 1, 0xAB);
+    hd.submit(huge.data(), huge.size(), 1920, 1080, captureUs, 11);
+    hd.submit(jpeg.data(), jpeg.size(), 8192, 1080, captureUs, 12);
+    assert(hd.stats().tooLarge == 3 && hd.stats().submitted == 1);
+
+    // Stalled reader: 500 frames never block the camera's thread; the busy
+    // queue and the latest-only slot account for every frame not sent.
+    const auto burst = std::chrono::steady_clock::now();
+    for (int i = 0; i < 500; ++i) hd.submit(jpeg.data(), jpeg.size(), 1920, 1080, captureUs + i, 100 + i);
+    assert(std::chrono::steady_clock::now() - burst < std::chrono::seconds(1));
+    // Keep offering, slower, until the worker has met the full queue.
+    for (int i = 0; i < 2000 && hd.stats().dropBusy == 0; ++i) {
+        hd.submit(jpeg.data(), jpeg.size(), 1920, 1080, captureUs + 500 + i, 600 + i);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    hd.stop();
+    const mon::MonitorHdStats hs = hd.stats();
+    assert(hs.submitted >= 501 && hs.dropBusy > 0);
+    assert(hs.sent + hs.replaced + hs.dropBusy + hs.dropMissing + hs.dropRefused + hs.dropOther <= hs.submitted);
+    hd.stop();   // idempotent
+
+    ::close(receiver);
+    assert(::unlink(sockPath.c_str()) == 0);
+    assert(::unlink(demandPath.c_str()) == 0);
+}
 } // namespace
 
 int main() {
@@ -268,4 +365,7 @@ int main() {
     testPreviewToAgent();
     std::puts("monitoring video: header layout, demand file freshness, missing/stalled/refused agent and "
               "byte-exact delivery, camera JPEG -> 640x360 datagram on demand passed");
+    testHd();
+    std::puts("monitoring HD: chunk header layout, demand gate, byte-exact chunked delivery, size limits and "
+              "a stalled agent never blocking the camera thread passed");
 }

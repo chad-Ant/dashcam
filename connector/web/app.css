@@ -102,6 +102,32 @@ h1 { font-size: 2rem; font-weight: 600; line-height: 1.2; }
   color: var(--video-text); font-weight: 600;
 }
 .video-caption { font-variant-numeric: tabular-nums; }
+/* Low / HD: two buttons as one control. */
+.segmented { display: inline-flex; align-self: flex-start; border: 1px solid var(--accent); border-radius: 22px; overflow: hidden; }
+.segmented .seg {
+  min-height: 40px; padding: 0 18px; border: 0; background: transparent; color: var(--accent);
+  font: inherit; font-weight: 600; cursor: pointer;
+}
+.segmented .seg + .seg { border-left: 1px solid var(--accent); }
+.segmented .seg[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+.segmented .seg:disabled { opacity: .45; cursor: default; }
+.segmented .seg:focus-visible { outline: 2px solid var(--accent); outline-offset: -4px; }
+/* Fullscreen camera: the Fullscreen API, or a fixed cover where the browser lacks it. */
+.video-fs-bar { display: none; }
+.video-box:fullscreen, .video-box.pseudo-fs { width: 100%; height: 100%; aspect-ratio: auto; border-radius: 0; background: #000; }
+.video-box:-webkit-full-screen { width: 100%; height: 100%; aspect-ratio: auto; border-radius: 0; background: #000; }
+.video-box.pseudo-fs { position: fixed; inset: 0; z-index: 1000; height: 100dvh; }
+.video-box:fullscreen .video-fs-bar, .video-box.pseudo-fs .video-fs-bar {
+  position: absolute; top: 0; left: 0; right: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+  padding: max(10px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left));
+  background: rgba(0, 0, 0, .55); color: var(--video-text);
+}
+.video-box:-webkit-full-screen .video-fs-bar {
+  position: absolute; top: 0; left: 0; right: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+  padding: 10px 16px; background: rgba(0, 0, 0, .55); color: var(--video-text);
+}
+.video-box.controls-hidden .video-fs-bar { display: none !important; }
+.video-fs-bar .video-caption { flex-basis: 100%; margin: 0; color: var(--video-text); }
 /* Vehicle map: OSM tiles (always light) under a marker, controls and the attribution. */
 .map-box {
   position: relative; height: clamp(260px, 62vw, 440px); overflow: hidden; border-radius: 14px;

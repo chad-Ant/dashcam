@@ -422,6 +422,8 @@ struct NetworkConfig {
     ConfigVar<std::string> monitoringVideoSocket {"MonitoringVideoSocket", "/run/dashcam-monitor/video.sock", "Unix datagram socket the monitoring agent receives preview frames on"};
     ConfigVar<std::string> monitoringVideoDemand {"MonitoringVideoDemand", "/run/dashcam-monitor/video-demand", "File the monitoring agent touches while a viewer watches; preview frames are converted only while it is fresh (< 3 s old)"};
     ConfigVar<int> monitoringVideoFps {"MonitoringVideoFps", 10, 1, 15, 1, "Monitoring preview frame-rate ceiling (fps); out of range = 10"};
+    ConfigVar<bool> monitoringVideoHdEnabled {"MonitoringVideoHdEnabled", true, "Also send the recording camera's original frames, unconverted and at the camera's rate, while a direct-LAN viewer selects HD (needs MonitoringVideoEnabled)"};
+    ConfigVar<std::string> monitoringVideoHdDemand {"MonitoringVideoHdDemand", "/run/dashcam-monitor/video-demand-hd", "File the monitoring agent touches while an HD viewer watches; original frames are sent only while it is fresh (< 3 s old)"};
     // WiFi bring-up at startup: ask NetworkManager to connect to the SSID; if it
     // cannot be fulfilled the app runs in offline mode (no time-sync, no streaming).
     ConfigVar<bool>        wifiConnectEnabled  {"WifiConnectEnabled",  true, "Ask the OS (NetworkManager) to connect to the WiFi SSID at startup; on failure, run offline"};

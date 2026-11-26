@@ -20,11 +20,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -143,14 +145,32 @@ private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake
 @Composable private fun CloudCameraCard() {
     val camera by CloudSession.camera.collectAsStateWithLifecycle()
     val picture by CloudSession.picture.collectAsStateWithLifecycle()
+    var fullscreen by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(camera) { if (!camera) fullscreen = false }
     SurfaceCard("Camera") {
         val frame = picture
-        if (camera && frame != null) Image(frame.asImageBitmap(), "Dashcam camera",
+        if (fullscreen) FullscreenPlaceholder(Modifier.align(Alignment.CenterHorizontally))
+        else if (camera && frame != null) Image(frame.asImageBitmap(), "Dashcam camera",
             Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(CameraCorner)))
         else Hint(if (camera) "Waiting for camera frames" else "Live view off")
-        OutlinedButton(onClick = { CloudSession.setCamera(!camera) }) {
-            Text(if (camera) "Stop live view" else "Start live view")
+        // The cloud relay carries the preview only: HD needs the Jetson on the same Wi-Fi.
+        QualitySelector(VideoQuality.LOW, hdAllowed = false, onSelect = {})
+        Hint("HD needs a direct LAN connection · cloud sessions show Low")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { CloudSession.setCamera(!camera) }) {
+                Text(if (camera) "Stop live view" else "Start live view")
+            }
+            OutlinedButton(onClick = { fullscreen = true }, enabled = camera) { Text("Fullscreen") }
         }
+    }
+    if (fullscreen) FullscreenCamera(onExit = { fullscreen = false },
+        controls = { QualitySelector(VideoQuality.LOW, hdAllowed = false, onSelect = {}) },
+        caption = { Hint("Cloud · Low quality") }) {
+        val frame = picture
+        if (frame != null) Image(frame.asImageBitmap(), "Dashcam camera", Modifier.fillMaxSize(),
+            contentScale = ContentScale.Fit)
+        else Text("Waiting for camera frames", Modifier.align(Alignment.Center), color = Color(0xFFFFCA80),
+            fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -400,11 +420,41 @@ private data class BannerUi(val fresh: Boolean, val title: String, val detail: S
     // countdown reach only this card. The pictures themselves never go through Compose.
     val video = repository.video.collectAsStateWithLifecycle()
     val live = repository.liveView.collectAsStateWithLifecycle()
+    val quality by repository.quality.collectAsStateWithLifecycle()
+    val note by repository.qualityNote.collectAsStateWithLifecycle()
+    val isOn = live.derive { on }
+    var fullscreen by rememberSaveable { mutableStateOf(false) }
+    // Live view off (Stop, the 10-minute window, another device) leaves fullscreen too.
+    LaunchedEffect(isOn) { if (!isOn) fullscreen = false }
     SurfaceCard("Camera") {
-        CameraPicture(video, live, repository.picture, Modifier.align(Alignment.CenterHorizontally))
+        // One surface draws the frames: the card's gives way while fullscreen is shown.
+        if (fullscreen) FullscreenPlaceholder(Modifier.align(Alignment.CenterHorizontally))
+        else CameraPicture(video, live, repository.picture, Modifier.align(Alignment.CenterHorizontally))
         CameraHint(video, live)
-        LiveViewButton(live) { repository.setLiveView(it) }
+        QualitySelector(quality, hdAllowed = true, onSelect = repository::setQuality)
+        Hint(note ?: qualityHint(quality))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LiveViewButton(live) { repository.setLiveView(it) }
+            OutlinedButton(onClick = { fullscreen = true }, enabled = isOn) { Text("Fullscreen") }
+        }
     }
+    if (fullscreen) FullscreenCamera(onExit = { fullscreen = false },
+        controls = { QualitySelector(quality, hdAllowed = true, onSelect = repository::setQuality) },
+        caption = { CameraHint(video, live) }) {
+        FullscreenPicture(video, live, repository.picture)
+    }
+}
+internal fun qualityHint(quality: VideoQuality) = when (quality) {
+    VideoQuality.LOW -> "Low: 640×360 at up to 10 fps, about 1–5 Mbit/s"
+    VideoQuality.HD -> "HD: the camera's original frames, up to 30 fps · 15–60 Mbit/s of Wi-Fi"
+}
+@Composable private fun BoxScope.FullscreenPicture(video: State<VideoState>, live: State<LiveViewState>,
+                                                   pictures: StateFlow<Bitmap?>) {
+    val showing by remember(video, live) { derivedStateOf { shownFrame(video.value, live.value) != null } }
+    if (showing) CameraSurface(pictures, Color.Black, 0.dp, Modifier.fillMaxSize()
+        .semantics { contentDescription = "Dashcam camera"; role = Role.Image })
+    else Text(if (video.value.frame != null) "Video stale" else "No video", Modifier.align(Alignment.Center),
+        color = Color(0xFFFFCA80), fontWeight = FontWeight.SemiBold)
 }
 private fun shownFrame(video: VideoState, live: LiveViewState) = video.frame?.takeUnless { video.stale }?.takeIf { live.on }
 @Composable private fun CameraPicture(video: State<VideoState>, live: State<LiveViewState>,

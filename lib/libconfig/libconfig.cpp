@@ -281,6 +281,8 @@ static void parseNetwork(pugi::xml_node node, NetworkConfig& n,
     readVar(node, n.monitoringVideoEnabled, log);
     readVar(node, n.monitoringVideoSocket, log);
     readVar(node, n.monitoringVideoDemand, log);
+    readVar(node, n.monitoringVideoHdEnabled, log);
+    readVar(node, n.monitoringVideoHdDemand, log);
     // Out of range falls back to the default (not clamped): 0 or 60 is a typo,
     // not a request for the nearest bound.
     if (pugi::xml_node fpsNode = node.child(n.monitoringVideoFps.name().c_str())) {
@@ -499,6 +501,8 @@ static void writeNetwork(pugi::xml_node parent, const NetworkConfig& n) {
     writeVar(node, n.monitoringVideoSocket);
     writeVar(node, n.monitoringVideoDemand);
     writeVar(node, n.monitoringVideoFps);
+    writeVar(node, n.monitoringVideoHdEnabled);
+    writeVar(node, n.monitoringVideoHdDemand);
     writeVar(node, n.wifiConnectEnabled);
     writeVar(node, n.wifiSsid);
     writeVar(node, n.wifiTimeoutSec);

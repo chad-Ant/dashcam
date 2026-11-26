@@ -43,6 +43,13 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     private var latestFrame: VideoFrame? = null
     private val liveMutable = MutableStateFlow(LiveViewState())
     val liveView = liveMutable.asStateFlow()
+    // Low (640x360 preview) or HD (the camera's original frames). Kept for the app's lifetime;
+    // every app start begins at Low, like live view itself.
+    private val qualityMutable = MutableStateFlow(VideoQuality.LOW)
+    val quality = qualityMutable.asStateFlow()
+    // Why HD fell back to Low (this Jetson sends no original frames); null otherwise.
+    private val qualityNoteMutable = MutableStateFlow<String?>(null)
+    val qualityNote = qualityNoteMutable.asStateFlow()
     private val liveSession = LiveViewSession()
     private var liveTicker: Job? = null
     // Why live view cannot work with the selected device (no video, rejected
@@ -82,6 +89,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
         // Another device or credential never inherits the previous live view.
         if (profile != desired) endLiveView()
         videoUnavailable = null
+        qualityNoteMutable.value = null
         desired = profile; restart()
     }
     fun setActive(value: Boolean) {
@@ -101,6 +109,13 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     fun setVideoWanted(value: Boolean) {
         if (videoWanted == value) return
         videoWanted = value
+        restartVideo()
+    }
+    // A new quality reconnects the video socket; the live view window keeps running.
+    fun setQuality(value: VideoQuality) {
+        qualityNoteMutable.value = null
+        if (qualityMutable.value == value) return
+        qualityMutable.value = value
         restartVideo()
     }
     // The user's Start/Stop: video additionally needs this, inside its window.
@@ -301,6 +316,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             }, nowMs = now)
         }
         if (!active || !videoWanted || !live || device == null || network == null) return
+        val quality = qualityMutable.value
         videoTask = scope.launch {
             // Conflated: while a JPEG is decoding only the newest pending frame is kept.
             val frames = Channel<EncodedFrame>(Channel.CONFLATED)
@@ -310,7 +326,7 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                 while (isActive) {
                     try {
                         videoStatus(epoch, "Connecting")
-                        connectVideo(device, network, epoch, frames)
+                        connectVideo(device, network, epoch, frames, quality)
                         videoStatus(epoch, "Video connection lost · retrying")
                         backoff = 1
                     } catch (e: CancellationException) { throw e
@@ -324,13 +340,21 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                     } catch (_: SecurityException) {
                         videoStatus(epoch, "Allow local network access in Android settings")
                         return@launch
+                    } catch (_: HdUnavailable) {
+                        // This Jetson sends no original frames (HD off in v0.4, or an older recorder): show Low.
+                        if (videoGeneration.get() == epoch) {
+                            qualityMutable.value = VideoQuality.LOW
+                            qualityNoteMutable.value = "HD is not offered by this Jetson · showing Low"
+                            restartVideo()
+                        }
+                        return@launch
                     } catch (e: Exception) {
                         // Never show raw URLs/headers/exceptions containing credentials.
                         val code = (e as? VideoHttpFailure)?.code
                         val reason = when (code) {
                             401 -> "Pairing rejected. Check device credential."
                             404 -> "This Jetson's connector has no video"
-                            503 -> "Too many video viewers · retrying"
+                            503 -> if (quality == VideoQuality.HD) "Too many HD viewers · retrying" else "Too many video viewers · retrying"
                             else -> "Video connection lost · retrying"
                         }
                         if (code == 401 || code == 404) {
@@ -347,11 +371,12 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             }
         }
     }
-    private suspend fun connectVideo(device: DeviceProfile, network: Network, epoch: Int, frames: Channel<EncodedFrame>) = suspendCancellableCoroutine<Unit> { continuation ->
+    private suspend fun connectVideo(device: DeviceProfile, network: Network, epoch: Int, frames: Channel<EncodedFrame>,
+                                     quality: VideoQuality) = suspendCancellableCoroutine<Unit> { continuation ->
         val client = pinnedClient(device, network)
         fun cleanup() { client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown() }
         val url = HttpUrl.Builder().scheme("https").host(device.host).port(device.port)
-            .addPathSegments("v1/video").build()
+            .addPathSegments("v1/video").apply { quality.query?.let { addQueryParameter("quality", it) } }.build()
         var sequence = 0L
         val ws = client.newWebSocket(Request.Builder().url(url).header("Authorization", "Bearer ${device.token}").build(),
             object : WebSocketListener() {
@@ -371,7 +396,9 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null) }
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     cleanup()
-                    if (continuation.isActive) continuation.resume(Unit)
+                    if (!continuation.isActive) return
+                    if (code == HD_UNAVAILABLE_CLOSE_CODE) continuation.resumeWith(Result.failure(HdUnavailable()))
+                    else continuation.resume(Unit)
                 }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     cleanup()
@@ -426,12 +453,13 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(data, offset, length, bounds)
             if (bounds.outWidth !in 1..4096 || bounds.outHeight !in 1..4096) return null
-            var sample = 1
-            while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1280) sample *= 2
+            // A 1080p HD frame decodes at full size; anything larger is subsampled.
+            val sample = decodeSampleSize(bounds.outWidth, bounds.outHeight)
             BitmapFactory.decodeByteArray(data, offset, length, BitmapFactory.Options().apply { inSampleSize = sample })
         } catch (_: Exception) { null }
     }
     private class EncodedFrame(val header: VideoHeader, val bytes: ByteArray, val receivedAtMs: Long)
     private class VideoHttpFailure(val code: Int) : IOException()
+    private class HdUnavailable : IOException()
     private class AuthenticationFailure : IOException()
 }

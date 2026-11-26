@@ -7,7 +7,9 @@
         android:supportsRtl="true" android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".CloudActivity" android:exported="false" />
-        <activity android:name=".MainActivity" android:exported="true">
+        <!-- Rotation (fullscreen live view turns landscape) keeps the activity, its sockets and the dialog. -->
+        <activity android:name=".MainActivity" android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

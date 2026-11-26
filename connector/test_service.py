@@ -840,6 +840,102 @@ class VideoStateTests(unittest.TestCase):
             self.assertEqual(jpeg_size(card.read_bytes()), (640, 360))
 
 
+HD_JPEG = b'\xff\xd8' + bytes(range(256)) * 700 + b'\xff\xd9'   # 179,204 bytes: three chunks
+
+
+def hd_frame(seq=1, capture=None, width=1920, height=1080, jpeg=HD_JPEG):
+    capture_us = int((time.monotonic() if capture is None else capture) * 1e6)
+    return service.hd_chunks(jpeg, capture_us, seq, width, height)
+
+
+class HdStateTests(unittest.TestCase):
+    def setUp(self):
+        self.state = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.')
+
+    def test_chunk_header_is_byte_exact(self):
+        chunk = service.HD_HEADER.pack(b'DCH1', 32, 0x0102030405060708, 0xA1B2C3D4, 1920, 1080, 0x030201, 0xF000)
+        self.assertEqual(service.HD_HEADER.size, 32)
+        self.assertEqual(chunk, b'DCH1' + b'\x20\0\0\0' + bytes.fromhex('0807060504030201') +
+                         bytes.fromhex('D4C3B2A1') + b'\x80\x07\x38\x04' + bytes.fromhex('01020300') +
+                         bytes.fromhex('00F00000'))
+        chunks = hd_frame()
+        self.assertEqual([len(c) - 32 for c in chunks], [61440, 61440, len(HD_JPEG) - 122880])
+
+    def test_complete_frame_becomes_current_and_preview_is_untouched(self):
+        chunks = hd_frame(seq=4)
+        for chunk in chunks[:-1]:
+            self.state.accept_hd_chunk(chunk)
+            self.assertIsNone(self.state.video_hd)
+        self.state.accept_hd_chunk(memoryview(chunks[-1]))
+        frame = self.state.video_hd
+        self.assertEqual((frame['jpeg'], frame['seq'], frame['source_seq'], frame['width'], frame['height']),
+                         (HD_JPEG, 1, 4, 1920, 1080))
+        self.assertIsNone(self.state.video)
+        self.assertEqual((self.state.invalid_video, self.state.hd_incomplete), (0, 0))
+        # A single-chunk frame, through the receiver as v0.4 would send it.
+        small = b'\xff\xd8small\xff\xd9'
+        for chunk in hd_frame(seq=5, width=1280, height=720, jpeg=small):
+            VideoReceiver(self.state).datagram_received(chunk, None)
+        self.assertEqual((self.state.video_hd['jpeg'], self.state.video_hd['seq']), (small, 2))
+        VideoReceiver(self.state).datagram_received(video_frame(seq=1), None)  # DCV1 still goes to the preview
+        self.assertEqual(self.state.video['jpeg'], JPEG)
+        self.assertEqual(self.state.video_hd['seq'], 2)
+
+    def test_missing_or_reordered_chunks_drop_only_that_frame(self):
+        first, second = hd_frame(seq=1), hd_frame(seq=2)
+        for chunk in (first[0], first[2]):  # a gap
+            self.state.accept_hd_chunk(chunk)
+        self.assertIsNone(self.state.video_hd)
+        self.state.accept_hd_chunk(second[0])  # a new frame starts while one is incomplete
+        self.state.accept_hd_chunk(first[1])   # a chunk of another frame
+        self.assertIsNone(self.state.video_hd)
+        for chunk in hd_frame(seq=3):
+            self.state.accept_hd_chunk(chunk)
+        self.assertEqual(self.state.video_hd['source_seq'], 3)
+        self.assertEqual(self.state.hd_incomplete, 2)
+        self.assertEqual(self.state.invalid_video, 0)
+        for chunk in hd_frame(seq=2):  # older than the current frame of the same producer
+            self.state.accept_hd_chunk(chunk)
+        self.assertEqual(self.state.video_hd['source_seq'], 3)
+
+    def test_each_validation_rule(self):
+        now = time.monotonic()
+        good = hd_frame()[0]
+        pack = service.HD_HEADER.pack
+
+        def chunk(**kw):
+            fields = dict(magic=b'DCH1', header=32, capture=int(now * 1e6), seq=1, width=1920, height=1080,
+                          total=len(HD_JPEG), offset=0)
+            fields.update(kw)
+            return pack(*fields.values()) + HD_JPEG[:100]
+        bad = {'header only': good[:32], 'short': good[:31], 'magic': chunk(magic=b'DCHX'),
+               'header 31': chunk(header=31), 'header past end': chunk(header=132),
+               'total 3': chunk(total=3), 'total over 1 MiB': chunk(total=service.MAX_HD_JPEG + 1),
+               'past total': chunk(total=50), 'width 0': chunk(width=0), 'height 4097': chunk(height=4097),
+               'old': chunk(capture=int((now - 2.5) * 1e6)), 'future': chunk(capture=int((now + .5) * 1e6))}
+        for name, data in bad.items():
+            before = self.state.invalid_video
+            self.state.accept_hd_chunk(data)
+            self.assertEqual(self.state.invalid_video, before + 1, name)
+        for data in hd_frame(jpeg=b'\0\xd8' + HD_JPEG[2:]):  # not a JPEG once reassembled
+            self.state.accept_hd_chunk(data)
+        self.assertEqual(self.state.invalid_video, len(bad) + 1)
+        self.assertIsNone(self.state.video_hd)
+
+    def test_hd_demand_file_is_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            low, hd = Path(directory) / 'video-demand', Path(directory) / 'video-demand-hd'
+            state = State({'id': 't'}, '.', video_demand=low, video_hd_demand=hd)
+            state.touch_demand(hd=True)
+            self.assertTrue(hd.exists())
+            self.assertFalse(low.exists())
+            self.assertEqual(hd.stat().st_mode & 0o777, 0o600)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                State({'id': 't'}, '.', video_hd_demand=Path(directory) / 'missing' / 'x').touch_demand(hd=True)
+            self.assertIn('WARNING', out.getvalue())
+
+
 class AdvertiseTests(unittest.IsolatedAsyncioTestCase):
     async def test_unassigned_address_disables_mdns_instead_of_stopping(self):
         try:
@@ -893,7 +989,8 @@ class VideoIpcTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.assertEqual((state.video['jpeg'], state.video['width'], state.video['height']), (card, 640, 360))
-        self.assertEqual(state.video['source_seq'], state.video_seq)
+        self.assertEqual(state.video['source_seq'], 3 * state.video_seq - 2)  # every third frame of 30 fps
+        self.assertIsNone(state.video_hd)  # no HD viewer, no HD frames
         self.assertLess(time.monotonic() - state.video['capture_mono_s'], .5)
         self.assertEqual(state.invalid_video, 0)
         out = io.StringIO()
@@ -1032,7 +1129,97 @@ class VideoApiTests(unittest.IsolatedAsyncioTestCase):
                               "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         capabilities = (await response.json())['capabilities']
         self.assertIs(capabilities['video'], True)
+        self.assertIs(capabilities['video_hd'], True)
         self.assertFalse(capabilities['controls'])
+
+
+class HdApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.low = Path(self.temp.name) / 'video-demand'
+        self.hd = Path(self.temp.name) / 'video-demand-hd'
+        self.state = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.', video_demand=self.low,
+                           video_hd_demand=self.hd)
+        self.client = TestClient(TestServer(create_app(self.state)))
+        await self.client.start_server()
+        self.headers = {'Authorization': 'Bearer ' + TOKEN}
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp.cleanup()
+
+    def feed_hd(self, seq=None):
+        for chunk in hd_frame(seq=self.state.video_hd_seq + 1 if seq is None else seq):
+            self.state.accept_hd_chunk(chunk)
+
+    async def test_hd_viewer_gets_original_frames_and_only_the_hd_demand(self):
+        self.feed_hd()
+        self.state.accept_video(video_frame(seq=1))
+        ws = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+        data = await ws.receive_bytes(timeout=2)
+        magic, header, seq, age_ms, width, height = struct.unpack('<4sIQIHH', data[:24])
+        self.assertEqual((magic, header, seq, width, height), (b'DCV1', 24, 1, 1920, 1080))
+        self.assertEqual(data[24:], HD_JPEG)
+        await wait_for(self.hd.exists, .5)
+        await asyncio.sleep(.6)
+        self.assertFalse(self.low.exists())  # an HD viewer never starts the 640x360 conversion
+        self.assertEqual(len(self.state.video_hd_clients), 1)
+        self.assertFalse(self.state.video_clients)
+        await ws.close()
+
+    async def test_hd_rate_follows_the_camera(self):
+        async def producer():
+            while True:
+                self.feed_hd()
+                await asyncio.sleep(1 / 30)
+        ws = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+        task = asyncio.create_task(producer())
+        received = 0
+        try:
+            start = time.monotonic()
+            while time.monotonic() - start < 1.0:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await ws.receive_bytes(timeout=.2)
+                    received += 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await ws.close()
+        self.assertGreaterEqual(received, 20)  # far above the preview's 10 fps cap
+        self.assertLessEqual(received, 41)
+
+    async def test_hd_limit_quality_validation_and_low_route_unchanged(self):
+        hd = [await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers) for _ in range(2)]
+        with self.assertRaises(WSServerHandshakeError) as failure:
+            await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+        self.assertEqual(failure.exception.status, 503)
+        low = await self.client.ws_connect('/v1/video?quality=low', headers=self.headers)  # separate limit
+        with self.assertRaises(WSServerHandshakeError) as failure:
+            await self.client.ws_connect('/v1/video?quality=4k', headers=self.headers)
+        self.assertEqual(failure.exception.status, 400)
+        self.state.accept_video(video_frame(seq=1))
+        self.assertEqual((await low.receive_bytes(timeout=2))[24:], JPEG)
+        for ws in hd + [low]:
+            await ws.close()
+
+    async def test_no_hd_frames_closes_with_4001(self):
+        with mock.patch.object(service, 'HD_FIRST_FRAME_SECONDS', .3):
+            ws = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+            message = await ws.receive(timeout=2)
+        self.assertEqual(message.type, WSMsgType.CLOSE)
+        self.assertEqual(ws.close_code, service.HD_UNAVAILABLE)
+        await wait_for(lambda: not self.state.video_hd_clients)
+
+    async def test_simulator_serves_hd_while_watched(self):
+        card = sof_jpeg(640, 360)
+        task = asyncio.create_task(simulate_video(self.state, card))
+        try:
+            ws = await self.client.ws_connect('/v1/video?quality=hd', headers=self.headers)
+            self.assertEqual((await ws.receive_bytes(timeout=2))[24:], card)
+            await ws.close()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == '__main__':

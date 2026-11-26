@@ -185,6 +185,8 @@ static bool test_roundtrip() {
     src.network.monitoringVideoSocket = "/run/example-video.sock";
     src.network.monitoringVideoDemand = "/run/example-video-demand";
     src.network.monitoringVideoFps = 7;
+    src.network.monitoringVideoHdEnabled = false;
+    src.network.monitoringVideoHdDemand = "/run/example-video-demand-hd";
     src.network.controlPort         = 8123;
     src.network.controlMaxClients   = 5;
     src.network.controlBindAddress  = "127.0.0.1";
@@ -347,6 +349,9 @@ static bool test_roundtrip() {
     check(static_cast<const std::string&>(dst.network.monitoringVideoDemand) == "/run/example-video-demand",
           "network.monitoringVideoDemand round-trip");
     check(dst.network.monitoringVideoFps == 7, "network.monitoringVideoFps round-trip");
+    check(dst.network.monitoringVideoHdEnabled == false, "network.monitoringVideoHdEnabled round-trip");
+    check(static_cast<const std::string&>(dst.network.monitoringVideoHdDemand) == "/run/example-video-demand-hd",
+          "network.monitoringVideoHdDemand round-trip");
     check(dst.network.controlPort == 8123,               "network.controlPort round-trip");
     check(dst.network.controlMaxClients == 5,            "network.controlMaxClients round-trip");
     check(dst.network.controlBindAddress == "127.0.0.1", "network.controlBindAddress round-trip");
@@ -1100,6 +1105,9 @@ static bool test_monitoring_video() {
               static_cast<const std::string&>(def.monitoringVideoSocket) == "/run/dashcam-monitor/video.sock" &&
               static_cast<const std::string&>(def.monitoringVideoDemand) == "/run/dashcam-monitor/video-demand",
           "monitoring video defaults: off, 10 fps, sockets under /run/dashcam-monitor");
+    check(def.monitoringVideoHdEnabled &&
+              static_cast<const std::string&>(def.monitoringVideoHdDemand) == "/run/dashcam-monitor/video-demand-hd",
+          "monitoring HD defaults: offered (still needs MonitoringVideoEnabled), demand file under /run/dashcam-monitor");
 
     const std::string tmpFile = "/tmp/libconfig_monitor_video_test.xml";
     std::vector<std::string> warns;

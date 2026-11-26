@@ -89,6 +89,21 @@ class VideoPolicyTest {
         assertTrue(publishFrameNow(10_000, 60_000))
     }
 
+    @Test fun hdFramesDecodeAtFullSizeAndLargerOnesAreSubsampled() {
+        assertEquals(1, decodeSampleSize(640, 360))
+        assertEquals(1, decodeSampleSize(1920, 1080))   // HD is not halved (the old 1280 limit did)
+        assertEquals(1, decodeSampleSize(1080, 1920))
+        assertEquals(2, decodeSampleSize(1921, 1080))
+        assertEquals(2, decodeSampleSize(3840, 2160))
+        assertEquals(4, decodeSampleSize(4096, 4096, maxPx = 1024))
+    }
+
+    @Test fun qualityQueryAndCloseCode() {
+        assertNull(VideoQuality.LOW.query)   // the unchanged /v1/video route, which older agents serve
+        assertEquals("hd", VideoQuality.HD.query)
+        assertEquals(4001, HD_UNAVAILABLE_CLOSE_CODE)
+    }
+
     @Test fun tickKeepsStalenessWithinTwoAndAHalfSeconds() {
         // The tick period plus the stale limit bounds how long a picture outlives its last frame.
         assertTrue(VIDEO_METADATA_TICK_MS + VIDEO_STALE_MS <= 2500)

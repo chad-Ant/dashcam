@@ -11,6 +11,7 @@ This file has three parts:
 ## Outstanding work brief (2026-11-25)
 
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
+- **HD live view and fullscreen (2026-11-26, not deployed).** Both clients gained a Low/HD choice and fullscreen. HD sends the camera's original frames over direct LAN only, and cloud stays Low. It is built and software-tested, including the C++ sender → agent → client path on the Jetson. Next: deploy v0.4, the agent, web assets and APK, then run the HD checks. [HD log](#2026-11-26-hd-live-view-and-fullscreen-not-deployed) · [Checks](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Connector field checks.** Exercise the Android token-refresh retry after rejection and mobile data on the A54. On the car network, check CAN/GNSS source loss and recovery, reconnect after a router or Jetson reboot, and recording performance with a phone and laptop watching. Tablet and local-browser CA checks remain. The S25 mobile-data trial, two-phone viewing and ten idle minutes already passed. [Pilot results](#2026-11-21-dashcam-connect-cloud-pilot) · [Physical checklist](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Next drive.** Secure the CSI mount, verify the connected devices and stock CSI driver, then calibrate the lane crops while parked. The IMX296 still resets in bright sun despite the gain floor. Run the parked raw-CAN loss test and collect day and night lane data. The recorder service and lane harness require separate runs. [Drive preparation](#open-work-in-priority-order)
 - **Bench work and owner decisions.** The main bench items are CSI night tuning and chart captures, MKR clock and C3 transmit-stall measurements, and display navigation/throughput checks. The turning EKF needs the antenna offset and a measured course. The incident threshold, CAN speed scale, stale-row handling and lane inference rate still need decisions. [Prioritized work and later prototypes](#open-work-in-priority-order)
@@ -406,6 +407,31 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-26 HD live view and fullscreen (not deployed)
+
+- **What.** Live view offers **Low** (640×360, ≤ 10 fps, unchanged) and **HD**: the UGREEN's original 1080p30 JPEGs,
+  byte for byte, over direct LAN only. Both clients also have **Fullscreen**. Cloud sessions show HD disabled; the
+  uplink still requests Low only. Design and protocol: [connector README, HD](connector/README.md#hd-direct-lan-only).
+- **v0.4** (`src/monitoring_video.h` `MonitorHdSender`, `src/dashcam_v0_4.cpp`). The preview tap copies each frame into a
+  latest-frame slot while the HD demand file is fresh. A worker sends it as `DCH1` chunks (61,440 B) on the existing
+  video socket, waiting at most 100 ms per frame on a full queue. With HD on, the tap runs at the camera rate. New
+  settings: `<MonitoringVideoHdEnabled>` (default true; needs `MonitoringVideoEnabled`) and `<MonitoringVideoHdDemand>`.
+- **Agent** (`connector/service.py`). It reassembles chunks and serves `/v1/video?quality=hd` (two viewers, up to
+  40 fps). It touches `video-demand-hd` (`--video-hd-demand`), adds `video_hd` to the identity capabilities, and
+  closes with 4001 when no HD frame arrives within 5 s. The simulator serves HD at 30 fps while watched.
+- **Android.** `VideoQuality`, a Low/HD segmented button, and a `FullscreenCamera` dialog (landscape, system bars
+  hidden). The HD socket falls back to Low on 4001. Frames up to 1920 px now decode at full size; the old 1280 px cap
+  halved 1080p. `MainActivity` now handles rotation itself (`configChanges`), so fullscreen keeps its sockets.
+- **Web.** A Low/HD control, and Fullscreen through the Fullscreen API with a CSS full-window fallback (iPhone
+  Safari, or a request that never settles).
+- **Verified (software, 2026-11-26):** see [VALIDATION](connector/VALIDATION.md#hd-live-view-and-fullscreen-2026-11-26-software-only).
+  The Jetson builds pass, and so do the C++, agent (58), Android (44) and web checks. A loopback run on the Jetson of
+  the C++ sender with the agent reached 28–29 fps for one or two HD viewers, with frames of 66–578 KB byte-exact and
+  4–20% of one core in the agent. **Not run with the camera, on Wi-Fi, or on a phone.** The deployed services and
+  `~/dashcam` on the Jetson were not touched.
+- **To deploy:** pull on the Jetson, `make` in the container, then restart `dashcam-v04` and `dashcam-monitor`
+  (sudo). Install the APK. The deployed config needs no change (HD defaults on with `MonitoringVideoEnabled`).
 
 ## 2026-11-25 Web and Android connector interface review
 

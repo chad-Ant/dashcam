@@ -42,6 +42,16 @@ VIDEO_NEW_PRODUCER_SECONDS = 5.0  # capture time going back this far = another v
 VIDEO_SEND_MAX_AGE = 1.0
 VIDEO_MIN_INTERVAL = .09  # <= 10 fps per viewer
 DEMAND_INTERVAL = .5  # v0.4 converts while the demand file is < 3 s old
+# HD (direct LAN, `/v1/video?quality=hd`): v0.4 sends the camera's original JPEGs cut into chunks, each one
+# datagram on the same socket: magic, header length, capture us, source sequence, width, height, total JPEG
+# bytes, offset of this chunk; then the chunk. The client message is the same DCV1 message as the preview.
+HD_MAGIC = b'DCH1'
+HD_HEADER = struct.Struct('<4sIQIHHII')
+MAX_HD_JPEG = 1048576
+MAX_HD_VIEWERS = 2  # one 1080p30 viewer is 16-56 Mbit/s
+VIDEO_HD_MIN_INTERVAL = .025  # never limits a 30 fps camera
+HD_FIRST_FRAME_SECONDS = 5.0  # no HD frame by then: v0.4 does not offer HD
+HD_UNAVAILABLE = 4001  # close code: this Jetson sends no HD frames; the client falls back to Low
 CA_NETWORKS = [ipaddress.ip_network(n) for n in (
     '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '169.254.0.0/16',
     '::1/128', 'fd00::/8', 'fe80::/10')]
@@ -301,8 +311,15 @@ def video_message(frame, age_s):
                              frame['width'], frame['height']) + frame['jpeg']
 
 
+def replaces(current, sequence, capture):
+    """Whether a frame (sequence, capture time) may replace @p current, the latest frame of a channel."""
+    return not (current and sequence <= current['source_seq'] and
+                capture >= current['capture_mono_s'] - VIDEO_NEW_PRODUCER_SECONDS and
+                time.monotonic() - current['capture_mono_s'] <= STALE_SECONDS)
+
+
 class State:
-    def __init__(self, identity, storage, video_demand=None):
+    def __init__(self, identity, storage, video_demand=None, video_hd_demand=None):
         self.identity = identity
         self.source = None
         self.health = {}
@@ -318,6 +335,13 @@ class State:
         self.video_clients = set()
         self.video_demand = Path(video_demand) if video_demand else None
         self.demand_failed = False
+        self.video_hd = None  # latest complete original frame only
+        self.video_hd_seq = 0
+        self.hd_partial = None  # the frame being reassembled
+        self.hd_incomplete = 0  # frames abandoned with a chunk missing
+        self.video_hd_clients = set()
+        self.video_hd_demand = Path(video_hd_demand) if video_hd_demand else None
+        self.hd_demand_failed = False
 
     def accept(self, data):
         try:
@@ -352,22 +376,61 @@ class State:
         except (ValueError, TypeError, struct.error):
             self.invalid_video += 1
             return
-        current = self.video
-        if (current and sequence <= current['source_seq'] and
-                capture >= current['capture_mono_s'] - VIDEO_NEW_PRODUCER_SECONDS and
-                time.monotonic() - current['capture_mono_s'] <= STALE_SECONDS):
+        if not replaces(self.video, sequence, capture):
             return  # queued or reordered datagram of the same producer; an expired frame binds nothing
         self.video_seq += 1
         self.video = {'jpeg': jpeg, 'seq': self.video_seq, 'source_seq': sequence,
                       'capture_mono_s': capture, 'width': width, 'height': height}
 
-    def touch_demand(self):
-        """Tell v0.4 someone is watching; it stops converting once the mtime is 3 s old."""
-        if self.video_demand is None:
-            return
+    def accept_hd_chunk(self, data):
+        """One DCH1 chunk; a frame becomes current only when its chunks arrived in order and complete."""
         try:
-            fd = os.open(self.video_demand, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK |
-                         os.O_CLOEXEC, 0o600)
+            if len(data) <= HD_HEADER.size:
+                raise ValueError('size')
+            magic, header, capture_us, sequence, width, height, total, offset = HD_HEADER.unpack_from(data)
+            capture = capture_us / 1e6
+            if (magic != HD_MAGIC or not HD_HEADER.size <= header < len(data) or not 4 <= total <= MAX_HD_JPEG or
+                    offset + len(data) - header > total or not 1 <= width <= 4096 or not 1 <= height <= 4096 or
+                    not math.isfinite(capture) or not 0 <= time.monotonic() - capture <= STALE_SECONDS):
+                raise ValueError('invalid chunk')
+        except (ValueError, TypeError, struct.error):
+            self.invalid_video += 1
+            self.hd_partial = None
+            return
+        key = (capture_us, sequence, width, height, total)
+        partial = self.hd_partial
+        if offset == 0:
+            if partial is not None:
+                self.hd_incomplete += 1
+            partial = self.hd_partial = {'key': key, 'parts': [], 'size': 0}
+        elif partial is None or partial['key'] != key or partial['size'] != offset:
+            if partial is not None:
+                self.hd_incomplete += 1
+            self.hd_partial = None
+            return  # a chunk went missing (the sender gave up on a busy queue): wait for the next frame
+        partial['parts'].append(bytes(data[header:]))
+        partial['size'] += len(data) - header
+        if partial['size'] < total:
+            return
+        self.hd_partial = None
+        jpeg = b''.join(partial['parts'])
+        if jpeg[:2] != b'\xff\xd8' or jpeg[-2:] != b'\xff\xd9':
+            self.invalid_video += 1
+            return
+        if not replaces(self.video_hd, sequence, capture):
+            return
+        self.video_hd_seq += 1
+        self.video_hd = {'jpeg': jpeg, 'seq': self.video_hd_seq, 'source_seq': sequence,
+                         'capture_mono_s': capture, 'width': width, 'height': height}
+
+    def touch_demand(self, hd=False):
+        """Tell v0.4 someone is watching; it stops converting (or sending HD) once the mtime is 3 s old."""
+        path = self.video_hd_demand if hd else self.video_demand
+        if path is None:
+            return
+        failed = self.hd_demand_failed if hd else self.demand_failed
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise OSError('not a regular file')
@@ -375,11 +438,15 @@ class State:
             finally:
                 os.close(fd)
         except OSError as error:
-            if not self.demand_failed:
-                print(f'WARNING: cannot update the video demand file {self.video_demand}: {error}', flush=True)
-            self.demand_failed = True
+            if not failed:
+                print(f'WARNING: cannot update the video demand file {path}: {error}', flush=True)
+            failed = True
         else:
-            self.demand_failed = False
+            failed = False
+        if hd:
+            self.hd_demand_failed = failed
+        else:
+            self.demand_failed = failed
 
     def snapshot(self):
         age = None if self.source is None else max(0, int((time.monotonic() - self.source['source_mono_s']) * 1000))
@@ -407,7 +474,10 @@ class VideoReceiver(asyncio.DatagramProtocol):
         self.state = state
 
     def datagram_received(self, data, _addr):
-        self.state.accept_video(data)
+        if data[:4] == HD_MAGIC:
+            self.state.accept_hd_chunk(data)
+        else:
+            self.state.accept_video(data)
 
 
 async def refuse_messages(ws):
@@ -421,6 +491,8 @@ async def touch_demand_while_watched(state):
     while True:
         if state.video_clients:
             state.touch_demand()
+        if state.video_hd_clients:
+            state.touch_demand(hd=True)
         await asyncio.sleep(DEMAND_INTERVAL)
 
 
@@ -513,7 +585,8 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
 
     async def identity(_request):
         return web.json_response({'schema': 1, 'id': state.identity['id'], 'name': state.identity['name'],
-                                  'capabilities': {'vehicle': True, 'system': True, 'video': True, 'lane': False,
+                                  'capabilities': {'vehicle': True, 'system': True, 'video': True,
+                                                   'video_hd': True, 'lane': False,
                                                    'driver': False, 'controls': False}}, dumps=encode)
 
     async def snapshot(_request):
@@ -548,13 +621,21 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
         return ws
 
     async def video(request):
-        if len(state.video_clients) >= MAX_VIEWERS:
-            raise web.HTTPServiceUnavailable(text='Maximum video viewers reached')
+        quality = request.query.get('quality', 'low')
+        if quality not in ('low', 'hd'):
+            raise web.HTTPBadRequest(text='quality must be low or hd')
+        hd = quality == 'hd'
+        clients = state.video_hd_clients if hd else state.video_clients
+        if len(clients) >= (MAX_HD_VIEWERS if hd else MAX_VIEWERS):
+            raise web.HTTPServiceUnavailable(text='Maximum HD video viewers reached' if hd else
+                                             'Maximum video viewers reached')
+        interval, tick = (VIDEO_HD_MIN_INTERVAL, .01) if hd else (VIDEO_MIN_INTERVAL, .05)
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=4096, compress=False)
-        state.video_clients.add(ws)  # reserved before the upgrade awaits, as for /v1/stream
+        clients.add(ws)  # reserved before the upgrade awaits, as for /v1/stream
         try:
             await ws.prepare(request)
-            state.touch_demand()  # start the conversion now, not at the next demand tick
+            state.touch_demand(hd)  # start the conversion now, not at the next demand tick
+            opened = time.monotonic()
             reader = asyncio.create_task(refuse_messages(ws))
             try:
                 shown, sent_at = 0, -math.inf
@@ -562,29 +643,32 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
                     if session_expired(request):
                         await ws.close(code=WSCloseCode.POLICY_VIOLATION, message=b'Session expired')
                         break
-                    frame, now = state.video, time.monotonic()
+                    frame, now = (state.video_hd if hd else state.video), time.monotonic()
                     # Only the newest frame, never queued: a slow viewer skips frames.
-                    if frame and frame['seq'] != shown and now - sent_at >= VIDEO_MIN_INTERVAL:
+                    if frame and frame['seq'] != shown and now - sent_at >= interval:
                         shown = frame['seq']
                         age = now - frame['capture_mono_s']
                         if age <= VIDEO_SEND_MAX_AGE:
                             sent_at = now
                             await asyncio.wait_for(ws.send_bytes(video_message(frame, age)), timeout=2)
-                    await asyncio.sleep(.05)
+                    if hd and sent_at < 0 and now - opened >= HD_FIRST_FRAME_SECONDS:
+                        await ws.close(code=HD_UNAVAILABLE, message=b'HD not offered')
+                        break
+                    await asyncio.sleep(tick)
             finally:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
         except (ConnectionError, asyncio.TimeoutError):
             pass
         finally:
-            state.video_clients.discard(ws)
+            clients.discard(ws)
             if ws.prepared:
                 await ws.close()
         return ws
 
     async def shutdown(_app):
-        await asyncio.gather(*(ws.close(code=1001) for ws in tuple(state.clients | state.video_clients)),
-                             return_exceptions=True)
+        everyone = state.clients | state.video_clients | state.video_hd_clients
+        await asyncio.gather(*(ws.close(code=1001) for ws in tuple(everyone)), return_exceptions=True)
 
     async def demand(_app):
         task = asyncio.create_task(touch_demand_while_watched(state))
@@ -601,7 +685,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     app.router.add_get('/v1/stream', stream)
     app.router.add_get('/v1/video', video)
     app.on_shutdown.append(shutdown)
-    if state.video_demand:
+    if state.video_demand or state.video_hd_demand:
         app.cleanup_ctx.append(demand)
     return app
 
@@ -633,11 +717,21 @@ async def simulate_video(state, card):
         print('Simulator: testcard.jpg has no readable frame size; no video', flush=True)
         return
     seq = 0
-    while True:
+    while True:  # 30 fps, the preview every third frame, HD (the same card, chunked) while watched
         seq = (seq + 1) & 0xFFFFFFFF
-        state.accept_video(VIDEO_HEADER.pack(VIDEO_MAGIC, VIDEO_HEADER.size, int(time.monotonic() * 1e6), seq,
-                                             *size) + card)
-        await asyncio.sleep(.1)
+        capture_us = int(time.monotonic() * 1e6)
+        if seq % 3 == 1:
+            state.accept_video(VIDEO_HEADER.pack(VIDEO_MAGIC, VIDEO_HEADER.size, capture_us, seq, *size) + card)
+        if state.video_hd_clients:
+            for chunk in hd_chunks(card, capture_us, seq, *size):
+                state.accept_hd_chunk(chunk)
+        await asyncio.sleep(1 / 30)
+
+
+def hd_chunks(jpeg, capture_us, seq, width, height, chunk_bytes=61440):
+    """The DCH1 datagrams v0.4 sends for one original frame (MonitorHdSender)."""
+    return [HD_HEADER.pack(HD_MAGIC, HD_HEADER.size, capture_us, seq, width, height, len(jpeg), offset) +
+            jpeg[offset:offset + chunk_bytes] for offset in range(0, len(jpeg), chunk_bytes)]
 
 
 async def bind_datagram(path, protocol):
@@ -711,7 +805,8 @@ async def maintain_advertisement(address, port, identity):
 
 
 async def run(args, identity):
-    state = State(identity, args.storage, video_demand=None if args.simulate else args.video_demand)
+    state = State(identity, args.storage, video_demand=None if args.simulate else args.video_demand,
+                  video_hd_demand=None if args.simulate else args.video_hd_demand)
     endpoints = []
     try:
         if args.simulate:
@@ -787,6 +882,8 @@ def main():
                    help='camera preview datagram socket (default: video.sock next to --socket)')
     p.add_argument('--video-demand', type=Path,
                    help='file touched while video viewers watch (default: video-demand next to --socket)')
+    p.add_argument('--video-hd-demand', type=Path,
+                   help='file touched while HD video viewers watch (default: video-demand-hd next to --socket)')
     p.add_argument('--storage', default='/user/output/footage')
     p.add_argument('--web-dir', type=Path, default=Path(__file__).parent / 'web')
     p.add_argument('--browser-session-days', type=int, default=30)
@@ -795,6 +892,7 @@ def main():
     args = p.parse_args()
     args.video_socket = args.video_socket or Path(args.socket).parent / 'video.sock'
     args.video_demand = args.video_demand or Path(args.socket).parent / 'video-demand'
+    args.video_hd_demand = args.video_hd_demand or Path(args.socket).parent / 'video-demand-hd'
     if not 1 <= args.port <= 65535:
         p.error('port must be 1..65535')
     if not 1 <= args.browser_session_days <= 365:

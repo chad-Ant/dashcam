@@ -1822,6 +1822,21 @@ int main(int argc, char* argv[]) {
                                  : std::string("monitor preview: converter not started (recording is unaffected)"));
         }
     }
+    // HD (<MonitoringVideoHdEnabled>, on with the preview): the camera's own
+    // JPEGs, unconverted and at the camera's rate, only while the agent's HD
+    // demand file is fresh (a direct-LAN viewer selected HD).  Same socket,
+    // chunked datagrams; a copy into a latest-frame slot is all the camera's
+    // thread does.
+    dashcam::monitor::MonitorHdSender monitorHd;
+    bool monitorHdOn = false, monitorHdDemand = false;
+    if ((bool)net.monitoringVideoEnabled && (bool)net.monitoringEnabled && (bool)net.monitoringVideoHdEnabled) {
+        monitorHdOn = monitorHd.open((std::string)net.monitoringVideoSocket, (std::string)net.monitoringVideoHdDemand);
+        log(monitorHdOn ? LogLevel::INFO : LogLevel::WARN,
+            monitorHdOn ? "monitor HD: on, original camera frames to " + (std::string)net.monitoringVideoSocket +
+                              " while an HD viewer watches"
+                        : std::string("monitor HD: cannot create the local sender (recording is unaffected)"));
+    }
+    const bool monitorAnyOn = monitorPreviewOn || monitorHdOn;
 
     // The ESP32-C3 bridge (MKR Zero: CAN, GNSS, IMU) feeds the overlay's vehicle
     // fields — speed, acceleration, position, heading — and, when enabled, GPS
@@ -1970,7 +1985,7 @@ int main(int argc, char* argv[]) {
 
         const bool mjpeg = f.pixelFormat == V4L2_PIX_FMT_MJPEG;
         recorder.setLumaTap(frameRateExposure && mjpeg);
-        if (previewOn || monitorPreviewOn) {
+        if (previewOn || monitorAnyOn) {
             // Possibly another camera or format: drop the waiting frame and the
             // cached geometry before this session's first frame.  The recorder
             // keeps the callable for every later session; both previews outlive
@@ -1980,26 +1995,31 @@ int main(int argc, char* argv[]) {
             if (monitorPreviewOn) monitorPreview.invalidateSource();
             // The network viewers get the road camera only: when the cabin
             // (driver) camera is the fallback recording, the monitor preview
-            // gets nothing this session (the in-car display still does).
+            // and HD get nothing this session (the in-car display still does).
             const bool toMonitorOn = monitorPreviewOn && !rc.cabinFallback;
-            if (monitorPreviewOn && rc.cabinFallback != monitorCabinPaused)
+            const bool toHdOn      = monitorHdOn && !rc.cabinFallback;
+            if (monitorAnyOn && rc.cabinFallback != monitorCabinPaused)
                 log(LogLevel::INFO, rc.cabinFallback ? "monitor preview: paused, recording the cabin camera"
                                                      : "monitor preview: resumed, recording the road camera");
-            monitorCabinPaused = monitorPreviewOn && rc.cabinFallback;
+            monitorCabinPaused = monitorAnyOn && rc.cabinFallback;
             const uint32_t displayFps = static_cast<uint32_t>((int)dp.targetFps);
+            const uint32_t cameraFps  = static_cast<uint32_t>(std::max(1.0, std::ceil((double)f.frameRate)));
             uint32_t tapFps = previewOn ? displayFps : monitorVideoFps;
             if (previewOn && toMonitorOn && displayFps != monitorVideoFps)
-                tapFps = std::max({displayFps, monitorVideoFps,
-                                   static_cast<uint32_t>(std::max(1.0, std::ceil((double)f.frameRate)))});
+                tapFps = std::max({displayFps, monitorVideoFps, cameraFps});
+            // HD wants every frame; the converters still rate-limit themselves.
+            if (toHdOn) tapFps = std::max(tapFps, cameraFps);
             dashcam::preview::VideoPreview* toDisplay = previewOn ? &preview : nullptr;
             dashcam::preview::VideoPreview* toMonitor = toMonitorOn ? &monitorPreview : nullptr;
+            dashcam::monitor::MonitorHdSender* toHd   = toHdOn ? &monitorHd : nullptr;
             // Always (re)installed: the recorder keeps the last callable, so an
             // earlier session's monitor target must be replaced; an empty
             // callable turns the tap off for this session.
-            if (toDisplay || toMonitor)
-                recorder.setPreviewTap([toDisplay, toMonitor](const rec::PreviewFrame& pf) {
+            if (toDisplay || toMonitor || toHd)
+                recorder.setPreviewTap([toDisplay, toMonitor, toHd](const rec::PreviewFrame& pf) {
                     if (toDisplay) toDisplay->submitJpeg(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs);
                     if (toMonitor) toMonitor->submitJpeg(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs);
+                    if (toHd) toHd->submit(pf.data, pf.size, pf.width, pf.height, pf.captureMonotonicUs, pf.sequence);
                 }, tapFps);
             else
                 recorder.setPreviewTap(rec::PreviewFrameCallback{}, 0);
@@ -2149,6 +2169,11 @@ int main(int argc, char* argv[]) {
             log(LogLevel::INFO, monitorDemand ? "monitor preview: a viewer is watching — converting"
                                               : "monitor preview: no viewer — idle");
         }
+        if (monitorHdOn && monitorHd.pollDemand() != monitorHdDemand) {
+            monitorHdDemand = !monitorHdDemand;
+            log(LogLevel::INFO, monitorHdDemand ? "monitor HD: an HD viewer is watching — sending original frames"
+                                                : "monitor HD: no HD viewer — idle");
+        }
         if (monitor.enabled()) {
             const bool active = recorder.isRecording();
             const uint64_t frames = recorder.framesReceived();
@@ -2216,6 +2241,21 @@ int main(int argc, char* argv[]) {
                       (unsigned long long)vs.dropped(), (unsigned long long)vs.dropBusy,
                       (unsigned long long)vs.dropMissing, (unsigned long long)vs.dropRefused,
                       (unsigned long long)vs.dropOther, ps.total.p95Ms);
+        log(LogLevel::INFO, b);
+        heartbeat.beat();
+    }
+    if (monitorHdOn) {
+        // After the recorder: no tap callback runs now; the worker finishes its frame.
+        monitorHd.stop();
+        const dashcam::monitor::MonitorHdStats hs = monitorHd.stats();
+        char b[256];
+        std::snprintf(b, sizeof(b), "monitor HD: %llu frames taken, %llu sent, %llu replaced, %llu dropped "
+                                    "(%llu agent busy, %llu no agent, %llu refused, %llu too large, %llu other)",
+                      (unsigned long long)hs.submitted, (unsigned long long)hs.sent,
+                      (unsigned long long)hs.replaced, (unsigned long long)hs.dropped(),
+                      (unsigned long long)hs.dropBusy, (unsigned long long)hs.dropMissing,
+                      (unsigned long long)hs.dropRefused, (unsigned long long)hs.tooLarge,
+                      (unsigned long long)hs.dropOther);
         log(LogLevel::INFO, b);
         heartbeat.beat();
     }

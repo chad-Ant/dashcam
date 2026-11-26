@@ -273,8 +273,29 @@ With preview off the recorder reported 30.0 fps. Four samples with preview on sh
 After Stop cleared the preview, the count reached 27,469. Reconnect returned to Live using
 the saved pairing. The final dashboard showed fresh telemetry with preview off.
 
+## HD live view and fullscreen, 2026-11-26 (software only)
+
+Not yet deployed or run with the camera. Checked so far:
+
+- **Jetson, container build** of `dashcam_v0_4`, `monitoring_test` and `config_test`: no warnings. All three pass,
+  including the new HD sender test (chunk layout, demand gate, byte-exact delivery, size limits, stalled agent)
+  and the `MonitoringVideoHd*` settings. `dashcam_v0_4 --self-test` passes.
+- **Agent tests on the Jetson** (host venv, Python 3.10): 58 pass, including 10 new HD tests.
+- **C++ sender → agent → WebSocket client** on the Jetson over loopback, 30 fps for 12 s, with a temporary agent on
+  port 9443 (the deployed services untouched). Real UGREEN frame (66,185 B): 29.3 fps, all frames byte-exact,
+  median age 5 ms, agent 4% of a core; two viewers 28.0 fps each, 6%. Noisy 1080p frame (577,869 B): one viewer
+  27.8 fps, 14%; two viewers 28.0 fps each, 20%; no frame dropped. The first run showed that frames over about
+  416 KB never fit the socket's send buffer; the sender now waits up to 100 ms per frame for the agent to drain it.
+- **Android** (Windows PC): debug build and 44 JVM unit tests pass.
+- **Web** (agent simulator served over plain HTTP on 127.0.0.1 in the desktop app's browser pane): Low/HD switch,
+  HD at about 30 fps, fullscreen with the CSS fallback (the pane never settles a Fullscreen API request),
+  HD switching inside fullscreen, tap to hide the controls, and exit.
+
 ## Remaining physical acceptance
 
+- HD live view on the car network and on home Wi-Fi with the UGREEN: fps, age and `monitor HD` counters, recording
+  fps/CPU unchanged with one and two HD viewers, the S25 and A54 frame rates and heat, and Android fullscreen
+  rotation. The 4001 fallback on a recorder with `MonitoringVideoHdEnabled` false.
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.
 - Tab S10 FE (app and browser); browsers on the phone/tablet (CA install). The S25 Ultra app and laptop Firefox
   passed on 2026-11-20 (above), as did mDNS on the router.

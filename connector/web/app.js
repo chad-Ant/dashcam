@@ -37,6 +37,10 @@
   let vws = null, vAttempt = 0, vTimer = 0, vOpenedMs = 0, vMsgMs = 0, vLastSeq = 0;
   let vImg = null, vUrl = null, vLoadingUrl = null, vLoading = null, vPending = null;
   let vMeta = null, vShownMs = 0, vTimes = [];
+  // Low = the 640x360 preview (LAN and cloud); HD = the camera's original frames, direct LAN only
+  // (/v1/video?quality=hd). Never stored: every load starts at Low, like live view.
+  const HD_UNAVAILABLE = 4001;   // close code: the Jetson sends no original frames, fall back to Low
+  let vQuality = 'low', vQualityNote = '';
   // Video also pauses while the camera box is scrolled fully out of view (after a short grace).
   const OFFSCREEN_GRACE_MS = 2000;
   let vOnScreen = true, vOffTimer = 0, updateCamera = () => {};
@@ -117,10 +121,23 @@
     vImg.draggable = false;   // with pointer-events: none, the context menu and drags target the box, not the picture
     vImg.addEventListener('load', () => frameDone(true));
     vImg.addEventListener('error', () => frameDone(false));
-    box.append(vImg, note);
+    // Shown only while the box is fullscreen: the quality choice and the way out.
+    const fsBar = h('div', 'video-fs-bar'), fsCaption = h('p', 'hint video-caption');
+    const fsQuality = qualityPicker(), fsExit = button('Exit fullscreen', 'btn', () => setFullscreen(box, false));
+    fsBar.append(fsQuality.el, fsExit, fsCaption);
+    box.append(vImg, note, fsBar);
     const caption = h('p', 'hint video-caption', '—');
+    const quality = qualityPicker(), qualityNote = hint('');
     const toggle = button('Start live view', 'btn', toggleLiveView), actions = h('div', 'actions');
-    actions.append(toggle);
+    const full = button('Fullscreen', 'btn secondary', () => setFullscreen(box, true));
+    actions.append(toggle, full);
+    // A tap on the fullscreen picture shows or hides its controls.
+    box.addEventListener('click', ev => {
+      if (isFullscreen(box) && !fsBar.contains(ev.target)) box.classList.toggle('controls-hidden');
+    });
+    for (const type of ['fullscreenchange', 'webkitfullscreenchange']) {
+      document.addEventListener(type, () => { if (!isFullscreen(box)) leftFullscreen(box); updateCamera(); });
+    }
     // A decoded frame refreshes only this card; everything else waits for render().
     updateCamera = (now = performance.now()) => {
       const open = vws !== null && vws.readyState === WebSocket.OPEN;
@@ -133,6 +150,12 @@
       toggle.setAttribute('aria-pressed', String(liveView));
       toggle.classList.toggle('secondary', liveView);
       toggle.disabled = !canVideo();
+      full.disabled = !liveView;
+      if (!liveView && isFullscreen(box)) setFullscreen(box, false);
+      const hd = hdAllowed();
+      quality.update(hd); fsQuality.update(hd);
+      setText(qualityNote, qualityText(hd));
+      setText(fsCaption, caption.textContent);
     };
     binds.push(v => updateCamera(v.now));
     // Any visible pixel counts as on screen; without IntersectionObserver the camera is always on screen.
@@ -140,7 +163,84 @@
       new IntersectionObserver(entries => setOnScreen(entries[entries.length - 1].isIntersecting),
         { threshold: 0 }).observe(box);
     }
-    return card('Camera', box, caption, actions);
+    return card('Camera', box, caption, quality.el, qualityNote, actions);
+  }
+  // Two buttons acting as one radio group; update(hdAllowed) refreshes both.
+  function qualityPicker() {
+    const el = h('div', 'segmented'), buttons = {};
+    el.setAttribute('role', 'group');
+    el.setAttribute('aria-label', 'Video quality');
+    for (const [value, label] of [['low', 'Low'], ['hd', 'HD']]) {
+      buttons[value] = button(label, 'seg', ev => { ev.stopPropagation(); setQuality(value); });
+      el.append(buttons[value]);
+    }
+    return {
+      el,
+      update(hd) {
+        for (const [value, b] of Object.entries(buttons)) {
+          b.setAttribute('aria-pressed', String(vQuality === value));
+          b.disabled = value === 'hd' && !hd;
+        }
+      },
+    };
+  }
+  function hdAllowed() { return !cloud && identity?.capabilities?.video_hd === true; }
+  function qualityText(hd) {
+    if (cloud) return 'HD needs a direct LAN connection · cloud sessions show Low';
+    if (vQualityNote) return vQualityNote;
+    if (identity && !hd) return "This Jetson's connector offers Low only";
+    return vQuality === 'hd' ? "HD: the camera's original frames, up to 30 fps · 15–60 Mbit/s of Wi-Fi"
+      : 'Low: 640×360 at up to 10 fps, about 1–5 Mbit/s';
+  }
+  function setQuality(value) {
+    vQualityNote = '';
+    if (value === vQuality || (value === 'hd' && !hdAllowed())) { updateCamera(); return; }
+    vQuality = value;
+    // Reconnect at the new quality now; live view and its 10-minute window carry on.
+    clearTimeout(vTimer); vTimer = 0; vAttempt = 0;
+    if (vws) closeVideo();
+    syncVideo();
+    render();
+  }
+  // Fullscreen API where the browser has it for any element; otherwise (iPhone Safari) the box
+  // covers the window with CSS.
+  function isFullscreen(box) {
+    return (document.fullscreenElement || document.webkitFullscreenElement) === box || box.classList.contains('pseudo-fs');
+  }
+  function setFullscreen(box, on) {
+    if (on === isFullscreen(box)) return;
+    const request = box.requestFullscreen || box.webkitRequestFullscreen;
+    if (on) {
+      box.classList.remove('controls-hidden');
+      if (request) {
+        Promise.resolve(request.call(box)).then(() => {
+          // Phones: landscape while fullscreen; desktops and refusals are fine as they are.
+          screen.orientation?.lock?.('landscape').catch(() => {});
+        }, () => { box.classList.add('pseudo-fs'); lockScroll(true); updateCamera(); });
+        // Some embedded browsers never settle the request: cover the window with CSS instead.
+        setTimeout(() => {
+          if ((document.fullscreenElement || document.webkitFullscreenElement) !== box) {
+            box.classList.add('pseudo-fs'); lockScroll(true); updateCamera();
+          }
+        }, 1000);
+        return;   // fullscreenchange refreshes the card
+      }
+      box.classList.add('pseudo-fs'); lockScroll(true);
+    } else if (box.classList.contains('pseudo-fs')) leftFullscreen(box);
+    else {
+      // Asynchronous: until fullscreenchange, isFullscreen() stays true, so no updateCamera() here
+      // (it would call this again).
+      Promise.resolve((document.exitFullscreen || document.webkitExitFullscreen).call(document)).catch(() => {});
+      return;
+    }
+    updateCamera();
+  }
+  // The page behind the CSS fullscreen must not scroll (or show its scrollbar).
+  function lockScroll(on) { document.documentElement.style.overflow = on ? 'hidden' : ''; }
+  function leftFullscreen(box) {
+    box.classList.remove('pseudo-fs', 'controls-hidden');
+    lockScroll(false);
+    try { screen.orientation?.unlock?.(); } catch (_) { /* not locked */ }
   }
   function videoCaption(now, open, showing) {
     if (showing) {
@@ -923,7 +1023,8 @@
   function openVideo() {
     let sock;
     try {
-      sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v1/video');
+      sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v1/video' +
+        (vQuality === 'hd' ? '?quality=hd' : ''));
     } catch (_) { return retryVideo(); }
     sock.binaryType = 'arraybuffer';
     vws = sock; vOpenedMs = performance.now(); vMsgMs = 0;
@@ -932,11 +1033,18 @@
       if (vws !== sock) return;
       if (!receiveFrame(ev.data)) { closeVideo(); retryVideo(); }
     });
-    sock.addEventListener('close', () => {
+    sock.addEventListener('close', ev => {
       if (vws !== sock) return;
       const delivered = vMsgMs > 0;
       vws = null;
       resetVideoFrames();
+      if (ev.code === HD_UNAVAILABLE) {   // no original frames from this Jetson: Low, at once
+        vQuality = 'low'; vQualityNote = 'HD is not offered by this Jetson · showing Low';
+        vAttempt = 0;
+        syncVideo();
+        render();
+        return;
+      }
       retryVideo();
       if (!delivered) revalidate();                 // failed upgrade or closed before any frame
       render();

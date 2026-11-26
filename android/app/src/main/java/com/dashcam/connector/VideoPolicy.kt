@@ -21,6 +21,25 @@ fun letterbox(srcWidth: Int, srcHeight: Int, dstWidth: Int, dstHeight: Int): Fit
     return FitRect(left.toFloat(), top.toFloat(), (left + width).toFloat(), (top + height).toFloat())
 }
 
+/**
+ * Live view quality. LOW is the 640×360, ≤ 10 fps preview (LAN and cloud); HD is the camera's original
+ * frames at its own rate, direct LAN only (`/v1/video?quality=hd`). [query] is the `quality` parameter.
+ */
+enum class VideoQuality(val query: String?, val label: String) { LOW(null, "Low"), HD("hd", "HD") }
+
+/** The agent closes an HD socket with this code when the Jetson sends no original frames; the app falls back to LOW. */
+const val HD_UNAVAILABLE_CLOSE_CODE = 4001
+
+/** Frames wider or taller than this decode subsampled; a 1080p HD frame decodes at full size. */
+const val VIDEO_MAX_DECODE_PX = 1920
+
+/** BitmapFactory's inSampleSize for a frame: the smallest power of two that brings it within [maxPx]. */
+fun decodeSampleSize(width: Int, height: Int, maxPx: Int = VIDEO_MAX_DECODE_PX): Int {
+    var sample = 1
+    while (maxOf(width, height) / sample > maxPx) sample *= 2
+    return sample
+}
+
 /** The clock tick that carries frame metadata into VideoState (and the caption) between immediate publishes. */
 const val VIDEO_METADATA_TICK_MS = 500L
 

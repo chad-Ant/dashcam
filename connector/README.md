@@ -44,6 +44,7 @@ Authenticated routes. Android sends `Authorization: Bearer <device credential>`
 | `GET /v1/snapshot` | Current snapshot |
 | `GET /v1/stream` | WebSocket, same snapshot envelope at 5 Hz; read-only (any client message closes it with 1008) |
 | `GET /v1/video` | WebSocket, binary camera frames, up to 10 fps per viewer; same auth as `/v1/stream`; read-only (1008); 503 with four video viewers, see [Camera video](#camera-video) |
+| `GET /v1/video?quality=hd` | WebSocket, the camera's original frames at its own rate; 503 with two HD viewers; 400 for another `quality`; closes with 4001 when no HD frame arrives within 5 s, see [HD](#hd-direct-lan-only) |
 | `POST /v1/session` | Bearer token + same-origin request → 204 and the browser session cookie |
 | `DELETE /v1/session` | Same-origin request → 204 and the cookie cleared (sign out) |
 
@@ -54,8 +55,9 @@ authorised). Unauthenticated static files, which contain no data or secrets:
 `GET /` (`/index.html`), `/app.js`, `/app.css`, `/icon.svg` from `connector/web/`
 (exact whitelist, no listing; `serve --web-dir` overrides the directory).
 
-`capabilities` in `/v1/identity`: `vehicle`, `system` and `video` are `true`;
-`lane`, `driver` and `controls` are `false`. `video=true` means the agent offers
+`capabilities` in `/v1/identity`: `vehicle`, `system`, `video` and `video_hd` are `true`;
+`lane`, `driver` and `controls` are `false`. `video_hd=true` means the agent offers
+`/v1/video?quality=hd`; without it the clients offer Low only. `video=true` means the agent offers
 `/v1/video`; frames only arrive when v0.4 has the preview enabled. With an older
 agent (no `video` capability, `/v1/video` answers 404) both clients show that
 this Jetson offers no video instead of a picture.
@@ -272,6 +274,60 @@ the four `/v1/stream` viewers. The agent never sends a frame older than **1 s**
 stale**, with the old picture hidden, when the last frame arrived more than
 **2 s** ago (by `performance.now()` / `SystemClock.elapsedRealtime`).
 
+### HD (direct LAN only)
+
+Both clients show a **Low / HD** choice under the camera and a **Fullscreen**
+button (enabled while live view is on). Low is the 640×360 preview above. **HD**
+is the recording camera's **original JPEG frames, byte for byte, at the camera's
+rate** (1920×1080 at 30 fps for the UGREEN): no decoding or re-encoding on the
+Jetson. The choice is never stored: every app start and page load begins at Low.
+Changing it reconnects the video socket; live view and its 10-minute window carry
+on.
+
+- **Direct LAN only.** A cloud session always shows Low, with HD disabled: the
+  uplink requests `/v1/video` without `quality`, so original frames never leave
+  the LAN. At 16–56 Mbit/s (bench 2026-11-26: 66 KB frames; night drive
+  2026-10-03: UGREEN ≈ 7 MB/s) they exceed a car's mobile uplink and would cost
+  about 7–25 GB of relay egress per viewer-hour.
+- **Network.** One HD viewer needs 16–56 Mbit/s between the Jetson and the client.
+  At most two HD viewers (503 for a third), separate from the four Low viewers.
+  On a slow link the newest-frame-only rule lowers the frame rate instead of
+  building up delay.
+- **Cost on the Jetson.** v0.4 copies each frame into a latest-frame slot on the
+  camera's tap thread and a worker sends it; nothing is converted, so HD costs
+  v0.4 less than Low. With HD enabled the recorder's preview tap runs at the
+  camera rate in every session (the converters still limit themselves). Measured
+  on the Jetson over loopback (2026-11-26, the C++ sender against this agent, 12 s
+  runs at 30 fps): 66 KB frames, one viewer 29.3 fps, 4% of a core in the agent,
+  5 ms median age; 578 KB frames, two viewers 28.0 fps each, 20% of a core; every
+  frame byte-exact, none dropped. Not yet measured with the real camera or Wi-Fi.
+- **Recording is never affected.** As for Low: nonblocking sends, a worker that
+  waits at most 100 ms per frame for the agent to drain its queue, and counted
+  drops (`monitor HD: … frames taken, … sent` at shutdown).
+- **Fallback.** If no original frame arrives within 5 s (HD off in v0.4, or a
+  recorder without HD), the agent closes the HD socket with **4001**. Both
+  clients then switch to Low and say "HD is not offered by this Jetson".
+- **Fullscreen.** Android: its own window, landscape, system bars hidden, the
+  Low/HD choice and **Exit fullscreen** on top (a tap hides or shows them; Back
+  exits). Web: the browser's Fullscreen API with a landscape lock where allowed,
+  or a fixed full-window view where the browser lacks or ignores it (iPhone
+  Safari, embedded browsers). Leaving live view leaves fullscreen.
+- **Phones.** Android decodes HD frames at full size (frames over 1920 px are
+  subsampled). Expect more battery use and heat than Low; older phones may show
+  fewer than 30 fps.
+
+v0.4 settings, under `<Network>` (needs `MonitoringVideoEnabled`):
+
+```xml
+<MonitoringVideoHdEnabled>true</MonitoringVideoHdEnabled>   <!-- default -->
+<MonitoringVideoHdDemand>/run/dashcam-monitor/video-demand-hd</MonitoringVideoHdDemand>   <!-- default -->
+```
+
+The agent touches the HD demand file (`serve --video-hd-demand`, default
+`video-demand-hd` next to `--socket`) while an HD viewer is connected, by the
+same 3-second rule as the preview's. An HD viewer does not touch the preview's
+demand file, so the 640×360 conversion stays idle.
+
 ### Video protocol
 
 All integers are **little-endian**. Both headers are 24 bytes, start with the
@@ -291,9 +347,32 @@ sender, like the telemetry publisher), at most 24 + 65536 bytes:
 | 22–23 | uint16 | height (360) |
 | 24– | bytes | JPEG (`FF D8` … `FF D9`) |
 
-The agent rejects (counting `invalid_video`) a datagram shorter than 24 bytes
-or longer than 24 + 262144, a wrong magic or header length, a JPEG without the
-`FF D8` start and `FF D9` end markers, a width or height outside 1–4096, and a
+**HD chunks**, v0.4 → agent on the same socket. A 1080p frame (60–600 KB) does not
+fit one Unix datagram (`net.core.wmem_max` is 212992), so v0.4 cuts each frame
+into chunks of up to 61,440 JPEG bytes, sent in order, one datagram each:
+
+| Bytes | Type | Field |
+|---|---|---|
+| 0–3 | ASCII | `DCH1` |
+| 4–7 | uint32 | header length = 32 |
+| 8–15 | uint64 | capture time, `CLOCK_MONOTONIC` microseconds |
+| 16–19 | uint32 | source sequence |
+| 20–21 | uint16 | width |
+| 22–23 | uint16 | height |
+| 24–27 | uint32 | total JPEG bytes (4 – 1,048,576) |
+| 28–31 | uint32 | offset of this chunk in the JPEG |
+| 32– | bytes | the chunk |
+
+The agent reassembles a frame only from consecutive chunks of the same frame
+(capture time, sequence, size and total), starting at offset 0. A gap drops that
+frame (`hd_incomplete`). A complete frame needs the JPEG start and end markers,
+and replaces the current HD frame under the same sequence and new-producer rules
+as the preview. A chunk with a bad header counts as `invalid_video`. HD viewers
+receive the same `DCV1` client message as the preview.
+
+A `DCV1` preview datagram is rejected (counting `invalid_video`) when it is shorter than 24 bytes
+or longer than 24 + 262144, or has a wrong magic or header length, a JPEG without the
+`FF D8` start and `FF D9` end markers, a width or height outside 1–4096, or a
 capture time that is not 0–2 s in the past of its own monotonic clock (host and
 container share `CLOCK_MONOTONIC`). A sequence that is not newer than the
 current frame's is ignored, unless the capture time went back by more than 5 s
