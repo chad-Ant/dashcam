@@ -481,6 +481,17 @@ Still needed on the rig: worker CPU with a real stalled agent, and an HD stop an
 - **mDNS is off on the bench:** the service's `LAN_ADDRESS` is the car network's 192.168.1.78, while the bench
   is on 192.168.0.x. That probably explains why **Find Jetsons** found nothing on the S25 LAN run. Manual
   pairing works.
+- **Fixed at 15:33.** `LAN_ADDRESS` in `~/.config/dashcam-monitor/service.env` is now 192.168.0.138 (the old
+  file is kept as `service.env.bak-20261126-lan-192.168.1.78`), and the user restarted `dashcam-monitor`.
+  - The warning is gone, and an mDNS browse for `_dashcam._tcp` from the Jetson and from the Windows PC both find
+    the agent at 192.168.0.138:8443.
+  - Superseded the same day: `LAN_ADDRESS=auto` (below) follows the network by itself.
+- **`LAN_ADDRESS=auto` (connector).** The agent advertises the IPv4 address of the default-route interface,
+  private addresses only, re-checked every 30 s. It re-advertises on a change and withdraws the advertisement
+  while there is no LAN. A fixed address behaves as before. Tests cover the address filter, detection on the
+  Jetson (192.168.0.138), the re-advertise sequence bench → car → no LAN → car, and that a fixed address never
+  detects; 68 agent tests pass. The certificate still lists only 192.168.0.138: Android pins the leaf and
+  ignores names, but browsers on another network need `cert --san` for that address.
 
 ## 2026-11-26 live view review
 

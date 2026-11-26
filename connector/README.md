@@ -107,12 +107,21 @@ reusable token), a local CA (`ca.pem`, `ca-key.pem`) and a TLS leaf certificate
 does not check names. For an existing state directory see
 [Browser setup on the Jetson](#browser-setup-on-the-jetson).
 
-Configure the paths for your rig. `LAN_ADDRESS` must be the Jetson's current
-host LAN IPv4; reserve its address on the router for predictable reconnection.
-The user's current address is `192.168.0.15`; it is not embedded in the APK.
+Configure the paths for your rig. `LAN_ADDRESS` is the address mDNS advertises (**Find Jetsons**):
+- **`auto` (recommended):** the IPv4 address of the interface holding the default route, found by a route
+  lookup that sends no packet. Only private LAN addresses are advertised. It is re-checked every 30 s, the
+  agent re-advertises when it changes (bench and car networks, a new DHCP lease), and it withdraws the
+  advertisement while there is no LAN.
+- **A fixed address:** pins it. On another network, mDNS then stays off (`mDNS advertisement off … is <address>
+  assigned to this host?`).
+- **Empty:** passes `--advertise-address ""`, which also leaves mDNS off.
+
+Manual pairing works either way, and no address is embedded in the APK. Reserving the Jetson's address on the
+router keeps paired devices' saved address valid. The service's `IPAddressAllow` must also include each LAN
+it uses (the rig has a drop-in for 192.168.1.0/24).
 
 ```bash
-printf 'LAN_ADDRESS=192.168.0.15\nFOOTAGE_PATH=/user/output/footage\n' \
+printf 'LAN_ADDRESS=auto\nFOOTAGE_PATH=/user/output/footage\n' \
   > ~/.config/dashcam-monitor/service.env
 chmod 600 ~/.config/dashcam-monitor/service.env
 # Edit FOOTAGE_PATH above to the actual HOST path backing the footage mount.

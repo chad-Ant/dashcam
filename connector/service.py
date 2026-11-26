@@ -868,22 +868,73 @@ async def advertise(address, port, identity):
         return None
 
 
-async def maintain_advertisement(address, port, identity):
-    delay = 2
-    while True:
-        advertisement = await advertise(address, port, identity)
-        if advertisement:
-            break
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 60)
+ADDRESS_AUTO = 'auto'
+ADDRESS_RECHECK_SECONDS = 30.0
+
+
+def lan_candidate(address):
+    """@p address if it is a private, non-loopback, non-link-local IPv4 address (what mDNS may advertise), else None."""
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except ValueError:
+        return None
+    return str(ip) if ip.is_private and not ip.is_loopback and not ip.is_link_local else None
+
+
+def detect_lan_address():
+    """The IPv4 address of the interface holding the default route, or None (no LAN yet, or not a private one).
+
+    Connecting a UDP socket only selects a route: no packet is sent, so the service's IP filter is not involved.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('192.0.2.1', 9))   # TEST-NET-1: any routed address picks the default route
+            return lan_candidate(probe.getsockname()[0])
+    except OSError:
+        return None
+
+
+async def withdraw(advertisement):
     zc, info = advertisement
     try:
-        await asyncio.Event().wait()
+        await zc.async_unregister_service(info)
     finally:
-        try:
-            await zc.async_unregister_service(info)
-        finally:
-            await zc.async_close()
+        await asyncio.gather(zc.async_close(), return_exceptions=True)
+
+
+async def maintain_advertisement(address, port, identity, detect=None, recheck=ADDRESS_RECHECK_SECONDS):
+    """Keeps the mDNS advertisement up. A fixed @p address is retried with backoff until it registers, then
+    held. With 'auto' the advertised address follows the default-route interface: re-checked every @p recheck
+    seconds, re-registered when it changes (bench and car networks, a new DHCP lease), withdrawn while there is
+    no LAN address.
+    """
+    auto = address.strip().lower() == ADDRESS_AUTO
+    detect = detect or detect_lan_address
+    current, advertised, delay = None, None, 2
+    try:
+        while True:
+            wanted = detect() if auto else address
+            if current is not None and wanted == advertised:
+                await (asyncio.sleep(recheck) if auto else asyncio.Event().wait())
+                continue
+            if current is not None:
+                print(f'mDNS: LAN address {advertised} -> {wanted or "none"}; re-advertising', flush=True)
+                await asyncio.gather(withdraw(current), return_exceptions=True)
+                current, advertised = None, None
+            if wanted is None:
+                await asyncio.sleep(recheck)
+                continue
+            current = await advertise(wanted, port, identity)
+            if current is None:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            advertised, delay = wanted, 2
+            if auto:
+                print(f'mDNS: advertising on {wanted} (detected)', flush=True)
+    finally:
+        if current is not None:
+            await withdraw(current)
 
 
 async def run(args, identity):
@@ -972,7 +1023,8 @@ def main():
                    help='do not offer the recorded segments in --storage to paired clients')
     p.add_argument('--web-dir', type=Path, default=Path(__file__).parent / 'web')
     p.add_argument('--browser-session-days', type=int, default=30)
-    p.add_argument('--advertise-address', help='Host LAN IPv4 for mDNS; omit for manual pairing only')
+    p.add_argument('--advertise-address',
+                   help="Host LAN IPv4 for mDNS, or 'auto' to follow the default-route interface; omit for manual pairing only")
     p.add_argument('--simulate', action='store_true')
     args = p.parse_args()
     args.video_socket = args.video_socket or Path(args.socket).parent / 'video.sock'

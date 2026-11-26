@@ -950,6 +950,62 @@ class AdvertiseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('mDNS advertisement off', out.getvalue())
         self.assertIn('Manual pairing still works', out.getvalue())
 
+    def test_lan_candidate_accepts_private_ipv4_only(self):
+        for good in ['192.168.0.138', '192.168.1.78', '10.1.2.3', '172.16.5.4']:
+            self.assertEqual(service.lan_candidate(good), good)
+        for bad in ['8.8.8.8', '127.0.0.1', '169.254.3.4', '::1', 'fe80::1', '', 'not an address', '192.0.2.1x']:
+            self.assertIsNone(service.lan_candidate(bad), bad)
+
+    def test_detect_gives_a_private_address_or_none(self):
+        found = service.detect_lan_address()
+        self.assertTrue(found is None or service.lan_candidate(found) == found, found)
+
+    async def test_auto_follows_the_default_route_address(self):
+        # Bench, unchanged, car network, no LAN for a while, car network again.
+        sequence = ['192.168.0.138', '192.168.0.138', '192.168.1.78', None, None, '192.168.1.78']
+        registered, withdrawn = [], []
+
+        class FakeZeroconf:
+            def __init__(self, address): self.address = address
+            async def async_unregister_service(self, info): withdrawn.append(self.address)
+            async def async_close(self): pass
+
+        async def fake_advertise(address, port, identity):
+            registered.append(address)
+            return FakeZeroconf(address), object()
+
+        def detect():
+            return sequence.pop(0) if len(sequence) > 1 else sequence[0]
+
+        with mock.patch.object(service, 'advertise', fake_advertise), contextlib.redirect_stdout(io.StringIO()) as out:
+            task = asyncio.create_task(service.maintain_advertisement('auto', 8443, {'id': 'x'}, detect=detect, recheck=.02))
+            await wait_for(lambda: len(sequence) == 1 and len(registered) == 3)
+            await asyncio.sleep(.1)   # stays put on an unchanged address
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(registered, ['192.168.0.138', '192.168.1.78', '192.168.1.78'])
+        # Withdrawn on the change, while there was no LAN, and at shutdown.
+        self.assertEqual(withdrawn, ['192.168.0.138', '192.168.1.78', '192.168.1.78'])
+        self.assertIn('mDNS: advertising on 192.168.1.78 (detected)', out.getvalue())
+
+    async def test_fixed_address_never_detects(self):
+        registered = []
+
+        async def fake_advertise(address, port, identity):
+            registered.append(address)
+            return mock.AsyncMock(), object()
+
+        def detect():
+            raise AssertionError('a fixed address must not be detected')
+
+        with mock.patch.object(service, 'advertise', fake_advertise):
+            task = asyncio.create_task(service.maintain_advertisement('192.168.0.138', 8443, {'id': 'x'}, detect=detect))
+            await wait_for(lambda: registered)
+            await asyncio.sleep(.05)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(registered, ['192.168.0.138'])
+
 
 class VideoIpcTests(unittest.IsolatedAsyncioTestCase):
     async def test_receiver_binds_privately_and_replaces_only_stale_sockets(self):
