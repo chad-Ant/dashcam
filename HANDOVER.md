@@ -471,6 +471,17 @@ and then against the fix:
 
 Still needed on the rig: worker CPU with a real stalled agent, and an HD stop and resume while the S25 watches.
 
+**Deployed with the LAN recordings, same day, 15:31.**
+- **Jetson:** runs `aa99454` as `bin/build_20261126_082828`. The build had no warnings; `--self-test`,
+  `videopreview_test` and `monitoring_test` pass (the queue-full frame was given up after 101 ms using 2.4 ms CPU).
+- **Agent:** reports `video_hd: true` and `recordings: true`, and lists 808 segments.
+- **S25 Ultra:** `dashcam-connect-0.1.0-aa99454-release.apk`, SHA-256
+  `84eadc747c0419e18a65f722a689d4c8a3da0fc12f41fce7e58d41b25e316a04` (release identity `51b92fab…`,
+  installed in place, hash checked).
+- **mDNS is off on the bench:** the service's `LAN_ADDRESS` is the car network's 192.168.1.78, while the bench
+  is on 192.168.0.x. That probably explains why **Find Jetsons** found nothing on the S25 LAN run. Manual
+  pairing works.
+
 ## 2026-11-26 live view review
 
 Reviewed `f29119b` (LAN HD and fullscreen) and `68de9e1` (higher-resolution SD). On the S25 Ultra over
