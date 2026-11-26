@@ -247,3 +247,13 @@ code {
 .rec-time { font-variant-numeric: tabular-nums; }
 .rec-title { flex-basis: 100%; font-size: .8rem; color: #a2b3c3; }
 .rec-player:fullscreen { width: 100%; height: 100%; }
+/* Cloud recordings: an export form under the segment, then the clip. */
+.rec-cloud { align-items: flex-start; }
+.rec-export { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 16px; }
+.rec-field { display: flex; flex-direction: column; gap: 4px; font-size: .85rem; color: var(--muted); }
+.rec-field input[type=number], .rec-field select { min-height: 40px; padding: 0 8px; font: inherit; color: var(--text);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
+.rec-field input[type=number] { width: 7em; }
+.rec-field input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--accent); }
+.rec-result { flex-basis: 100%; display: flex; flex-direction: column; gap: 8px; }
+.rec-result video { width: 100%; max-height: 70vh; background: #000; border-radius: 10px; }

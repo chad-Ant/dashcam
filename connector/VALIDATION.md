@@ -291,11 +291,44 @@ Not yet deployed or run with the camera. Checked so far:
   HD at about 30 fps, fullscreen with the CSS fallback (the pane never settles a Fullscreen API request),
   HD switching inside fullscreen, tap to hide the controls, and exit.
 
-## Remaining physical acceptance
+## Cloud recordings, 2026-11-26 (software only)
+
+Not yet deployed. Checked so far:
+
+- **Agent tests on the Jetson:** 72 pass. Among them, a real `ffmpeg` clip export from the recorder fixture, Small
+  and 720p, with burned-in captions. ffprobe checks the size, and the `moov` atom sits before `mdat`.
+- **Real footage on the Jetson** (temporary agent, port 9443):
+  - 30 s Small: 9.7 s, 3.8 MB;
+  - 30 s 720p: 21.4 s, 5.5 MB;
+  - 3 min Small: 82 s;
+  - 3 min 720p: 127 s, 34 MB;
+  - about 2.2–2.4 cores while exporting;
+  - burned-in caption time correct at the clip offset.
+- **Relay and uplink unit tests on the PC:**
+  - request validation;
+  - grant re-check;
+  - pending-request cleanup;
+  - V4 signing arguments;
+  - the upload host check;
+  - a fake agent and a fake upload server.
+- **Android:** JVM unit tests and the debug build.
+- **Web**, in the desktop app's browser pane against a fake relay:
+  - list;
+  - export request;
+  - status;
+  - playable MP4;
+  - download link;
+  - error path.
+
 
 - Recordings (LAN): playback fps on the A54, VLC opening a download with its captions (VLC is not on the S25), and
   the web page in a visible desktop and phone browser. On the S25: list, real-time playback with captions, close,
   and two downloads (byte-identical, `.ass` named correctly after the fix) passed on 2026-11-26 (HANDOVER).
+- Cloud recordings after deployment:
+  - on the S25 (list, export Small and 720p, play, download) and in a browser;
+  - an export through the systemd-sandboxed agent;
+  - clips deleted by the bucket lifecycle after a day;
+  - expired links refused after an hour.
 - SD live view (720×404) on the phone and in a browser, LAN and cloud: caption size, fps and Mbit/s against the
   converter measurement (day 3.6, night 1.9 Mbit/s), and the `monitor preview` conversion p95 at v0.4 shutdown.
 - HD live view on the car network and on home Wi-Fi with the UGREEN: fps, age and `monitor HD` counters, recording

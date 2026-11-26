@@ -32,6 +32,18 @@ class RelayProtocolTest {
         assertNull(inbox.takeSnapshot())
     }
 
+    @Test fun recordingAnswersAreQueuedApartFromSnapshots() {
+        val inbox = RelayInbox { 0L }
+        inbox.offer("""{"type":"clip_status","id":"a1","status":"exporting"}""")
+        inbox.offer("""{"type":"snapshot","seq":3}""")
+        inbox.offer("""{"type":"clip","id":"a1","url":"https://storage.googleapis.com/x"}""")
+        inbox.offer("""{"type":"error","id":"a2","error":"busy"}""")
+        assertEquals(listOf("clip_status", "clip", "error"),
+            generateSequence { inbox.takeReply() }.map { it.getString("type") }.toList())
+        assertEquals(3, inbox.takeSnapshot()!!.data.getInt("seq"))
+        assertNull(inbox.takeReply())
+    }
+
     @Test fun capacityIsRetryableAndDistinctFromAccess() {
         assertEquals(RelayClose.FULL, relayClose(1013))
         for (code in listOf(401, 403, 1008)) assertEquals(RelayClose.REJECTED, relayClose(code))

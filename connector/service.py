@@ -14,10 +14,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
 import struct
+import tempfile
 import time
 import uuid
 from urllib.parse import quote, urlencode
@@ -57,6 +59,35 @@ HD_UNAVAILABLE = 4001  # close code, reason "HD not offered" or "HD stopped"; th
 RECORDING_FILE = re.compile(r'(dashcam_(\d{6})_(\d{8})_(\d{6}))\.(mkv|ass)')
 RECORDING_SETTLE_SECONDS = 10
 RECORDING_TYPES = {'mkv': 'video/x-matroska', 'ass': 'text/plain; charset=utf-8'}
+# Clips (connector/README.md "Cloud recordings"): part of one segment as H.264 MP4 for the cloud, made by the
+# host's ffmpeg at low priority, one at a time. "small" decodes the 1080p MJPEG at half size (no resize cost).
+CLIP_QUALITIES = {
+    'small': dict(lowres=True, filters=['fps=10', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'], label='960x540, 10 fps'),
+    '720p': dict(lowres=False, filters=['scale=1280:720'], label='1280x720, 30 fps'),
+}
+MAX_CLIP_SECONDS = 180
+CLIP_NICE = 15
+
+
+def clip_command(ffmpeg, video, start, duration, quality, captions, out):
+    """The ffmpeg argument list for one clip. @p captions is the .ass path or None.
+
+    Input seeking (-ss before -i) restarts timestamps at 0, so burned-in captions are drawn at the
+    segment's own time (PTS + start) and the clip's timestamps are reset afterwards.
+    """
+    q = CLIP_QUALITIES[quality]
+    cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y']
+    if q['lowres']:
+        cmd += ['-lowres', '1']
+    cmd += ['-ss', f'{start:.3f}', '-t', f'{duration:.3f}', '-i', str(video)]
+    filters = list(q['filters'])
+    if captions is not None:
+        escaped = str(captions).replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'")
+        filters += [f'setpts=PTS+{start:.3f}/TB', f"ass='{escaped}'", 'setpts=PTS-STARTPTS']
+    filters += ['format=yuv420p']
+    cmd += ['-vf', ','.join(filters), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26',
+            '-threads', '2', '-movflags', '+faststart', str(out)]
+    return cmd
 CA_NETWORKS = [ipaddress.ip_network(n) for n in (
     '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '169.254.0.0/16',
     '::1/128', 'fd00::/8', 'fe80::/10')]
@@ -401,6 +432,8 @@ class State:
         self.video_hd_demand = Path(video_hd_demand) if video_hd_demand else None
         self.hd_demand_failed = False
         self.recordings = Recordings(recordings_dir)
+        self.ffmpeg = shutil.which('ffmpeg') if recordings_dir else None
+        self.clip_lock = asyncio.Lock()
 
     def accept(self, data):
         try:
@@ -646,6 +679,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
         return web.json_response({'schema': 1, 'id': state.identity['id'], 'name': state.identity['name'],
                                   'capabilities': {'vehicle': True, 'system': True, 'video': True,
                                                    'video_hd': True, 'recordings': state.recordings.available(),
+                                                   'clips': bool(state.ffmpeg) and state.recordings.available(),
                                                    'lane': False,
                                                    'driver': False, 'controls': False}}, dumps=encode)
 
@@ -746,6 +780,57 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
             headers['Content-Disposition'] = f'attachment; filename="{name}"'
         return web.FileResponse(path, headers=headers)   # Range, If-Range and HEAD included
 
+    async def recording_clip(request):
+        name = request.match_info['name']
+        if not state.ffmpeg or not state.recordings.available():
+            raise web.HTTPNotFound(text='Clips are not available on this Jetson')
+        try:
+            body = await request.json()
+            start, duration = float(body['start_s']), float(body['duration_s'])
+            quality, captions = body['quality'], body.get('captions', False)
+            if (quality not in CLIP_QUALITIES or not isinstance(captions, bool) or not math.isfinite(start)
+                    or not math.isfinite(duration) or start < 0 or start > 3600 or not 1 <= duration <= MAX_CLIP_SECONDS):
+                raise ValueError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            raise web.HTTPBadRequest(text='start_s (s), duration_s (1-180 s), quality (small|720p), captions (bool)') from None
+        video, status = await asyncio.to_thread(state.recordings.resolve, name)
+        if status == 409:
+            raise web.HTTPConflict(text='Segment still recording')
+        if video is None:
+            raise web.HTTPNotFound(text='No such segment')
+        ass = None
+        if captions:
+            ass, _ = await asyncio.to_thread(state.recordings.resolve, name[:-4] + '.ass')
+        if state.clip_lock.locked():
+            raise web.HTTPServiceUnavailable(text='Another clip is being exported')
+        async with state.clip_lock:
+            with tempfile.TemporaryDirectory(prefix='dashcam-clip-') as tmp:
+                out = Path(tmp) / 'clip.mp4'
+                proc = await asyncio.create_subprocess_exec(
+                    *clip_command(state.ffmpeg, video, start, duration, quality, ass, out),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=lambda: os.nice(CLIP_NICE))
+                try:
+                    _, err = await asyncio.wait_for(proc.communicate(), timeout=60 + 3 * duration)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    raise web.HTTPGatewayTimeout(text='Clip export took too long') from None
+                if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+                    print(f'WARNING: clip export failed ({proc.returncode}): {err.decode(errors="replace")[-300:]}', flush=True)
+                    raise web.HTTPUnprocessableEntity(text='Clip export failed (is the start inside the segment?)')
+                size = out.stat().st_size
+                response = web.StreamResponse(headers={
+                    'Content-Type': 'video/mp4', 'Content-Length': str(size),
+                    'X-Clip-Captions': 'burned' if ass else 'none',
+                    'Content-Disposition': f'attachment; filename="{name[:-4]}_{int(start)}s_{quality}.mp4"'})
+                await response.prepare(request)
+                with open(out, 'rb') as f:
+                    while chunk := f.read(256 * 1024):
+                        await response.write(chunk)
+                await response.write_eof()
+                return response
+
     async def shutdown(_app):
         everyone = state.clients | state.video_clients | state.video_hd_clients
         await asyncio.gather(*(ws.close(code=1001) for ws in tuple(everyone)), return_exceptions=True)
@@ -766,6 +851,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     app.router.add_get('/v1/video', video)
     app.router.add_get('/v1/recordings', recordings)
     app.router.add_get(r'/v1/recordings/{name:[A-Za-z0-9_]+\.(?:mkv|ass)}', recording_file)
+    app.router.add_post(r'/v1/recordings/{name:[A-Za-z0-9_]+\.mkv}/clip', recording_clip)
     app.on_shutdown.append(shutdown)
     if state.video_demand or state.video_hd_demand:
         app.cleanup_ctx.append(demand)

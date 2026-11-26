@@ -462,8 +462,49 @@ with no Cues yet) is neither listed nor served (409). A segment that retention d
 downloads ends with "Not found".
 
 **Privacy.** Recordings are a location and time history. On the LAN they need the same pairing credential or
-browser session as live view. Run the agent with `--no-recordings` to withhold them. Cloud sessions do not
-offer recordings yet: their Recordings page says to connect on the LAN.
+browser session as live view. Run the agent with `--no-recordings` to withhold them. That also withholds them from cloud sessions.
+
+## Cloud recordings
+
+In a cloud session the Recordings page lists the same segments, but it does not stream the original files.
+The Jetson's uplink is often on mobile data, and the originals run at 16–73 Mbit/s. A viewer instead exports a
+**clip**: part of one segment, made into an H.264 MP4 on the Jetson and uploaded to Cloud Storage. Owners and
+viewers granted the vehicle may both export clips.
+
+1. The viewer asks for the list. The relay forwards `{type: "list_recordings"}` to the uplink. The uplink reads
+   the agent's `/v1/recordings`, keeping at most 1,500 segments.
+2. The viewer chooses the start (seconds into the segment), a length (10 s, 30 s, 1 min or 3 min), a quality and
+   whether to burn in the captions. The relay validates the request. It makes a random object name under
+   `clips/<vehicle>/` and signs a PUT URL for it (15 minutes). It answers `clip_status: exporting` and sends the
+   uplink `export_clip` with that URL.
+3. The uplink accepts only an `https://storage.googleapis.com/` upload URL. It POSTs the request to the agent's
+   `POST /v1/recordings/<segment>.mkv/clip` and PUTs the returned MP4 to the signed URL.
+4. The relay signs a play link and a download link, each valid for an hour. The download link carries the clip's
+   file name. The page shows a player and a **Download MP4** button. On Android the player is fullscreen and the
+   download goes through the system download manager to *Download/Dashcam*.
+
+**The export on the Jetson** runs `ffmpeg` (Ubuntu's 4.4 package) at `nice 15` with two x264 threads, one export
+at a time (a second one answers 503 "busy"). The JPEG decoder runs at half size for **Small**.
+
+| Quality | Output | 30 s clip | 3 min clip | Size per 30 s |
+|---|---|---|---|---|
+| Small | 960×540, 10 fps | 9.7 s | 82 s | 3.8 MB |
+| 720p | 1280×720, 30 fps | 21.4 s | 127 s | 5.5 MB |
+
+These were measured 2026-11-26 on the Jetson from a night-drive segment with captions burned in. Each export uses
+about 2.2–2.4 cores while it runs. The recorder keeps priority, but the CPU is shared, so avoid long 720p exports
+while the Jetson is under load. Burned-in captions keep the recorder's styles and clock. Their timing follows the
+clip's place in the segment: at 5 s into a clip that starts 60 s into a segment from 22:35:50, the caption reads
+22:36:55.
+
+**Limits.** A clip is at most 180 s and comes from one finished segment. The segment still being written
+answers 409. Export time is bounded at 60 s + 3 × the clip length. Clip objects are deleted by the bucket's
+lifecycle rule a day after upload. Links expire after an hour; export again for new ones. Setup:
+cloud/README.md "Cloud recordings bucket".
+
+**Privacy.** A clip is a location and time record that leaves the vehicle. Only a signed-in user with a grant for
+the vehicle can ask for one. The relay re-checks the sign-in and the grant on every request. Anyone holding a
+link can fetch the clip until the link expires, so share links with care.
 
 ## Vehicle map
 

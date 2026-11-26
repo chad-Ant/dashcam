@@ -12,10 +12,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import socket
 import ssl
 import stat
 import struct
+import subprocess
 import tempfile
 import time
 import unittest
@@ -1395,6 +1397,105 @@ class RecordingsTests(unittest.IsolatedAsyncioTestCase):
                                                headers=self.headers)).status, 404)
         finally:
             await client.close()
+
+
+
+FIXTURE = Path(__file__).resolve().parents[1] / 'android/app/src/test/resources/recorder_fixture.mkv'
+
+
+class ClipTests(unittest.IsolatedAsyncioTestCase):
+    def test_command_offsets_burned_captions_to_segment_time(self):
+        cmd = service.clip_command('ffmpeg', Path('/f/v.mkv'), 12.5, 30, 'small', Path('/f/v.ass'), Path('/t/o.mp4'))
+        self.assertEqual(cmd[cmd.index('-ss') + 1], '12.500')
+        self.assertEqual(cmd[cmd.index('-t') + 1], '30.000')
+        self.assertIn('-lowres', cmd)
+        self.assertLess(cmd.index('-lowres'), cmd.index('-i'))   # a decoder option: before the input
+        vf = cmd[cmd.index('-vf') + 1]
+        self.assertEqual(vf, "fps=10,scale=trunc(iw/2)*2:trunc(ih/2)*2,setpts=PTS+12.500/TB,ass='/f/v.ass',"
+                             "setpts=PTS-STARTPTS,format=yuv420p")   # even sizes: x264 needs them
+        self.assertEqual(cmd[-3:], ['-movflags', '+faststart', '/t/o.mp4'])
+        hd = service.clip_command('ffmpeg', Path('v.mkv'), 0, 5, '720p', None, Path('o.mp4'))
+        self.assertNotIn('-lowres', hd)
+        self.assertEqual(hd[hd.index('-vf') + 1], 'scale=1280:720,format=yuv420p')
+        tricky = service.clip_command('ffmpeg', Path('v.mkv'), 0, 5, '720p', "C:/a'b.ass", Path('o.mp4'))
+        self.assertIn("ass='C\\:/a\\'b.ass'", tricky[tricky.index('-vf') + 1])
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+        old = time.time() - 600
+        name = 'dashcam_000001_20261126_120000'
+        (self.dir / (name + '.mkv')).write_bytes(FIXTURE.read_bytes())
+        (self.dir / (name + '.ass')).write_text(
+            '[Script Info]\nPlayResX: 96\nPlayResY: 54\n\n[V4+ Styles]\n'
+            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, '
+            'Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, '
+            'MarginR, MarginV, Encoding\n'
+            'Style: TL,Monospace,8,&H00FFFFFF,&H00FFFFFF,&H26000000,&H26000000,-1,0,0,0,100,100,0,0,3,1,0,7,2,2,2,1\n\n'
+            '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
+            'Dialogue: 0,0:00:00.00,0:00:01.00,TL,,0,0,0,,SPD 50\n')
+        for f in self.dir.iterdir():
+            os.utime(f, (old, old))
+        (self.dir / 'dashcam_000002_20261126_120300.mkv').write_bytes(b'growing')   # still recording
+        self.name = name
+        self.state = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.', recordings_dir=self.dir)
+        self.client = TestClient(TestServer(create_app(self.state)))
+        await self.client.start_server()
+        self.headers = {'Authorization': 'Bearer ' + TOKEN}
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp.cleanup()
+
+    def clip(self, name, **body):
+        return self.client.post(f'/v1/recordings/{name}.mkv/clip', headers=self.headers, json=body)
+
+    async def test_capability_and_validation(self):
+        ident = await (await self.client.get('/v1/identity', headers=self.headers)).json()
+        self.assertIs(ident['capabilities']['clips'], bool(shutil.which('ffmpeg')))
+        if not shutil.which('ffmpeg'):
+            self.skipTest('ffmpeg not installed')
+        good = dict(start_s=0, duration_s=1, quality='small', captions=False)
+        for bad in [dict(good, quality='4k'), dict(good, duration_s=0), dict(good, duration_s=181),
+                    dict(good, start_s=-1), dict(good, captions='yes'), dict(good, start_s='nan'), {}]:
+            self.assertEqual((await self.clip(self.name, **bad)).status, 400, bad)
+        self.assertEqual((await self.clip('dashcam_000002_20261126_120300', **good)).status, 409)
+        self.assertEqual((await self.clip('dashcam_000009_20261126_120900', **good)).status, 404)
+        unauth = await self.client.post(f'/v1/recordings/{self.name}.mkv/clip', json=good)
+        self.assertEqual(unauth.status, 401)
+
+    async def test_real_clip_with_burned_captions(self):
+        if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            self.skipTest('ffmpeg not installed')
+        for quality in ('small', '720p'):
+            r = await self.clip(self.name, start_s=0.2, duration_s=1, quality=quality, captions=True)
+            data = await r.read()
+            self.assertEqual(r.status, 200, data[:300])
+            self.assertEqual(r.headers['Content-Type'], 'video/mp4')
+            self.assertEqual(r.headers['X-Clip-Captions'], 'burned')
+            self.assertEqual(int(r.headers['Content-Length']), len(data))
+            with tempfile.NamedTemporaryFile(suffix='.mp4') as f:
+                f.write(data)
+                f.flush()
+                probe = json.loads(subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_name,width,height,pix_fmt:format=duration',
+                     '-of', 'json', f.name], capture_output=True, text=True, check=True).stdout)
+            stream = probe['streams'][0]
+            self.assertEqual((stream['codec_name'], stream['pix_fmt']), ('h264', 'yuv420p'))
+            self.assertEqual((stream['width'], stream['height']), (48, 26) if quality == 'small' else (1280, 720))   # 96x54 halved, made even
+            self.assertAlmostEqual(float(probe['format']['duration']), 0.8, delta=.25)   # 1 s asked, 0.8 s left in the fixture
+            self.assertEqual(data[4:8], b'ftyp')
+            self.assertLess(data.find(b'moov'), data.find(b'mdat'))   # fast start: the index first
+
+    async def test_one_export_at_a_time(self):
+        if not shutil.which('ffmpeg'):
+            self.skipTest('ffmpeg not installed')
+        await self.state.clip_lock.acquire()
+        try:
+            r = await self.clip(self.name, start_s=0, duration_s=1, quality='small')
+            self.assertEqual(r.status, 503)
+        finally:
+            self.state.clip_lock.release()
 
 
 if __name__ == '__main__':

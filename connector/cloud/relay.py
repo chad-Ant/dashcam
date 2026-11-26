@@ -1,7 +1,9 @@
 """Single-instance Cloud Run relay. Firestore owns authorization and demand."""
 import asyncio
 import json
+import math
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -19,6 +21,49 @@ WEB = Path(__file__).parent / 'web'
 COOKIE = '__Host-dashcam'
 MAX_PACKET = 262144 + 24
 VEHICLE_FULL = 1013   # viewer close code: every lease slot is taken; retry later
+# Cloud recordings (connector/README.md "Cloud recordings"): viewers ask for the segment list or a clip; the
+# relay forwards to the vehicle's uplink and, for a clip, hands it a signed upload URL, then gives the viewer
+# signed play and download links. Owners and viewers alike may use it.
+REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
+SEGMENT = re.compile(r'dashcam_\d{6}_\d{8}_\d{6}')
+CLIP_QUALITIES = ('small', '720p')
+MAX_CLIP_SECONDS = 180
+PENDING_SECONDS = 15 * 60   # an unanswered request is forgotten after this
+
+
+class ClipStorage:
+    """Signed V4 URLs for clips in one bucket. The relay's service account signs through the IAM signBlob API
+    (it holds Service Account Token Creator on itself), so no key file exists. A bucket lifecycle rule deletes
+    clips after a day."""
+    UPLOAD_SECONDS = 15 * 60
+    LINK_SECONDS = 60 * 60
+
+    def __init__(self, bucket):
+        import google.auth
+        from google.cloud import storage
+        self.credentials, project = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+        self.bucket = storage.Client(project=project, credentials=self.credentials).bucket(bucket)
+
+    def _sign(self, name, **options):
+        if not self.credentials.valid:   # the access token also authorises the IAM signBlob call
+            import google.auth.transport.requests
+            self.credentials.refresh(google.auth.transport.requests.Request())
+        return self.bucket.blob(name).generate_signed_url(
+            version='v4', service_account_email=self.credentials.service_account_email,
+            access_token=self.credentials.token, **options)
+
+    @staticmethod
+    def object_name(vehicle, segment, start, quality):
+        return f'clips/{vehicle}/{segment}_{int(start)}s_{quality}_{secrets.token_hex(6)}.mp4'
+
+    def upload_url(self, name):
+        return self._sign(name, method='PUT', content_type='video/mp4', expiration=timedelta(seconds=self.UPLOAD_SECONDS))
+
+    def download_urls(self, name, filename):
+        expiry = timedelta(seconds=self.LINK_SECONDS)
+        return (self._sign(name, method='GET', expiration=expiry),
+                self._sign(name, method='GET', expiration=expiry,
+                           response_disposition=f'attachment; filename="{filename}"'))
 
 
 def trace(event, **fields):
@@ -77,17 +122,27 @@ class Viewer:
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     first: bool = False
     sent: int = 0
+    replies: list = field(default_factory=list)
 
     def offer(self, channel, payload):
         if channel in self.channels and time.monotonic() < self.deadline:
             self.pending[channel] = payload
             self.wake.set()
 
+    def reply(self, value):
+        """A recordings answer for this viewer only; the send loop is the socket's single writer."""
+        self.replies.append(json.dumps(value))
+        self.wake.set()
+
     async def send(self):
         try:
             while True:
                 await self.wake.wait()
                 self.wake.clear()
+                while self.replies:
+                    data = self.replies.pop(0)
+                    await asyncio.wait_for(self.ws.send_str(data), 2)
+                    self.sent += len(data)
                 for channel in list(self.pending):
                     data = self.pending.pop(channel)
                     if channel not in self.channels or time.monotonic() >= self.deadline:
@@ -100,11 +155,76 @@ class Viewer:
 
 
 class Relay:
-    def __init__(self, store, config):
-        self.store, self.config = store, config
+    def __init__(self, store, config, clips=None):
+        self.store, self.config, self.clips = store, config, clips
         self.viewers = set()
         self.devices = {}
         self.releasing = set()
+        self.requests = {}   # token sent to the device -> dict(viewer, id, kind, object, filename, at)
+
+    async def recording_request(self, viewer, key, body):
+        """A viewer's 'recordings' or 'clip' request: checked here, carried out by the vehicle."""
+        rid = body.get('id')
+        if not isinstance(rid, str) or not REQUEST_ID.fullmatch(rid):
+            raise ValueError('request id')
+        now = time.monotonic()
+        for token, request in list(self.requests.items()):
+            if now - request['at'] > PENDING_SECONDS:
+                del self.requests[token]
+
+        def fail(error):
+            viewer.reply(dict(type='error', id=rid, error=error))
+        device = self.devices.get(key)
+        if device is None or device.closed:
+            return fail('The vehicle is not connected yet. Try again in a moment.')
+        token = secrets.token_hex(12)
+        if body['type'] == 'recordings':
+            self.requests[token] = dict(viewer=viewer, id=rid, kind='recordings', at=now)
+            message = dict(type='list_recordings', id=token)
+        else:
+            if self.clips is None:
+                return fail('Clip export is not set up on this relay')
+            if any(r['viewer'] is viewer and r['kind'] == 'clip' for r in self.requests.values()):
+                return fail('Wait for the clip being exported to finish')
+            segment, quality, captions = body.get('segment'), body.get('quality'), body.get('captions', False)
+            try:
+                start, duration = float(body.get('start_s')), float(body.get('duration_s'))
+            except (TypeError, ValueError):
+                start = duration = math.nan
+            if (not isinstance(segment, str) or not SEGMENT.fullmatch(segment) or quality not in CLIP_QUALITIES
+                    or not isinstance(captions, bool) or not math.isfinite(start) or not math.isfinite(duration)
+                    or not 0 <= start <= 3600 or not 1 <= duration <= MAX_CLIP_SECONDS):
+                return fail('The clip request was not valid')
+            name = self.clips.object_name(key, segment, start, quality)
+            upload = await asyncio.to_thread(self.clips.upload_url, name)
+            filename = f'{segment}_{int(start)}s_{int(duration)}s_{quality}.mp4'
+            self.requests[token] = dict(viewer=viewer, id=rid, kind='clip', object=name, filename=filename, at=now)
+            message = dict(type='export_clip', id=token, segment=segment, start_s=start, duration_s=duration,
+                           quality=quality, captions=captions, upload_url=upload)
+            viewer.reply(dict(type='clip_status', id=rid, status='exporting'))
+        trace('recordings_request', requestId=viewer.request_id, vehicle=key, kind=body['type'])
+        try:
+            await asyncio.wait_for(device.send_json(message), 5)
+        except (ConnectionError, asyncio.TimeoutError):
+            self.requests.pop(token, None)
+            fail('The vehicle is not connected yet. Try again in a moment.')
+
+    async def recording_response(self, body):
+        """The vehicle's answer, to the viewer that asked (if still connected)."""
+        request = self.requests.pop(body.get('id'), None)
+        if request is None or request['viewer'] not in self.viewers:
+            return
+        viewer, rid = request['viewer'], request['id']
+        if body.get('error') or (request['kind'] == 'clip' and not body.get('ok')):
+            return viewer.reply(dict(type='error', id=rid, error=str(body.get('error') or 'The clip failed')[:300]))
+        if request['kind'] == 'recordings':
+            segments = body.get('segments')
+            return viewer.reply(dict(type='recordings', id=rid, segments=segments if isinstance(segments, list) else []))
+        play, download = await asyncio.to_thread(self.clips.download_urls, request['object'], request['filename'])
+        viewer.reply(dict(type='clip', id=rid, url=play, download=download, bytes=body.get('bytes'),
+                          captions=bool(body.get('captions')), expires_s=self.clips.LINK_SECONDS,
+                          filename=request['filename']))
+        trace('clip_ready', requestId=viewer.request_id, bytes=body.get('bytes'))
 
     async def release(self, key, uid, session):
         doc = await self.store.update(key, uid, session=session)
@@ -193,6 +313,12 @@ class Relay:
                 if msg.type != WSMsgType.TEXT:
                     break
                 body = json.loads(msg.data)
+                if body.get('type') in ('recordings', 'clip'):
+                    await identity(request)   # still signed in, and still granted below
+                    if not (await self.store.grant(user['uid'], key).get()).exists:
+                        raise PermissionError
+                    await self.recording_request(v, key, body)
+                    continue
                 channels = body['channels']
                 if channels not in (['telemetry'], ['telemetry', 'video']):
                     break
@@ -212,6 +338,8 @@ class Relay:
             await ws.close(code=1008)
         finally:
             self.viewers.discard(v)
+            for token in [t for t, r in self.requests.items() if r['viewer'] is v]:
+                del self.requests[token]
             writer.cancel()
             release = asyncio.create_task(self.release(key, user['uid'], v.request_id))
             self.releasing.add(release)
@@ -276,6 +404,9 @@ class Relay:
                     if body.get('type') == 'heartbeat':
                         await ws.send_json(dict(type='heartbeat'))
                         continue
+                    if body.get('type') in ('recordings', 'clip_result'):
+                        await self.recording_response(body)
+                        continue
                     if body.get('type') != 'snapshot':
                         break
                     channel = 'telemetry'
@@ -297,9 +428,9 @@ class Relay:
         return ws
 
 
-def application(store, config):
+def application(store, config, clips=None):
     app = web.Application(middlewares=[errors], client_max_size=4096)
-    relay = Relay(store, config)
+    relay = Relay(store, config, clips)
     app.on_cleanup.append(relay.drain)
     async def static(request):
         return web.FileResponse(WEB / (request.match_info.get('name') or 'index.html'),
@@ -333,7 +464,8 @@ async def production():
     config = json.loads(os.environ['FIREBASE_WEB_CONFIG'])
     firebase_admin.initialize_app(options={'projectId': config['projectId']})
     db = firestore.AsyncClient(project=config['projectId'])
-    return application(Store(db), config)
+    bucket = os.getenv('CLIP_BUCKET')
+    return application(Store(db), config, ClipStorage(bucket) if bucket else None)
 
 
 if __name__ == '__main__':

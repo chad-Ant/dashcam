@@ -46,6 +46,21 @@ gcloud projects add-iam-policy-binding "$project" \
   --member="serviceAccount:$builder" --role=roles/run.builder
 ```
 
+### Cloud recordings bucket
+
+Clips that viewers export from recordings go to one private bucket (connector/README.md "Cloud recordings"). The relay signs time-limited upload and download URLs for it with its own account, through the IAM signBlob permission granted above. No key file is involved. A lifecycle rule deletes every clip a day after upload. Viewers download straight from Cloud Storage, so no CORS rule is needed: the page plays the link in a `<video>` element and downloads it through a plain link.
+
+```sh
+bucket="$project"-clips
+gcloud storage buckets create gs://"$bucket" --project="$project" --location=asia-southeast1   --uniform-bucket-level-access --public-access-prevention
+printf '%s' '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1}}]}' > /tmp/clip-lifecycle.json
+gcloud storage buckets update gs://"$bucket" --lifecycle-file=/tmp/clip-lifecycle.json
+gcloud storage buckets add-iam-policy-binding gs://"$bucket" --member="serviceAccount:$account" --role=roles/storage.objectCreator
+gcloud storage buckets add-iam-policy-binding gs://"$bucket" --member="serviceAccount:$account" --role=roles/storage.objectViewer
+```
+
+`stage.sh` passes the bucket to the relay as `CLIP_BUCKET` (default `<project>-clips`) and checks that it exists. Run it with `CLIP_BUCKET=` to deploy without clips. The Recordings list still works then, but each export answers that clips are not set up. Storage costs little: a 3-minute 720p clip is about 34 MB and is kept for at most two days. Each viewer download is billed as Cloud Storage egress.
+
 From `connector/cloud`, run `./stage.sh` after comparing the current default-database rules with `firestore.rules`. The deployment publishes that ruleset for the entire default database. Preserve any separately managed rules if the project is shared. The script checks billing, deploys the single-instance relay, then prints the actual service URL and revision. The pilot uses an in-memory connection registry, one active revision receiving all traffic, and one instance. Stop old sessions before shifting revisions. Cloud Run terminates TLS at its ingress.
 
 Add the printed hostname to **Firebase Authentication → Settings → Authorized domains**. Open the printed URL and sign in once with the chosen Google account. A new account sees an empty vehicle list. In **Authentication → Users**, copy that account's **User UID**. This identifies the person who can view vehicle A and issue its enrollment code. The label below is the name displayed to that person. Run the grant from an administrator Python environment with the relay requirements installed and application default credentials for the pilot project.
@@ -58,6 +73,8 @@ python admin.py --project jetson-dashcam-handler grant A --uid "$pilot_uid" --ro
 Refresh the dashboard. For additional people, use their individual UIDs and `--role viewer`. The owner selects **Issue enrollment code**. Each code expires in five minutes and permits one exchange. Issuing a newer code supersedes the previous pending code.
 
 ## Install and enroll one Jetson
+
+To update an installed uplink, for example for cloud recordings, repeat the `install` of the three Python files and `libdashcam_uplink.so`, then run `sudo systemctl restart dashcam-uplink`. The enrollment is kept. Deploy the relay first: an older relay closes the viewer's socket when it receives a recordings request.
 
 Run from `connector/cloud` on the Jetson. The service needs outbound HTTPS and HTTP/2 to Firestore. Use the paired LAN connector's existing link. The installer copies only the uplink and its runtime into `/opt/dashcam-uplink`.
 

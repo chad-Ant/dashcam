@@ -884,6 +884,7 @@
         if (vws === sock) receiveFrame(ev.data);
         return;
       }
+      if (cloud && cloudRecordingMessage(ev.data)) return;
       const data = parseSnapshot(ev.data);
       if (!data) { closeSocket(); return retryLater(epoch, 'Unsupported or invalid monitoring data · retrying'); }
       if (cloud && data.type === 'connecting') { requestId = data.requestId; return; }
@@ -1317,7 +1318,8 @@
 
   let recList = null, recLoading = false, recStatus = '', renderRecordings = () => {};
   async function loadRecordings() {
-    if (cloud || recLoading) return;
+    if (cloud) { cloudLoadRecordings(); return; }
+    if (recLoading) return;
     recLoading = true; recStatus = 'Loading recordings'; renderRecordings();
     try {
       const r = await fetch('/v1/recordings', { cache: 'no-store', credentials: 'same-origin' });
@@ -1331,10 +1333,7 @@
     } finally { recLoading = false; renderRecordings(); }
   }
   function recordingsPage() {
-    if (cloud) {
-      return [card('Recordings', hint('Recorded segments are available on a direct LAN connection: open this ' +
-        "Jetson's own address on the same Wi-Fi."))];
-    }
+    if (cloud) return cloudRecordingsPage();
     const status = hint(''), list = h('div', 'rec-days');
     const refresh = button('Refresh', 'btn secondary', () => loadRecordings());
     const head = card('Recordings', status, hint('3-minute segments as recorded (1080p MJPEG with telemetry captions). ' +
@@ -1379,6 +1378,118 @@
     a.href = '/v1/recordings/' + name + '?download=1';
     a.download = name;
     return a;
+  }
+
+  // ---- cloud recordings: list through the relay, clips as signed Cloud Storage links ------------------
+  // The relay forwards {type: 'recordings'} and {type: 'clip'} to the vehicle; the Jetson makes an H.264 MP4
+  // and uploads it, and the relay answers with expiring play and download links (connector/README.md
+  // "Cloud recordings"). The browser plays the MP4 natively.
+  const cloudRequests = new Map();   // request id -> handler(message)
+  let cloudExport = null;            // the row exporting now: {id, render}
+  function cloudRequest(body, handler) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const id = 'w' + Math.random().toString(36).slice(2, 12);
+    cloudRequests.set(id, handler);
+    ws.send(JSON.stringify(Object.assign({ id }, body)));
+    return true;
+  }
+  function cloudRecordingMessage(text) {
+    if (typeof text !== 'string' || text.length > 1 << 20 || !/^\{"type": ?"(recordings|clip|clip_status|error)"/.test(text)) return false;
+    let j;
+    try { j = JSON.parse(text); } catch (_) { return false; }
+    const handler = isObj(j) && cloudRequests.get(j.id);
+    if (!handler) return true;   // an answer to a request this page no longer waits for
+    if (j.type !== 'clip_status') cloudRequests.delete(j.id);
+    handler(j);
+    return true;
+  }
+  function cloudLoadRecordings() {
+    if (recLoading) return;
+    recLoading = true; recStatus = 'Asking the vehicle for its recordings'; renderRecordings();
+    const asked = cloudRequest({ type: 'recordings' }, m => {
+      recLoading = false;
+      if (m.type === 'recordings' && Array.isArray(m.segments)) {
+        recList = m.segments;
+        recStatus = recList.length ? recList.length + (recList.length === 1 ? ' segment' : ' segments') : 'No finished segments yet';
+      } else recStatus = m.error || 'The vehicle did not answer';
+      renderRecordings();
+    });
+    if (!asked) { recLoading = false; recStatus = 'Not connected to the vehicle yet · Refresh in a moment'; renderRecordings(); }
+  }
+  function cloudRecordingsPage() {
+    const status = hint(''), list = h('div', 'rec-days');
+    const refresh = button('Refresh', 'btn secondary', () => cloudLoadRecordings());
+    const head = card('Recordings', status, hint('In a cloud session a recording is shared as a clip: part of one ' +
+      '3-minute segment, made into an MP4 on the Jetson and kept in Cloud Storage for a day. The links last an hour. ' +
+      'Small clips (960×540, 10 fps) are about 1 Mbit/s; 720p (30 fps) about 1.5 Mbit/s.'), refresh);
+    let shown = null;
+    renderRecordings = () => {
+      setText(status, recStatus);
+      refresh.disabled = recLoading;
+      if (recList === shown) return;
+      shown = recList;
+      list.replaceChildren();
+      const days = new Map();
+      for (const s of recList || []) {
+        const day = String(s.start).slice(0, 10);
+        if (!days.has(day)) days.set(day, []);
+        days.get(day).push(s);
+      }
+      let first = true;
+      for (const [day, segments] of days) {
+        const group = h('details', 'card rec-day');
+        group.open = first; first = false;
+        group.append(h('summary', null, day + ' · ' + segments.length + (segments.length === 1 ? ' segment' : ' segments')));
+        for (const s of segments) group.append(cloudRow(s));
+        list.append(group);
+      }
+    };
+    return [head, list];
+  }
+  function cloudRow(s) {
+    const row = h('div', 'rec-row rec-cloud'), text = h('div', 'rec-text');
+    const length = typeof s.duration_s === 'number' ? s.duration_s : 180;
+    text.append(h('strong', null, String(s.start).slice(11) + ' · ' + clock(length * 1000)),
+      h('span', 'hint', megabytes(s.bytes) + (s.caption_bytes ? ' · captions' : ' · no captions')));
+    const actions = h('div', 'actions'), panel = h('div', 'rec-export');
+    panel.hidden = true;
+    actions.append(button('Export clip', 'btn', () => { panel.hidden = !panel.hidden; }));
+    const field = (label, input) => { const l = h('label', 'rec-field'); l.append(h('span', null, label), input); return l; };
+    const start = h('input'); Object.assign(start, { type: 'number', min: 0, max: Math.floor(length), step: 1, value: 0 });
+    const span = h('select');
+    for (const v of [10, 30, 60, 180]) { const o = h('option', null, v < 60 ? v + ' s' : v / 60 + ' min'); o.value = v; span.append(o); }
+    span.value = '30';
+    const quality = h('select');
+    for (const [v, l] of [['small', 'Small · 960×540 · 10 fps'], ['720p', '720p · 30 fps']]) { const o = h('option', null, l); o.value = v; quality.append(o); }
+    const captions = h('input'); captions.type = 'checkbox'; captions.checked = Boolean(s.caption_bytes); captions.disabled = !s.caption_bytes;
+    const go = button('Export', 'btn', exportNow), note = hint(''), result = h('div', 'rec-result');
+    panel.append(field('Start (s into the segment)', start), field('Length', span), field('Quality', quality),
+      field('Burn in captions', captions), go, note, result);
+    function exportNow() {
+      const body = { type: 'clip', segment: s.id, start_s: Math.max(0, Math.min(+start.value || 0, length - 1)),
+        duration_s: +span.value, quality: quality.value, captions: captions.checked };
+      result.replaceChildren();
+      const began = performance.now();
+      const asked = cloudRequest(body, m => {
+        if (m.type === 'clip_status') { setText(note, 'Making the clip on the Jetson and uploading it…'); return; }
+        go.disabled = false;
+        if (m.type !== 'clip' || typeof m.url !== 'string' || !m.url.startsWith('https://storage.googleapis.com/')) {
+          setText(note, m.error || 'The clip failed'); return;
+        }
+        setText(note, 'Ready after ' + Math.round((performance.now() - began) / 1000) + ' s · ' + megabytes(m.bytes || 0) +
+          (m.captions ? ' · captions burned in' : '') + ' · links expire in ' + Math.round((m.expires_s || 3600) / 60) + ' min');
+        const video = h('video');
+        Object.assign(video, { controls: true, playsInline: true, preload: 'metadata', src: m.url });
+        const download = h('a', 'btn secondary rec-link', 'Download MP4');
+        download.href = m.download; download.rel = 'noopener';
+        result.replaceChildren(video, download);
+      });
+      if (!asked) { setText(note, 'Not connected to the vehicle · try again in a moment'); return; }
+      go.disabled = true;
+      setText(note, 'Asking the vehicle…');
+    }
+    row.append(text, actions, panel);
+    return row;
   }
 
   // The player: one at a time, over the whole window.

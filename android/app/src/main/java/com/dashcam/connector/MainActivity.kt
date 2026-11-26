@@ -145,14 +145,17 @@ private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake
             map.update(TileMath.fix(fix.finite("latitude"), fix.finite("longitude"), fix.finite("heading_deg")))
         }
     }
+    // The clip being played, if any (its links come from CloudRecordings).
+    var playing by remember { mutableStateOf<ClipState.Ready?>(null) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    playing?.let { clip ->
+        CloudClipPlayer(clip, onDownload = { CloudRecordings.download(context, clip) }, onClose = { playing = null })
+    }
     DashboardLayout(
         state = state, deviceName = vehicle.label + " · cloud", initialPage = 0, onKeepAwake = onKeepAwake,
         onVideoWanted = CloudSession::setDashboardVideo,
         cameraCard = { CloudCameraCard() }, mapCard = { MapCard(map, tiles) },
-        recordingsItems = { item { SurfaceCard("Recordings") {
-            Hint("Recorded segments are available on a direct LAN connection: disconnect the cloud session " +
-                "and connect to the Jetson on the same Wi-Fi.")
-        } } }
+        recordingsItems = { cloudRecordingsPage { playing = it } }
     ) {
         item { CloudSessionCard(vehicle) }
     }

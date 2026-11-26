@@ -11,7 +11,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.tasks.await
 import okhttp3.*
 import okio.ByteString
+import org.json.JSONObject
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
 internal data class CloudVehicle(val id: String, val label: String, val owner: Boolean)
@@ -58,19 +60,51 @@ internal object CloudSession {
     private var started = 0
     private var foreground = false
     private var pause: Job? = null
+    // Recordings requests sent on the open socket and waiting for their answer, by request id.
+    private val pending = HashMap<String, (JSONObject) -> Unit>()
 
     fun connect(origin: String, vehicle: CloudVehicle) {
         if (vehicleMutable.value == vehicle && task != null) return
         stop()
         this.origin = origin
         vehicleMutable.value = vehicle
+        CloudRecordings.reset(vehicle.id)
         restart()
     }
 
     fun disconnect(reason: String = "Disconnected") {
         vehicleMutable.value = null
         stop()
+        CloudRecordings.reset(null)
         publishStatus(reason)
+    }
+
+    /**
+     * Sends a recordings request ({type: "recordings"} or {type: "clip", ...}) on the open relay socket;
+     * [onReply] gets each answer on the main thread: for a clip a "clip_status" first, then "clip" or
+     * "error". A socket that closes first answers "error". False when no socket is open.
+     */
+    fun request(body: JSONObject, onReply: (JSONObject) -> Unit): Boolean {
+        val ws = socket ?: return false
+        val id = "a" + UUID.randomUUID().toString().replace("-", "").take(20)
+        if (!ws.send(body.put("id", id).toString())) return false
+        pending[id] = onReply
+        return true
+    }
+
+    private fun dispatch(reply: JSONObject) {
+        val id = reply.optString("id")
+        val handler = pending[id] ?: return   // an answer nobody waits for any more
+        if (reply.optString("type") != "clip_status") pending.remove(id)
+        handler(reply)
+    }
+
+    private fun failPending(why: String) {
+        if (pending.isEmpty()) return
+        val waiting = pending.values.toList()
+        pending.clear()
+        val reply = JSONObject().put("type", "error").put("error", why)
+        waiting.forEach { it(reply) }
     }
 
     /** Called from every activity's onStart and onStop: the session streams only while one is started. */
@@ -140,6 +174,7 @@ internal object CloudSession {
         generation++
         task?.cancel(); task = null
         socket?.close(1000, null); socket = null
+        failPending("The cloud session closed · try again once it is connected")
         cameraMutable.value = false
         pictureMutable.value = null
         requestIdMutable.value = ""
@@ -206,6 +241,7 @@ internal object CloudSession {
                         if (now >= renew) { ws.send(demand()); renew = now + 10000 }
                         if (cameraMutable.value && now - cameraStart >= LIVE_VIEW_MAX_MS) setCamera(false)
                         inbox.takeRequestId()?.let { requestIdMutable.value = it }
+                        while (true) dispatch(inbox.takeReply() ?: break)
                         inbox.takeSnapshot()?.let {
                             val s = it.data
                             if (s.optString("type") == "snapshot") {
@@ -255,7 +291,7 @@ internal object CloudSession {
                     }
                 } finally {
                     ws.close(1000, null)
-                    if (socket === ws) socket = null
+                    if (socket === ws) { socket = null; failPending("The connection to the relay closed · try again") }
                     if (current()) { stateMutable.value = MonitorState(stateMutable.value.status); pictureMutable.value = null }
                 }
                 if (!current()) break

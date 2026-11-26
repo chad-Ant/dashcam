@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.update
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
 import java.io.File
@@ -31,6 +32,14 @@ data class RecordingSegment(val id: String, val seq: Int, val start: String, val
                             val bytes: Long, val captionBytes: Long?) {
     val day get() = start.take(10)
     val time get() = start.drop(11)
+}
+
+/** The connector's segment list (also what the cloud relay forwards from it). */
+internal fun parseSegments(list: JSONArray): List<RecordingSegment> = (0 until list.length()).map { i ->
+    val j = list.getJSONObject(i)
+    RecordingSegment(j.getString("id"), j.getInt("seq"), j.getString("start"),
+        if (j.isNull("duration_s")) null else j.getDouble("duration_s"), j.getLong("bytes"),
+        if (j.isNull("caption_bytes")) null else j.getLong("caption_bytes"))
 }
 
 /** Why recordings are unavailable, in words fit for the screen. */
@@ -57,14 +66,7 @@ class RecordingSource(private val client: OkHttpClient, private val base: HttpUr
         client.newCall(request(null, null)).execute().use { r ->
             if (r.code == 404) throw RecordingsException("This Jetson's connector does not offer recordings (update it)")
             if (!r.isSuccessful) throw failure(r.code)
-            val body = JSONObject(r.body!!.string())
-            val list = body.getJSONArray("segments")
-            return (0 until list.length()).map { i ->
-                val j = list.getJSONObject(i)
-                RecordingSegment(j.getString("id"), j.getInt("seq"), j.getString("start"),
-                    if (j.isNull("duration_s")) null else j.getDouble("duration_s"), j.getLong("bytes"),
-                    if (j.isNull("caption_bytes")) null else j.getLong("caption_bytes"))
-            }
+            return parseSegments(JSONObject(r.body!!.string()).getJSONArray("segments"))
         }
     }
 

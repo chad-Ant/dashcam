@@ -13,6 +13,7 @@ This file has three parts:
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
 - **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. The four review findings are fixed and regression-tested, but not deployed yet. [Findings](#2026-11-26-live-view-review) · [Fixes](#2026-11-26-live-view-review-fixes-not-deployed)
 - **Recordings on the LAN (2026-11-26, not deployed).** Both clients can now list, play (with telemetry captions, seek and fullscreen) and download v0.4's recorded segments over a direct LAN connection. The client decodes the video; the Jetson only serves files. It is built and tested on real footage in a browser. Not deployed; the Android player has not run on a phone yet. [Log](#2026-11-26-recordings-on-the-lan-not-deployed)
+- **Cloud recordings (2026-11-26, not deployed).** A cloud session's Recordings page now lists the segments. Owners and viewers can export a clip: up to 3 min of one segment, made into an H.264 MP4 on the Jetson and uploaded to a private Cloud Storage bucket. The relay answers with signed play and download links that last an hour. The code and tests are done, and the web page was checked against a fake relay. Deployment is the user's: create the bucket, run `stage.sh`, reinstall the uplink, restart the agent and uplink, and install the APK. [Log](#2026-11-26-cloud-recordings-not-deployed)
 - **Connector field checks.** Exercise the Android token-refresh retry after rejection and mobile data on the A54. On the car network, check CAN/GNSS source loss and recovery, reconnect after a router or Jetson reboot, and recording performance with a phone and laptop watching. Tablet and local-browser CA checks remain. The S25 mobile-data trial, two-phone viewing and ten idle minutes already passed. [Pilot results](#2026-11-21-dashcam-connect-cloud-pilot) · [Physical checklist](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Next drive.** Secure the CSI mount, verify the connected devices and stock CSI driver, then calibrate the lane crops while parked. The IMX296 still resets in bright sun despite the gain floor. Run the parked raw-CAN loss test and collect day and night lane data. The recorder service and lane harness require separate runs. [Drive preparation](#open-work-in-priority-order)
 - **Bench work and owner decisions.** The main bench items are CSI night tuning and chart captures, MKR clock and C3 transmit-stall measurements, and display navigation/throughput checks. The turning EKF needs the antenna offset and a measured course. The incident threshold, CAN speed scale, stale-row handling and lane inference rate still need decisions. [Prioritized work and later prototypes](#open-work-in-priority-order)
@@ -408,6 +409,71 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-26 Cloud recordings (not deployed)
+
+The user chose Cloud Storage links, with owners and viewers both allowed to export. The design and the measurements
+are in connector/README.md "Cloud recordings"; the bucket setup is in connector/cloud/README.md "Cloud recordings
+bucket".
+
+**Path.** A viewer request goes from the viewer socket to the relay, then to the uplink, then to the agent:
+- `{type:"recordings"}` → `list_recordings` → `GET /v1/recordings`.
+- `{type:"clip"}` → `export_clip` (with a signed PUT URL) → `POST /v1/recordings/<seg>.mkv/clip`. The agent
+  returns the MP4, which the uplink PUTs to the bucket. The relay then signs a play link and a download link.
+
+**Code.**
+- **Agent** (`service.py`): the clip route runs `ffmpeg` at nice 15 with two x264 threads, one export at a time.
+  The `clips` capability is true only when `ffmpeg` exists.
+- **Uplink** (`uplink.py`): two handlers. It accepts only a `https://storage.googleapis.com/` upload URL.
+- **Relay** (`relay.py`):
+  - `ClipStorage` signs V4 URLs through IAM signBlob, so no key file is needed.
+  - Pending requests are tracked per viewer.
+  - Identity and grant are re-checked on every request.
+  - Answers go through the viewer's single writer.
+- **Web** (`app.js`): the cloud Recordings page has an export form per segment, a `<video>` player and a download
+  link.
+- **Android:**
+  - `CloudRecordings.kt`: the page, the export form, and a fullscreen `VideoView` player.
+  - The system `DownloadManager` saves to *Download/Dashcam*.
+  - `RelayInbox` queues the answers.
+  - `CloudSession.request` fails pending requests when the socket closes.
+
+**Tests.**
+- **Agent:** 72 pass on the Jetson. They include a real ffmpeg export of the recorder fixture, with the size,
+  captions and faststart checked by ffprobe.
+- **Cloud (PC):** relay and uplink recordings tests, plus the earlier uplink resource tests.
+- **Android:** JVM unit tests and the debug build.
+- **Web:** checked in the desktop app's browser pane against a throwaway fake relay that served a real 720p clip:
+  - the list grouped by day;
+  - the export request fields;
+  - the status text;
+  - a playable 1280×720, 30 s video and the download link;
+  - the error path.
+
+**Real exports on the Jetson** (temporary agent on port 9443, night segment 000311):
+
+| Clip | Time | Size |
+|---|---|---|
+| 30 s Small | 9.7 s | 3.8 MB |
+| 30 s 720p | 21.4 s | 5.5 MB |
+| 3 min Small | 82 s | 23 MB |
+| 3 min 720p | 127 s | 34 MB |
+
+Each export used about 2.2–2.4 cores. At 5 s into a clip from 60 s, the burned-in clock read 22:36:55, which
+matches the segment's 22:35:50 start.
+
+**Not yet run:**
+- **The deployed path.** Nothing has gone through the real relay and bucket, the real uplink, or `ffmpeg` under
+  the agent's systemd sandbox (`PrivateTmp`, `ProtectHome=read-only`; fontconfig cannot write its cache there).
+- **The Android player and download on the S25.** Run these before relying on them: the LAN phase found two
+  Android-only crashes.
+
+**Deploy order** (gcloud, firebase and sudo are the user's):
+1. Create the bucket.
+2. Run `stage.sh`. An old relay closes a viewer socket that sends a recordings request.
+3. Reinstall the uplink files and restart `dashcam-uplink`.
+4. Restart `dashcam-monitor`.
+5. Build and install the release APK.
 
 ## 2026-11-26 Recordings on the LAN (not deployed)
 

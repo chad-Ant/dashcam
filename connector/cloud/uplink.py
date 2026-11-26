@@ -5,6 +5,7 @@ import getpass
 import json
 import os
 import random
+import re
 import stat
 import tempfile
 import time
@@ -17,6 +18,16 @@ from yarl import URL
 
 from listener import Snapshot, listen
 from native import Controller
+
+# Cloud recordings (connector/README.md "Cloud recordings"): the relay asks for the segment list or for one
+# clip; this host gets both from the local connector over the pinned LAN link and uploads a clip only to the
+# signed Cloud Storage URL the relay issued. Footage never goes anywhere else.
+CLIP_UPLOAD_SCHEME, CLIP_UPLOAD_HOST = 'https', 'storage.googleapis.com'
+SEGMENT = re.compile(r'dashcam_\d{6}_\d{8}_\d{6}')
+MAX_LISTED = 1500   # about 210 KB of JSON: under the relay's 256 KB uplink message limit
+CLIP_ERRORS = {400: 'The clip request was not valid', 404: 'That segment is no longer on the Jetson',
+               409: 'That segment is still recording', 422: 'The Jetson could not make that clip',
+               503: 'The Jetson is busy exporting another clip', 504: 'The clip took too long to make'}
 
 
 def private_read(path):
@@ -93,6 +104,7 @@ class Resources:
         self.mode = None
         self.version = -1
         self.failure = asyncio.get_running_loop().create_future()
+        self.exporting = False
 
     def task(self, coro, wanted=None):
         """wanted() says whether the task's work is still current when it ends; None means always."""
@@ -171,6 +183,66 @@ class Resources:
                 else:
                     break
 
+    def local_url(self, path):
+        local = self.cfg['local']
+        return URL.build(scheme='https', host=local['host'], port=int(local['port']), path=path)
+
+    def local_request(self):
+        local = self.cfg['local']
+        return dict(ssl=aiohttp.Fingerprint(bytes.fromhex(local['pin'])),
+                    headers={'Authorization': 'Bearer ' + local['token']})
+
+    async def list_recordings(self, ws, request):
+        reply = dict(type='recordings', id=request.get('id'))
+        try:
+            async with self.http.get(self.local_url('/v1/recordings'), **self.local_request()) as r:
+                if r.status == 404:
+                    reply['error'] = "This Jetson's connector does not offer recordings"
+                else:
+                    r.raise_for_status()
+                    reply['segments'] = (await r.json())['segments'][:MAX_LISTED]
+        except Exception as exc:   # noqa: BLE001 - reported to the viewer, never fatal here
+            reply['error'] = 'Could not read the recordings on the Jetson (' + type(exc).__name__ + ')'
+        await asyncio.wait_for(ws.send_json(reply), 10)
+
+    async def export_clip(self, ws, request):
+        reply = dict(type='clip_result', id=request.get('id'))
+        try:
+            upload = URL(request['upload_url'])
+            segment = request['segment']
+            if upload.scheme != CLIP_UPLOAD_SCHEME or upload.host != CLIP_UPLOAD_HOST or not SEGMENT.fullmatch(segment):
+                raise ValueError('refused')
+            body = {k: request[k] for k in ('start_s', 'duration_s', 'quality', 'captions')}
+        except (KeyError, TypeError, ValueError):
+            reply['error'] = 'The clip request was not valid'
+            await asyncio.wait_for(ws.send_json(reply), 10)
+            return
+        if self.exporting:
+            reply['error'] = CLIP_ERRORS[503]
+            await asyncio.wait_for(ws.send_json(reply), 10)
+            return
+        self.exporting = True
+        try:
+            async with self.http.post(self.local_url(f'/v1/recordings/{segment}.mkv/clip'), json=body,
+                                      timeout=aiohttp.ClientTimeout(total=700), **self.local_request()) as r:
+                if r.status != 200:
+                    reply['error'] = CLIP_ERRORS.get(r.status, f'The Jetson answered HTTP {r.status}')
+                else:
+                    clip = await r.read()   # at most a few tens of MB: one 3-minute 720p clip
+                    reply['captions'] = r.headers.get('X-Clip-Captions') == 'burned'
+            if 'error' not in reply:
+                async with self.http.put(upload, data=clip, headers={'Content-Type': 'video/mp4'},
+                                         timeout=aiohttp.ClientTimeout(total=900)) as up:
+                    if up.status not in (200, 201):
+                        raise ConnectionError(f'upload HTTP {up.status}')
+                reply.update(ok=True, bytes=len(clip))
+                print(json.dumps(dict(event='clip_uploaded', id=reply['id'], bytes=len(clip))), flush=True)
+        except Exception as exc:   # noqa: BLE001 - reported to the viewer, never fatal here
+            reply['error'] = 'The clip could not be made or uploaded (' + type(exc).__name__ + ')'
+        finally:
+            self.exporting = False
+        await asyncio.wait_for(ws.send_json(reply), 10)
+
     async def register_loop(self, ws, attempt):
         while self.attempt == attempt:
             try:
@@ -188,7 +260,7 @@ class Resources:
         url = URL(origin(self.cfg['relay'])).with_scheme('wss').with_path('/v1/uplink')
         async with self.http.ws_connect(url.with_query(vehicle=self.cfg['vehicle']),
                                         headers={'Authorization': 'Bearer ' + self.token},
-                                        max_msg_size=2048) as ws:
+                                        max_msg_size=16384) as ws:   # export requests carry a signed URL
             if self.core.state().attempt != attempt:
                 return
             self.socket = ws
@@ -210,6 +282,11 @@ class Resources:
                         if fields['expiresAt'] is not None:
                             fields['expiresAt'] = datetime.fromtimestamp(fields['expiresAt'], timezone.utc)
                         self.core.snapshot(Snapshot(grant['path'], fields, True))
+                    elif grant['type'] == 'list_recordings':
+                        # Never ends the session: a failure is reported to the relay instead.
+                        self.task(self.list_recordings(ws, grant), lambda: False)
+                    elif grant['type'] == 'export_clip':
+                        self.task(self.export_clip(ws, grant), lambda: False)
                     elif grant['type'] == 'grant' and grant['attempt'] == attempt:
                         self.core.confirm(attempt, grant['generation'], grant['channels'])
                         if (grant['mode'] == self.mode == 'ready_while_powered' and self.watcher
