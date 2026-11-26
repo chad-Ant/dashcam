@@ -1222,5 +1222,90 @@ class HdApiTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
 
 
+
+class RecordingsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+        old = time.time() - 600
+        self.video = bytes(range(256)) * 4096   # 1 MiB
+        for name, data in [('dashcam_000861_20261126_134121.mkv', self.video),
+                           ('dashcam_000861_20261126_134121.ass', b'[Script Info]\n'),
+                           ('dashcam_000860_20261126_133821.mkv', b'older'),
+                           ('notes.txt', b'x'), ('dashcam_1_2_3.mkv', b'x')]:
+            (self.dir / name).write_bytes(data)
+            os.utime(self.dir / name, (old, old))
+        start = time.mktime(dt.datetime(2026, 11, 26, 13, 41, 21).timetuple())
+        os.utime(self.dir / 'dashcam_000861_20261126_134121.mkv', (start + 180, start + 180))
+        os.utime(self.dir / 'dashcam_000860_20261126_133821.mkv', (start - 900, start - 900))   # before its own start
+        (self.dir / 'dashcam_000862_20261126_134421.mkv').write_bytes(b'growing')   # still recording
+        (self.dir / 'dashcam_000859_20261126_133521.mkv').mkdir()                    # not a file
+        os.symlink('/etc/passwd', self.dir / 'dashcam_000858_20261126_133221.mkv')    # never followed
+        self.state = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.', recordings_dir=self.dir)
+        self.client = TestClient(TestServer(create_app(self.state)))
+        await self.client.start_server()
+        self.headers = {'Authorization': 'Bearer ' + TOKEN}
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp.cleanup()
+
+    async def test_list_has_finished_segments_only_newest_first(self):
+        response = await self.client.get('/v1/recordings', headers=self.headers)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body['schema'], 1)
+        self.assertEqual([s['id'] for s in body['segments']],
+                         ['dashcam_000861_20261126_134121', 'dashcam_000860_20261126_133821'])
+        first = body['segments'][0]
+        self.assertEqual((first['seq'], first['start'], first['bytes'], first['caption_bytes'], first['duration_s']),
+                         (861, '2026-11-26 13:41:21', len(self.video), 14, 180.0))
+        self.assertIsNone(body['segments'][1]['caption_bytes'])
+        self.assertIsNone(body['segments'][1]['duration_s'])   # last write before its named start: unknown
+
+    async def test_ranges_downloads_and_types(self):
+        name = 'dashcam_000861_20261126_134121.mkv'
+        response = await self.client.get('/v1/recordings/' + name, headers={**self.headers, 'Range': 'bytes=1000-1999'})
+        self.assertEqual(response.status, 206)
+        self.assertEqual(await response.read(), self.video[1000:2000])
+        self.assertEqual(response.headers['Content-Type'], 'video/x-matroska')
+        self.assertEqual(response.headers['Content-Range'], f'bytes 1000-1999/{len(self.video)}')
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+        tail = await self.client.get('/v1/recordings/' + name, headers={**self.headers, 'Range': 'bytes=-16'})
+        self.assertEqual((tail.status, await tail.read()), (206, self.video[-16:]))
+        whole = await self.client.get('/v1/recordings/' + name + '?download=1', headers=self.headers)
+        self.assertEqual((whole.status, len(await whole.read())), (200, len(self.video)))
+        self.assertEqual(whole.headers['Content-Disposition'], f'attachment; filename="{name}"')
+        ass = await self.client.get('/v1/recordings/dashcam_000861_20261126_134121.ass', headers=self.headers)
+        self.assertEqual((ass.status, ass.headers['Content-Type']), (200, 'text/plain; charset=utf-8'))
+
+    async def test_refusals(self):
+        for name, status in [('dashcam_000862_20261126_134421.mkv', 409),   # still recording
+                             ('dashcam_000859_20261126_133521.mkv', 404),   # a directory
+                             ('dashcam_000858_20261126_133221.mkv', 404),   # a symlink
+                             ('dashcam_000857_20261126_132921.mkv', 404),   # missing
+                             ('dashcam_000862_20261126_134421.txt', 404),
+                             ('notes.mkv', 404), ('..%2Fservice.mkv', 404), ('%2Fetc%2Fpasswd.ass', 404)]:
+            response = await self.client.get('/v1/recordings/' + name, headers=self.headers)
+            self.assertEqual(response.status, status, name)
+        for path in ['/v1/recordings', '/v1/recordings/dashcam_000861_20261126_134121.mkv']:
+            self.assertEqual((await self.client.get(path)).status, 401, path)
+
+    async def test_capability_and_disabled(self):
+        ident = await (await self.client.get('/v1/identity', headers=self.headers)).json()
+        self.assertIs(ident['capabilities']['recordings'], True)
+        off = State({'id': 'test', 'name': 'test', 'token': TOKEN}, '.')
+        client = TestClient(TestServer(create_app(off)))
+        await client.start_server()
+        try:
+            ident = await (await client.get('/v1/identity', headers=self.headers)).json()
+            self.assertIs(ident['capabilities']['recordings'], False)
+            self.assertEqual((await client.get('/v1/recordings', headers=self.headers)).status, 404)
+            self.assertEqual((await client.get('/v1/recordings/dashcam_000861_20261126_134121.mkv',
+                                               headers=self.headers)).status, 404)
+        finally:
+            await client.close()
+
+
 if __name__ == '__main__':
     unittest.main()

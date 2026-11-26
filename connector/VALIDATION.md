@@ -293,6 +293,8 @@ Not yet deployed or run with the camera. Checked so far:
 
 ## Remaining physical acceptance
 
+- Recordings (LAN): list, play with captions and seek on the S25 and A54 (fps over Wi-Fi), a download to
+  Download/Dashcam that VLC opens with captions, and the web page in a visible desktop and phone browser.
 - SD live view (720×404) on the phone and in a browser, LAN and cloud: caption size, fps and Mbit/s against the
   converter measurement (day 3.6, night 1.9 Mbit/s), and the `monitor preview` conversion p95 at v0.4 shutdown.
 - HD live view on the car network and on home Wi-Fi with the UGREEN: fps, age and `monitor HD` counters, recording

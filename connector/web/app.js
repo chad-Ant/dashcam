@@ -6,7 +6,7 @@
   const LIVENESS_MS = 15000, FETCH_MS = 5000;   // parity with the Android read/connect timeouts
   const GIB = 1073741824;
   const TOKEN = /^[A-Za-z0-9_-]{32,128}$/;
-  const PAGES = { live: 'Live', vehicle: 'Vehicle', system: 'System', connection: 'Connection' };
+  const PAGES = { live: 'Live', vehicle: 'Vehicle', system: 'System', recordings: 'Recordings', connection: 'Connection' };
   const WAKE_HINT = 'Monitoring pauses while this page is in the background.';
   const $ = id => document.getElementById(id);
 
@@ -1103,6 +1103,430 @@
     } finally { wakeBusy = false; }
   }
 
+  // ---- recordings (direct LAN) ----------------------------------------------
+  // The connector lists v0.4's finished segments and serves the .mkv and .ass files by byte range
+  // (connector/README.md "Recordings"). This page reads the Matroska itself: header, Cues, then whole
+  // clusters, each frame a complete JPEG decoded off the main thread (createImageBitmap). The same
+  // reader is in the Android app (MkvReader.kt, AssCaptions.kt) and is unit-tested there.
+  const MKV = { EBML: 0x1A45DFA3, SEGMENT: 0x18538067, SEEK_HEAD: 0x114D9B74, SEEK: 0x4DBB, SEEK_ID: 0x53AB,
+    SEEK_POSITION: 0x53AC, INFO: 0x1549A966, SCALE: 0x2AD7B1, DURATION: 0x4489, TRACKS: 0x1654AE6B, ENTRY: 0xAE,
+    NUMBER: 0xD7, TYPE: 0x83, CODEC: 0x86, PRIVATE: 0x63A2, FRAME: 0x23E383, VIDEO: 0xE0, WIDTH: 0xB0, HEIGHT: 0xBA,
+    CLUSTER: 0x1F43B675, TIMECODE: 0xE7, SIMPLE: 0xA3, GROUP: 0xA0, BLOCK: 0xA1, CUES: 0x1C53BB6B, POINT: 0xBB,
+    CUE_TIME: 0xB3, CUE_POS: 0xB7, CUE_CLUSTER: 0xF1, HEADER_BYTES: 65536 };
+  function mkvError(why) { const e = new Error(why); e.mkv = true; return e; }
+  function vint(b, at, keepMarker) {
+    if (at >= b.length) throw mkvError('Truncated element');
+    const first = b[at];
+    let n = 1;
+    while (n <= 8 && !(first & (0x80 >> (n - 1)))) n += 1;
+    if (n > 8 || at + n > b.length) throw mkvError('Bad variable-length integer');
+    let v = keepMarker ? first : first & (0xFF >> n);
+    for (let k = 1; k < n; k += 1) v = v * 256 + b[at + k];
+    if (!keepMarker && v === 2 ** (7 * n) - 1) v = -1;   // unknown size
+    return [v, n];
+  }
+  function element(b, at, limit, whole = true) {
+    const [id, a] = vint(b, at, true), [size, c] = vint(b, at + a, false);
+    const body = at + a + c, end = size < 0 ? limit : body + size;
+    if (whole && end > limit) throw mkvError('Element past the end of the data');
+    return { id, body, end: Math.min(end, Number.MAX_SAFE_INTEGER) };
+  }
+  function* kids(b, from, to) { for (let at = from; at < to;) { const e = element(b, at, to); yield e; at = e.end; } }
+  function uint(b, e) { let v = 0; for (let k = e.body; k < e.end; k += 1) v = v * 256 + b[k]; return v; }
+  function float(b, e) {
+    const view = new DataView(b.buffer, b.byteOffset + e.body, e.end - e.body);
+    return e.end - e.body === 4 ? view.getFloat32(0) : view.getFloat64(0);
+  }
+  function ascii(b, from, to) { return String.fromCharCode(...b.subarray(from, to)).replace(/[\0 ]+$/, ''); }
+  function mkvHeader(b) {
+    const ebml = element(b, 0, b.length);
+    if (ebml.id !== MKV.EBML) throw mkvError('Not a Matroska file');
+    const seg = element(b, ebml.end, b.length, false);
+    if (seg.id !== MKV.SEGMENT) throw mkvError('No Segment');
+    const info = { dataStart: seg.body, cues: -1, scale: 1e6, duration: -1, track: -1, width: 0, height: 0, frameMs: 1000 / 30 };
+    let codec = '', fourcc = '';
+    for (let at = seg.body; at < b.length;) {
+      const e = element(b, at, b.length, false);
+      if (e.id === MKV.CLUSTER) break;
+      if (e.end > b.length) throw mkvError('Header too long');
+      at = e.end;
+      if (e.id === MKV.SEEK_HEAD) {
+        for (const s of kids(b, e.body, e.end)) if (s.id === MKV.SEEK) {
+          let target = 0, pos = -1;
+          for (const f of kids(b, s.body, s.end)) { if (f.id === MKV.SEEK_ID) target = uint(b, f); if (f.id === MKV.SEEK_POSITION) pos = uint(b, f); }
+          if (target === MKV.CUES && pos >= 0) info.cues = seg.body + pos;
+        }
+      } else if (e.id === MKV.INFO) {
+        for (const f of kids(b, e.body, e.end)) { if (f.id === MKV.SCALE) info.scale = uint(b, f); if (f.id === MKV.DURATION) info.duration = float(b, f); }
+      } else if (e.id === MKV.TRACKS) {
+        for (const t of kids(b, e.body, e.end)) if (t.id === MKV.ENTRY && info.track < 0) {
+          let num = -1, type = 0, id = '', priv = null, w = 0, h = 0, fd = 0;
+          for (const f of kids(b, t.body, t.end)) {
+            if (f.id === MKV.NUMBER) num = uint(b, f);
+            else if (f.id === MKV.TYPE) type = uint(b, f);
+            else if (f.id === MKV.CODEC) id = ascii(b, f.body, f.end);
+            else if (f.id === MKV.PRIVATE) priv = f;
+            else if (f.id === MKV.FRAME) fd = uint(b, f);
+            else if (f.id === MKV.VIDEO) for (const v of kids(b, f.body, f.end)) { if (v.id === MKV.WIDTH) w = uint(b, v); if (v.id === MKV.HEIGHT) h = uint(b, v); }
+          }
+          if (type !== 1) continue;
+          Object.assign(info, { track: num, width: w, height: h });
+          if (fd > 0) info.frameMs = fd / 1e6;
+          codec = id;
+          if (priv && priv.end - priv.body >= 20) fourcc = ascii(b, priv.body + 16, priv.body + 20);
+        }
+      }
+    }
+    if (info.track < 0) throw mkvError('No video track');
+    if (!(codec === 'V_MJPEG' || (codec === 'V_MS/VFW/FOURCC' && fourcc === 'MJPG'))) throw mkvError('Not an MJPEG recording');
+    if (info.cues < 0) throw mkvError('Segment has no index');
+    if (info.duration < 0) throw mkvError('Segment has no duration');
+    info.durationMs = Math.floor(info.duration * info.scale / 1e6);
+    return info;
+  }
+  function mkvCues(b, info) {
+    const cues = element(b, 0, b.length);
+    if (cues.id !== MKV.CUES) throw mkvError('No Cues at the indexed position');
+    const first = new Map();
+    for (const p of kids(b, cues.body, cues.end)) if (p.id === MKV.POINT) {
+      let time = -1, pos = -1;
+      for (const f of kids(b, p.body, p.end)) {
+        if (f.id === MKV.CUE_TIME) time = uint(b, f);
+        else if (f.id === MKV.CUE_POS) for (const g of kids(b, f.body, f.end)) if (g.id === MKV.CUE_CLUSTER) pos = uint(b, g);
+      }
+      if (time < 0 || pos < 0) continue;
+      const offset = info.dataStart + pos, ms = Math.floor(time * info.scale / 1e6);
+      first.set(offset, Math.min(first.has(offset) ? first.get(offset) : Infinity, ms));
+    }
+    if (!first.size) throw mkvError('Empty index');
+    return [...first].map(([offset, ms]) => ({ offset, ms })).sort((a, b2) => a.offset - b2.offset);
+  }
+  function mkvCluster(b, info) {
+    const c = element(b, 0, b.length);
+    if (c.id !== MKV.CLUSTER) throw mkvError('No Cluster at the indexed position');
+    let base = 0;
+    const frames = [];
+    const block = e => {
+      const [track, n] = vint(b, e.body, false);
+      if (e.body + n + 3 > e.end) throw mkvError('Truncated block');
+      if (track !== info.track) return;
+      const rel = (b[e.body + n] << 24 >> 16) | b[e.body + n + 1];   // signed 16-bit
+      if (b[e.body + n + 2] & 0x06) throw mkvError('Laced blocks are not supported');
+      frames.push({ ms: Math.floor((base + rel) * info.scale / 1e6), data: b.subarray(e.body + n + 3, e.end) });
+    };
+    for (const e of kids(b, c.body, c.end)) {
+      if (e.id === MKV.TIMECODE) base = uint(b, e);
+      else if (e.id === MKV.SIMPLE) block(e);
+      else if (e.id === MKV.GROUP) for (const f of kids(b, e.body, e.end)) if (f.id === MKV.BLOCK) block(f);
+    }
+    return frames;
+  }
+  function clusterAt(clusters, ms) {
+    let lo = 0, hi = clusters.length - 1, found = 0;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (clusters[mid].ms <= ms) { found = mid; lo = mid + 1; } else hi = mid - 1; }
+    return found;
+  }
+  // The recorder's .ass: styles pin text to a corner, the top centre or the left middle; 5 Hz lines.
+  function assTime(t) {
+    const m = /^\s*(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*$/.exec(t);
+    return m && +m[2] < 60 && +m[3] < 60 ? Math.round(((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000) : -1;
+  }
+  function parseAss(text) {
+    const script = { resX: 384, resY: 288, styles: new Map(), byStyle: new Map() };
+    let section = '', styleFormat = [], eventFormat = [];
+    for (const raw of text.split('\n')) {
+      const line = raw.replace(/\r$/, '').replace(/^﻿/, '');
+      if (line.startsWith('[')) { section = line.trim().toLowerCase(); continue; }
+      const colon = line.indexOf(':');
+      if (colon < 0) continue;
+      const key = line.slice(0, colon).trim(), value = line.slice(colon + 1).trimStart();
+      if (section === '[script info]') {
+        if (key === 'PlayResX') script.resX = parseInt(value, 10) || script.resX;
+        if (key === 'PlayResY') script.resY = parseInt(value, 10) || script.resY;
+      } else if (section === '[v4+ styles]' || section === '[v4 styles]') {
+        if (key === 'Format') styleFormat = value.split(',').map(s => s.trim().toLowerCase());
+        if (key === 'Style') {
+          const f = value.split(',').map(s => s.trim()), get = n => f[styleFormat.indexOf(n)];
+          const align = parseInt(get('alignment'), 10);
+          script.styles.set(get('name'), { align: align >= 1 && align <= 9 ? align : 2, size: parseFloat(get('fontsize')) || 20,
+            l: parseInt(get('marginl'), 10) || 0, r: parseInt(get('marginr'), 10) || 0, v: parseInt(get('marginv'), 10) || 0 });
+        }
+      } else if (section === '[events]') {
+        if (key === 'Format') eventFormat = value.split(',').map(s => s.trim().toLowerCase());
+        if (key === 'Dialogue') {
+          const ti = eventFormat.indexOf('text');
+          if (ti < 0) continue;
+          const f = [], parts = value.split(',');
+          f.push(...parts.slice(0, ti), parts.slice(ti).join(','));
+          if (f.length !== ti + 1) continue;
+          const get = n => (f[eventFormat.indexOf(n)] || '').trim();
+          const start = assTime(get('start')), end = assTime(get('end'));
+          if (start < 0 || end <= start) continue;
+          const style = get('style') || 'Default';
+          const body = f[ti].replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, '\n').replace(/\\h/g, ' ');
+          if (!script.byStyle.has(style)) script.byStyle.set(style, []);
+          script.byStyle.get(style).push({ start, end, text: body });
+        }
+      }
+    }
+    for (const list of script.byStyle.values()) list.sort((a, b2) => a.start - b2.start);
+    return script;
+  }
+  function assAt(script, ms) {
+    const out = [];
+    for (const [name, list] of script.byStyle) {
+      const style = script.styles.get(name);
+      if (!style) continue;
+      let lo = 0, hi = list.length - 1, found = -1;
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (list[mid].start <= ms) { found = mid; lo = mid + 1; } else hi = mid - 1; }
+      if (found >= 0 && ms < list[found].end && list[found].text.trim()) out.push({ style, text: list[found].text });
+    }
+    return out;
+  }
+  async function fetchRange(name, from, to) {
+    const r = await fetch('/v1/recordings/' + name, { headers: { Range: 'bytes=' + from + '-' + (to ?? '') },
+      cache: 'no-store', credentials: 'same-origin' });
+    if (r.status !== 206 && !(r.status === 200 && from === 0)) throw recError(r.status);
+    return new Uint8Array(await r.arrayBuffer());
+  }
+  function recError(status) {
+    const e = new Error(status === 401 ? 'Pairing rejected · pair this browser again'
+      : status === 404 ? 'Not found: deleted by retention, or this connector has no recordings'
+      : status === 409 ? 'This segment is still recording' : 'Jetson answered HTTP ' + status);
+    e.rec = true;
+    return e;
+  }
+  const clock = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  const megabytes = n => (n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.round(n / 1e6) + ' MB');
+
+  let recList = null, recLoading = false, recStatus = '', renderRecordings = () => {};
+  async function loadRecordings() {
+    if (cloud || recLoading) return;
+    recLoading = true; recStatus = 'Loading recordings'; renderRecordings();
+    try {
+      const r = await fetch('/v1/recordings', { cache: 'no-store', credentials: 'same-origin' });
+      if (r.status === 404) throw Object.assign(new Error("This Jetson's connector does not offer recordings (update it)"), { rec: true });
+      if (!r.ok) throw recError(r.status);
+      const body = await r.json();
+      recList = Array.isArray(body.segments) ? body.segments : [];
+      recStatus = recList.length ? recList.length + (recList.length === 1 ? ' segment' : ' segments') : 'No finished segments yet';
+    } catch (e) {
+      recStatus = e.rec ? e.message : 'Could not reach the Jetson · Refresh to retry';
+    } finally { recLoading = false; renderRecordings(); }
+  }
+  function recordingsPage() {
+    if (cloud) {
+      return [card('Recordings', hint('Recorded segments are available on a direct LAN connection: open this ' +
+        "Jetson's own address on the same Wi-Fi."))];
+    }
+    const status = hint(''), list = h('div', 'rec-days');
+    const refresh = button('Refresh', 'btn secondary', () => loadRecordings());
+    const head = card('Recordings', status, hint('3-minute segments as recorded (1080p MJPEG with telemetry captions). ' +
+      'Playback and downloads use the original files: about 15–75 Mbit/s while playing, 0.4–1.6 GB per download.'), refresh);
+    let shown = null;
+    renderRecordings = () => {
+      setText(status, recStatus);
+      refresh.disabled = recLoading;
+      if (recList === shown) return;
+      shown = recList;
+      list.replaceChildren();
+      const days = new Map();
+      for (const s of recList || []) {
+        const day = String(s.start).slice(0, 10);
+        if (!days.has(day)) days.set(day, []);
+        days.get(day).push(s);
+      }
+      let first = true;
+      for (const [day, segments] of days) {
+        const group = h('details', 'card rec-day');
+        group.open = first; first = false;
+        group.append(h('summary', null, day + ' · ' + segments.length + (segments.length === 1 ? ' segment' : ' segments')));
+        for (const s of segments) {
+          const row = h('div', 'rec-row');
+          const label = String(s.start).slice(11) + (typeof s.duration_s === 'number' ? ' · ' + clock(s.duration_s * 1000) : '');
+          const meta = megabytes(s.bytes) + (s.caption_bytes ? ' · captions' : ' · no captions');
+          const text = h('div', 'rec-text');
+          text.append(h('strong', null, label), h('span', 'hint', meta));
+          const actions = h('div', 'actions');
+          actions.append(button('Play', 'btn', () => openPlayer(s)), downloadLink(s.id + '.mkv', 'Video'));
+          if (s.caption_bytes) actions.append(downloadLink(s.id + '.ass', 'Captions'));
+          row.append(text, actions);
+          group.append(row);
+        }
+        list.append(group);
+      }
+    };
+    return [head, list];
+  }
+  function downloadLink(name, label) {
+    const a = h('a', 'btn secondary rec-link', label);
+    a.href = '/v1/recordings/' + name + '?download=1';
+    a.download = name;
+    return a;
+  }
+
+  // The player: one at a time, over the whole window.
+  let player = null;
+  function openPlayer(segment) {
+    if (player) player.close();
+    const root = h('div', 'rec-player'), stage = h('div', 'rec-stage'), canvas = h('canvas'), layer = h('div', 'rec-captions');
+    const note = h('p', 'video-note', 'Loading');
+    stage.append(canvas, layer);
+    const bar = h('div', 'rec-bar');
+    const play = button('Pause', 'btn', () => (state.playing ? pause() : resume()));
+    const seek = h('input');
+    Object.assign(seek, { type: 'range', min: 0, max: 0, step: 100, value: 0 });
+    seek.setAttribute('aria-label', 'Position');
+    const time = h('span', 'rec-time', '0:00 / 0:00');
+    const caps = button('Captions on', 'btn secondary', () => { showCaps = !showCaps; setText(caps, showCaps ? 'Captions on' : 'Captions off'); drawCaptions(); });
+    const full = button('Fullscreen', 'btn secondary', () => {
+      const req = root.requestFullscreen || root.webkitRequestFullscreen;
+      if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      else if (req) Promise.resolve(req.call(root)).then(() => screen.orientation?.lock?.('landscape').catch(() => {}), () => {});
+    });
+    const close = button('Close', 'btn secondary', () => player && player.close());
+    const title = h('span', 'rec-title', segment.start);
+    bar.append(play, seek, time, caps, downloadLink(segment.id + '.mkv', 'Download'), full, close, title);
+    root.append(stage, note, bar);
+    document.body.append(root);
+    document.documentElement.style.overflow = 'hidden';
+    const ctx = canvas.getContext('2d');
+    const name = segment.id + '.mkv';
+    const state = { playing: false, position: 0, duration: 0, info: null, clusters: [], script: null, token: 0, captions: [] };
+    let showCaps = true, dragging = false, closed = false;
+
+    function layout() {   // the stage is the letterboxed picture; captions scale with it
+      const info = state.info;
+      if (!info) return;
+      const W = root.clientWidth, H = root.clientHeight - bar.offsetHeight;
+      const s = Math.min(W / info.width, H / info.height);
+      Object.assign(stage.style, { width: info.width * s + 'px', height: info.height * s + 'px',
+        left: (W - info.width * s) / 2 + 'px', top: (H - info.height * s) / 2 + 'px' });
+      drawCaptions();
+    }
+    function drawCaptions() {
+      layer.replaceChildren();
+      if (!showCaps || !state.script) return;
+      const u = stage.clientHeight / state.script.resY;
+      for (const c of state.captions) {
+        const box = h('div', 'rec-caption', c.text), a = c.style.align, col = (a - 1) % 3, row = 2 - Math.floor((a - 1) / 3);
+        box.style.fontSize = Math.max(9, c.style.size * u) + 'px';
+        if (col === 0) box.style.left = c.style.l * u + 'px';
+        else if (col === 2) box.style.right = c.style.r * u + 'px';
+        else { box.style.left = '50%'; box.style.transform = 'translateX(-50%)'; }
+        if (row === 0) box.style.top = c.style.v * u + 'px';
+        else if (row === 2) box.style.bottom = c.style.v * u + 'px';
+        else { box.style.top = '50%'; box.style.transform = (box.style.transform || '') + ' translateY(-50%)'; }
+        layer.append(box);
+      }
+    }
+    function status(text) { note.hidden = !text; setText(note, text || ''); }
+    function updateBar() {
+      setText(play, state.playing ? 'Pause' : 'Play');
+      seek.max = state.duration;
+      if (!dragging) seek.value = state.position;
+      setText(time, clock(dragging ? +seek.value : state.position) + ' / ' + clock(state.duration));
+    }
+    const decodeFrame = frame => createImageBitmap(new Blob([frame.data], { type: 'image/jpeg' }));
+    async function show(frame, decoded) {
+      const bitmap = await (decoded || decodeFrame(frame));
+      if (closed) { bitmap.close(); return; }
+      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) { canvas.width = bitmap.width; canvas.height = bitmap.height; }
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      state.position = frame.ms;
+      const next = state.script ? assAt(state.script, frame.ms) : [];
+      if (next.map(c => c.text).join('\u0001') !== state.captions.map(c => c.text).join('\u0001')) { state.captions = next; drawCaptions(); }
+      updateBar();
+    }
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    async function playFrom(from, autoplay) {
+      const token = ++state.token, info = state.info, clusters = state.clusters;
+      state.playing = autoplay; updateBar();
+      const fetchCluster = i => fetchRange(name, clusters[i].offset,
+        (i + 1 < clusters.length ? clusters[i + 1].offset : info.cues) - 1).then(b => mkvCluster(b, info));
+      let index = clusterAt(clusters, from), next = fetchCluster(index), wall = -1, pts = 0;
+      try {
+        while (next) {
+          const waitStart = performance.now();
+          let done = false;
+          next.then(() => { done = true; }, () => {});
+          await sleep(0);
+          if (!done && autoplay) status('Buffering');
+          const frames = await next;
+          if (token !== state.token) return;
+          status('');
+          if (performance.now() - waitStart > 50) wall = -1;   // restart the clock after a stall
+          next = index + 1 < clusters.length ? fetchCluster(index + 1) : null;
+          for (let k = 0; k < frames.length; k += 1) {
+            const f = frames[k];
+            if (f.ms + info.frameMs / 2 < from) continue;
+            if (!autoplay) { await show(f); return; }
+            let now = performance.now();
+            if (wall < 0) { wall = now; pts = f.ms; }
+            const due = wall + (f.ms - pts);
+            if (now > due + 2 * info.frameMs && k < frames.length - 1) continue;   // behind: skip
+            // Decode first (off the main thread), then wait for the frame's time: decoding overlaps the wait.
+            const decoded = decodeFrame(f);
+            await decoded;
+            now = performance.now();
+            if (due > now) await sleep(due - now);
+            if (token !== state.token) { (await decoded).close(); return; }
+            await show(f, decoded);
+          }
+          index += 1;
+        }
+        state.playing = false; state.position = state.duration; updateBar();
+      } catch (e) {
+        if (token !== state.token) return;
+        state.playing = false; updateBar();
+        status(e.mkv ? 'Cannot play this segment: ' + e.message : e.rec ? e.message : 'Connection lost · Play to resume');
+      }
+    }
+    function pause() { state.token += 1; state.playing = false; status(''); updateBar(); }
+    function resume() {
+      if (!state.info) return;
+      playFrom(state.position >= state.duration - 50 ? 0 : state.position, true);
+    }
+    seek.addEventListener('input', () => { dragging = true; updateBar(); });
+    seek.addEventListener('change', () => { dragging = false; if (state.info) playFrom(+seek.value, state.playing); });
+    stage.addEventListener('click', () => (state.playing ? pause() : resume()));
+    const onResize = () => layout();
+    const onKey = e => { if (e.key === 'Escape' && !document.fullscreenElement) player && player.close(); };
+    const onHide = () => { if (document.hidden) pause(); };
+    window.addEventListener('resize', onResize);
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('visibilitychange', onHide);
+    player = {
+      close() {
+        closed = true; state.token += 1;
+        window.removeEventListener('resize', onResize);
+        window.removeEventListener('keydown', onKey);
+        document.removeEventListener('visibilitychange', onHide);
+        if (document.fullscreenElement === root) document.exitFullscreen().catch(() => {});
+        root.remove();
+        document.documentElement.style.overflow = '';
+        player = null;
+      },
+    };
+    (async () => {
+      try {
+        const info = mkvHeader(await fetchRange(name, 0, MKV.HEADER_BYTES - 1));
+        state.clusters = mkvCues(await fetchRange(name, info.cues), info);
+        if (segment.caption_bytes) {
+          try { state.script = parseAss(new TextDecoder().decode(await fetchRange(segment.id + '.ass', 0))); } catch (_) { state.script = null; }
+        }
+        caps.hidden = !state.script;
+        state.info = info; state.duration = info.durationMs;
+        if (closed) return;
+        layout();
+        playFrom(0, true);
+      } catch (e) {
+        status(e.mkv ? 'Cannot play this segment: ' + e.message : e.rec ? e.message : 'Could not reach the Jetson');
+      }
+    })();
+  }
+
   // ---- navigation and startup ----------------------------------------------
   function showPage(name) {
     for (const tab of document.querySelectorAll('.tab')) {
@@ -1112,6 +1536,7 @@
     for (const p of Object.keys(PAGES)) $('page-' + p).hidden = p !== name;
     $('title').textContent = PAGES[name];
     page = name;
+    if (name === 'recordings' && recList === null) loadRecordings();
     syncVideo();
     render();
   }
@@ -1126,6 +1551,7 @@
     $('page-live').append(cameraCard(), speedCard(), duo(recordingCard(), adasCard()), duo(positionCard(), healthCard()));
     $('page-vehicle').append(speedCard(), mapCard(), duo(powertrainCard(), positionCard()), linkCard());
     $('page-system').append(duo(healthCard(), memoryCard()), temperaturesCard(), adasCard());
+    $('page-recordings').append(...recordingsPage());
     $('page-connection').append(...(cloud ? cloudConnectionPage() : connectionPage()));
     const banner = $('banner'), statusLine = $('status'), detail = $('detail'), subtitle = $('subtitle');
     binds.push(v => {

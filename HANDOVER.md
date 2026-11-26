@@ -8,10 +8,11 @@ This file has three parts:
 
 # Start here (2026-10-12)
 
-## Outstanding work brief (2026-11-25)
+## Outstanding work brief (updated 2026-11-26)
 
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
-- **HD live view and fullscreen (2026-11-26, not deployed).** Both clients gained a Low/HD choice and fullscreen. HD sends the camera's original frames over direct LAN only, and cloud stays Low. It is built and software-tested, including the C++ sender → agent → client path on the Jetson. Next: deploy v0.4, the agent, web assets and APK, then run the HD checks. [HD log](#2026-11-26-hd-live-view-and-fullscreen-not-deployed) · [Checks](connector/VALIDATION.md#remaining-physical-acceptance)
+- **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. Four review findings are open. Address the HD sender retry loop and recovery from a stalled HD stream first. [Findings and regression checks](#2026-11-26-live-view-review)
+- **Recordings on the LAN (2026-11-26, not deployed).** Both clients can now list, play (with telemetry captions, seek and fullscreen) and download v0.4's recorded segments over a direct LAN connection. The client decodes the video; the Jetson only serves files. It is built and tested on real footage in a browser. Not deployed; the Android player has not run on a phone yet. [Log](#2026-11-26-recordings-on-the-lan-not-deployed)
 - **Connector field checks.** Exercise the Android token-refresh retry after rejection and mobile data on the A54. On the car network, check CAN/GNSS source loss and recovery, reconnect after a router or Jetson reboot, and recording performance with a phone and laptop watching. Tablet and local-browser CA checks remain. The S25 mobile-data trial, two-phone viewing and ten idle minutes already passed. [Pilot results](#2026-11-21-dashcam-connect-cloud-pilot) · [Physical checklist](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Next drive.** Secure the CSI mount, verify the connected devices and stock CSI driver, then calibrate the lane crops while parked. The IMX296 still resets in bright sun despite the gain floor. Run the parked raw-CAN loss test and collect day and night lane data. The recorder service and lane harness require separate runs. [Drive preparation](#open-work-in-priority-order)
 - **Bench work and owner decisions.** The main bench items are CSI night tuning and chart captures, MKR clock and C3 transmit-stall measurements, and display navigation/throughput checks. The turning EKF needs the antenna offset and a measured course. The incident threshold, CAN speed scale, stale-row handling and lane inference rate still need decisions. [Prioritized work and later prototypes](#open-work-in-priority-order)
@@ -408,7 +409,98 @@ compile-checked from these parts:
 
 # Log (newest first)
 
-## 2026-11-26 SD preview (720×404) replaces Low (640×360), not deployed
+## 2026-11-26 Recordings on the LAN (not deployed)
+
+- **What.** A **Recordings** page in the Android app and the web client lists the finished segments by day. Each
+  can be played (pause, seek, fullscreen, telemetry captions drawn at the recorder's positions) or downloaded
+  (`.mkv` plus `.ass`: Android to *Download/Dashcam*, web as two links). Cloud sessions show a note instead.
+  Design: [connector README, Recordings](connector/README.md#recordings-direct-lan). SSH/SFTP was considered and
+  dropped: browsers cannot use it, and it would add a second credential system.
+- **Agent** (`connector/service.py`): `GET /v1/recordings` and `GET /v1/recordings/<segment>.mkv|.ass`, which
+  support byte ranges and `?download=1`. The routes use the existing auth and read only `--storage`;
+  `--no-recordings` turns them off. Only recorder-pattern regular files are served, never symlinks. A segment
+  modified in the last 10 s is still recording and gets 409. The identity capabilities gain `recordings`.
+- **Clients read the Matroska themselves** (the codec is `V_MS/VFW/FOURCC` MJPG, which no native player
+  decodes). They fetch the header, then the Cues at the end, then 0.5 s clusters by range, one ahead. Each frame
+  is a JPEG, decoded and shown at its timestamp, and skipped when behind. `MkvReader.kt` and `AssCaptions.kt`
+  have unit tests against `recorder_fixture.mkv`, made with GStreamer's matroskamux via splitmuxsink as v0.4
+  records. The web client has the same reader in `app.js`, checked against the same fixture in Node.
+- **Measured (2026-11-26).**
+  - Jetson, temporary agent on the real footage folder: 790 segments listed in 73 ms; the recording segment
+    returns 409; byte ranges match the file; a full segment served at 62 MB/s over loopback TLS for about
+    16 ms of agent CPU per MB (about 0.1 core at Wi-Fi playback rates).
+  - Browser (Chrome-based pane on the PC, two real segments over a local harness):
+    - the list, play, seek (2:00 then captions at 74.4 km/h), pause, captions on and off, download headers and
+      close all work;
+    - frames decode in about 10 ms each at 1080p;
+    - the pane was hidden (background timing), so its 20 fps reading does not count.
+  - Agent tests: 62 pass. Android: 50 unit tests and lint pass.
+- **Not done.** Deploy (agent restart with sudo, APK), then on the phones: playback fps on the S25 and A54 over
+  Wi-Fi, a download to Download/Dashcam opening in VLC with captions, and the web page in a visible browser.
+  Cloud recordings (H.264 clips through Cloud Storage) are a separate phase. The live view review findings
+  below are not addressed by this work.
+
+## 2026-11-26 live view review
+
+Reviewed `f29119b` (LAN HD and fullscreen) and `68de9e1` (higher-resolution SD). On the S25 Ultra over
+direct Wi-Fi, fullscreen showed the UGREEN at 720×404 and 10.0 fps. Switching to HD within fullscreen showed
+1920×1080 and 30.0 fps. Cloud SD also displayed live camera frames in fullscreen. Cloud HD is disabled by
+design. These were short bench observations. Physical browser playback, sustained heat and recorder performance
+with two HD viewers still need testing. All 26 selected connector tests passed during the review.
+
+### High — the HD sender can spin when the monitor's receive queue fills
+
+- **Trigger and impact.** `MonitorHdSender::sendFrame` sends each chunk through an unconnected Unix datagram
+  socket with a destination address. On `EAGAIN` it polls the sender for `POLLOUT` and immediately retries.
+  The sender can report writable while the destination queue is still full. Repeated immediate wakeups can
+  consume a Jetson CPU core for up to the 100 ms frame budget per affected frame. This finding comes from
+  code inspection. Worker CPU under this condition has yet to be measured on the rig. [HD sender](src/monitoring_video.h)
+- **Recommended fix.** On queue pressure, sleep briefly between retries within the remaining frame deadline,
+  or abandon the rest of the frame and take the newest pending frame. Keep all waiting on the worker.
+- **Regression check.** Bind the receiving socket and pause its reader until the queue fills. Measure worker
+  thread CPU time alongside wall time and capture callback latency. Check that the drop counter advances,
+  the deadline bounds each attempt, and a fresh complete frame arrives when reading resumes. [Sender tests](src/tests/test_monitoring.cpp)
+
+### Medium — HD fallback only covers the first frame
+
+- **Reproduced.** A client received one HD frame. The test then supplied 60 SD frames. After 5.7 seconds
+  of HD silence the HD socket was still open. The first successful send sets `sent_at`, disabling the
+  five-second startup check for the rest of that socket's lifetime. Android can keep showing stale video
+  status while SD is available. [Agent video handler](connector/service.py)
+- **Recommended fix.** Keep the startup timeout and track the last fresh HD delivery with a monotonic clock.
+  After five seconds of HD silence with SD available, close the HD socket with the existing `4001` signal
+  so clients switch to SD. SD production is demand-driven. For an HD-only viewer, use a short SD probe or
+  another availability signal before using SD freshness as a fallback condition.
+- **Regression check.** Exercise an HD-only viewer and simultaneous SD/HD viewers. Deliver one HD frame,
+  stop HD while the road camera remains available, and verify a `4001` close followed by fresh SD.
+  A shorter HD interruption that recovers within the timeout should keep the viewer in HD. [Agent tests](connector/test_service.py)
+
+### Medium — Android offers HD on older SD-only agents
+
+- **Reproduced at the protocol boundary.** The agent from `4f94de4` omitted `video_hd` from its capabilities.
+  It accepted `/v1/video?quality=hd` and returned a 640×360 frame because it ignored the query parameter.
+  Android enables HD unconditionally in the LAN card and fullscreen selector. The successful socket leaves
+  HD selected while the user watches SD. [Android quality selectors](android/app/src/main/java/com/dashcam/connector/MainActivity.kt)
+- **Recommended fix.** Read `capabilities.video_hd` from the selected Jetson's authenticated, certificate-pinned
+  identity response. Enable HD only for an explicit `true`. Use the same capability in both selectors and
+  reset the selection to SD when switching to a device without HD.
+- **Regression check.** Test an agent with the field absent, one with `false`, and one with `true`. Switch
+  between them in one app session. Check both selectors and the requested video URL for each device.
+
+### Medium — a delayed browser callback can reopen fullscreen after exit
+
+- **Reproduced with the committed JavaScript handler.** Enter native fullscreen, exit within one second,
+  then let the fallback timer fire. It sees that the camera box is outside native fullscreen, adds
+  `pseudo-fs` and sets page overflow to `hidden`. The camera covers the page again and scrolling is locked.
+  [Browser fullscreen handler](connector/web/app.js)
+- **Recommended fix.** Track the active fullscreen request and its timer. Cancel the timer when native entry
+  succeeds or the user exits. The timeout and promise rejection should enter CSS fullscreen only while that
+  same request is current and the viewer still wants fullscreen.
+- **Regression check.** Enter, exit before one second, then advance the clock past one second. Verify the
+  camera stays inline and the page scrolls. Repeat with a late promise rejection. Also verify CSS fallback
+  still works when the native request fails and the viewer has kept fullscreen selected.
+
+## 2026-11-26 SD preview (720×404) replaces Low (640×360)
 
 - **What.** The preview, called **SD** in both clients (still `quality=low` on the wire), is now **720×404** at up to
   10 fps, on direct LAN and in cloud sessions. `libvideopreview` picks the libjpeg-turbo DCT scale in eighths
@@ -436,9 +528,9 @@ compile-checked from these parts:
 - **Deployed, same day, 13:41.** The Jetson runs `68de9e1` as `bin/build_20261126_060535`. The log shows
   `monitor preview: on` and `monitor HD: on`, and the UGREEN is recording at 1080p30. The S25 Ultra has
   `dashcam-connect-0.1.0-68de9e1-release.apk`, SHA-256 `a7530172f4ecd42b599f8c94da9aaaa94cab5ff3bc7369e3de9ad38380c86e41`
-  (release identity `51b92fab…`, installed in place, hash checked). SD and HD have not yet been watched on the phone.
+  (release identity `51b92fab…`, installed in place, hash checked). See the subsequent [S25 playback checks](#2026-11-26-live-view-review).
 
-## 2026-11-26 HD live view and fullscreen (not deployed)
+## 2026-11-26 HD live view and fullscreen
 
 - **What.** Live view offers **Low** (640×360, ≤ 10 fps, unchanged) and **HD**: the UGREEN's original 1080p30 JPEGs,
   byte for byte, over direct LAN only. Both clients also have **Fullscreen**. Cloud sessions show HD disabled; the

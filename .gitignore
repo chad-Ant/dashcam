@@ -4,6 +4,8 @@ archive/*
 # Recorded videos land in the archive dir (/user/dashcam == repo root under the dev
 # mount), so keep stray recordings out of git.
 *.mkv
+# ...except the 32 KB recorder-made test segment the Android Matroska reader is tested against.
+!/android/app/src/test/resources/recorder_fixture.mkv
 models/*
 docs/*
 testlogs/*

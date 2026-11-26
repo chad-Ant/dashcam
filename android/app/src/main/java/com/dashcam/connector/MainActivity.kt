@@ -86,8 +86,9 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val pages = listOf("Live", "Vehicle", "System", "Connection")
-private val marks = listOf("◉", "↗", "▥", "⌁")
+private val pages = listOf("Live", "Vehicle", "System", "Recordings", "Connection")
+private val marks = listOf("◉", "↗", "▥", "▶", "⌁")
+private const val CONNECTION_PAGE = 4
 private const val CAMERA_ITEM = "camera"
 /** Scrolled-away camera keeps its video socket this long, so a brief scroll never reopens TLS. */
 private const val CAMERA_OFFSCREEN_GRACE_MS = 2000L
@@ -107,11 +108,22 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     val state = model.repository.state.collectAsStateWithLifecycle()
     val profiles by model.profiles.collectAsStateWithLifecycle()
     val selected by model.selected.collectAsStateWithLifecycle()
+    // The segment being played, if any; its player lives while this dashboard is shown.
+    var playing by remember { mutableStateOf<RecordingSegment?>(null) }
+    val playerScope = rememberCoroutineScope()
+    val player = remember(playing) {
+        playing?.let { segment -> model.repository.openRecordings()?.let { RecordingPlayer(it, segment, playerScope).also { p -> p.start() } } }
+    }
+    DisposableEffect(player) { onDispose { player?.close() } }
+    LaunchedEffect(selected) { playing = null; model.recordings.refresh() }
+    if (player != null) RecordingPlayerDialog(player, onDownload = { model.recordings.download(player.segment) },
+        onClose = { playing = null })
     DashboardLayout(
         state = state, deviceName = profiles.find { it.id == selected }?.name ?: "Your Jetson, at a glance",
-        initialPage = if (profiles.isEmpty()) 3 else 0, onKeepAwake = onKeepAwake,
+        initialPage = if (profiles.isEmpty()) CONNECTION_PAGE else 0, onKeepAwake = onKeepAwake,
         onVideoWanted = model.repository::setVideoWanted, cameraCard = { CameraCard(model.repository) },
-        mapCard = { MapCard(model.map, model.tiles) }
+        mapCard = { MapCard(model.map, model.tiles) },
+        recordingsItems = { recordingsPage(model.recordings) { playing = it } }
     ) {
         item {
             val context = androidx.compose.ui.platform.LocalContext.current
@@ -136,7 +148,11 @@ private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake
     DashboardLayout(
         state = state, deviceName = vehicle.label + " · cloud", initialPage = 0, onKeepAwake = onKeepAwake,
         onVideoWanted = CloudSession::setDashboardVideo,
-        cameraCard = { CloudCameraCard() }, mapCard = { MapCard(map, tiles) }
+        cameraCard = { CloudCameraCard() }, mapCard = { MapCard(map, tiles) },
+        recordingsItems = { item { SurfaceCard("Recordings") {
+            Hint("Recorded segments are available on a direct LAN connection: disconnect the cloud session " +
+                "and connect to the Jetson on the same Wi-Fi.")
+        } } }
     ) {
         item { CloudSessionCard(vehicle) }
     }
@@ -197,7 +213,7 @@ private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake
 internal fun DashboardLayout(
     state: State<MonitorState>, deviceName: String, initialPage: Int, onKeepAwake: (Boolean) -> Unit,
     onVideoWanted: (Boolean) -> Unit, cameraCard: @Composable () -> Unit,
-    mapCard: @Composable () -> Unit, connectionItems: LazyListScope.() -> Unit
+    mapCard: @Composable () -> Unit, recordingsItems: LazyListScope.() -> Unit, connectionItems: LazyListScope.() -> Unit
 ) {
     val videoWanted by rememberUpdatedState(onVideoWanted)
     var page by remember { mutableIntStateOf(initialPage) }
@@ -265,7 +281,8 @@ internal fun DashboardLayout(
                             item { TemperaturesCard(state) }
                             item { AdasCard() }
                         }
-                        3 -> {
+                        3 -> recordingsItems()
+                        CONNECTION_PAGE -> {
                             connectionItems()
                             item { SurfaceCard("Display") {
                                 Row(verticalAlignment = Alignment.CenterVertically) {

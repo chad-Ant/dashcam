@@ -52,6 +52,11 @@ MAX_HD_VIEWERS = 2  # one 1080p30 viewer is 16-56 Mbit/s
 VIDEO_HD_MIN_INTERVAL = .025  # never limits a 30 fps camera
 HD_FIRST_FRAME_SECONDS = 5.0  # no HD frame by then: v0.4 does not offer HD
 HD_UNAVAILABLE = 4001  # close code: this Jetson sends no HD frames; the client falls back to Low
+# Recorded segments (direct LAN): v0.4's dashcam_<seq>_<YYYYmmdd>_<HHMMSS>.mkv plus its .ass captions, read only.
+# A segment modified this recently is still being written (no Cues yet) and is neither listed nor served.
+RECORDING_FILE = re.compile(r'(dashcam_(\d{6})_(\d{8})_(\d{6}))\.(mkv|ass)')
+RECORDING_SETTLE_SECONDS = 10
+RECORDING_TYPES = {'mkv': 'video/x-matroska', 'ass': 'text/plain; charset=utf-8'}
 CA_NETWORKS = [ipaddress.ip_network(n) for n in (
     '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '169.254.0.0/16',
     '::1/128', 'fd00::/8', 'fe80::/10')]
@@ -311,6 +316,59 @@ def video_message(frame, age_s):
                              frame['width'], frame['height']) + frame['jpeg']
 
 
+class Recordings:
+    """The footage directory as a read-only list of finished segments. Names, never paths, come from clients."""
+
+    def __init__(self, directory):
+        self.dir = Path(directory) if directory else None
+
+    def available(self):
+        return self.dir is not None and self.dir.is_dir()
+
+    def segments(self, now=None):
+        now = time.time() if now is None else now
+        found, captions = {}, {}
+        with os.scandir(self.dir) as entries:
+            for entry in entries:
+                match = RECORDING_FILE.fullmatch(entry.name)
+                if not match or not entry.is_file(follow_symlinks=False):
+                    continue
+                info = entry.stat(follow_symlinks=False)
+                if match[5] == 'ass':
+                    captions[match[1]] = info.st_size
+                elif now - info.st_mtime >= RECORDING_SETTLE_SECONDS:
+                    found[match[1]] = (match, info)
+        out = []
+        for base, (match, info) in found.items():
+            try:
+                start = dt.datetime.strptime(match[3] + match[4], '%Y%m%d%H%M%S')
+            except ValueError:
+                continue
+            # The name is the Jetson's local start time; the last write is the end.
+            duration = info.st_mtime - time.mktime(start.timetuple())
+            out.append({'id': base, 'seq': int(match[2]), 'start': start.strftime('%Y-%m-%d %H:%M:%S'),
+                        'duration_s': round(duration, 1) if 0 <= duration <= 3600 else None,
+                        'bytes': info.st_size, 'caption_bytes': captions.get(base)})
+        out.sort(key=lambda item: (item['start'], item['seq']), reverse=True)
+        return out
+
+    def resolve(self, name, now=None):
+        """(path, None) for a servable file, else (None, HTTP status)."""
+        match = RECORDING_FILE.fullmatch(name or '')
+        if not match or not self.available():
+            return None, 404
+        path = self.dir / name
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return None, 404
+        if not stat.S_ISREG(info.st_mode):
+            return None, 404
+        if match[5] == 'mkv' and (time.time() if now is None else now) - info.st_mtime < RECORDING_SETTLE_SECONDS:
+            return None, 409
+        return path, None
+
+
 def replaces(current, sequence, capture):
     """Whether a frame (sequence, capture time) may replace @p current, the latest frame of a channel."""
     return not (current and sequence <= current['source_seq'] and
@@ -319,7 +377,7 @@ def replaces(current, sequence, capture):
 
 
 class State:
-    def __init__(self, identity, storage, video_demand=None, video_hd_demand=None):
+    def __init__(self, identity, storage, video_demand=None, video_hd_demand=None, recordings_dir=None):
         self.identity = identity
         self.source = None
         self.health = {}
@@ -342,6 +400,7 @@ class State:
         self.video_hd_clients = set()
         self.video_hd_demand = Path(video_hd_demand) if video_hd_demand else None
         self.hd_demand_failed = False
+        self.recordings = Recordings(recordings_dir)
 
     def accept(self, data):
         try:
@@ -586,7 +645,8 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     async def identity(_request):
         return web.json_response({'schema': 1, 'id': state.identity['id'], 'name': state.identity['name'],
                                   'capabilities': {'vehicle': True, 'system': True, 'video': True,
-                                                   'video_hd': True, 'lane': False,
+                                                   'video_hd': True, 'recordings': state.recordings.available(),
+                                                   'lane': False,
                                                    'driver': False, 'controls': False}}, dumps=encode)
 
     async def snapshot(_request):
@@ -666,6 +726,24 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
                 await ws.close()
         return ws
 
+    async def recordings(_request):
+        if not state.recordings.available():
+            raise web.HTTPNotFound(text='No recordings on this Jetson')
+        return web.json_response({'schema': 1, 'segments': await asyncio.to_thread(state.recordings.segments)},
+                                 dumps=encode)
+
+    async def recording_file(request):
+        name = request.match_info['name']
+        path, status = await asyncio.to_thread(state.recordings.resolve, name)
+        if status == 409:
+            raise web.HTTPConflict(text='Segment still recording')
+        if path is None:
+            raise web.HTTPNotFound(text='No such segment')
+        headers = {'Content-Type': RECORDING_TYPES[name.rsplit('.', 1)[1]]}
+        if request.query.get('download') == '1':
+            headers['Content-Disposition'] = f'attachment; filename="{name}"'
+        return web.FileResponse(path, headers=headers)   # Range, If-Range and HEAD included
+
     async def shutdown(_app):
         everyone = state.clients | state.video_clients | state.video_hd_clients
         await asyncio.gather(*(ws.close(code=1001) for ws in tuple(everyone)), return_exceptions=True)
@@ -684,6 +762,8 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
     app.router.add_get('/v1/snapshot', snapshot)
     app.router.add_get('/v1/stream', stream)
     app.router.add_get('/v1/video', video)
+    app.router.add_get('/v1/recordings', recordings)
+    app.router.add_get(r'/v1/recordings/{name:[A-Za-z0-9_]+\.(?:mkv|ass)}', recording_file)
     app.on_shutdown.append(shutdown)
     if state.video_demand or state.video_hd_demand:
         app.cleanup_ctx.append(demand)
@@ -806,7 +886,8 @@ async def maintain_advertisement(address, port, identity):
 
 async def run(args, identity):
     state = State(identity, args.storage, video_demand=None if args.simulate else args.video_demand,
-                  video_hd_demand=None if args.simulate else args.video_hd_demand)
+                  video_hd_demand=None if args.simulate else args.video_hd_demand,
+                  recordings_dir=None if args.no_recordings else args.storage)
     endpoints = []
     try:
         if args.simulate:
@@ -885,6 +966,8 @@ def main():
     p.add_argument('--video-hd-demand', type=Path,
                    help='file touched while HD video viewers watch (default: video-demand-hd next to --socket)')
     p.add_argument('--storage', default='/user/output/footage')
+    p.add_argument('--no-recordings', action='store_true',
+                   help='do not offer the recorded segments in --storage to paired clients')
     p.add_argument('--web-dir', type=Path, default=Path(__file__).parent / 'web')
     p.add_argument('--browser-session-days', type=int, default=30)
     p.add_argument('--advertise-address', help='Host LAN IPv4 for mDNS; omit for manual pairing only')

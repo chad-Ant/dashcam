@@ -209,6 +209,19 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
             }
         }
     }
+    /**
+     * Pinned HTTPS access to the selected Jetson's recordings over the current Wi-Fi network,
+     * or null while no device is selected or there is no Wi-Fi. Same pin and credential as the
+     * live connection; the caller closes it.
+     */
+    fun openRecordings(): RecordingSource? {
+        val device = desired ?: return null
+        val network = wifi ?: return null
+        val base = HttpUrl.Builder().scheme("https").host(device.host).port(device.port)
+            .addPathSegments("v1/recordings").build()
+        return RecordingSource(pinnedClient(device, network).newBuilder().readTimeout(30, TimeUnit.SECONDS).build(),
+            base, device.token, device.id)
+    }
     // One pinned client per connection: the exact leaf SHA-256 is the device
     // identity, independent of DHCP hostnames/IPs. Shared by both streams so
     // the pin and hostname checks exist exactly once.

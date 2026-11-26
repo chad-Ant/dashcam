@@ -44,6 +44,8 @@ Authenticated routes. Android sends `Authorization: Bearer <device credential>`
 | `GET /v1/snapshot` | Current snapshot |
 | `GET /v1/stream` | WebSocket, same snapshot envelope at 5 Hz; read-only (any client message closes it with 1008) |
 | `GET /v1/video` | WebSocket, binary camera frames, up to 10 fps per viewer; same auth as `/v1/stream`; read-only (1008); 503 with four video viewers, see [Camera video](#camera-video) |
+| `GET /v1/recordings` | Finished recorded segments, newest first (see [Recordings](#recordings-direct-lan)); 404 when the agent offers none |
+| `GET /v1/recordings/<segment>.mkv` / `.ass` | One segment's video or captions, byte ranges supported; `?download=1` adds `Content-Disposition: attachment`; 409 while that segment is still recording |
 | `GET /v1/video?quality=hd` | WebSocket, the camera's original frames at its own rate; 503 with two HD viewers; 400 for another `quality`; closes with 4001 when no HD frame arrives within 5 s, see [HD](#hd-direct-lan-only) |
 | `POST /v1/session` | Bearer token + same-origin request → 204 and the browser session cookie |
 | `DELETE /v1/session` | Same-origin request → 204 and the cookie cleared (sign out) |
@@ -57,7 +59,8 @@ authorised). Unauthenticated static files, which contain no data or secrets:
 
 `capabilities` in `/v1/identity`: `vehicle`, `system`, `video` and `video_hd` are `true`;
 `lane`, `driver` and `controls` are `false`. `video_hd=true` means the agent offers
-`/v1/video?quality=hd`; without it the clients offer SD only. `video=true` means the agent offers
+`/v1/video?quality=hd`; without it the clients offer SD only. `recordings=true` means `/v1/recordings` lists the
+footage folder (`serve --storage`; off with `--no-recordings`). `video=true` means the agent offers
 `/v1/video`; frames only arrive when v0.4 has the preview enabled. With an older
 agent (no `video` capability, `/v1/video` answers 404) both clients show that
 this Jetson offers no video instead of a picture.
@@ -405,6 +408,47 @@ and height 1–4096 and a sequence greater than the last one shown. The web
 client displays it through a `blob:` object URL (the Content-Security-Policy
 allows `img-src 'self' data: blob:`) and revokes the previous URL once the new
 image has loaded.
+
+## Recordings (direct LAN)
+
+Both clients have a **Recordings** page that lists v0.4's finished segments by day, newest first.
+- **Each segment** is a 3-minute `dashcam_<seq>_<YYYYmmdd>_<HHMMSS>.mkv` (1080p MJPEG, 0.4–1.6 GB) with its
+  `.ass` telemetry captions (0.3–0.8 MB). The time in the name is the Jetson's local start time; a segment made
+  before the clock was set shows under 1970-01-01.
+- **Play** opens a full-window player, with fullscreen, pause and seek. Captions are drawn where the recorder's
+  styles put them (corners, top centre, left middle), and can be turned off.
+- **Download** saves the original files:
+  - Android: both files in *Download/Dashcam*. On Android 9, the app's own Download folder.
+  - Web: two links.
+
+  VLC loads the captions automatically when they sit next to the video with the same name.
+
+**The client does the playback; the Jetson only moves bytes.** The agent lists the folder and serves the two
+files by byte range. It never decodes, converts or deletes anything. The client reads the Matroska itself:
+1. the header (first 64 KiB): codec `V_MS/VFW/FOURCC` MJPG, size, duration;
+2. the Cues at the end of the file (about 170 KB): where each 0.5 s cluster starts;
+3. whole clusters by range, one ahead, decoding each frame's JPEG and showing it at its timestamp.
+
+When decoding falls behind, frames are skipped rather than delayed, and a seek jumps straight to the cluster
+that holds the target time. The Android reader (`MkvReader.kt`, `AssCaptions.kt`) is unit-tested against a
+segment written by the recorder's own muxer (`src/test/resources/recorder_fixture.mkv`). The web client has
+the same reader in `app.js`.
+
+**What it costs.**
+- **Wi-Fi:** playback needs the original bitrate, about 16 Mbit/s for a bench scene, 41 at night, 73 for
+  detailed daylight. On a slower link the player buffers.
+- **Jetson CPU:** serving costs the agent about 16 ms of CPU per MB over TLS (measured 2026-11-26 on the
+  Jetson, real footage). That is about 0.1 of a core at playback rates; a full-speed download uses more.
+- **Speed:** listing 790 segments takes about 70 ms.
+
+**What is not served.** Only names matching the recorder's pattern, as regular files in the folder, never
+symlinks. Requests are by name, never by path. The segment still being written (modified in the last 10 s,
+with no Cues yet) is neither listed nor served (409). A segment that retention deletes while it plays or
+downloads ends with "Not found".
+
+**Privacy.** Recordings are a location and time history. On the LAN they need the same pairing credential or
+browser session as live view. Run the agent with `--no-recordings` to withhold them. Cloud sessions do not
+offer recordings yet: their Recordings page says to connect on the LAN.
 
 ## Vehicle map
 

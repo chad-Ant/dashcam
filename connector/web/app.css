@@ -226,3 +226,24 @@ code {
   }
   .duo { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
 }
+/* Recordings: days as native collapsible groups, rows of segments, and the full-window player. */
+.rec-days { display: flex; flex-direction: column; gap: 12px; }
+.rec-day summary { cursor: pointer; font-weight: 600; color: var(--muted); }
+.rec-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px;
+  padding: 10px 0; border-top: 1px solid var(--line); }
+.rec-text { display: flex; flex-direction: column; gap: 2px; }
+.rec-link { display: inline-flex; align-items: center; text-decoration: none; }
+.rec-player { position: fixed; inset: 0; z-index: 1000; background: #000; color: var(--video-text); }
+.rec-stage { position: absolute; cursor: pointer; }
+.rec-stage canvas { display: block; width: 100%; height: 100%; }
+.rec-captions { position: absolute; inset: 0; pointer-events: none; }
+.rec-caption { position: absolute; white-space: pre; font-family: ui-monospace, monospace; font-weight: 700;
+  line-height: 1.15; color: #fff; background: rgba(0, 0, 0, .78); padding: 0 .25em; border-radius: 2px; }
+.rec-player .video-note { position: absolute; inset: 0 0 64px 0; pointer-events: none; color: #ffca80; }
+.rec-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding: 8px max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  background: rgba(0, 0, 0, .7); }
+.rec-bar input[type=range] { flex: 1 1 200px; accent-color: var(--accent); }
+.rec-time { font-variant-numeric: tabular-nums; }
+.rec-title { flex-basis: 100%; font-size: .8rem; color: #a2b3c3; }
+.rec-player:fullscreen { width: 100%; height: 100%; }

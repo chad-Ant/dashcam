@@ -21,6 +21,8 @@ class DashboardModel(app: Application) : AndroidViewModel(app) {
     // Vehicle map: view state and last known position in memory only, OSM tiles.
     val map = MapViewState()
     val tiles = TileLoader(app, viewModelScope)
+    // Recorded segments over the direct LAN: the list and the downloads.
+    val recordings = RecordingsBrowser(app, repository, viewModelScope)
     init {
         repository.select(saved.value.firstOrNull())
         viewModelScope.launch {
