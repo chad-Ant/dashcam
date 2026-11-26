@@ -411,6 +411,46 @@ compile-checked from these parts:
 
 ## 2026-11-26 Recordings on the LAN (not deployed)
 
+**First run on the S25 (15:32–15:46): two crashes, both fixed; the Android release APK is reinstalled.**
+- **The app stopped on every open.** `RecordingSource.close()` evicted OkHttp's connection pool on the caller's
+  thread. Closing a TLS connection writes `close_notify`, so the call raised `NetworkOnMainThreadException`
+  when it came from the main thread: the list refresh's `finally` (the startup refresh is always cancelled
+  once) and the player's dispose. It now runs on a background thread.
+- **Play crashed** with `ExceptionInInitializerError`. The caption regex `\{[^}]*}` has a bare `}` that the
+  desktop JVM accepts but Android's ICU engine rejects, so the JVM unit tests could not catch it. Both braces
+  are now escaped.
+- **Checked over adb on the S25** with `dashcam-connect-0.1.0-closefix-release.apk` (SHA-256 `f92ef659…`):
+  - launch: Live connected, HD offered (capability true);
+  - Recordings: 811 segments;
+  - Play: landscape fullscreen with captions at all five positions, real-time playback (0:08 → 0:30 matching
+    the recorded clock caption 15:40:28 → 15:40:50), about 85% of one core while decoding 1080p;
+  - Back closed the player.
+  - The crash buffer stayed empty throughout. A download to the phone was not tried.
+- **Lesson:** run new Android code on a phone before deploying. JVM tests miss Android-only behaviour
+  (StrictMode, ICU regex).
+- **Download on the S25 (15:50–16:02).**
+  - Segment 000901 (353 MB) took 64 s. The video's SHA-256 matches the Jetson's original.
+  - **A third bug, fixed:** the captions were saved as `….ass.txt`, so a player would not pick them up.
+    MediaStore appends the extension of a MIME type that does not match the name (`text/plain`). The `.ass`
+    is now inserted without a type. Re-downloading 000905 gave exactly `….mkv` plus `….ass` (both hashes match
+    the Jetson's), replacing the earlier copy without a "(1)" duplicate. Earlier copies of the same name are
+    deleted first.
+  - VLC is not installed on the S25, so the caption pickup itself was not tried.
+- **Jetson resources during the phone test** (1 Hz sampler, 6 cores; mean / peak):
+
+  | Phase | Whole Jetson | Agent (one core) | Recorder (one core) | Network out | Disk read |
+  |---|---|---|---|---|---|
+  | Idle (21 s) | 5.3 / 7.8 % | 1.3 / 3 % | 10.4 / 12 % | 0.1 Mbit/s | 0 |
+  | Playback, bench segment (42 s) | 3.6 / 11.3 % | 7.4 / 12 % | 8.8 / 11 % | 16 / 28 Mbit/s | 0 |
+  | Download, 353 MB (64 s) | 7.4 / 10.6 % | 16.2 / 19.9 % | 8.7 / 12 % | 46 / 54.5 Mbit/s | 0 |
+
+  - Download totals: 369 MB on the wire (TLS/TCP overhead about 4.5 %), 46 Mbit/s mean, about 28 ms of agent
+    CPU per MB.
+  - Recording was unaffected: recorder CPU stayed at its idle level and disk writes at 2.0 MB/s throughout.
+  - The served file was recent and in the page cache, so there were no disk reads; an old segment would read
+    from the NVMe at the same rate.
+  - Memory available stayed at about 6.05 GB, and the agent's RSS at about 47 MB.
+
 - **What.** A **Recordings** page in the Android app and the web client lists the finished segments by day. Each
   can be played (pause, seek, fullscreen, telemetry captions drawn at the recorder's positions) or downloaded
   (`.mkv` plus `.ass`: Android to *Download/Dashcam*, web as two links). Cloud sessions show a note instead.

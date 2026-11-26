@@ -36,7 +36,9 @@ class AssScript(val playResX: Int, val playResY: Int, val styles: Map<String, As
     }
 
     companion object {
-        private val OVERRIDE = Regex("\\{[^}]*}")
+        // Both braces escaped: Android's ICU regex engine rejects a bare "}" that the desktop JVM accepts
+        // (PatternSyntaxException at class load, which crashed playback; the JVM unit tests never saw it).
+        private val OVERRIDE = Regex("\\{[^}]*\\}")
         private const val BYTE_ORDER_MARK = 0xFEFF.toChar()
 
         /** h:mm:ss.cc (centiseconds) to milliseconds; -1 when malformed. */

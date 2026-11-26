@@ -98,7 +98,12 @@ class RecordingSource(private val client: OkHttpClient, private val base: HttpUr
         }
     }
 
-    override fun close() { client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown() }
+    // Closing an idle TLS connection writes close_notify: network I/O, which Android forbids on the main
+    // thread (NetworkOnMainThreadException). Callers close from the main thread (a refresh's finally block,
+    // the player's dispose), so the eviction always runs on a thread of its own.
+    override fun close() {
+        Thread({ client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown() }, "recordings-close").start()
+    }
 }
 
 data class RecordingsState(val status: String = "", val loading: Boolean = false,
@@ -174,10 +179,17 @@ class RecordingsBrowser(private val context: Context, private val repository: Mo
     private fun save(name: String, write: (OutputStream) -> Unit): String {
         if (Build.VERSION.SDK_INT >= 29) {
             val resolver = context.contentResolver
+            val folder = Environment.DIRECTORY_DOWNLOADS + "/Dashcam/"
+            // A second download of a segment replaces this app's earlier copy instead of adding "name (1).mkv".
+            resolver.delete(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                "${MediaStore.Downloads.RELATIVE_PATH} = ? AND ${MediaStore.Downloads.DISPLAY_NAME} = ?", arrayOf(folder, name))
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, name)
-                put(MediaStore.Downloads.MIME_TYPE, if (name.endsWith(".mkv")) "video/x-matroska" else "text/plain")
-                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Dashcam")
+                // Only the video gets a type. MediaStore appends the extension of any type that does not
+                // match the name ("text/plain" turned x.ass into x.ass.txt, which players do not pick up
+                // as captions); without one it keeps the name exactly.
+                if (name.endsWith(".mkv")) put(MediaStore.Downloads.MIME_TYPE, "video/x-matroska")
+                put(MediaStore.Downloads.RELATIVE_PATH, folder)
                 put(MediaStore.Downloads.IS_PENDING, 1)
             }
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
