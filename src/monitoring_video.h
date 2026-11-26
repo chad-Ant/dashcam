@@ -1,7 +1,7 @@
 #pragma once
 // Best-effort camera preview for the host monitoring agent (connector/README.md,
 // "Camera video").  A second VideoPreview converts the recording camera's JPEGs
-// to 640x360 while a viewer watches; this sink sends each one as ONE nonblocking
+// to SD, 720x404, while a viewer watches; this sink sends each one as ONE nonblocking
 // Unix datagram.  Never opens a camera, never waits for the agent: a missing or
 // stalled agent only drops preview frames, recording is unaffected.
 //
@@ -35,8 +35,10 @@
 namespace dashcam::monitor {
 constexpr size_t   kVideoHeaderBytes   = 24;
 constexpr size_t   kVideoMaxJpegBytes  = 65536;   ///< = the monitor preview's PreviewConfig::maxJpegBytes.
-constexpr uint16_t kVideoCanvasWidth   = 640;
-constexpr uint16_t kVideoCanvasHeight  = 360;
+// SD: a 16:9 camera fills 720x404 of this canvas (the letterbox keeps sizes even), which
+// the converter decodes at 3/8 (1920x1080 -> 720x405) and crops by one row: no resampling.
+constexpr uint16_t kVideoCanvasWidth   = 720;
+constexpr uint16_t kVideoCanvasHeight  = 406;
 constexpr double   kVideoDemandFreshSec = 3.0;    ///< Demand file older (or newer) than this = nobody watching.
 
 inline void putLe(uint8_t* out, uint64_t v, size_t bytes) {
@@ -162,7 +164,7 @@ private:
 // every recorded camera JPEG goes to the agent byte for byte, at the camera's
 // rate.  A 1080p MJPEG frame (60-400 KB) does not fit one Unix datagram
 // (net.core.wmem_max is 212992 on the Jetson), so each frame is cut into chunks,
-// each its own datagram on the same socket as the 640x360 preview:
+// each its own datagram on the same socket as the SD preview:
 //
 //   0-3 "DCH1", 4-7 uint32 header length (32), 8-15 uint64 capture
 //   CLOCK_MONOTONIC us, 16-19 uint32 source sequence, 20-21 uint16 width,

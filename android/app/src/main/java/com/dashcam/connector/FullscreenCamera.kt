@@ -74,7 +74,7 @@ internal fun FullscreenCamera(onExit: () -> Unit, controls: @Composable RowScope
 }
 
 /**
- * Low / HD. [hdAllowed] false (a cloud session) shows HD disabled; Low is then the only choice.
+ * SD / HD. [hdAllowed] false (a cloud session) shows HD disabled; SD is then the only choice.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -82,7 +82,7 @@ internal fun QualitySelector(quality: VideoQuality, hdAllowed: Boolean, onSelect
     SingleChoiceSegmentedButtonRow {
         VideoQuality.entries.forEachIndexed { index, option ->
             SegmentedButton(selected = quality == option, onClick = { onSelect(option) },
-                enabled = option == VideoQuality.LOW || hdAllowed,
+                enabled = option == VideoQuality.SD || hdAllowed,
                 shape = SegmentedButtonDefaults.itemShape(index, VideoQuality.entries.size)) {
                 Text(option.label)
             }

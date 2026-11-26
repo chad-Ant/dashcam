@@ -1796,7 +1796,7 @@ int main(int argc, char* argv[]) {
 
     // ── monitoring agent: camera preview (optional) ──────────────────────────
     // <Network><MonitoringVideoEnabled> (with MonitoringEnabled): a second
-    // converter makes 640x360 JPEGs of the recording camera, but only while the
+    // converter makes SD (720x404) JPEGs of the recording camera, but only while the
     // agent's demand file is fresh (someone watches the Live tab); each goes to
     // the agent as one nonblocking datagram.  Like the display preview it never
     // gates recording: any failure leaves the agent without video.

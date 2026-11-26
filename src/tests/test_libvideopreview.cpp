@@ -447,6 +447,21 @@ static void testDctScale() {
         {1919, 1079, 240, 135, 8, "odd source: ceil() sizes (240x135 at 1/8)"},
     };
     for (const Case& c : cases) check(chooseDctScaleDenom(c.sw, c.sh, c.vw, c.vh) == c.want, c.what);
+
+    // Eighths (what the converter uses): the smallest M/8 that still covers the viewport.
+    const Case eighths[] = {
+        {1920, 1080, 720, 404, 3, "1080p -> 720x404 (monitor): 3/8 (720x405)"},
+        {1920, 1080, 640, 360, 3, "1080p -> 640x360: 3/8 (720x405), not 1/2"},
+        {1920, 1080, 320, 180, 2, "1080p -> 320x180 (display): 2/8 = 1/4, unchanged"},
+        {1280, 720, 320, 180, 2, "720p -> 320x180: 2/8, exactly 320x180"},
+        {640, 480, 320, 240, 4, "640x480 -> 320x240: 4/8 = 1/2, unchanged"},
+        {3840, 2160, 320, 180, 1, "4K -> 320x180: 1/8"},
+        {1920, 1080, 960, 540, 4, "1080p -> 960x540: 4/8"},
+        {1920, 1080, 961, 540, 5, "one pixel past 4/8: 5/8"},
+        {1919, 1079, 720, 404, 3, "odd source: ceil() sizes (720x405 at 3/8)"},
+        {16, 16, 240, 240, 8, "16x16 upscale: full size"},
+    };
+    for (const Case& c : eighths) check(chooseDctScaleEighths(c.sw, c.sh, c.vw, c.vh) == c.want, c.what);
 }
 
 static void testPool() {
@@ -558,8 +573,23 @@ static void testConverter() {
     {
         const auto j = makeJpeg(1920, 1080, Fmt::S420, solid(10, 120, 250));
         const ConvertResult r = run(j, 640, 480);
-        check(r.status == ConvertStatus::Ok && r.viewport == Viewport{0, 60, 640, 360} && r.scaleDenom == 2,
-              "640x480 canvas: 640x360 at DCT 1/2");
+        check(r.status == ConvertStatus::Ok && r.viewport == Viewport{0, 60, 640, 360} && r.scaleEighths == 3 &&
+                  r.scaleDenom == 0,
+              "640x480 canvas: 640x360 from a 3/8 decode (720x405)");
+        // The monitor preview: 720x406 canvas, a 3/8 decode (720x405) cropped by one row, no filter.
+        const ConvertResult rm = run(j, 720, 406);
+        const Img im = rm.status == ConvertStatus::Ok ? decodeJpeg(out.data(), rm.jpegBytes) : Img{};
+        const uint8_t blue[3] = {10, 120, 250};
+        check(rm.status == ConvertStatus::Ok && rm.viewport == Viewport{0, 1, 720, 404} && rm.scaleEighths == 3 &&
+                  im.ok && im.w == 720 && im.h == 404 && im.maxDiff(blue) <= 10,
+              "720x406 canvas (monitor): 720x404 from a 3/8 decode, colour kept");
+        const auto lr = makeJpeg(1920, 1080, Fmt::S420, leftRight(1920));
+        const ConvertResult rl = run(lr, 720, 406);
+        const Img il = rl.status == ConvertStatus::Ok ? decodeJpeg(out.data(), rl.jpegBytes) : Img{};
+        const uint32_t q = il.ok ? il.w / 4 : 0;
+        check(il.ok && il.mean(0, 0, q, il.h, 0) > 190 && il.mean(0, 0, q, il.h, 2) < 70 &&
+                  il.mean(il.w - q, 0, il.w, il.h, 2) > 190 && il.mean(il.w - q, 0, il.w, il.h, 0) < 70,
+              "720x406 canvas (monitor): left/right split stays put through the crop path");
         const ConvertResult r2 = run(j, 160, 120);
         check(r2.status == ConvertStatus::Ok && r2.viewport == Viewport{0, 15, 160, 90} && r2.scaleDenom == 8,
               "160x120 canvas: 160x90 at DCT 1/8");

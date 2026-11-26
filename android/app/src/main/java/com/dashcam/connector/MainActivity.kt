@@ -154,8 +154,8 @@ private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake
             Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(CameraCorner)))
         else Hint(if (camera) "Waiting for camera frames" else "Live view off")
         // The cloud relay carries the preview only: HD needs the Jetson on the same Wi-Fi.
-        QualitySelector(VideoQuality.LOW, hdAllowed = false, onSelect = {})
-        Hint("HD needs a direct LAN connection · cloud sessions show Low")
+        QualitySelector(VideoQuality.SD, hdAllowed = false, onSelect = {})
+        Hint("HD needs a direct LAN connection · cloud sessions show SD")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = { CloudSession.setCamera(!camera) }) {
                 Text(if (camera) "Stop live view" else "Start live view")
@@ -164,8 +164,8 @@ private fun CloudDashboard(vehicle: CloudVehicle, tiles: TileLoader, onKeepAwake
         }
     }
     if (fullscreen) FullscreenCamera(onExit = { fullscreen = false },
-        controls = { QualitySelector(VideoQuality.LOW, hdAllowed = false, onSelect = {}) },
-        caption = { Hint("Cloud · Low quality") }) {
+        controls = { QualitySelector(VideoQuality.SD, hdAllowed = false, onSelect = {}) },
+        caption = { Hint("Cloud · SD quality") }) {
         val frame = picture
         if (frame != null) Image(frame.asImageBitmap(), "Dashcam camera", Modifier.fillMaxSize(),
             contentScale = ContentScale.Fit)
@@ -445,8 +445,8 @@ private data class BannerUi(val fresh: Boolean, val title: String, val detail: S
     }
 }
 internal fun qualityHint(quality: VideoQuality) = when (quality) {
-    VideoQuality.LOW -> "Low: 640×360 at up to 10 fps, about 1–5 Mbit/s"
-    VideoQuality.HD -> "HD: the camera's original frames, up to 30 fps · 15–60 Mbit/s of Wi-Fi"
+    VideoQuality.SD -> "SD: 720×404 at up to 10 fps, about 2–4 Mbit/s"
+    VideoQuality.HD -> "HD: the camera's original frames, up to 30 fps · 15–75 Mbit/s of Wi-Fi"
 }
 @Composable private fun BoxScope.FullscreenPicture(video: State<VideoState>, live: State<LiveViewState>,
                                                    pictures: StateFlow<Bitmap?>) {

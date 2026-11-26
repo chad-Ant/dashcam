@@ -43,11 +43,11 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
     private var latestFrame: VideoFrame? = null
     private val liveMutable = MutableStateFlow(LiveViewState())
     val liveView = liveMutable.asStateFlow()
-    // Low (640x360 preview) or HD (the camera's original frames). Kept for the app's lifetime;
-    // every app start begins at Low, like live view itself.
-    private val qualityMutable = MutableStateFlow(VideoQuality.LOW)
+    // SD (720x404 preview) or HD (the camera's original frames). Kept for the app's lifetime;
+    // every app start begins at SD, like live view itself.
+    private val qualityMutable = MutableStateFlow(VideoQuality.SD)
     val quality = qualityMutable.asStateFlow()
-    // Why HD fell back to Low (this Jetson sends no original frames); null otherwise.
+    // Why HD fell back to SD (this Jetson sends no original frames); null otherwise.
     private val qualityNoteMutable = MutableStateFlow<String?>(null)
     val qualityNote = qualityNoteMutable.asStateFlow()
     private val liveSession = LiveViewSession()
@@ -341,10 +341,10 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
                         videoStatus(epoch, "Allow local network access in Android settings")
                         return@launch
                     } catch (_: HdUnavailable) {
-                        // This Jetson sends no original frames (HD off in v0.4, or an older recorder): show Low.
+                        // This Jetson sends no original frames (HD off in v0.4, or an older recorder): show SD.
                         if (videoGeneration.get() == epoch) {
-                            qualityMutable.value = VideoQuality.LOW
-                            qualityNoteMutable.value = "HD is not offered by this Jetson · showing Low"
+                            qualityMutable.value = VideoQuality.SD
+                            qualityNoteMutable.value = "HD is not offered by this Jetson · showing SD"
                             restartVideo()
                         }
                         return@launch

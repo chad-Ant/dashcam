@@ -37,9 +37,9 @@
   let vws = null, vAttempt = 0, vTimer = 0, vOpenedMs = 0, vMsgMs = 0, vLastSeq = 0;
   let vImg = null, vUrl = null, vLoadingUrl = null, vLoading = null, vPending = null;
   let vMeta = null, vShownMs = 0, vTimes = [];
-  // Low = the 640x360 preview (LAN and cloud); HD = the camera's original frames, direct LAN only
-  // (/v1/video?quality=hd). Never stored: every load starts at Low, like live view.
-  const HD_UNAVAILABLE = 4001;   // close code: the Jetson sends no original frames, fall back to Low
+  // SD = the 720x404 preview (LAN and cloud; quality 'low' on the wire); HD = the camera's original
+  // frames, direct LAN only (/v1/video?quality=hd). Never stored: every load starts at SD, like live view.
+  const HD_UNAVAILABLE = 4001;   // close code: the Jetson sends no original frames, fall back to SD
   let vQuality = 'low', vQualityNote = '';
   // Video also pauses while the camera box is scrolled fully out of view (after a short grace).
   const OFFSCREEN_GRACE_MS = 2000;
@@ -170,7 +170,7 @@
     const el = h('div', 'segmented'), buttons = {};
     el.setAttribute('role', 'group');
     el.setAttribute('aria-label', 'Video quality');
-    for (const [value, label] of [['low', 'Low'], ['hd', 'HD']]) {
+    for (const [value, label] of [['low', 'SD'], ['hd', 'HD']]) {
       buttons[value] = button(label, 'seg', ev => { ev.stopPropagation(); setQuality(value); });
       el.append(buttons[value]);
     }
@@ -186,11 +186,11 @@
   }
   function hdAllowed() { return !cloud && identity?.capabilities?.video_hd === true; }
   function qualityText(hd) {
-    if (cloud) return 'HD needs a direct LAN connection · cloud sessions show Low';
+    if (cloud) return 'HD needs a direct LAN connection · cloud sessions show SD';
     if (vQualityNote) return vQualityNote;
-    if (identity && !hd) return "This Jetson's connector offers Low only";
-    return vQuality === 'hd' ? "HD: the camera's original frames, up to 30 fps · 15–60 Mbit/s of Wi-Fi"
-      : 'Low: 640×360 at up to 10 fps, about 1–5 Mbit/s';
+    if (identity && !hd) return "This Jetson's connector offers SD only";
+    return vQuality === 'hd' ? "HD: the camera's original frames, up to 30 fps · 15–75 Mbit/s of Wi-Fi"
+      : 'SD: 720×404 at up to 10 fps, about 2–4 Mbit/s';
   }
   function setQuality(value) {
     vQualityNote = '';
@@ -1039,7 +1039,7 @@
       vws = null;
       resetVideoFrames();
       if (ev.code === HD_UNAVAILABLE) {   // no original frames from this Jetson: Low, at once
-        vQuality = 'low'; vQualityNote = 'HD is not offered by this Jetson · showing Low';
+        vQuality = 'low'; vQualityNote = 'HD is not offered by this Jetson · showing SD';
         vAttempt = 0;
         syncVideo();
         render();

@@ -10,9 +10,11 @@
  * still waiting).  One worker thread then
  *   1. reads the JPEG header and fits the source into the sink's canvas
  *      (computeLetterbox(): aspect preserved, never stretched or cropped);
- *   2. decodes with libjpeg DCT scaling (chooseDctScaleDenom(): 1080p → 1/4,
- *      480×270 — the plan's measured 3× saving over a full decode);
- *   3. area-averages to the viewport (exact integer box filter, deterministic);
+ *   2. decodes with libjpeg DCT scaling in 1/8 steps (chooseDctScaleEighths():
+ *      1080p → 2/8 = 480×270 for the display, 3/8 = 720×405 for the monitor's
+ *      720×404 — the plan's measured 3× saving over a full decode);
+ *   3. area-averages to the viewport (exact integer box filter, deterministic),
+ *      or just crops when the scaled decode is within one pixel of it;
  *   4. encodes a baseline 4:2:0 JPEG straight into a free slot of a fixed
  *      two-slot output pool, retrying ONCE at the minimum quality when the
  *      result would exceed the byte cap;
@@ -67,8 +69,8 @@ namespace dashcam::preview {
 // ─── hard limits ──────────────────────────────────────────────────────────────
 
 constexpr uint32_t kMaxSourceDimension = 8192;     ///< Larger JPEG headers are rejected.
-constexpr uint16_t kMaxCanvasWidth     = 640;      ///< Largest display canvas served
-constexpr uint16_t kMaxCanvasHeight    = 480;      ///< (the ES3C28P is 320×240).
+constexpr uint16_t kMaxCanvasWidth     = 960;      ///< Largest canvas served (the ES3C28P is
+constexpr uint16_t kMaxCanvasHeight    = 540;      ///< 320×240, the monitor preview 720×406).
 constexpr uint32_t kMinTargetFps       = 1;        ///< PreviewConfig::targetFps range —
 constexpr uint32_t kMaxTargetFps       = 15;       ///< the plan's supported 1–15 fps.
 constexpr size_t   kMinJpegBytes       = 1024;     ///< PreviewConfig::maxJpegBytes range.
@@ -119,6 +121,17 @@ Viewport computeLetterbox(uint32_t srcW, uint32_t srcH, uint16_t canvasW, uint16
  *        in both dimensions.  1 when even the full size is smaller (upscale).
  */
 uint32_t chooseDctScaleDenom(uint32_t srcW, uint32_t srcH, uint32_t viewW, uint32_t viewH);
+
+/**
+ * @brief The libjpeg DCT scale in eighths (scale_num M with scale_denom 8, the
+ *        libjpeg v7+ scaling libjpeg-turbo implements) for decoding srcW×srcH
+ *        toward a viewW×viewH viewport: the smallest M in 1..8 whose output
+ *        (ceil(src × M / 8) per axis) is still at least the viewport in both
+ *        dimensions.  8 (full size) when even that is smaller (upscale).
+ *        Finer than chooseDctScaleDenom(): 1080p → 720×404 decodes at 3/8
+ *        (720×405) instead of 1/2 (960×540), with no resampling at all.
+ */
+uint32_t chooseDctScaleEighths(uint32_t srcW, uint32_t srcH, uint32_t viewW, uint32_t viewH);
 
 // ─── output frames ────────────────────────────────────────────────────────────
 
@@ -277,7 +290,8 @@ struct ConvertResult {
     bool          retried      = false;  ///< The first encode was over the cap.
     uint32_t      sourceWidth  = 0;      ///< From the JPEG header (0 if unreadable).
     uint32_t      sourceHeight = 0;
-    uint32_t      scaleDenom   = 0;      ///< libjpeg DCT scale used (1/2/4/8).
+    uint32_t      scaleEighths = 0;      ///< libjpeg DCT scale used, in eighths (3 = 3/8).
+    uint32_t      scaleDenom   = 0;      ///< The same as 1/scaleDenom when it is 1/1, 1/2, 1/4 or 1/8; else 0.
     uint32_t      warnings     = 0;      ///< Benign libjpeg warnings (metadata quirks).
     double        decodeMs     = 0.0;
     double        resizeMs     = 0.0;
@@ -365,7 +379,8 @@ struct PreviewStats {
     int      lastQuality          = 0;
     uint32_t lastSourceWidth      = 0;
     uint32_t lastSourceHeight     = 0;
-    uint32_t lastScaleDenom       = 0;
+    uint32_t lastScaleDenom       = 0;   ///< 0 for a scale that is not 1/1, 1/2, 1/4 or 1/8.
+    uint32_t lastScaleEighths     = 0;
     Viewport lastViewport;
     size_t   outputSlotsFree      = 0; ///< Free output slots now (0 when stopped).
     uint32_t timingSamples        = 0; ///< Frames in the timing window.
@@ -480,7 +495,7 @@ private:
     mutable std::mutex statsMu_;
     size_t     lastJpegBytes_ = 0, maxJpegBytes_ = 0;
     int        lastQuality_ = 0;
-    uint32_t   lastSourceW_ = 0, lastSourceH_ = 0, lastScaleDenom_ = 0;
+    uint32_t   lastSourceW_ = 0, lastSourceH_ = 0, lastScaleDenom_ = 0, lastScaleEighths_ = 0;
     Viewport   lastViewport_;
     double     lastDecodeMs_ = 0, lastResizeMs_ = 0, lastEncodeMs_ = 0, lastTotalMs_ = 0;
     TimingRing decodeRing_, resizeRing_, encodeRing_, totalRing_;

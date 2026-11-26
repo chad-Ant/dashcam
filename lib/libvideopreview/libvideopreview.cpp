@@ -245,7 +245,7 @@ bool VideoPreview::start(const PreviewConfig& cfg, IPreviewSink& sink, dashcam::
         std::lock_guard<std::mutex> sl(statsMu_);
         lastJpegBytes_ = maxJpegBytes_ = 0;
         lastQuality_ = 0;
-        lastSourceW_ = lastSourceH_ = lastScaleDenom_ = 0;
+        lastSourceW_ = lastSourceH_ = lastScaleDenom_ = lastScaleEighths_ = 0;
         lastViewport_ = Viewport{};
         lastDecodeMs_ = lastResizeMs_ = lastEncodeMs_ = lastTotalMs_ = 0;
         decodeRing_ = resizeRing_ = encodeRing_ = totalRing_ = TimingRing{};
@@ -578,6 +578,7 @@ void VideoPreview::processFrame(const InputSlot& in) {
     lastSourceW_    = r.sourceWidth;
     lastSourceH_    = r.sourceHeight;
     lastScaleDenom_ = r.scaleDenom;
+    lastScaleEighths_ = r.scaleEighths;
     lastViewport_   = r.viewport;
     lastDecodeMs_   = r.decodeMs;
     lastResizeMs_   = r.resizeMs;
@@ -626,6 +627,7 @@ PreviewStats VideoPreview::stats() const {
     s.lastSourceWidth  = lastSourceW_;
     s.lastSourceHeight = lastSourceH_;
     s.lastScaleDenom   = lastScaleDenom_;
+    s.lastScaleEighths = lastScaleEighths_;
     s.lastViewport     = lastViewport_;
     s.outputSlotsFree  = pool_ ? pool_->freeSlots() : 0;
     s.timingSamples    = totalRing_.count;

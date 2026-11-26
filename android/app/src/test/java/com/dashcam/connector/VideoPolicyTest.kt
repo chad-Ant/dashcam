@@ -99,7 +99,7 @@ class VideoPolicyTest {
     }
 
     @Test fun qualityQueryAndCloseCode() {
-        assertNull(VideoQuality.LOW.query)   // the unchanged /v1/video route, which older agents serve
+        assertNull(VideoQuality.SD.query)   // the unchanged /v1/video route, which older agents serve
         assertEquals("hd", VideoQuality.HD.query)
         assertEquals(4001, HD_UNAVAILABLE_CLOSE_CODE)
     }

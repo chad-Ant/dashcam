@@ -53,7 +53,7 @@ void testVideo() {
     assert(sink.open(sockPath, demandPath));
     assert(!sink.open(sockPath, demandPath));   // once
     const pv::PreviewDemand d0 = sink.demand();
-    assert(!d0.active && d0.canvasW == 640 && d0.canvasH == 360 && d0.maxJpegBytes == 0);
+    assert(!d0.active && d0.canvasW == 720 && d0.canvasH == 406 && d0.maxJpegBytes == 0);
 
     // Demand file: missing / fresh / 4 s old / future / a directory.
     assert(!sink.pollDemand() && !sink.demand().active);
@@ -174,7 +174,7 @@ std::vector<uint8_t> cameraJpeg() {
 }
 
 // The v0.4 wiring: camera JPEG -> VideoPreview (monitor settings) -> sink ->
-// one 640x360 datagram while the demand file is fresh, nothing once it is gone.
+// one SD (720x404) datagram while the demand file is fresh, nothing once it is gone.
 void testPreviewToAgent() {
     const std::string base = "/tmp/dashcam-monitor-e2e-test-" + std::to_string(::getpid());
     const std::string sockPath = base + ".sock", demandPath = base + ".demand";
@@ -208,7 +208,7 @@ void testPreviewToAgent() {
     assert(got > static_cast<ssize_t>(mon::kVideoHeaderBytes + 4) &&
            got <= static_cast<ssize_t>(mon::kVideoHeaderBytes + mon::kVideoMaxJpegBytes));
     uint8_t want[mon::kVideoHeaderBytes];
-    mon::writeVideoHeader(want, captureUs, 1, 640, 360);
+    mon::writeVideoHeader(want, captureUs, 1, 720, 404);
     assert(std::memcmp(rx.data(), want, sizeof(want)) == 0);
     const size_t end = static_cast<size_t>(got);
     assert(rx[24] == 0xFF && rx[25] == 0xD8 && rx[end - 2] == 0xFF && rx[end - 1] == 0xD9);
@@ -364,7 +364,7 @@ int main() {
     testVideo();
     testPreviewToAgent();
     std::puts("monitoring video: header layout, demand file freshness, missing/stalled/refused agent and "
-              "byte-exact delivery, camera JPEG -> 640x360 datagram on demand passed");
+              "byte-exact delivery, camera JPEG -> SD 720x404 datagram on demand passed");
     testHd();
     std::puts("monitoring HD: chunk header layout, demand gate, byte-exact chunked delivery, size limits and "
               "a stalled agent never blocking the camera thread passed");

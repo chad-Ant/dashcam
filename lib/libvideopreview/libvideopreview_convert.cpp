@@ -1,7 +1,8 @@
 /**
  * @file libvideopreview_convert.cpp
- * @brief FrameConverter — libjpeg DCT-scaled decode, integer area-average
- *        resample, baseline 4:2:0 encode — and the pure geometry helpers.
+ * @brief FrameConverter — libjpeg DCT-scaled decode (1/8 steps), integer
+ *        area-average resample or a crop of at most one pixel, baseline 4:2:0
+ *        encode — and the pure geometry helpers.
  *
  * libjpeg reports errors through error_exit(), which here longjmp()s back to a
  * guard instead of exiting.  To keep that well-defined in C++:
@@ -68,6 +69,14 @@ uint32_t chooseDctScaleDenom(uint32_t srcW, uint32_t srcH, uint32_t viewW, uint3
         if ((uint64_t(srcW) + d - 1) / d >= viewW && (uint64_t(srcH) + d - 1) / d >= viewH) return d;
     }
     return 1;
+}
+
+uint32_t chooseDctScaleEighths(uint32_t srcW, uint32_t srcH, uint32_t viewW, uint32_t viewH) {
+    for (uint32_t m = 1; m < 8; ++m) {
+        // libjpeg's scaled output size is ceil(image size × m / 8).
+        if ((uint64_t(srcW) * m + 7) / 8 >= viewW && (uint64_t(srcH) * m + 7) / 8 >= viewH) return m;
+    }
+    return 8;
 }
 
 const char* convertStatusName(ConvertStatus s) {
@@ -150,6 +159,7 @@ struct FrameConverter::Impl {
     struct Geometry {
         uint32_t scaledW = 0, scaledH = 0, viewW = 0, viewH = 0;
         size_t   hCount = 0, vCount = 0;
+        bool     crop = false;   ///< Scaled decode within 1 px of the viewport: copy, no filter.
     } geo;
 
     /// Resampling tables for a scaled decode → viewport (cached until it changes).
@@ -165,7 +175,10 @@ struct FrameConverter::Impl {
         const size_t h = buildAxis(scaledW, viewW, hseg.data(), hseg.size());
         const size_t v = buildAxis(scaledH, viewH, vseg.data(), vseg.size());
         if (h == 0 || v == 0) return false;
-        geo = {scaledW, scaledH, viewW, viewH, h, v};
+        // At most one extra column/row (an odd 3/8 size against an even
+        // viewport): cropping it is sharper and cheaper than a 405→404 box filter.
+        const bool crop = scaledW >= viewW && scaledW - viewW <= 1 && scaledH >= viewH && scaledH - viewH <= 1;
+        geo = {scaledW, scaledH, viewW, viewH, h, v, crop};
         return true;
     }
 
@@ -175,6 +188,13 @@ struct FrameConverter::Impl {
      * write out each output row whose last source row this is.
      */
     void resampleRow(uint32_t y, size_t& vcur, uint32_t& outRow) {
+        if (geo.crop) {   // the decoded row is the output row; the extra column/row is dropped
+            if (y < geo.viewH) {
+                std::memcpy(image.data() + size_t(y) * geo.viewW * 3, row.data(), size_t(geo.viewW) * 3);
+                outRow = y + 1;
+            }
+            return;
+        }
         const uint8_t* src = row.data();
         uint16_t*      h   = hrow.data();
         uint32_t a0 = 0, a1 = 0, a2 = 0;
@@ -302,7 +322,7 @@ struct DecodeCtx {
     size_t                 size;
     uint16_t               canvasW, canvasH;
     // Out.
-    uint32_t               srcW, srcH, denom;
+    uint32_t               srcW, srcH, eighths;
     Viewport               viewport;
     double                 decodeMs, resizeMs;
     char                   reason[96];   ///< Why a source is unsupported.
@@ -335,9 +355,9 @@ ConvertStatus decodeBody(DecodeCtx* c) {
     }
     c->viewport = computeLetterbox(c->srcW, c->srcH, c->canvasW, c->canvasH);
     if (!c->viewport.valid()) return ConvertStatus::InvalidArgument;
-    c->denom          = chooseDctScaleDenom(c->srcW, c->srcH, c->viewport.width, c->viewport.height);
-    ci->scale_num     = 1;
-    ci->scale_denom   = c->denom;
+    c->eighths        = chooseDctScaleEighths(c->srcW, c->srcH, c->viewport.width, c->viewport.height);
+    ci->scale_num     = c->eighths;
+    ci->scale_denom   = 8;
     ci->out_color_space = JCS_RGB;   // grayscale sources are expanded by libjpeg
     jpeg_calc_output_dimensions(ci);
     if (ci->output_components != 3 ||
@@ -509,7 +529,8 @@ ConvertResult FrameConverter::convert(const ConvertRequest& req) {
     r.viewport   = dc.viewport;
     r.width      = dc.viewport.width;
     r.height     = dc.viewport.height;
-    r.scaleDenom = dc.denom;
+    r.scaleEighths = dc.eighths;
+    r.scaleDenom   = 8 % dc.eighths == 0 ? 8 / dc.eighths : 0;   // 1/1, 1/2, 1/4, 1/8 only
     r.decodeMs   = dc.decodeMs;
     r.resizeMs   = dc.resizeMs;
 

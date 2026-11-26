@@ -293,6 +293,8 @@ Not yet deployed or run with the camera. Checked so far:
 
 ## Remaining physical acceptance
 
+- SD live view (720×404) on the phone and in a browser, LAN and cloud: caption size, fps and Mbit/s against the
+  converter measurement (day 3.6, night 1.9 Mbit/s), and the `monitor preview` conversion p95 at v0.4 shutdown.
 - HD live view on the car network and on home Wi-Fi with the UGREEN: fps, age and `monitor HD` counters, recording
   fps/CPU unchanged with one and two HD viewers, the S25 and A54 frame rates and heat, and Android fullscreen
   rotation. The 4001 fallback on a recorder with `MonitoringVideoHdEnabled` false.

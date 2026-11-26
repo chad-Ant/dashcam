@@ -57,7 +57,7 @@ authorised). Unauthenticated static files, which contain no data or secrets:
 
 `capabilities` in `/v1/identity`: `vehicle`, `system`, `video` and `video_hd` are `true`;
 `lane`, `driver` and `controls` are `false`. `video_hd=true` means the agent offers
-`/v1/video?quality=hd`; without it the clients offer Low only. `video=true` means the agent offers
+`/v1/video?quality=hd`; without it the clients offer SD only. `video=true` means the agent offers
 `/v1/video`; frames only arrive when v0.4 has the preview enabled. With an older
 agent (no `video` capability, `/v1/video` answers 404) both clients show that
 this Jetson offers no video instead of a picture.
@@ -195,14 +195,18 @@ The **Live** page of the Android app and of the web client starts with a
 (the pinned UGREEN camera v0.4 records by passthrough; no CSI or cabin camera —
 if v0.4 ever falls back to recording the cabin camera, the preview pauses and
 logs `monitor preview: paused, recording the cabin camera`),
-scaled to **640×360** (16:9, letterboxed if the source is not), **up to 10 fps**,
-with a caption such as `640×360 · 9.8 fps · 120 ms old`. Measured on the bench
-(2026-10-29, real UGREEN at 1080p30): 9.8 fps, about 11 KB per frame (≈ 0.9 Mbit/s
-per viewer; detailed road scenes are larger, capped at 64 KB, so budget up to
-~5 Mbit/s), 110–160 ms old when sent. Converting costs v0.4 about **0.3 of a CPU
-core** while someone watches (27 ms p95 per frame: a 1080p source is decoded at
-half scale for 640×360) and nothing otherwise; recording is passthrough and is
-not affected. It is a monitoring aid, not footage: nothing is stored by the agent
+in **SD, 720×404** (16:9; a source of another shape is letterboxed into a 720×406
+canvas), **up to 10 fps**, with a caption such as `720×404 · 9.8 fps · 120 ms old`.
+This is the **SD** choice in both clients (`quality=low` on the wire; until
+2026-11-26 it was 640×360). A 1080p frame is decoded straight at 3/8 scale
+(libjpeg-turbo DCT scaling: 720×405, one row cropped), so nothing is resampled.
+Measured on the Jetson with the converter on real UGREEN drive frames (2026-11-26):
+**day** 43 KB per frame, **3.6 Mbit/s** at 10 fps, 10.9 ms per frame; **night**
+23 KB, **1.9 Mbit/s**, 10.4 ms; SSIM 0.948 against a lanczos downscale. The old
+640×360 path took 14.7 ms for 2.6 Mbit/s (day), so SD costs about a quarter less
+CPU while watching. Frames are capped at 64 KB (re-encoded at quality 45 if
+larger; no drive frame needed it). Converting runs only while someone watches;
+recording is passthrough and is not affected. It is a monitoring aid, not footage: nothing is stored by the agent
 or the clients.
 
 **Off by default.** It needs the existing `MonitoringEnabled` plus, under
@@ -276,44 +280,45 @@ stale**, with the old picture hidden, when the last frame arrived more than
 
 ### HD (direct LAN only)
 
-Both clients show a **Low / HD** choice under the camera and a **Fullscreen**
-button (enabled while live view is on). Low is the 640×360 preview above. **HD**
+Both clients show an **SD / HD** choice under the camera and a **Fullscreen**
+button (enabled while live view is on). SD is the 720×404 preview above. **HD**
 is the recording camera's **original JPEG frames, byte for byte, at the camera's
 rate** (1920×1080 at 30 fps for the UGREEN): no decoding or re-encoding on the
-Jetson. The choice is never stored: every app start and page load begins at Low.
+Jetson. The choice is never stored: every app start and page load begins at SD.
 Changing it reconnects the video socket; live view and its 10-minute window carry
 on.
 
-- **Direct LAN only.** A cloud session always shows Low, with HD disabled: the
+- **Direct LAN only.** A cloud session always shows SD, with HD disabled: the
   uplink requests `/v1/video` without `quality`, so original frames never leave
-  the LAN. At 16–56 Mbit/s (bench 2026-11-26: 66 KB frames; night drive
-  2026-10-03: UGREEN ≈ 7 MB/s) they exceed a car's mobile uplink and would cost
-  about 7–25 GB of relay egress per viewer-hour.
-- **Network.** One HD viewer needs 16–56 Mbit/s between the Jetson and the client.
-  At most two HD viewers (503 for a third), separate from the four Low viewers.
+  the LAN. At 16–75 Mbit/s (bench 66 KB frames; night drive 2026-10-03 ≈ 5.2 MB/s;
+  day drive 2026-09-26 ≈ 9.1 MB/s, 297 KB per frame ≈ 71 Mbit/s) they exceed a
+  car's mobile uplink and would cost about 7–32 GB of relay egress per viewer-hour.
+- **Network.** One HD viewer needs 16–75 Mbit/s between the Jetson and the client
+  (daylight driving is the top of that range). At most two HD viewers (503 for a
+  third), separate from the four SD viewers.
   On a slow link the newest-frame-only rule lowers the frame rate instead of
   building up delay.
 - **Cost on the Jetson.** v0.4 copies each frame into a latest-frame slot on the
   camera's tap thread and a worker sends it; nothing is converted, so HD costs
-  v0.4 less than Low. With HD enabled the recorder's preview tap runs at the
+  v0.4 less than SD. With HD enabled the recorder's preview tap runs at the
   camera rate in every session (the converters still limit themselves). Measured
   on the Jetson over loopback (2026-11-26, the C++ sender against this agent, 12 s
   runs at 30 fps): 66 KB frames, one viewer 29.3 fps, 4% of a core in the agent,
   5 ms median age; 578 KB frames, two viewers 28.0 fps each, 20% of a core; every
   frame byte-exact, none dropped. Not yet measured with the real camera or Wi-Fi.
-- **Recording is never affected.** As for Low: nonblocking sends, a worker that
+- **Recording is never affected.** As for SD: nonblocking sends, a worker that
   waits at most 100 ms per frame for the agent to drain its queue, and counted
   drops (`monitor HD: … frames taken, … sent` at shutdown).
 - **Fallback.** If no original frame arrives within 5 s (HD off in v0.4, or a
   recorder without HD), the agent closes the HD socket with **4001**. Both
-  clients then switch to Low and say "HD is not offered by this Jetson".
+  clients then switch to SD and say "HD is not offered by this Jetson".
 - **Fullscreen.** Android: its own window, landscape, system bars hidden, the
-  Low/HD choice and **Exit fullscreen** on top (a tap hides or shows them; Back
+  SD/HD choice and **Exit fullscreen** on top (a tap hides or shows them; Back
   exits). Web: the browser's Fullscreen API with a landscape lock where allowed,
   or a fixed full-window view where the browser lacks or ignores it (iPhone
   Safari, embedded browsers). Leaving live view leaves fullscreen.
 - **Phones.** Android decodes HD frames at full size (frames over 1920 px are
-  subsampled). Expect more battery use and heat than Low; older phones may show
+  subsampled). Expect more battery use and heat than SD; older phones may show
   fewer than 30 fps.
 
 v0.4 settings, under `<Network>` (needs `MonitoringVideoEnabled`):
@@ -326,7 +331,7 @@ v0.4 settings, under `<Network>` (needs `MonitoringVideoEnabled`):
 The agent touches the HD demand file (`serve --video-hd-demand`, default
 `video-demand-hd` next to `--socket`) while an HD viewer is connected, by the
 same 3-second rule as the preview's. An HD viewer does not touch the preview's
-demand file, so the 640×360 conversion stays idle.
+demand file, so the SD conversion stays idle.
 
 ### Video protocol
 
@@ -343,8 +348,8 @@ sender, like the telemetry publisher), at most 24 + 65536 bytes:
 | 4–7 | uint32 | header length = 24 |
 | 8–15 | uint64 | capture time, `CLOCK_MONOTONIC` microseconds (camera frame) |
 | 16–19 | uint32 | source sequence (recorder's frame counter, truncated) |
-| 20–21 | uint16 | width (640) |
-| 22–23 | uint16 | height (360) |
+| 20–21 | uint16 | width (720) |
+| 22–23 | uint16 | height (404) |
 | 24– | bytes | JPEG (`FF D8` … `FF D9`) |
 
 **HD chunks**, v0.4 → agent on the same socket. A 1080p frame (60–600 KB) does not

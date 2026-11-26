@@ -22,12 +22,12 @@ fun letterbox(srcWidth: Int, srcHeight: Int, dstWidth: Int, dstHeight: Int): Fit
 }
 
 /**
- * Live view quality. LOW is the 640×360, ≤ 10 fps preview (LAN and cloud); HD is the camera's original
+ * Live view quality. SD is the 720×404, ≤ 10 fps preview (LAN and cloud); HD is the camera's original
  * frames at its own rate, direct LAN only (`/v1/video?quality=hd`). [query] is the `quality` parameter.
  */
-enum class VideoQuality(val query: String?, val label: String) { LOW(null, "Low"), HD("hd", "HD") }
+enum class VideoQuality(val query: String?, val label: String) { SD(null, "SD"), HD("hd", "HD") }
 
-/** The agent closes an HD socket with this code when the Jetson sends no original frames; the app falls back to LOW. */
+/** The agent closes an HD socket with this code when the Jetson sends no original frames; the app falls back to SD. */
 const val HD_UNAVAILABLE_CLOSE_CODE = 4001
 
 /** Frames wider or taller than this decode subsampled; a 1080p HD frame decodes at full size. */

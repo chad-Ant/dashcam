@@ -408,6 +408,33 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-11-26 SD preview (720×404) replaces Low (640×360), not deployed
+
+- **What.** The preview, called **SD** in both clients (still `quality=low` on the wire), is now **720×404** at up to
+  10 fps, on direct LAN and in cloud sessions. `libvideopreview` picks the libjpeg-turbo DCT scale in eighths
+  (`chooseDctScaleEighths`), so 1080p decodes at 3/8 (720×405). When the decode is within one pixel of the viewport,
+  it is cropped instead of resampled. `kMaxCanvas*` is now 960×540, and the monitor canvas is 720×406
+  (`src/monitoring_video.h`). The ES3C28P display path is unchanged (2/8 = 1/4). No protocol change: older clients
+  show the larger picture.
+- **Why this path.** Options were measured on the Jetson with 240 frames of daytime driving at 10 fps:
+  - the GStreamer CPU path, and today's converter at 720 or 854;
+  - the GStreamer hardware path `nvjpegdec ! nvvidconv ! nvjpegenc`. Its levels are washed out: the decoder emits
+    limited range tagged as YUV420, and `nvvidconv` in NVMM does not undo it. That matches NVIDIA's forum position
+    that the stock plugins handle limited range only;
+  - the Multimedia API path, decoding into a `YUV420_ER` surface. It fixes the levels, but the hardware decode still
+    loses detail (SSIM 0.77 against 0.95, cause not found). The hardware path that looks right costs as much CPU as
+    the CPU path;
+  - x264 H.264, which needs about a quarter of the JPEG bandwidth but is a larger client and protocol change.
+  
+  The 3/8 decode was the cheapest and the sharpest JPEG option.
+- **Measured (converter, real UGREEN frames, 2026-11-26):** SD day 10.9 ms/frame, 43 KB, 3.6 Mbit/s; night 10.4 ms,
+  23 KB, 1.9 Mbit/s. The old 640×360 path was 14.7 ms and 2.6 Mbit/s in daylight. SSIM 0.948. Daytime UGREEN
+  footage is about 9.1 MB/s (297 KB per frame), so **HD in daylight is about 71 Mbit/s**; the README now says 16–75.
+- **Tests:** on the Jetson, the container build passed with no warnings. `videopreview_test` passed, including new
+  eighth-scale, 720×406 canvas and crop-path checks. `es3display_test`, `monitoring_test` (SD 720×404 datagram),
+  `config_test` and `--self-test` passed. Android: release build, 44 unit tests and lint passed. Not deployed, and
+  not yet watched on a phone.
+
 ## 2026-11-26 HD live view and fullscreen (not deployed)
 
 - **What.** Live view offers **Low** (640×360, ≤ 10 fps, unchanged) and **HD**: the UGREEN's original 1080p30 JPEGs,
@@ -432,6 +459,13 @@ compile-checked from these parts:
   `~/dashcam` on the Jetson were not touched.
 - **To deploy:** pull on the Jetson, `make` in the container, then restart `dashcam-v04` and `dashcam-monitor`
   (sudo). Install the APK. The deployed config needs no change (HD defaults on with `MonitoringVideoEnabled`).
+- **Deployed, same day.** The Jetson runs `f29119b` as `bin/build_20261126_034625`, built with no warnings; its
+  self-test and the config, monitoring and overlay tests pass. The services were restarted at 11:02, and the log reads
+  `monitor HD: on, original camera frames to /run/dashcam-monitor/video.sock while an HD viewer watches`. The S25 Ultra
+  has the release APK `android/app/build/outputs/apk/release/dashcam-connect-0.1.0-f29119b-release.apk`, SHA-256
+  `f67279a671dd8800a3999439b6184505224361384a617aa21bc933215a9742a5`. It is signed with the release identity
+  (`51b92fab…`, v3, version code 1) and was installed in place; the installed hash was checked. The 44 unit tests and
+  release lint passed. The HD checks on the phone have not been run yet.
 
 ## 2026-11-25 Web and Android connector interface review
 
