@@ -34,3 +34,5 @@ peripherals/mkr_zero/helper_scripts/CanMapInstall/canmap_text.h
 /connector/cloud/*.so
 /connector/cloud/*-debug.log
 /connector/cloud/.firebase/
+# adb log dumps captured while debugging the Android app on a phone.
+/android/*.txt

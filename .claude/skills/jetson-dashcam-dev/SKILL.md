@@ -111,7 +111,7 @@ Each finding: file/line (or code region) → what's wrong → why it bites on *t
 | Trigger words / topics | Read this |
 |---|---|
 | recording, encoding, multi-stream, throughput, `nvpmodel`, MAXN_SUPER, thermal, swap, DLA, CPU saturation, TOPS, clocks | `references/orin-nano-constraints.md` |
-| CSI, IMX219/IMX477/IMX296 (global shutter), `nvarguscamerasrc`, `v4l2src`, `nvv4l2camerasrc`, USB/UVC, `v4l2-ctl`, multi-cam, stereo, sensor-mode, exposure/gain | `references/cameras.md` |
+| CSI, IMX219/IMX477/IMX296 (global shutter), `nvarguscamerasrc`, `v4l2src`, `nvv4l2camerasrc`, USB/UVC, `v4l2-ctl`, multi-cam, sensor-mode, exposure/gain | `references/cameras.md` |
 | libargus C++, V4L2 C++ API, Jetson Multimedia API, `NvVideoEncoder`/`NvVideoDecoder`, `NvBufSurface`, EGLStream, software H.264 (libx264), `19_argus_camera_sw_encode`, `13_argus_multi_camera`, `nvunixfdsink`/`nvunixfdsrc` IPC, appsink | `references/multimedia-api.md` |
 | Docker, podman, `jetson-containers`, `l4t-ml`, `l4t-jetpack`, `deepstream` container, `--runtime nvidia`, device passthrough, `argus_socket` | `references/containers.md` |
 | DeepStream, `nvinfer`, `nvtracker`, `nvstreammux`, `nvdsosd`, PGIE/SGIE, `deepstream-app`, pyds | `references/deepstream-pipelines.md` |
@@ -157,11 +157,11 @@ gst-launch-1.0 nvarguscamerasrc sensor-id=0 num-buffers=900 ! \
   h264parse ! mp4mux ! filesink location=/data/clip.mp4
 ```
 
-### Run l4t-ml with all cameras visible (1 CSI + 3 USB)
+### Run l4t-ml with the CSI and USB recording cameras visible
 ```bash
 jetson-containers run \
   --device /dev/video0 \
-  --device /dev/video1 --device /dev/video2 --device /dev/video3 \
+  --device /dev/video1 \
   --volume /tmp/argus_socket:/tmp/argus_socket \
   --volume /etc/enctune.conf:/etc/enctune.conf \
   --volume /data:/data \
@@ -223,6 +223,6 @@ role degrades independently. Architecture facts to respect:
 - **TRT engines (`culane_res18`, `drowsiness_resnet18`) are built with `trtexec` inside this
   container on this Orin Nano** — never assume portability. YuNet is ONNX (CPU, OpenCV).
 - **Not yet in v0.3** (repo has the libs, planned for later / the production `dashcam` target): sign
-  reading (`libsigndetector`), stereo rangefinding (`libstereocam`, needs VPI), GPS/CAN/GPIO alarm
+  reading (`libsigndetector`), GPS/CAN/GPIO alarm
   wiring. Don't describe these as running.
 - Recommendations should fit *this* headless architecture, not generic NVIDIA cloud demos.

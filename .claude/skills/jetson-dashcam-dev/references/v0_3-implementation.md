@@ -26,7 +26,6 @@ injected `dashcam::log::LogCallback` (never writes to stdout itself).
 
 **Present in the repo but NOT in v0.3** (planned / production `dashcam` target): `libsigndetector`
 (sign reading — `<Detection>` has `signTargetHz` etc., but v0.3 instantiates no sign detector),
-`libstereocam` (VPI stereo rangefinder — needs `libnvvpi-dev`, only in the `dashcam` target),
 and the peripheral libs `libcan`/`libgpio`/`libi2c`/`libmidi`/`libspi`/`libuart` (GPS/CAN/alarm
 wiring for later versions). Don't assume these run in v0.3.
 
@@ -194,7 +193,7 @@ Both anchor scenarios are verified on-device (single C270 → `RECORD-ONLY`; C27
 
 - **Two-model load** (lane + driver) measures ≈ **+8 pts CPU / +1.3 GB RAM / GPU 34 % avg** over
   recording alone — comfortable on the 8 GB unified board at MAXN_SUPER, but watch RAM if sign
-  detection / stereo are added later.
+  detection is added later.
 - **`nvarguscamerasrc` teardown** (IMX296): the PAUSED→READY transition can block ~5 s internally on
   `stop()` (daemon-state dependent, not fixable app-side) — expect a few-second gap between "stopping
   pipeline" and "camera closing" at shutdown. `appsink` also defers EOS until drained (handled in

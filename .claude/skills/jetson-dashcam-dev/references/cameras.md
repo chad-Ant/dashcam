@@ -80,7 +80,7 @@ sudo systemctl restart nvargus-daemon
 The user's front camera is the IMX296 running **1456×1088 @ 60 fps**. Notes specific to this configuration:
 
 - **Argus support**: The IMX296 has Argus drivers on most modern carrier-board BSPs (Connect Tech, Leopard Imaging). Verify with `gst-inspect-1.0 nvarguscamerasrc` and a sanity capture; if Argus doesn't see it, you're on the V4L2 path with manual debayer (much harder).
-- **Why global shutter matters for this build**: it eliminates rolling-shutter skew. That's important for (a) reading road signs at speed without text being warped, and (b) any AI feature that relies on optical flow or geometric correspondence between frames (e.g., visual odometry, stereo derived from sequential frames).
+- **Why global shutter matters for this build**: it eliminates rolling-shutter skew. That's important for (a) reading road signs at speed without text being warped, and (b) any AI feature that relies on optical flow or geometric correspondence between frames (e.g., visual odometry).
 - **Sample pipeline** (Argus path, native 1456×1088 @ 60, headless):
   ```bash
   gst-launch-1.0 nvarguscamerasrc sensor-id=0 ! \
@@ -133,27 +133,6 @@ v4l2-ctl -d /dev/video2 --list-formats-ext
     SYMLINK+="dashcam_driver_facing"
   ```
 - USB 3.0 ports give a full 5 Gbps lane each — much better for higher-bandwidth USB cameras. Plug demanding cameras into USB 3 first.
-
-## Stereo USB cameras (rangefinder) — 360p @ 10 fps each
-
-Two reused laptop webcams operating at 360p / 10 fps for stereo depth. Notes:
-
-1. **Hardware sync** — UVC doesn't standardize external triggers, and reused webcams definitely don't sync. Frames from the two cameras drift in time; on a moving vehicle this means depth gets noisy whenever the scene or vehicle moves. Mitigations:
-   - Capture timestamps with `v4l2_buffer.timestamp` per frame and pair the closest matches; expect ±50 ms misalignment at 10 fps.
-   - Accept the result is rough — fine for "is there an obstacle in the next 5 m" coarse rangefinding, **not** fine for safety-critical AEB-style decisions.
-   - If accuracy matters more later, swap to a synced pair (Stereolabs ZED, Arducam Stereo HAT, or two Argus-driven CSI cameras hardware-triggered).
-2. **Calibration** — intrinsic + extrinsic via OpenCV's `cv2.stereoCalibrate` once, save to `/data/calib/stereo.yaml`, reuse forever. Recalibrate if you remount the cameras.
-3. **Disparity computation** — at 360p / 10 fps the compute cost is small, so plenty of options:
-   - `cv2.StereoBM` (fastest, blockmatching) — fine here.
-   - `cv2.StereoSGBM` (slower, better at textureless surfaces) — also fine at this resolution.
-   - VPI's CUDA stereo (`vpi.stereodisp`) — overkill for 360p10 but available if you want GPU offload:
-     ```python
-     import vpi
-     with vpi.Backend.CUDA:
-         disparity = vpi.stereodisp(left, right, maxdisp=64)
-     ```
-4. **Bandwidth check**: 360p MJPEG at 10 fps per camera is ~5–10 Mbps each — comfortably fits USB 2.0 even with the driver-monitoring camera on the same root hub. If you went to 720p or 30 fps you'd need to think harder about USB topology.
-5. **Be honest with the user** about the limits of two unsynced webcams as a rangefinder on a moving vehicle. Useful for prototyping; not a production safety sensor.
 
 ## Driver-monitoring camera (single USB, 360p @ 10 fps)
 

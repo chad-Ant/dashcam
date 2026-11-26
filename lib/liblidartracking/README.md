@@ -1,6 +1,6 @@
 # GRF-250 + IMX296 vehicle ranging prototype
 
-Separate from `libstereocam`, which it neither replaces nor modifies. This library estimates a selected vehicle's **LiDAR slant range** and
+This library estimates a selected vehicle's **LiDAR slant range** and
 camera-frame forward distance, associates returns with camera tracks, and emits
 pan requests for a **separate single-servo/encoder library**. It never drives a
 motor, CAN bus, throttle or brake. Not a collision-avoidance / AEB system.

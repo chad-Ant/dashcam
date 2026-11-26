@@ -17,9 +17,15 @@ This file has three parts:
 
 ## The rig now
 
+**2026-11-26 USB-camera bench check.** The UGREEN capture interface was at `/dev/video0`.
+With only the camera connected, the S25 Ultra on mobile data received host health while v0.4 was
+stopped, then fresh recorder telemetry and live video after startup. Reconnecting to the running
+recorder delivered the first fresh sample in 1.882 s. The phone ran the signed `c75773d` release.
+[Connector validation](connector/VALIDATION.md#s25-ultra-on-mobile-data-2026-11-26)
+
 | Item | State |
 |---|---|
-| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | **The UGREEN and the CYD only.** The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CYD is `/dev/ttyUSB0` since the out-of-tree `ch341.ko` was installed and brltty-udev masked (2026-10-12 log section). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. **Update 2026-10-25 (bench):** the IMX296 (`/dev/video0`, Argus id 0), the UGREEN (`/dev/video1`), the MKR (`/dev/ttyACM0`, its console reports GNSS and IMU up) and the C3 (`/dev/ttyACM1`) were all attached and worked for the lane test suite; `dashcam-v04` was inactive throughout. **Update 2026-10-26 (bench):** same devices plus the CYD (`/dev/ttyUSB0`). **Update 2026-10-27 (bench):** the degradation hunt ended at the first fault (06:02); the IMX296 tests that followed (2026-10-27 log section) left driver candidate C loaded: reload the stock driver (`sudo docker_dev/csi_driver.sh reload`) or reboot before using the CSI camera. `dashcam-v04` stayed stopped. **Update 2026-11-20 (bench):** the ES3C28P is attached (USB-C port, `/dev/ttyACM0`, alias `/dev/dashcam-display`, fixed udev rule installed and verified) with an SD card and the speaker; no cameras, MKR or C3. `dashcam-v04` was stopped for the bench (sudo) and is still stopped: restart it when done. |
+| **Attached now** (boot of 2026-10-12 11:25, on the bench, not in the car) | The UGREEN is `/dev/video0` while no CSI camera is present (v0.4 pins it by-id, so that is fine). The CSI camera, MKR and C3 are unplugged. Reconnect them, reseat the CSI ribbon, power-cycle, and check `csi_test 0` before relying on anything below. **Update 2026-10-25 (bench):** the IMX296 (`/dev/video0`, Argus id 0), the UGREEN (`/dev/video1`), the MKR (`/dev/ttyACM0`, its console reports GNSS and IMU up) and the C3 (`/dev/ttyACM1`) were all attached and worked for the lane test suite; `dashcam-v04` was inactive throughout. **Update 2026-10-27 (bench):** the degradation hunt ended at the first fault (06:02); the IMX296 tests that followed (2026-10-27 log section) left driver candidate C loaded: reload the stock driver (`sudo docker_dev/csi_driver.sh reload`) or reboot before using the CSI camera. `dashcam-v04` stayed stopped. **Update 2026-11-20 (bench):** the ES3C28P is attached (USB-C port, `/dev/ttyACM0`, alias `/dev/dashcam-display`, fixed udev rule installed and verified) with an SD card and the speaker; no cameras, MKR or C3. `dashcam-v04` was stopped for the bench (sudo) and is still stopped: restart it when done. |
 | Platform | L4T R36.5.2 / JetPack 6.2.3+b81 / kernel 5.15.199-tegra, UEFI 36.5.2 (upgraded 2026-10-01). The 65 NVIDIA packages are held. |
 | CSI camera | IMX296 in CAM1 (`/dev/video0`, Argus id 0). Rebuilt `imx296.ko` for 5.15.199 (still built with `#define DEBUG 1`). Overlay `imx296-cam1.dtbo` caps gain at 200 (20 dB) and exposure at 1000 lines (14.8 ms). ISP override **c8_sh15** (sha256 `43ec0c81…`). `csi-driver.service` is enabled and replaces `imx296-reload.service` (disabled). **At low analogue gain the sensor resets itself** mid-stream: it drops off I2C for ~170 ms and comes back with its power-on defaults, and Argus reports `waitCsiFrameStart Timeout … Sensor GUID 0 is in error state`. The hazard rises steeply as the gain falls: GAIN register 16 (Argus 1.0, the DT floor) resets within seconds to a minute; in the dark none was seen at 64 and above, but in midday sun the module also reset at 64 and on stream-on. Heat is the main factor: cooled to a ~34 °C die it ran gain 16 clean (2026-10-29). Bright scenes hit it because AE drives the gain to the floor. Light, exposure, register traffic, GPU load, frame rate, module age and the driver build are ruled out; the cause is on the module (power or bias margin, unit or design; not testable without hardware). **Mitigation, not a fix, in `Camera_CSI` since 2026-10-27:** every CSI pipeline sets `gainrange="4 12.5"` (register 64–200); a `gainrange` attribute replaces it. It passed a 30-min daylight `trtexec` soak that otherwise faulted within 1–3 min, but a midday two-camera `lane_drive` soak (run_018, camera in the sun) still reset 6 times at gain 64 plus 3 times at stream start; the harness kept CSI lanes at a mean 19.75 Hz through 9 container restarts. Expect CSI gaps on a sunny drive until the module is replaced or fixed. The 2026-10-26 "degraded driver state, reboot before a drive" diagnosis was wrong (2026-10-27 log section). Driver candidate C (no group hold, no gain delay) is not a fix; do not install it. **Staged, not installed:** a debug-off module and two overlay candidates, with install/rollback scripts (`~/drive_logs/tools/imx296_driver/staging_20261010/`, 2026-10-11 log section). |
 | UGREEN | `/dev/video1` next to the CSI camera (`/dev/video0` without it), pinned by `/dev/v4l/by-id`. Deployed config: `FocusMode=fixed`, `FocusAbsolute=690`. `usb_test`, `record_test` Part B and `scan_cameras` pass on it with the 2026-10-11 build (2026-10-12). It has **no** `exposure_dynamic_framerate` control. |
@@ -44,11 +50,9 @@ This file has three parts:
 | IMX296 v2 chart | `7e45172`; helper uncommitted | Offline analyser; synthetic tests only. Printed by the user (banding, crushed shadow steps 0–32: fine for relative A/B, not absolute). Capture helper `capture_chart.py` (2026-10-12): UGREEN path run live, **CSI path not run**. | Capture the three sheets once the CSI camera is back. |
 | GRF-250 ranging | `e46bf71` | Sensor parser, bench bridge sketch and Orin association library; host and container tests only. | Check the converter's IC and levels before wiring; bench test. |
 | Encoder-supervised pan servo | Uncommitted | `peripherals/mkr_zero/libraries/EncoderPan`: fixed-point controller, AS5048B reader, gated PWM adapter and default-disabled MKR bench sketch. Hardware choice: Hitec D646WP + enclosed AS5048B. | Buy/check hardware, build sealed output-shaft mount and independent power cutoff; calibrate/bench before production transport integration. |
-| CYD dashboard | Removed 2026-11-25 | `peripherals/cyd/` was deleted from the repo; the ES3C28P replaces it. The last source is in git history before the removal commit. `lib/libes3display` no longer accepts the CYD's HELLO identity (only `ES3C28P`). `lane_run.sh --display auto` now picks `/dev/dashcam-display`, and `lane_status` uses the default 1 s reconnect. `es3display_test` passes in WSL (0 failures; test 25 is now the generic whole-map fallback, `--map-fallback`). | None. |
 | ES3C28P display preview | `c90778d` | Jetson side done 2026-10-14 (log section): wire protocol v1 frozen (shared headers + golden vectors), recorder preview tap, `<DisplayPreview>` config (off by default), `lib/libvideopreview` (6.5 ms per 1080p frame), `lib/libes3display` (USB link, tested against a fake board on a pty), wired into v0.4. A colleague wrote the firmware side (`peripherals/es3c28p`, 2026-10-13); compatible with it (firmware-logic fake + UGREEN end-to-end run). **Board here since 2026-11-20:** flashed (factory flash backed up), USB link, pages, touch, rotation, SET tab, audio and `/settings.xml` checked on the board; microphone level drives the SET tab MIC IN indicator (`MIC_LEVEL_PLAN.md`; 2026-11-20 log sections). | Bench sketches (need a 3.3 V UART adapter). Done 2026-11-20 evening: C3 rule pinned by serial, `<DisplayPreview>` enabled and soaked at 10 and 15 fps, firmware fix for the 32 s session resets. |
 | ES3C28P map | `5a04a0a`, `91f01aa`; panning uncommitted | Jetson side done 2026-10-14: map wire extension `Es3MapProtocol.h` (0x0A-0x0C, vectors), `lib/libnavigation` (GPS state, Mercator, SQLite tile cache, compositor, service with warm map), link page-driven camera/map switching, `<Navigation>` config, v0.4 wiring, launcher `navcache` mount. All suites pass; end-to-end with a map-capable fake board. **Extension v2, board-side panning** (smooth map, same day, uncommitted): the board scrolls a 512x384 background from 20 Hz poses interpolated between GPS fixes; Jetson and ES3C28P firmware sides implemented and software-tested (2026-10-15 handover entry); firmware supports retained backgrounds, separate strips and local markers, with whole-frame fallback. Reviewed/refactored 2026-10-16, including a default-page startup fix (review log below). No physical board validation. | Flash/bench both USB modes; verify transitions, panning, GPS states and actual throughput; then enable `<Navigation>`. |
 | Android and web LAN connector | `9fac0c2`, `d911446` and later | The deployed monitor serves telemetry and on-demand camera video. A54 and laptop completed the two-hour bench soak. The A54 also demonstrated cloud-to-LAN fallback. | Install the APK with the discovery fix (2026-11-25 review) and complete the remaining car-network and tablet checks. [Validation record](connector/VALIDATION.md) |
-| Stereo prototype | `e46bf71` | Orin-side 100 m feasibility tool; 30/30 tests in the container. | Evaluate with synchronised cameras (its README). |
 | Lane detection test suite | `24110f6`, `650701a`, P5b in the commit after this file's 2026-10-26 update | Plan `~/drive_logs/lane_test_suite_plan_20261025.md` (lean cut chosen); results `~/drive_logs/lane_p0/P0_REPORT.md`. P0–P5a done on the bench (2026-10-25 log section): library test seams, `lane_test --unit/--gpu/--replay`, 12 robustness fixes, the `lane_drive` + `lane_run.sh` drive harness. **P5b done on the bench (2026-10-26 log section):** clip rings, tensor dumps, mount monitor, live CAN triggers, supervisor (restarts, degrade ladder, status), status display program, calibration, bench tools; B0 / B3m / 60-min soak pass (UGREEN), the 10-03 CSI slip is detected. Never run in the car. | The IMX296 module still resets in bright sun even with the gain floor (2026-10-27 log section): replace or fix the module before relying on CSI lanes, or accept CSI gaps; `lane_run.sh calibrate` in the parked car; then the first lane drive (day, then night). |
 | IMU (BNO055) | `fda019c`, `ff69f84` | Corrupt bursts with the engine running. All 66 High-G latches of the night drive were real road shocks: at 2 g it counts road roughness (44/h), not incidents. | Wiring rework; decide the incident threshold. |
 
@@ -101,15 +105,16 @@ This file has three parts:
    is enabled in the deployed config (TargetFps 15 now) and soaked at 10 and 15 fps with the UGREEN; a firmware fix
    stopped the 32 s session resets (blinks); see the "local tests" log section. Still to do: the bench sketches (USB
    throughput hwcdc vs TinyUSB, JPEG decode/blit; need a 3.3 V UART adapter), the 15 fps totals (logged at v0.4's next stop).
-10. **CYD:** dropped. `peripherals/cyd/` was removed from the repo on 2026-11-25, and its board checks are no longer needed.
-11. **Web and Android connector.** The [November 25 review](#2026-11-25-web-and-android-connector-interface-review) covers the seven fixes in `c75773d`, the follow-up fix for the browser capacity timing and the field checks to run after deployment. The [outstanding work brief](#outstanding-work-brief-2026-11-25) lists the remaining field checks. See the [November 22 pilot results](#2026-11-21-dashcam-connect-cloud-pilot) for deployment, mobile-data timings and two-phone acceptance.
-12. **Smaller items:**
+   On the ES3C28P, `lane_run.sh --display auto` selects `/dev/dashcam-display`, and `lane_status` retries the link every second.
+   `es3display_test --map-fallback` covers whole-map fallback.
+10. **Web and Android connector.** The [November 25 review](#2026-11-25-web-and-android-connector-interface-review) covers the seven fixes in `c75773d`, the follow-up fix for the browser capacity timing and the field checks to run after deployment. The [outstanding work brief](#outstanding-work-brief-2026-11-25) lists the remaining field checks. See the [November 22 pilot results](#2026-11-21-dashcam-connect-cloud-pilot) for deployment, mobile-data timings and two-phone acceptance.
+11. **Smaller items:**
    - tape over the in-car status LEDs, add a dark dash mat, clean the CSI lens and its windscreen patch;
    - a daylight CSI A/B (c5 / c7n) and the CSI properties in the app's config;
    - a night plate test on an unlit road, and autofocus while driving;
    - whether a link loss minutes after a recovered link-up should stay DEBUG-only (the 00:06 MKR reboot was);
    - item U with a replug, and the optional item O step (both need sudo).
-13. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
+12. **Code backlog:** see "Backlog: deliberately not done" under Reference. Done 2026-10-11: the two `read()`
     warnings and the float control ranges. Left: the `const_cast` in `getCameraStatus()`.
 
 # Reference
@@ -177,9 +182,7 @@ and the tools' own `--version`. Re-collect after an upgrade.
     over ESLOV.
   - **SD card:** on SPI1, holding the CAN map and the IMU calibration profile.
 - **Bridge:** Seeed XIAO ESP32-C3. It talks to the MKR over UART1 at 115200 and to the Jetson over native USB CDC.
-- **Dashboard (bench only, 2026-10-12):** CYD, ESP32-2432S028R (classic ESP32, ILI9341 2.8", XPT2046 touch, microSD).
-  USB through a CH340 (`1a86:7523`), which needs the out-of-tree `ch341.ko`. Retired: its firmware
-  (`peripherals/cyd/`) was removed from the repo on 2026-11-25, and the ES3C28P replaces it.
+- **Dashboard:** ES3C28P (ESP32-S3), connected over USB as `/dev/dashcam-display`. See the [board documentation](peripherals/es3c28p/README.md).
 
 **Jetson host**
 - JetPack 6.2.3 (`nvidia-jetpack 6.2.3+b81`), L4T R36.5.2 (`/etc/nv_tegra_release` R36 REVISION 5.2), kernel
@@ -200,8 +203,8 @@ and the tools' own `--version`. Re-collect after an upgrade.
 **Dev container** `l4t-ml-gpio:latest`
 - Built 2026-09-25 from `docker_dev/Dockerfile`, base `dustynv/l4t-ml:r36.4.0`; **rebuilt 2026-10-12**
   (`e8686f613fba`, from the final Dockerfile; the 2026-09-25 image is kept as `:build_20261012_115503`). The first 70 of 74 layers are
-  byte-identical: only the MKR layer (re-run because `install_samd_aarch64.py` changed in `a04f749`; same
-  123,236 B MKR image) and the new CYD layer differ. The repo is mounted at `/user/dashcam`. It builds everything:
+  byte-identical. The MKR layer was rebuilt because `install_samd_aarch64.py` changed in `a04f749`; it produced the same
+  123,236 B MKR image. The repo is mounted at `/user/dashcam`. It builds everything:
   plain `make` gives a timestamped `bin/build_<ts>/`.
 - `docker_dev/build.sh` no longer untags `:latest` before building. `docker build --tag` moves it only on success,
   so a failed or interrupted build leaves it in place (2026-10-12: a dropped download from downloads.arduino.cc left
@@ -375,7 +378,7 @@ compile-checked from these parts:
 
 - **v0.3 overlay:** it keeps its own copy of the bridge→overlay rules. On a fix without altitude it shows the last
   altitude, or the 52.3 m placeholder. v0.4 uses `src/bridge_overlay.h`. Skipped on request.
-- **Unused libraries:** `libstereocam` and `libsigndetector` are in the tree, but no target builds them.
+- **Unused library:** no target builds `libsigndetector`.
 - **Seen during the libcamera pass, left for the next libraries:**
   - `libcan.cpp:319` and `libgpio.cpp:311` ignore `read()`'s return (the only two warnings in the build).
   - `Camera_GST::getCameraStatus()` drains the bus through a `const_cast` (it works, but it is a smell).
@@ -388,8 +391,8 @@ compile-checked from these parts:
       level, so the log file still grows.
     - Proposal: double the interval per consecutive handshake failure, capped at about 30 s, and reset it on a
       compatible HELLO. It would slow reconnecting to a bridge that was just reflashed by up to the cap.
-  - **Twelve more libraries** keep their own truncating `doLog()`: libcan, libconfig, libdriverstate, libgpio (x2),
-    libi2c, liblanedetector, libmidi, librecord (x2), libspi and libstereocam. Switch each to `logPrintf()` in its
+  - **Other libraries** keep their own truncating `doLog()`: libcan, libconfig, libdriverstate, libgpio (x2),
+    libi2c, liblanedetector, libmidi, librecord (x2) and libspi. Switch each to `logPrintf()` in its
     own pass.
   - **`Uart::readLine()`** costs a poll and a read per character. That is fine for `gpio_test`'s NMEA; buffer it if
     a real consumer appears.
@@ -1098,8 +1101,8 @@ ladder, `.ass` banner, ROI calibration, bench tests B0/B3/B3m/B5/B9). Full numbe
   display a separate binary. A `videorate max-rate=5` after a tee negotiated the upstream 30 fps `videorate` down to
   ~5 fps → PTS probe decimators.
 - **Open:** the IMX296 sensor timeouts (found the same evening to be a degraded state: section above; corrected
-  2026-10-27, a low-gain sensor reset); the CYD needs its navigation firmware for the status
-  pages; the single-camera TensorRT p99 gate (25 ms) fails at the governor's low GPU clock (29.6 ms); not done: B5
+  2026-10-27, a low-gain sensor reset); the single-camera TensorRT p99 gate (25 ms) fails at the
+  governor's low GPU clock (29.6 ms); not done: B5
   (needs a person with a torch), a dark-room soak, B1b, GNSS logger, a lane-based mount check.
 
 ## 2026-10-25 (Jetson, bench): lane detection test suite P0–P5a (committed `24110f6`, `650701a`)
@@ -1145,32 +1148,6 @@ the repo); the CSI mount is now rigid (a view shift is a FAIL); day and night dr
 - **Not done (lean cut):** live CAN in the logs, instrumentation-neutrality (B1b), a dark-room night-bitrate soak,
   physical fault injection (unplug), status display, clip rings, tensor dumps, mount monitor, analysis/report (P6).
 - **Next:** crop check in the parked car (P0b), then the first lane drive with `lane_run.sh` (day, then night).
-
-## 2026-10-17 — Original CYD whole-frame navigation port
-
-- Added `peripherals/cyd/lib/cydNavigation/`: shared ES3 protocol wrappers,
-  bounded single-buffer receiver, baseline JPEG MCU rendering, and UART0 controller.
-  The original CYD uses 115200-baud CH340 USB, advertises a 32 KiB image limit and
-  one credit, and declines panning/camera streaming. The user approved whole-map
-  fallback: the Jetson supplies the marker, uncertain-heading dot and attribution.
-- Added the sixth MAP tab with a 320×224 viewport; retained local tabs, calibration,
-  SD, audio and LDR control. Runtime Serial diagnostics are suppressed for binary
-  transport. Hidden/calibrating demand, stale/placeholder display, bounded partial
-  writes, heartbeat expiry and reconnect are handled by the application loop.
-- `lib/libes3display` now accepts the explicit CYD HELLO identity. Added a CYD
-  fallback regression to its full suite. ES3C28P source/protocol/plans unchanged.
-- Build helpers include the new library and pin JPEGDEC 1.8.4. Setup, slower-link
-  timeouts and limitations are documented in `peripherals/cyd/NAVIGATION_IMPLEMENTATION.md`
-  and the CYD README. No deployed config, service or device firmware changed.
-- Validation: Arduino ESP32 3.2.0 compile passed (475042 bytes flash, 79744 bytes
-  static RAM); receiver C++11/C++17 and ASan/UBSan passed; real JPEG decoder and
-  actual controller native tests passed; complete Jetson display-link suite passed
-  (0 failures). Windows/PlatformIO not executed. No physical board validation.
-- Next: flash/bench deliberately, verify CH340 throughput, marker/attribution,
-  transitions/reconnect, six-tab calibration and audio/SD/backlight heap margin.
-  At the 32 KiB cap, payload transmission alone takes about 2.85 s; do not expect
-  ES3C28P panning performance. Work remains uncommitted.
-
 
 ## 2026-10-17 (Jetson): navigation (map) Jetson side reviewed and refactored
 
@@ -1454,9 +1431,9 @@ fakes on ptys and synthetic JPEGs, plus the real UGREEN frames for timing.
   The plan says `videorate` for the preview branch; the probe limiter replaces it (TargetFps 11/13/14 give 10/12/13.3 at
   30 fps). Independent reviews of the converter, link and Python playback were cut off by the usage limit.
 
-## 2026-10-12 (Jetson, bench): UGREEN work and the CYD toolchain
+## 2026-10-12 (Jetson, bench): UGREEN checks and container build
 
-Only the UGREEN and the CYD were attached; the rig was not in the car. Nothing was committed, flashed or installed
+The UGREEN was tested on the bench. Nothing was committed, flashed or installed
 with sudo, and dashcam-v04 stayed stopped. The captures taken (the room, no chart) stay in the session scratchpad.
 
 **1. UGREEN: the 2026-10-11 library change on the real camera** (`bin/build_20261011_003045`, control ranges as
@@ -1514,111 +1491,24 @@ with sudo, and dashcam-v04 stayed stopped. The captures taken (the room, no char
 
   Re-run live on the UGREEN afterwards: offsets 62, 63, …, 0 gaps, controls identical.
 
-**3. CYD toolchain** (`peripherals/cyd/`)
-- **No serial port:** the CYD enumerates as a CH340 (`1a86:7523`), but 5.15.199-tegra has
-  `CONFIG_USB_SERIAL_CH341` unset (`usbserial`, `cp210x` and `ftdi_sio` are built). Ubuntu's `brltty` udev rule also
-  claims `1a86/7523` (`SYSTEMD_WANTS=brltty-udev.service`; that service was running).
-- **`host/ch341_module.sh`:**
-  - `build` fetches `ch341.c` for stable v5.15.199 and refuses an unpinned sha256. That file is byte-identical to
-    NVIDIA's R36.4.3/R36.4.4/R36.5 public_sources copy.
-  - It builds against `/lib/modules/5.15.199-tegra/build`, then checks vermagic and 28/28 imported symbol CRCs.
-  - Output: `~/drive_logs/tools/ch341_driver/out-5.15.199-tegra/` (`ch341.ko`, source, SHA256SUMS). It prints the
-    sudo install and undo commands.
-  - `check` is read-only (driver, tty per CH34x, brltty). Tested: unpinned source refused (exit 3), the NVIDIA copy
-    builds, usage, temp dirs cleaned.
-  - **Not installed: that needs the user's sudo.**
-- **`build_and_upload.sh`:** the Linux twin of the README's Windows command (FQBN `esp32:esp32:esp32`); `auto`
-  takes the single CH340 under `/dev/serial/by-id`. The bring-up sketch compiles to 384,162 B with no warnings.
-  The upload is not run (no tty yet).
-- **Image:** a new last layer adds Adafruit ILI9341 1.6.4 (`--no-deps`; GFX and BusIO come from the MKR layer). The
-  Xtensa toolchain was already in the esp32 core.
-  - The first rebuild died on a downloads.arduino.cc `EOF` in the MKR layer. That layer re-ran because
-    `install_samd_aarch64.py` changed after the image was built (`a04f749`).
-  - `build.sh` had already untagged `:latest`, so there was **no `:latest`**, which the service needs. I re-tagged
-    the old image by hand.
-  - Fixes: `build.sh` re-tags on failure (tested with a stub `docker`). The library installs retry 3 times, then
-    check every name@version, POSIX-only since the base image's `/bin/sh` is dash (tested under dash, including a
-    wrong version).
-  - Rebuilt: `f2304ca58b60`, and after the review fixes `e8686f613fba` (the current `:latest`; no retry was
-    needed, the intermediate image is deleted). 70 of 74 layers are byte-identical to the old image. The MKR firmware still builds to
-    123,236 B / 23,924 B (the production numbers), and the C3 bridge builds.
-- **Review fixes:**
-  - The printed undo ran `modprobe -r` after `depmod`, which fails (kmod 29 cannot find a module it has
-    forgotten); it now unloads first.
-  - `check` prints the brltty fix command, honours an `/etc` rules override and commented lines, and accepts
-    `masked-runtime`.
-  - `build_and_upload.sh` no longer takes a mistyped sketch path as the port.
-  - Image: `build.sh` keeps `:latest` during the build; the index downloads retry too; the Dockerfile comment
-    now says RUN uses the base image's bash. Not changed: the version check greps the `lib list` table. The
-    reviewer showed it cannot false-pass for libraries installed from the index.
-  - The rebuild after these fixes hung for 20+ min on `CMSIS@4.5.0` (about 1.5 KB/s, no retry) and was
-    cancelled when the session ended. `:latest` stayed on the working image, as the new `build.sh` intends.
-    Cause: `install_samd_aarch64.py`'s `urlretrieve` has no timeout. It now sets a 60 s socket timeout, so a
-    stall raises into its existing retry/backoff (shown against a local server that never answers).
-- **Bring-up sketch review** (user asked to check the existing CYD code first; the only CYD code anywhere is
-  `cyd_bringup_test`, from `2f6b3f6`, never run on a board). Checked against witnessmenow's
-  ESP32-Cheap-Yellow-Display pin list and `User_Setup.h`, and the core 3.2.0 / Adafruit sources in the image:
-  - The SD card was probed over the display's pins. `SPI.begin(14, 12, 13, 15)` remaps the global (VSPI) bus to
-    the display, and `SD.begin(5, SPI)` calls `spi.begin()`, which returns early on a started bus. The card is on
-    18/19/23 (CS 5), so it would always read `NOT FOUND`. The display now has its own `SPIClass(HSPI)`; the
-    global bus is started on the card's pins.
-  - The backlight (GPIO 21, HIGH = on) was never driven, so the panel would most likely stay dark. It is now driven HIGH.
-  - `TFT_RST = 4` is the red LED (active low). The panel's reset is tied to EN, so the sketch now passes -1 and
-    Adafruit sends a software reset instead.
-  - Not changed: the serial `display OK` is printed unconditionally (README now says to look at the screen).
-    Some CYD batches use an ST7789 panel rather than an ILI9341; if the screen shows wrong colours or garbage,
-    that is the first suspect.
-  - Compiles to 384,186 B, no warnings.
-- **Driver installed (user's sudo, 16:18):** brltty-udev masked; `ch341.ko` in
-  `/lib/modules/5.15.199-tegra/updates/`, loaded; `check` OK, CYD = `/dev/ttyUSB0`
-  (`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`). A mangled paste left an empty `/lib/modules/updates`
-  (empty `$K`); the user removed it. Give sudo steps with literal paths, one per line.
-- **Chip:** ESP32-D0WD-V3 rev 3.1, 4 MB flash (0x68/0x4016); esptool auto-reset works.
-- **Flash backed up before any write:** `~/drive_logs/cyd_backup/factory_flash_20261012.bin` (full 4 MB, sha256
-  `0c80861d…`, `verify-flash` digest matched), plus the boot log and flash-id output. Not for the repo. Restore:
-  `esptool --port /dev/ttyUSB0 write-flash 0 factory_flash_20261012.bin` (in the container).
-- **What was on the board is not a factory demo.** `app0` is a custom dashboard app built 2026-07-20 on a Windows PC
-  with arduino-esp32 **3.3.11** (IDF v5.5.5): the strings include `DASHCAM LIVE`, `[cyd]` logs for SD splash
-  (BMP/RGB565), LDR auto-backlight, touch calibration saved to SD (`CYD_TOUCH_CAL_V3`), and DAC audio on a GPIO.
-  Partitions are the default layout (app0 0x10000, app1 empty, spiffs, coredump). **It crash-loops at boot:**
-  `E (163) ADC: CONFLICT! driver_ng is not allowed to be used with the legacy driver`, abort, reboot, every
-  ~0.2 s, before `setup()`. IDF 5 aborts when the legacy ADC driver and the new oneshot driver (Arduino's
-  `analogRead`, e.g. the LDR) are linked together. The legacy one is most likely pulled in by audio through the
-  legacy I2S/DAC API; that is inferred from the strings, not seen in source. **Its source is not on the Jetson
-  or on any branch**; asked the user where it is.
-
-**4. Dashboard app source** (the user copied a colleague's uncommitted work into `peripherals/cyd/` at 16:34). It is
-the app that was on the board. Layout: `cyd.ino` marker, `src/main.cpp` (five placeholder pages), `lib/cydStorage`
-(SD on VSPI 18/19/23/5, 20 MHz with 10 MHz fallback, `/cyd_touch.cal`), `lib/cydGraphics` (ILI9341 on HSPI, bit-banged
-XPT2046, 12-point touch calibration with a check screen, LDR GPIO34 to backlight PWM on GPIO21, SD splash
-`/splash.rgb565` or `.bmp`), `lib/cydAudio` (8-bit mono 8–16 kHz WAV from SD), `assets/`, `tools/bmp24_to_rgb565.py`,
-`BuildAndUpload.cmd`, `platformio.ini`.
-- **The copy overwrote my uncommitted `build_and_upload.sh` and `README.md`.** Its own `build_and_upload.sh` (builds
-  the app with the three `--library` dirs) is kept, plus my `auto` port (tested with a stub `arduino-cli`: no arg,
-  `auto`, explicit port, and none found, which exits 1). The README is the colleague's, with my "From the Jetson",
-  CH340 driver and bring-up sections merged back in.
-- **Boot crash, root cause confirmed:** `cydAudio` used the legacy `driver/i2s.h` built-in-DAC mode, which links the
-  legacy ADC driver; `analogRead()` for the LDR links the new one. The original build on core 3.2.0 contains both
-  `adc_oneshot_new_unit` and the legacy `check_adc_oneshot_driver_conflict` constructor, the one that aborts.
-  **Fix:** `CydAudio` now uses `driver/dac_continuous.h`, with the same public API. GPIO26 = `DAC_CHANNEL_MASK_CH1`;
-  APLL clock, because PLL_D2 cannot go below 19.6 kHz; 8×256 B DMA; non-blocking writes (timeout 0, keeping the
-  remainder), up to 4 blocks per `update()`; a natural end lets the queued tail play; `stop()` deletes the channel
-  (enable/disable could replay stale descriptors). The rebuilt ELF has no legacy ADC or I2S symbols. Also fixed two
-  bugs in the old version: `stop()` at end-of-data zeroed the DMA and cut up to ~96 ms of the tail, and one block per
-  loop could not keep up with 16 kHz.
-- `kTftRst` 4 → -1 (red LED, same as the bring-up sketch).
-- Builds on 3.2.0 with `--warnings all`: no warnings, 442,402 B.
-- Not changed, noted: `platformio.ini` targets PlatformIO's stock `espressif32` (Arduino 2.x, no `ledcAttach`) and
-  declares no `lib_deps`, so it probably does not build. README's `darkRaw`/`brightRaw` "window" only sets polarity in
-  the code. A missing splash triggers an SD remount (100s of ms) on every LIVE redraw.
-- Assets: `splash.bmp` is an illustration (dashcam over a road), not a capture; `splash.rgb565` is exactly its
-  conversion; `alert.wav` is a 0.35 s 8 kHz tone. The artwork's origin and licence are unknown; settle that before the
-  public repo gets it.
-- **Flashed 2026-10-13** (user's OK) with `build_and_upload.sh auto`. Boot log: `SD mounted at 20 MHz`, `calibration
-  loaded`, `RGB565 splash rendered ... 130 ms`, `audio ready: GPIO26 DAC`, `audio playing: /alert.wav`, LDR ~980 and
-  backlight 32/255; no crash. The first flash printed ~20 `dac_continuous ... Get available descriptor timeout` lines
-  per alert: the driver logs every full queue on a zero-timeout write. `begin()` now sets that tag to ESP_LOG_NONE
-  (update() still reports real failures); reflashed, log clean. Audibility and touch not yet checked by a person.
+**3. Container rebuild**
+- The first rebuild died on a downloads.arduino.cc `EOF` in the MKR layer. That layer re-ran because
+  `install_samd_aarch64.py` changed after the image was built (`a04f749`).
+- `build.sh` had already untagged `:latest`, so there was **no `:latest`**, which the service needs. I re-tagged
+  the old image by hand.
+- Fixes: `build.sh` re-tags on failure (tested with a stub `docker`). The library installs retry 3 times, then
+  check every name@version, POSIX-only since the base image's `/bin/sh` is dash (tested under dash, including a
+  wrong version).
+- Rebuilt: `f2304ca58b60`, and after the review fixes `e8686f613fba` (the current `:latest`; no retry was
+  needed, the intermediate image is deleted). 70 of 74 layers are byte-identical to the old image. The MKR firmware still builds to
+  123,236 B / 23,924 B (the production numbers), and the C3 bridge builds.
+- Image: `build.sh` keeps `:latest` during the build; the index downloads retry too; the Dockerfile comment
+  now says RUN uses the base image's bash. Not changed: the version check greps the `lib list` table. The
+  reviewer showed it cannot false-pass for libraries installed from the index.
+- The rebuild after these fixes hung for 20+ min on `CMSIS@4.5.0` (about 1.5 KB/s, no retry) and was
+  cancelled when the session ended. `:latest` stayed on the working image, as the new `build.sh` intends.
+  Cause: `install_samd_aarch64.py`'s `urlretrieve` has no timeout. It now sets a 60 s socket timeout, so a
+  stall raises into its existing retry/backoff (shown against a local server that never answers).
 
 ## 2026-10-11 (MKR pan library): encoder-aware servo prototype, no deployment
 
@@ -1665,7 +1555,7 @@ Servo 1.3.0 and vendor Wire passes; two unused-parameter warnings are in the
 upstream Servo source, not this library. Default-disabled sketch: 20,628 bytes
 flash, 3,328 bytes static RAM. Existing GRF protocol/FSM tests and all 36 Orin
 LiDAR tests also pass in the container. No servo/encoder live test, firmware
-flash, service restart, commit or push. Stereo and production telemetry are
+flash, service restart, commit or push. Production telemetry is
 unchanged; unrelated dirty work has been preserved.
 
 ## 2026-10-11 (Jetson, rig stripped): the hardware-free open items
@@ -1849,10 +1739,9 @@ All of these need the user's decision or hardware to validate.
 
 User ordered GRF-250, requested an RS-422 link through MKR and a separate
 single-pan-servo interface; subsequently supplied a photo of the **3.3 V variant**
-of the converter board and plans an **encoder-equipped servo**. Stereo work is
-preserved, including the pre-existing untracked `lib/libstereoprototype/`.
+of the converter board and plans an **encoder-equipped servo**.
 
-Implemented (committed 2026-10-10 at the user's request, with `lib/libstereoprototype/`):
+Implemented (committed 2026-10-10 at the user's request):
 
 - `lib/liblidartracking/`: Orin Python association library, optional OpenCV
   rectification + COCO YOLOv8 ONNX detector adapter, bounded IoU tracks, explicit
@@ -1887,7 +1776,7 @@ Verification:
   tests skip because the existing host cv2 / NumPy2 ABI mismatch persists.
   Do not change system Python packages to address this task; use the container.
 - Arduino SAMD 1.8.14 compile-only, warnings all: 14892 bytes flash / 3096 bytes
-  globals. No new warnings. Existing stereo suite: 30/30 passed in container.
+  globals. No new warnings.
 - No physical LiDAR, encoder, actual ONNX model inference or moving-vehicle
   ranging tested. No ±1 m at 100 m validation. No hardware flash, service stop,
   camera ownership change, commit or push performed.

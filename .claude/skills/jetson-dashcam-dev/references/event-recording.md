@@ -160,7 +160,7 @@ This makes events queryable later without re-running inference — important sin
 - **Wear management.** Prefer larger segment files (fewer metadata writes), let the ring/aging job overwrite oldest segments, avoid tiny frequent `fsync`s. Watch `dmesg` for `mmc`/`I/O error` — the first sign of a dying card.
 - **Isolation is good:** footage on the SD card (not rootfs) means a full or failed card can't wedge the OS on the NVMe.
 
-Architecture: The **primary footage source is a USB camera (model/specs TBD)** — its resolution and bitrate will determine actual recording throughput and SD-card lifespan. The IMX296 CSI camera is **inference-primary** (lane detection, sign reading, other AI tasks) and also outputs a **debug video stream** (low-bitrate/low-fps encode for post-hoc review of what the inference saw — not the evidentiary recording). The 3 other USB cameras (stereo @ 360p10 + driver cam @ 360p10) are inference-only; only their analysis outputs are logged unless an event triggers.
+Architecture: The **primary footage source is a USB camera (model/specs TBD)** — its resolution and bitrate will determine actual recording throughput and SD-card lifespan. The IMX296 CSI camera is **inference-primary** (lane detection, sign reading, other AI tasks) and also outputs a **debug video stream** (low-bitrate/low-fps encode for post-hoc review of what the inference saw — not the evidentiary recording). The driver-monitoring camera runs at 360p10. Its analysis outputs are logged unless an event triggers.
 
 **Capacity calculation** — depends on the final USB camera's bitrate. **Template:** if recording bitrate is B Mbps, then:
 - Throughput: B Mbps = B/8 MB/s
@@ -174,7 +174,7 @@ Smart-record-only (no continuous record) is much cheaper:
 - ~30 MB per 60 s event clip (front camera only)
 - ~167 GB ≈ ~5,000+ events stored
 
-If you want to also persist USB-camera footage during events: a 60 s event clip from each USB cam at 360p10 MJPEG-recoded is tiny (~5 MB). Bundle them into the event directory.
+If you want to also persist USB-camera footage during events: a 60 s event clip from the driver camera at 360p10 MJPEG-recoded is tiny (~5 MB). Bundle it into the event directory.
 
 Recommend: smart record for the front camera, **and** keep a low-bitrate continuous "context loop" (e.g., 720p15 @ 1.5 Mbps, ~675 MB/hour, ~5.4 GB / 8h) so you have evidence even for non-trigger events. Rotate the context loop to overwrite anything older than ~7 days.
 

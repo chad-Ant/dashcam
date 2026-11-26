@@ -235,6 +235,44 @@ clears the picture to the "Live view off" box. The remaining ~40 % is mostly JPE
 (Play Protect's "send app for a security check?" dialog can appear on an adb install and cover the app; benchmark
 runs must check the focused window.)
 
+## S25 Ultra on mobile data, 2026-11-26
+
+Updated the signed release in place on the SM-S938B using the `c75773d` APK. The existing
+Google sign-in still listed Pilot Jetson. The phone used cellular data with USB debugging from the PC.
+
+- Cloud connect opened the dashboard and delivered advancing host samples. The System tab showed
+  1.36 GiB of 7.43 GiB RAM in use and 231.1 GiB free on the footage disk.
+- With recorder data expired, the Live tab showed recording as unavailable and vehicle speed as
+  unknown. Start live view showed “Waiting for camera frames”. Stop returned the camera to idle.
+- Back from Cloud vehicles kept the active session. Disconnect returned to the unpaired LAN screen.
+  Connecting again issued a new request and received another host sample.
+- The Jetson reported the UGREEN capture interface at `/dev/video0`. Starting `dashcam-v04` while
+  the S25 was connected changed the dashboard from expired recorder data to **Recording** without
+  reconnecting. Speed and acceleration stayed unavailable with the vehicle sensors disconnected.
+- Start live view displayed the camera. Three successive samples of the camera region on the phone
+  had different pixel hashes. Stop cleared the picture and the dashboard still showed **Recording**.
+  A new cloud connection to the running recorder delivered its first fresh sample in **1.882 s**.
+  Live view started off, then displayed the camera again when requested. The phone was disconnected
+  at the end. Direct LAN pairing and saved recording playback were outside this run.
+- On Windows the six compiled Android JVM test classes passed all 42 tests. The connector service,
+  on-demand controller and uplink suites passed 49 of 60 tests. The 11 failures match the earlier
+  Windows limitations around POSIX permissions, Unix sockets and the video demand file.
+
+## S25 Ultra on the Jetson LAN, 2026-11-26
+
+The phone routed directly from `192.168.0.222` on `wlan0` to `192.168.0.138`.
+A credential-free reachability check received HTTP 401 from the monitor's HTTPS identity endpoint
+on port 8443. Android granted local network access. Two quick taps on **Find Jetsons** started
+a second mDNS scan on Wi-Fi. Android reported zero services found during the observation window.
+
+Manual pairing with the Jetson-issued link succeeded. The S25 listed **Car Jetson** at
+`192.168.0.138:8443`. The Live tab reported fresh recorder telemetry and **Recording**.
+With preview off the recorder reported 30.0 fps. Four samples with preview on showed
+640×360 at 9.8–10.0 fps and displayed frame ages of 62–117 ms. Each sample still showed
+30.0 recorder fps, and the session frame count advanced from 26,988 to 27,331.
+After Stop cleared the preview, the count reached 27,469. Reconnect returned to Live using
+the saved pairing. The final dashboard showed fresh telemetry with preview off.
+
 ## Remaining physical acceptance
 
 - Vehicle map with real tiles: the S25 Ultra app (after the Windows build) and laptop Firefox with internet.

@@ -34,8 +34,7 @@ RUN apt-get update && apt-get install -y \
 
 # VPI is distributed through NVIDIA's Jetson repository rather than Ubuntu's
 # repositories.  Keep this on the r36.4 line to match the l4t-ml base image.
-# libstereocam and the production `dashcam` target need the VPI headers and
-# unversioned linker entry supplied by vpi3-dev.
+# vpi3-dev supplies the headers and unversioned linker entry.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         gnupg \

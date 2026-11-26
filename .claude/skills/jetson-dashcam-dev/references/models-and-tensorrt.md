@@ -100,7 +100,7 @@ Important: calibration data must look like real driving data (same lighting, sam
 
 ## Inference outside DeepStream (raw TensorRT)
 
-For the rangefinder USB camera pair (stereo) or driver-monitoring camera, you may not want DeepStream. Plain TensorRT in Python:
+For the driver-monitoring camera, you may not want DeepStream. Plain TensorRT in Python:
 
 ```python
 import tensorrt as trt

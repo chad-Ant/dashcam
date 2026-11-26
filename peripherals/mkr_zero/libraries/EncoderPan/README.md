@@ -1,7 +1,7 @@
 # EncoderPan — MKR Zero single-axis pan prototype
 
 Separate library for the GRF-250 pan mount. The production sketch, telemetry
-protocol, Orin tracker and stereo implementation are **not changed**. Nothing is
+protocol and Orin tracker are **not changed**. Nothing is
 flashed. `PanBench` builds with motion disabled. Do not use this prototype for
 vehicle control or unattended operation.
 

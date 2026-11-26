@@ -449,9 +449,3 @@ $(BUILD_DIR)/%.o: %.cu
 # Remove all timestamped build directories.
 clean:
 	rm -rf bin/
-
-# ─── notes ────────────────────────────────────────────────────────────────────
-# libstereocam needs VPI 3.x (vpi3-dev) and has no target since the old
-# `dashcam` app (src/main.cpp) was removed.  To add a stereo test binary, link:
-#   $(LIBCAM_SRCS) $(LIBCFG_SRCS) $(LIBSTEREO_SRCS) + LD_BASE + LD_CV + LD_VPI
-# No stereo test binary exists yet; add src/tests/test_stereocam.cpp to activate.
