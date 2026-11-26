@@ -432,8 +432,11 @@ compile-checked from these parts:
   footage is about 9.1 MB/s (297 KB per frame), so **HD in daylight is about 71 Mbit/s**; the README now says 16–75.
 - **Tests:** on the Jetson, the container build passed with no warnings. `videopreview_test` passed, including new
   eighth-scale, 720×406 canvas and crop-path checks. `es3display_test`, `monitoring_test` (SD 720×404 datagram),
-  `config_test` and `--self-test` passed. Android: release build, 44 unit tests and lint passed. Not deployed, and
-  not yet watched on a phone.
+  `config_test` and `--self-test` passed. Android: release build, 44 unit tests and lint passed.
+- **Deployed, same day, 13:41.** The Jetson runs `68de9e1` as `bin/build_20261126_060535`. The log shows
+  `monitor preview: on` and `monitor HD: on`, and the UGREEN is recording at 1080p30. The S25 Ultra has
+  `dashcam-connect-0.1.0-68de9e1-release.apk`, SHA-256 `a7530172f4ecd42b599f8c94da9aaaa94cab5ff3bc7369e3de9ad38380c86e41`
+  (release identity `51b92fab…`, installed in place, hash checked). SD and HD have not yet been watched on the phone.
 
 ## 2026-11-26 HD live view and fullscreen (not deployed)
 
