@@ -15,12 +15,18 @@ This file has three parts:
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
 - **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. The four review findings are fixed and regression-tested, but not deployed yet. [Findings](#2026-11-26-live-view-review) · [Fixes](#2026-11-26-live-view-review-fixes-not-deployed)
 - **Recordings on the LAN (2026-11-26, not deployed).** Both clients can now list, play (with telemetry captions, seek and fullscreen) and download v0.4's recorded segments over a direct LAN connection. The client decodes the video; the Jetson only serves files. It is built and tested on real footage in a browser. Not deployed; the Android player has not run on a phone yet. [Log](#2026-11-26-recordings-on-the-lan-not-deployed)
-- **Cloud recordings (2026-11-26, not deployed).** A cloud session's Recordings page now lists the segments. Owners and viewers can export a clip: up to 3 min of one segment, made into an H.264 MP4 on the Jetson and uploaded to a private Cloud Storage bucket. The relay answers with signed play and download links that last an hour. The code and tests are done, and the web page was checked against a fake relay. Deployment is the user's: create the bucket, run `stage.sh`, reinstall the uplink, restart the agent and uplink, and install the APK. [Log](#2026-11-26-cloud-recordings-not-deployed)
+- **Cloud recordings (2026-11-26, not deployed).** A cloud session's Recordings page now lists the segments. Owners and viewers can export a clip: up to 3 min of one segment, made into an H.264 MP4 on the Jetson and uploaded to a private Cloud Storage bucket. The relay answers with signed play and download links that last an hour. The code and tests are done, and the web page was checked against a fake relay. **2026-11-27:** the Jetson is on `eaa8c6e` and the agent with the clip route is running. The uplink in `/opt` is still old. The remaining work is the user's: check the relay's signing grant, create the bucket, run `stage.sh`, install `uplink.py`, then build and install the APK. Fix review findings 1–3 before real use. [Configuration runbook](#2026-11-27-cloud-recordings-configuration-partly-deployed) · [Log](#2026-11-26-cloud-recordings-not-deployed)
 - **Connector field checks.** Exercise the Android token-refresh retry after rejection and mobile data on the A54. On the car network, check CAN/GNSS source loss and recovery, reconnect after a router or Jetson reboot, and recording performance with a phone and laptop watching. Tablet and local-browser CA checks remain. The S25 mobile-data trial, two-phone viewing and ten idle minutes already passed. [Pilot results](#2026-11-21-dashcam-connect-cloud-pilot) · [Physical checklist](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Next drive.** Secure the CSI mount, verify the connected devices and stock CSI driver, then calibrate the lane crops while parked. The IMX296 still resets in bright sun despite the gain floor. Run the parked raw-CAN loss test and collect day and night lane data. The recorder service and lane harness require separate runs. [Drive preparation](#open-work-in-priority-order)
 - **Bench work and owner decisions.** The main bench items are CSI night tuning and chart captures, MKR clock and C3 transmit-stall measurements, and display navigation/throughput checks. The turning EKF needs the antenna offset and a measured course. The incident threshold, CAN speed scale, stale-row handling and lane inference rate still need decisions. [Prioritized work and later prototypes](#open-work-in-priority-order)
 
 ## The rig now
+
+**2026-11-27 bench check (wired, 192.168.0.138).** The IMX296 on CAM1 is `/dev/video0`, and a 60-frame Argus capture
+at 1456×1088@60 with the gain floor passed. The UGREEN is `/dev/video1`/`video2`, and `dashcam-v04` records 180 s
+segments from it. The MKR, C3 and ES3C28P are not attached. v0.4 logs a DEBUG retry for `/dev/dashcam-display` every
+second, which grows the log. The power mode is MAXN_SUPER. The repo is on `eaa8c6e`, and the agent was restarted on it.
+[Configuration runbook](#2026-11-27-cloud-recordings-configuration-partly-deployed)
 
 **2026-11-26 USB-camera bench check.** The UGREEN capture interface was at `/dev/video0`.
 With only the camera connected, the S25 Ultra on mobile data received host health while v0.4 was
@@ -412,6 +418,154 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-11-27 Cloud recordings configuration (partly deployed)
+
+This section replaces the five-line deploy order in the [2026-11-26 Cloud recordings](#2026-11-26-cloud-recordings-not-deployed)
+section. It lists every cloud and device step, with the facts already known, the commands, a check for each step and
+rollback. gcloud, firebase, sudo and the release keystore are the user's.
+
+**Done on 2026-11-27 (Jetson, wired at 192.168.0.138).**
+- `~/dashcam` was fast-forwarded from `ed9373b` to `eaa8c6e`. The working tree is clean. No C++ changed in
+  `5e840b6` or `eaa8c6e`, so no rebuild was made. `dashcam-v04` still runs `bin/build_20261126_082828` and was not
+  interrupted.
+- On the Jetson, the agent suite passed (72 tests, including the real ffmpeg export), as did the cloud suite
+  (13 tests).
+- The user restarted `dashcam-monitor` and `dashcam-uplink` at 08:29:52. The monitor runs `service.py` from the repo,
+  so it now serves the `eaa8c6e` agent with the clip route. `/usr/bin/ffmpeg` is on the service's `PATH`, so
+  `clips` should be true. The identity endpoint needs the device credential, so it was not read.
+- mDNS advertises 192.168.0.138 (detected). The uplink reconnected and received a device control (generation 246).
+- **The uplink still runs the old code.** The restart reloaded `/opt/dashcam-uplink`, whose `uplink.py` predates
+  cloud recordings. Compared with the repo, only `uplink.py` differs. `listener.py`, `native.py` and
+  `libdashcam_uplink.so` are identical. `device-requirements.txt` has not changed since `8d1da5e` (2026-11-21), before
+  the uplink was installed. Cloud clip export cannot work until step 4 below.
+- **Order note.** The monitor restart happened before the [recordings review](#2026-11-27-recordings-code-review)
+  was read. Finding 6 (truncated segments listed as playable) was already live on the LAN from 2026-11-26. Finding 5
+  (empty MP4 beyond EOF) is in the clip route, which no client can reach until the uplink is updated.
+
+**Fixed facts (from the pilot and `stage.sh`).**
+
+| Item | Value |
+|---|---|
+| Project | `jetson-dashcam-handler`, region `asia-southeast1` |
+| Relay service | `dashcam-relay-staging`, single instance, 3600 s timeout. Last recorded revision `dashcam-relay-staging-00002-w8j` (2026-11-22); `stage.sh` prints the current one |
+| Public origin | `https://dashconnect.cloud.run` (also the regional `run.app` URL). Both are Firebase-authorized; the APKs are built against the first |
+| Runtime account | `dashcam-relay@jetson-dashcam-handler.iam.gserviceaccount.com` |
+| Build account | `dashcam-relay-build@…` (Cloud Run Builder) |
+| Clip bucket | `jetson-dashcam-handler-clips` (the `stage.sh` default `<project>-clips`) |
+| Jetson uplink | `/opt/dashcam-uplink`, state `/var/lib/dashcam-uplink/device.json` (the enrollment is kept across reinstalls) |
+| Release signing | alias `dashcam-release`, PKCS#12 keystore in `%USERPROFILE%\.android\dashcam-release` on the Windows build PC, certificate SHA-256 `51b92fab…` |
+
+**Before the steps: what blocks a real rollout.** Review findings 2 and 3 are in `relay.py`. Today a signing error
+closes the vehicle socket, and a vehicle reconnect leaves an export pending. Finding 1 (a failed Android download
+erases the saved copy) is in the APK. Fix those three before cloud recordings are used for real. Steps 1 and 2 can be
+run first as infrastructure: an empty bucket costs nothing, and the relay can be staged with `CLIP_BUCKET=` until
+the fixes land.
+
+**Step 1: check the relay account can sign (one-time pilot provisioning).** `ClipStorage` signs V4 URLs through IAM
+signBlob, so there is no key file. That needs the IAM Credentials API and `roles/iam.serviceAccountTokenCreator`
+granted to the relay account on itself (connector/cloud/README.md, "Prepare the staging project"). The pilot log
+does not say whether that grant was made, so check it:
+
+```sh
+project=jetson-dashcam-handler
+account=dashcam-relay@"$project".iam.gserviceaccount.com
+gcloud services list --enabled --project="$project" --filter=name:iamcredentials.googleapis.com
+gcloud iam service-accounts get-iam-policy "$account" --project="$project"
+# Expect roles/iam.serviceAccountTokenCreator with member serviceAccount:$account. If it is missing:
+gcloud services enable iamcredentials.googleapis.com --project="$project"
+gcloud iam service-accounts add-iam-policy-binding "$account" --project="$project" \
+  --member="serviceAccount:$account" --role=roles/iam.serviceAccountTokenCreator
+```
+
+**Step 2: create the clip bucket.** It is private, with uniform access, public access prevention, and clips deleted
+one day after upload. The relay account gets create (for the signed PUT) and view (for the signed play and download
+links). No CORS rule is needed: the page uses a `<video>` element and a plain link.
+
+```sh
+bucket="$project"-clips
+gcloud storage buckets create gs://"$bucket" --project="$project" --location=asia-southeast1 \
+  --uniform-bucket-level-access --public-access-prevention
+printf '%s' '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1}}]}' > /tmp/clip-lifecycle.json
+gcloud storage buckets update gs://"$bucket" --lifecycle-file=/tmp/clip-lifecycle.json
+gcloud storage buckets add-iam-policy-binding gs://"$bucket" --member="serviceAccount:$account" --role=roles/storage.objectCreator
+gcloud storage buckets add-iam-policy-binding gs://"$bucket" --member="serviceAccount:$account" --role=roles/storage.objectViewer
+```
+
+- **Check:** `gcloud storage buckets describe gs://"$bucket"` shows `asia-southeast1`, uniform bucket-level access,
+  public access prevention `enforced` and the 1-day delete rule. `gcloud storage buckets get-iam-policy gs://"$bucket"`
+  lists both roles for the relay account and no `allUsers`.
+- **Cost:** a 3 min 720p clip is about 34 MB and lives at most two days. Each viewer download is billed as Cloud
+  Storage egress.
+
+**Step 3: stage the relay (`connector/cloud/stage.sh`).** Run it in a Linux or WSL shell with gcloud and the
+Firebase CLI signed in to the project. `FIREBASE_WEB_CONFIG` must hold the registered web app's configuration as
+JSON: Firebase console → Project settings → Your apps → the web app → SDK setup and configuration. It needs
+`projectId`, `apiKey`, `authDomain` and `appId`; never put a service-account key in it.
+- **What it does:** checks both service accounts, billing and (unless `CLIP_BUCKET=` is empty) that the bucket
+  exists. It then **republishes `firestore.rules` for the whole default database** and deploys the relay from
+  `connector/` with `CLIP_BUCKET` set. Compare the live rules with `firestore.rules` first; the active pilot
+  ruleset is `57ce7eb3-…`.
+- **What it carries:** everything on `camera` for the relay and web client since the last stage, not just
+  recordings. That includes the `c75773d` interface-review fixes and the capacity timing fix, if they were not
+  staged yet.
+- **Order matters:** deploy the relay before any new client or uplink. An old relay closes a viewer socket that
+  sends a recordings request.
+
+```sh
+cd connector/cloud
+export FIREBASE_WEB_CONFIG='{"projectId":"jetson-dashcam-handler", ...}'   # from the console
+gcloud run services describe dashcam-relay-staging --region=asia-southeast1 --project="$project" \
+  --format='value(status.latestReadyRevisionName)'                        # record it for rollback
+./stage.sh                          # with clips
+CLIP_BUCKET= ./stage.sh             # alternative: Recordings list only; exports answer "clips are not set up"
+```
+
+- **Check:** the printed URL and new revision serve 100% of traffic. `https://dashconnect.cloud.run` loads and
+  signs in. The hostname does not change, so the Firebase authorized domains stay as they are.
+- **Rollback:** stop open sessions, then run
+  `gcloud run services update-traffic dashcam-relay-staging --region=asia-southeast1 --project="$project" --to-revisions=<previous>=100`.
+
+**Step 4: update the uplink on the Jetson.** Only `uplink.py` changed (see above). No `make`, venv or re-enrollment
+is needed:
+
+```sh
+cd ~/dashcam/connector/cloud
+sudo cp -p /opt/dashcam-uplink/uplink.py /opt/dashcam-uplink/uplink.py.bak-20261127
+sudo install -m 0644 uplink.py /opt/dashcam-uplink/
+sudo systemctl restart dashcam-uplink
+journalctl -u dashcam-uplink -n 20 --no-pager
+```
+
+- **Check:** `cmp uplink.py /opt/dashcam-uplink/uplink.py` is silent. The journal shows `uplink_target` and then a
+  `device_control` event after the restart. The two Google `FutureWarning` lines about Python 3.10 are expected. The
+  new uplink accepts only `https://storage.googleapis.com/` upload URLs.
+- **Rollback:** put the `.bak-20261127` copy back and restart.
+
+**Step 5: the agent (`dashcam-monitor`).** It has been on `eaa8c6e` since 08:29:52 today, so nothing is left unless
+the agent changes again (for review finding 5 or 6). Then `git pull` on the Jetson and `sudo systemctl restart
+dashcam-monitor`. **Not yet run:** ffmpeg under the service's sandbox (`PrivateTmp`, `ProtectHome=read-only`).
+fontconfig cannot write its cache there. Watch `journalctl -u dashcam-monitor` during the first export for font or
+cache errors, and check that the burned-in clock is drawn.
+
+**Step 6: build and install the Android release APK (Windows build PC).** Build from `android` with
+`-PdashcamRelayOrigin=https://dashconnect.cloud.run`, sign it with the `dashcam-release` identity (in-place update
+on the S25, pairings kept), and record its SHA-256 here. The A54 stays on debug-signed builds, which use a different
+identity. Include the review finding 1 fix first. The JVM tests do not catch Android-only failures, as the two LAN
+crashes showed, so run it on the S25 before relying on it.
+
+**Step 7: acceptance checks after steps 1–6.**
+- **Web, owner account:** on Recordings, export a 30 s Small clip, then a 3 min 720p clip. The object appears in
+  `gs://jetson-dashcam-handler-clips`, the play link plays in the page, and the download link saves an MP4. Expected
+  Jetson times are about 10 s and 127 s (2026-11-26 table). While it exports, a second viewer keeps fresh telemetry.
+- **Viewer account:** the same export works, because owners and viewers may both export.
+- **S25:** the Android cloud Recordings page, player and download to *Download/Dashcam*.
+- **Expiry:** links stop working after an hour, and the object is gone after the lifecycle delete (up to two days).
+- **Recorder:** footage stays continuous through the exports (each uses about 2.2–2.4 cores at nice 15).
+- **Review regressions:** run the checks for findings 2 and 3 against the deployed relay once they are fixed.
+
+**Back to LAN-only clips:** `CLIP_BUCKET= ./stage.sh`, or move traffic back to the previous revision. The bucket can
+stay; its lifecycle rule empties it.
+
 ## 2026-11-27 Recordings code review
 
 Reviewed the seven commits on `camera` after `68de9e1` through `eaa8c6e`. All eight findings below are open.
@@ -525,7 +679,9 @@ matches the segment's 22:35:50 start.
 - **The Android player and download on the S25.** Run these before relying on them: the LAN phase found two
   Android-only crashes.
 
-**Deploy order** (gcloud, firebase and sudo are the user's):
+**Deploy order** (gcloud, firebase and sudo are the user's). *Superseded 2026-11-27 by the
+[configuration runbook](#2026-11-27-cloud-recordings-configuration-partly-deployed), which also records the agent
+restart done that day.*
 1. Create the bucket.
 2. Run `stage.sh`. An old relay closes a viewer socket that sends a recordings request.
 3. Reinstall the uplink files and restart `dashcam-uplink`.
