@@ -8,7 +8,9 @@ This file has three parts:
 
 # Start here (2026-10-12)
 
-## Outstanding work brief (updated 2026-11-26)
+## Outstanding work brief (updated 2026-11-27)
+
+- **Recordings review, eight open findings.** Before deploying the recordings update, protect existing Android downloads and make cloud exports recover from signing failures and uplink reconnects. Five medium-priority findings cover browser recovery, clip and segment validity, and Android playback retry. [Findings, proposed fixes and regression checks](#2026-11-27-recordings-code-review)
 
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
 - **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. The four review findings are fixed and regression-tested, but not deployed yet. [Findings](#2026-11-26-live-view-review) · [Fixes](#2026-11-26-live-view-review-fixes-not-deployed)
@@ -409,6 +411,61 @@ compile-checked from these parts:
     the car uses a blocking branch today.
 
 # Log (newest first)
+
+## 2026-11-27 Recordings code review
+
+Reviewed the seven commits on `camera` after `68de9e1` through `eaa8c6e`. All eight findings below are open.
+The regression checks describe how to verify each proposed fix. Source locations refer to `eaa8c6e`.
+
+### 1. High — An interrupted Android download can erase the saved copy
+
+- **Failure.** On Android 10 and later, `RecordingsBrowser.save` deletes the existing MediaStore entry before opening the replacement. On Android 9 it opens the final path for writing, which truncates the file. A Wi-Fi drop, cancellation or full disk can therefore destroy a previously saved MKV or ASS sidecar. This follows from the write and error paths in [Recordings.kt](android/app/src/main/java/com/dashcam/connector/Recordings.kt#L186).
+- **Proposed fix.** Stage the video and any expected captions under unique temporary names. Close the streams and verify the byte counts before publishing the replacements. Keep the previous files until publication succeeds. On failure or cancellation, clean up the staged files. Use pending MediaStore entries on Android 10+ and same-directory temporary files on Android 9.
+- **Regression check.** Save a segment and captions, record their hashes, then repeat the download and cancel midway through the video. Repeat with a failure during the captions transfer. Both original hashes should survive. A successful retry should leave one correctly named MKV/ASS pair.
+
+### 2. High — A clip signing error can disconnect the vehicle uplink
+
+- **Failure.** The relay signs the upload URL in the viewer handler and the play/download URLs in the vehicle handler. An injected failure during download-link signing closed the vehicle socket after upload and left the requesting viewer without a final reply. Other viewers on the same vehicle lose telemetry and live video until the uplink reconnects. [relay.py](connector/cloud/relay.py#L223)
+- **Proposed fix.** Catch signing failures at both signing calls. Complete the affected request with one error carrying its original viewer request ID, clear its pending state, and keep the viewer and vehicle sockets serving other messages.
+- **Regression check.** Inject a signer exception before the export is sent, then separately after a successful upload. In each case, verify the requester receives an error, a second viewer continues receiving telemetry on the same connection, and a subsequent export succeeds once signing recovers.
+
+### 3. High — A vehicle reconnect leaves its previous export pending
+
+- **Failure.** Disconnecting the uplink after it accepted a clip, then reconnecting it and retrying from the same viewer, reproduced “Wait for the clip being exported to finish.” The relay associates the request with the viewer only. Its 15-minute expiry runs when another request arrives and silently discards expired entries, leaving the client waiting. [relay.py](connector/cloud/relay.py#L173)
+- **Proposed fix.** Record which uplink socket accepted each list or clip request. Fail that socket's outstanding requests on disconnect or replacement. Schedule a deadline for each request so a silent device also produces a final error. Remove completed entries once and ignore late replies from the old socket.
+- **Regression check.** Keep the viewer connected, drop the device after it receives the export, and reconnect it. The viewer should receive one error for the original ID and be able to export immediately. Test a silent device with a shortened deadline and verify that expiry works without another request.
+
+### 4. Medium — Switching browser tabs can leave Refresh or Export disabled
+
+- **Failure.** Hiding the cloud dashboard closes its viewer socket. The browser keeps callbacks for requests sent on that socket. Closing and reopening the socket during a list request reproduced `recLoading = true` with one stale callback. Refresh then refuses to issue another request. An export can similarly leave its button disabled. [app.js](connector/web/app.js#L1392)
+- **Proposed fix.** Associate callbacks with the socket that sent each request. When it closes or is replaced, remove its callbacks and deliver a connection-closed result to each handler. Re-enable the controls, reload an interrupted list on reconnect, and let the user explicitly retry an interrupted export to avoid making a duplicate clip.
+- **Regression check.** Hide and restore the tab once during list loading and once after the export status arrives. The list should reload on the new socket, and the interrupted export should show a retry option. A late message from the old socket should have no effect.
+
+### 5. Medium — A clip starting beyond the last frame returns an empty MP4
+
+- **Failure.** With the one-second recorder fixture, a start offset of two seconds produced a 261-byte MP4 with no video stream. FFmpeg exited successfully. The service accepts any nonempty output file on exit code zero, so the uplink can upload it and the relay can report the clip ready. [service.py](connector/service.py#L819)
+- **Proposed fix.** Add FFmpeg's `-abort_on empty_output` to the export command. It made the same fixture command fail in the review. Map that failure to HTTP 422 and report it to the viewer. Preserve the existing behavior for clips that start inside the segment and end early at EOF.
+- **Regression check.** Request a clip beyond EOF and verify HTTP 422, zero uploads and a final viewer error. Request a second clip that overlaps EOF and verify that the shorter MP4 contains playable video. Run both cases with the Jetson's installed FFmpeg.
+
+### 6. Medium — A power-interrupted segment can be listed as playable
+
+- **Failure.** The connector treats an MKV as finished after ten seconds without a write. A truncated copy of the recorder fixture older than that threshold was both listed and servable. The Android and browser players need the Matroska Cues seek index, which may be missing after an abrupt shutdown. [service.py](connector/service.py#L367)
+- **Proposed fix.** Mark new segments complete when the recorder receives the muxer's fragment-closed event. For existing footage without a marker, validate that the Cues index exists and lies inside the file before offering Play. Apply the same eligibility decision to the list and playback path, while keeping incomplete footage available for recovery. [Recorder event handler](lib/librecord/libsegment.cpp#L510)
+- **Regression check.** Use a finalized legacy segment, a newly closed segment, a growing segment and an aged copy truncated before Cues. The first two should play and seek on both clients. The growing and truncated files should never be advertised as playable, and their original bytes should be preserved.
+
+### 7. Medium — Refreshing the cloud list discards exported clip links
+
+- **Failure.** A successful list refresh rebuilds every segment row. An in-flight export callback still points to the old row, so a later success writes the play and download links into a detached element. Refreshing after a successful export also removes links that are still valid. This happens even with a healthy socket. [app.js](connector/web/app.js#L1431)
+- **Proposed fix.** Store export progress, errors, URLs and expiry by vehicle and segment ID outside the row elements. Have the request callback update that state and render it into the current row. Clear the state on vehicle change or sign-out.
+- **Regression check.** Export a clip, refresh the list before the final reply, then refresh again after the links appear. The current row should show the playable clip and download link after both refreshes, with only one export request.
+
+### 8. Medium — Android disables Play after telling the user to retry
+
+- **Failure.** A transient network exception during a LAN cluster read calls `fail("Connection lost · tap Play to resume")`. That sets `failed = true`, disabling the Play button and causing `play()` to return immediately. Reopening the segment loses the playback position. [Player](android/app/src/main/java/com/dashcam/connector/Recordings.kt#L287) and [Play control](android/app/src/main/java/com/dashcam/connector/RecordingsUi.kt#L92)
+- **Proposed fix.** Distinguish recoverable transport errors from terminal format errors. On connection loss, pause at the last displayed frame, keep Play enabled, and use the existing seek index to resume fetching from that position. Keep a clear terminal message for unreadable media.
+- **Regression check.** On the S25, interrupt Wi-Fi during playback, restore it, then tap Play without closing the player. Playback and captions should resume near the last displayed timestamp. Check a malformed MKV separately to confirm that it still gives a terminal format error.
+
+**Review verification.** All 53 Android JVM tests and all 13 cloud tests passed on the PC. The Linux connector suite ran on Windows with 12 failures and 13 errors across 72 tests, including Linux-only file flag and subprocess calls. The relay disconnect and signing cases used an in-process relay, the tab-switch check exercised the JavaScript socket handlers, and the media checks used local fixture files. The user reported the Jetson wired at `192.168.0.138` with CSI on CAM1 and a USB camera. This review session could reach neither SSH nor connector HTTPS there. Linux service tests, on-device camera operation and the S25 regression checks above remain pending for these fixes.
 
 ## 2026-11-26 Cloud recordings (not deployed)
 
