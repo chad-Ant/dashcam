@@ -19,6 +19,7 @@ docker run -it --rm --network=host --privileged --ipc=host \
     -v $MEDIA_DIR/configs:/user/output/configs \
     -v $MEDIA_DIR/footage:/user/output/footage \
     -v $MEDIA_DIR/logs:/user/output/logs \
+    -v /mnt:/user/output/mnt:rslave \
     -v /etc/localtime:/etc/localtime:ro \
     -v /etc/timezone:/etc/timezone:ro \
     $IMAGE_NAME

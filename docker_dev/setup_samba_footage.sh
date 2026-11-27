@@ -2,7 +2,10 @@
 #
 # setup_samba_footage.sh — share the dashcam footage folder on the network.
 #
-# Makes /media/$USER/backup/footage appear on a Windows PC as
+# Segments recorded to <repo>/footage_fallback while the card was missing are
+# not shared.
+#
+# Makes $FOOTAGE_DIR (default /mnt/sdcard/footage, the SD card v0.4 records to) appear on a Windows PC as
 #   \\<jetson-ip>\footage        (Explorer address bar, or "Map network drive")
 # READ-ONLY: the PC can copy footage off but never delete or modify it; the
 # dashcam's own loop overwrite manages disk space.  Login is the Jetson
@@ -21,13 +24,14 @@
 
 SHARE_NAME="footage"
 SHARE_USER="${SUDO_USER:-$USER}"
-FOOTAGE_DIR="/media/$SHARE_USER/backup/footage"
+# Share another folder (e.g. old footage on the SSD): FOOTAGE_DIR=/media/$USER/backup/footage ./setup_samba_footage.sh
+FOOTAGE_DIR="${FOOTAGE_DIR:-/mnt/sdcard/footage}"
 SMB_CONF="/etc/samba/smb.conf"
 BEGIN_MARK="# >>> dashcam footage share (managed by setup_samba_footage.sh) >>>"
 END_MARK="# <<< dashcam footage share <<<"
 
 if [ "$(id -u)" -ne 0 ]; then
-    exec sudo "$0" "$@"
+    exec sudo FOOTAGE_DIR="$FOOTAGE_DIR" "$0" "$@"   # sudo drops the environment
 fi
 set -e
 

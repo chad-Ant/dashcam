@@ -268,6 +268,10 @@ struct CameraConfig {
 // None of these locations is itself config-driven — the config directory obviously
 // cannot be, and the log directory is resolved before the config is read.  Footage
 // is overridable via the <System> config (FootagePath) since it is used after load.
+// v0.4 deployment: FootagePath points at the SD card through the launcher's
+// /mnt -> /user/output/mnt bind (/user/output/mnt/sdcard/footage), guarded by
+// FootageMountPoint; FallbackFootagePath (default <repo>/footage_fallback) stays
+// on the M.2 system SSD.
 inline constexpr const char* kDefaultFootageDir = "/user/output/footage";
 inline constexpr const char* kDefaultLogDir     = "/user/output/logs";
 inline constexpr const char* kDefaultConfigsDir = "/user/output/configs";
@@ -290,6 +294,8 @@ inline constexpr const char* kFallbackConfigsName = "config";
  */
 struct SystemConfig {
     ConfigVar<std::string> footagePath  {"FootagePath",  kDefaultFootageDir, "Directory for recorded dashcam video (USB primary feed, with overlay)"};
+    ConfigVar<std::string> footageMountPoint   {"FootageMountPoint",   "", "v0.4: FootagePath counts as usable only while this path is a mount point (e.g. the SD card's mount seen inside the container), so a missing card never turns the empty mount directory on the system disk into the recording target; empty = no check"};
+    ConfigVar<std::string> fallbackFootagePath {"FallbackFootagePath", "", "v0.4: directory recorded into while FootagePath is unusable (card missing, unmounted, failing or read-only); empty = <repo>/footage_fallback next to the build"};
 };
 
 /**

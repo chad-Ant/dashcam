@@ -134,7 +134,7 @@ DeepStream depends on Triton; Triton's JP 6 build path has changed. Either pin t
 
 ## Storage strategy for dashcam recordings
 
-Don't write to the container overlay. Mount host paths — point `/data` at the **footage directory on the SD card** (`mmcblk0`, mounted at `/media/jetson/backup`; the exact footage subdirectory is TBD), e.g. `-v /media/jetson/backup/dashcam:/data`. The card is removable (evidence retrieval) and isolated from the system rootfs on NVMe. Use a high-endurance card + power-loss-safe segmenting (see `event-recording.md`):
+Don't write to the container overlay. Mount host paths — point `/data` at the **footage directory on the SD card** (`mmcblk0`, mounted at `/mnt/sdcard`; v0.4 uses `/mnt/sdcard/footage`), e.g. `-v /mnt:/data/mnt:rslave` (bind the parent with slave propagation so a re-mounted card reaches the running container, and check that the card is mounted before writing). The card is removable (evidence retrieval) and isolated from the system rootfs on NVMe. Use a high-endurance card + power-loss-safe segmenting (see `event-recording.md`):
 - `/data/recordings/<date>/<time>.mp4` — primary recordings
 - `/data/events/<event-id>/{video.mp4, gps.json, imu.csv}` — event clips with metadata
 

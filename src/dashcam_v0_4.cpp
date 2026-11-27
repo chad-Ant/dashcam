@@ -246,6 +246,49 @@ static std::string fallbackFootageDir() {
     return (exe.parent_path().parent_path().parent_path() / "footage_fallback").string();
 }
 
+// A /proc/self/mountinfo field with its octal escapes (\040 space, \011 tab,
+// \012 newline, \134 backslash) decoded.
+static std::string unescapeMountField(const std::string& f) {
+    std::string out;
+    out.reserve(f.size());
+    for (size_t i = 0; i < f.size(); ++i) {
+        if (f[i] == '\\' && i + 3 < f.size() &&
+            f[i + 1] >= '0' && f[i + 1] <= '3' && f[i + 2] >= '0' && f[i + 2] <= '7' &&
+            f[i + 3] >= '0' && f[i + 3] <= '7') {
+            out += static_cast<char>((f[i + 1] - '0') * 64 + (f[i + 2] - '0') * 8 + (f[i + 3] - '0'));
+            i += 3;
+        } else {
+            out += f[i];
+        }
+    }
+    return out;
+}
+
+// True when @p path (absolute) is itself a mount point in this process's mount
+// namespace — the container's, so a card mounted on the host counts once it has
+// propagated in.  Reads only procfs, never the target filesystem, so it cannot
+// hang on a card that stopped answering.  A card pulled without an unmount
+// stays listed: the write probe catches that one (EIO).
+static bool isMountPoint(const std::string& path) {
+    const std::string want = fs::path(path).lexically_normal().string();
+    const std::string norm = want.size() > 1 && want.back() == '/' ? want.substr(0, want.size() - 1) : want;
+    std::ifstream in("/proc/self/mountinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+        // "<id> <parent> <maj:min> <root> <mount point> <options> ..."
+        size_t pos = 0;
+        for (int field = 0; field < 4 && pos != std::string::npos; ++field) {
+            pos = line.find(' ', pos);
+            if (pos != std::string::npos) ++pos;
+        }
+        if (pos == std::string::npos) continue;
+        const size_t end = line.find(' ', pos);
+        if (unescapeMountField(line.substr(pos, end == std::string::npos ? std::string::npos : end - pos)) == norm)
+            return true;
+    }
+    return false;
+}
+
 // ─── camera choice (pure; covered by --self-test) ─────────────────────────────
 
 // Largest compressed mode <=1080p at 24-31 fps; H.264 preferred over MJPEG
@@ -793,12 +836,19 @@ static int selfTestCameras() {
 
 class Storage {
 public:
-    using ProbeFn = std::function<int(const std::string&)>;
+    using ProbeFn   = std::function<int(const std::string&)>;
+    using MountedFn = std::function<bool(const std::string&)>;
 
+    /// @p requiredMount non-empty: the preferred directory is usable only while
+    /// that path is a mount point (<System><FootageMountPoint>), so a missing SD
+    /// card never makes its empty mount directory on the system disk the target.
     Storage(std::string preferred, rec::RetentionPolicy policy, dashcam::log::LogCallback log,
-            std::string fallback = fallbackFootageDir(), ProbeFn probe = probeDir)
+            std::string fallback = fallbackFootageDir(), ProbeFn probe = probeDir,
+            std::string requiredMount = "", MountedFn mounted = isMountPoint)
         : preferred_(std::move(preferred)), fallback_(std::move(fallback)),
-          policy_(std::move(policy)), log_(std::move(log)), probe_(std::move(probe)) {}
+          requiredMount_(std::move(requiredMount)),
+          policy_(std::move(policy)), log_(std::move(log)), probe_(std::move(probe)),
+          mounted_(std::move(mounted)) {}
     ~Storage() { release(); }
 
     /**
@@ -812,8 +862,18 @@ public:
      */
     std::string acquire(std::string& why) {
         std::string reasons, preferredWhy;
+        bool fallbackBusy = false;
         for (const std::string* dir : {&preferred_, &fallback_}) {
             std::string whyNot;
+            if (*dir == preferred_ && preferredFailed_ && *dir != fallback_) {
+                // Its last session died of a storage error: keep off it until
+                // preferredBack() finds it working again (once a probe
+                // interval), so a flaky card cannot drive a restart loop.
+                preferredWhy = "storage failed during the last session; rechecked every " +
+                               std::to_string(kPreferredProbe.count()) + " s";
+                reasons += preferred_ + ": " + preferredWhy;
+                continue;
+            }
             if (claim(*dir, whyNot)) {
                 const bool fallback = (*dir != preferred_);
                 if (fallback && !onFallback_)
@@ -823,11 +883,34 @@ public:
                 return dir_;
             }
             if (*dir == preferred_) preferredWhy = whyNot;
+            else fallbackBusy = whyNot.rfind("locked:", 0) == 0;
             reasons += (reasons.empty() ? "" : "; ") + *dir + ": " + whyNot;
+        }
+        if (preferredFailed_ && !fallbackBusy) {
+            // The fallback is unusable too (not merely held for a moment by a
+            // cleanup pass of ours): a flaky card beats no recording.
+            preferredFailed_ = false;
+            std::string whyNot;
+            if (claim(preferred_, whyNot)) { onFallback_ = false; return dir_; }
+            reasons += "; " + preferred_ + " (retried): " + whyNot;
         }
         why = "no usable footage directory (" + reasons + ")";
         return "";
     }
+
+    /**
+     * The session recording into the held directory died of a storage failure
+     * (librecord's storageFailed()).  If that is the preferred directory, the
+     * next acquire() records to the fallback even if a probe of the preferred
+     * one happens to succeed; preferredBack() lifts this once a probe interval.
+     */
+    /// True when this call marked the preferred directory.
+    bool markFailed() {
+        if (dir_.empty() || dir_ != preferred_ || preferred_ == fallback_) return false;
+        preferredFailed_ = true;
+        return true;
+    }
+    bool preferredFailed() const { return preferredFailed_; }
 
     /**
      * On the fallback: true when the preferred directory takes writes again and
@@ -839,6 +922,7 @@ public:
      */
     bool preferredBack() {
         if (!onFallback_) return false;
+        if (!preferredMounted()) return false;
         int err = probe_(preferred_);
         if (err != 0 && err != ENOSPC) return false;
         std::string whyNot;
@@ -849,6 +933,7 @@ public:
             err = probe_(preferred_);
         }
         ::close(fd);                              // acquire() re-takes it
+        if (err == 0) preferredFailed_ = false;
         return err == 0;
     }
 
@@ -883,12 +968,16 @@ public:
     }
 
 private:
-    std::string               preferred_, fallback_, dir_;
+    std::string               preferred_, fallback_, requiredMount_, dir_;
     rec::RetentionPolicy      policy_;
     dashcam::log::LogCallback log_;
     ProbeFn                   probe_;
+    MountedFn                 mounted_;
     int                       lockFd_ = -1;
     bool                      onFallback_ = false;
+    bool                      preferredFailed_ = false;   ///< See markFailed().
+
+    bool preferredMounted() const { return requiredMount_.empty() || mounted_(requiredMount_); }
 
     rec::RetentionResult retainIn(const std::string& dir, uint64_t watermark) {
         rec::RetentionPolicy p = policy_;
@@ -899,6 +988,12 @@ private:
     // Lock @p dir (unless already held) and make sure it takes a write.  Never
     // deletes anything in a directory whose lock it does not hold.
     bool claim(const std::string& dir, std::string& whyNot) {
+        // Checked before the probe: probeDir would create the directory (and its
+        // probe file) on whatever filesystem holds the bare mount directory.
+        if (dir == preferred_ && !preferredMounted()) {
+            whyNot = requiredMount_ + " is not mounted (SD card missing?)";
+            return false;
+        }
         int err = probe_(dir);
         if (err != 0 && err != ENOSPC) {
             whyNot = err == ETIMEDOUT ? "not answering (write probe still pending)" : std::strerror(err);
@@ -1001,6 +1096,72 @@ static int selfTestStorage() {
         std::string why;
         check(st.acquire(why).empty() && !why.empty(), "nothing usable: empty result with a reason");
     }
+    {
+        // FootageMountPoint: the SD card's mount.  Not mounted = the preferred
+        // directory is never probed (so never created on the bare mount dir).
+        const std::string P = A + "/sd/footage";
+        bool mounted = false;
+        std::string asked;
+        auto mountedFn = [&](const std::string& m) { asked = m; return mounted; };
+        Storage st(P, pol, quiet, B, probeDir, A + "/sd", mountedFn);
+        std::string why;
+        check(st.acquire(why) == B, "card not mounted: records to the fallback");
+        check(asked == A + "/sd", "... the configured mount point is the one checked");
+        check(!fs::exists(A + "/sd"), "... and nothing is created under the bare mount directory");
+        check(!st.preferredBack(), "preferredBack() while unmounted: not back");
+        mounted = true;
+        check(st.preferredBack(), "card mounted again: preferred back");
+        st.release();
+        check(st.acquire(why) == P, "acquire then records to the card");
+        mounted = false;
+        st.release();
+        check(st.acquire(why) == B, "card gone at the next start: fallback again");
+    }
+    {
+        Storage st(A, pol, quiet, B, probeDir, "", [](const std::string&) { return false; });
+        std::string why;
+        check(st.acquire(why) == A, "no FootageMountPoint: no mount check");
+    }
+    {
+        // A session on the card died of a storage error (librecord storageFailed()).
+        Storage st(A, pol, quiet, B);
+        std::string why;
+        check(st.acquire(why) == A, "storage failure: starts on the preferred directory");
+        check(st.markFailed(), "... a failure on the preferred directory marks it");
+        st.release();
+        check(st.acquire(why) == B, "... after the failure: fallback even though the preferred probe passes");
+        check(!st.markFailed(), "... a failure on the fallback marks nothing");
+        check(st.preferredFailed(), "... the mark stays while recording on the fallback");
+        check(st.preferredBack() && !st.preferredFailed(), "... preferredBack() checks it out and lifts the mark");
+        st.release();
+        check(st.acquire(why) == A, "... then back on the preferred directory");
+    }
+    {
+        Storage st(A, pol, quiet, "/proc/v04_selftest_no_fb");
+        std::string why;
+        check(st.acquire(why) == A, "storage failure, fallback unusable: on the preferred");
+        st.markFailed();
+        st.release();
+        check(st.acquire(why) == A && !st.preferredFailed(), "... a flaky card beats no recording");
+    }
+    {
+        // The fallback only held for a moment (a cleanup pass of ours keeps its lock).
+        Storage st(A, pol, quiet, B);
+        std::string why;
+        check(st.acquire(why) == A && st.markFailed(), "storage failure, fallback briefly locked: marked");
+        st.release();
+        const int pass = ::open((B + "/" + kLockName).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        const bool locked = pass >= 0 && ::flock(pass, LOCK_EX | LOCK_NB) == 0;
+        check(locked && st.acquire(why).empty() && st.preferredFailed(),
+              "... no start, and the failed card is not taken back");
+        if (pass >= 0) ::close(pass);
+        check(st.acquire(why) == B, "... the fallback once its lock is free");
+    }
+    check(isMountPoint("/") && isMountPoint("/proc") && !isMountPoint(A),
+          "isMountPoint: / and /proc are mounts, a plain temp dir is not");
+    check(isMountPoint("/proc/") , "isMountPoint: a trailing slash is ignored");
+    check(unescapeMountField("/mnt/my\\040card") == "/mnt/my card" && unescapeMountField("a\\") == "a\\",
+          "mountinfo escapes decoded, a dangling backslash kept");
     std::error_code ec;
     fs::remove_all(A, ec);
     fs::remove_all(B, ec);
@@ -1568,17 +1729,34 @@ int main(int argc, char* argv[]) {
     const bool fixedFocus = focusMode == "fixed";
     const std::string focusText = fixedFocus ? "fixed at " + std::to_string((int)r.focusAbsolute)
                                              : std::string("camera");
+    // Footage targets: the preferred directory (the SD card in the deployment),
+    // guarded by FootageMountPoint, and the fallback on the system SSD.
+    const std::string footageMount = cfg.system.footageMountPoint;
+    const std::string fallbackDir  = std::string(cfg.system.fallbackFootagePath).empty()
+                                         ? fallbackFootageDir()
+                                         : std::string(cfg.system.fallbackFootagePath);
+    if (!footageMount.empty()) {
+        const fs::path mp = fs::path(footageMount).lexically_normal();
+        const fs::path fp = fs::path(std::string(cfg.system.footagePath)).lexically_normal();
+        const auto rel = fp.lexically_relative(mp);
+        if (mp.is_relative() || rel.empty() || *rel.begin() == "..")
+            log(LogLevel::WARN, "FootageMountPoint " + footageMount + " does not contain FootagePath " +
+                                std::string(cfg.system.footagePath) + " — the mount check guards nothing useful");
+    }
+    if (fallbackDir == std::string(cfg.system.footagePath))
+        log(LogLevel::WARN, "FallbackFootagePath equals FootagePath — there is no separate fallback");
     {
         char quotaBuf[32];
         std::snprintf(quotaBuf, sizeof(quotaBuf), "%.1f GB", (double)(float)r.maxFootageGB);
         const std::string quotaText = quota ? quotaBuf : "off";
-        char buf[640];
+        char buf[1024];
         std::snprintf(buf, sizeof(buf),
-                      "settings: footage=%s segment=%d s quota=%s floor=%.1f GB stall=%d ms "
+                      "settings: footage=%s (mount check: %s) fallback=%s segment=%d s quota=%s floor=%.1f GB stall=%d ms "
                       "firstFrame=%d ms retry=%d s sync=%d ms recordFps=%d exposure=%s focus=%s "
                       "config=%s/dashcam.xml",
-                      std::string(cfg.system.footagePath).c_str(), (int)r.segmentSec,
-                      quotaText.c_str(),
+                      std::string(cfg.system.footagePath).c_str(),
+                      footageMount.empty() ? "off" : footageMount.c_str(), fallbackDir.c_str(),
+                      (int)r.segmentSec, quotaText.c_str(),
                       (double)(float)r.minFreeGB, (int)r.stallTimeoutMs, (int)r.firstFrameTimeoutMs,
                       (int)r.retryIntervalSec, (int)r.syncIntervalMs, (int)r.recordFps,
                       exposureText.c_str(), focusText.c_str(),
@@ -1601,7 +1779,7 @@ int main(int argc, char* argv[]) {
     policy.minFreeBytes = floor;
     // Directory probes are bounded: a footage filesystem that stopped
     // answering counts as unusable instead of stalling the supervisor.
-    Storage   storage(cfg.system.footagePath, policy, log, fallbackFootageDir(), BoundedProbe{});
+    Storage   storage(cfg.system.footagePath, policy, log, fallbackDir, BoundedProbe{}, footageMount);
     Retention retention;                   // deletes run off the supervisor, one runner per dir
     FailureLog failures(log);
 
@@ -2115,6 +2293,15 @@ int main(int argc, char* argv[]) {
             // failed start and backs off, so a camera that fails right after its
             // first frame cannot drive a tight restart loop.
             const std::string why = recorder.lastError();
+            if (recorder.storageFailed()) {
+                if (storage.markFailed()) {
+                    nextProbe = now + kPreferredProbe;    // a full probe interval on the fallback
+                    log(LogLevel::WARN, "footage storage " + storage.dir() + " failed (" + why +
+                                        ") — recording to the fallback until it checks out again");
+                } else {
+                    log(LogLevel::WARN, "footage storage " + storage.dir() + " failed (" + why + ")");
+                }
+            }
             stopRecording();
             scheduleRetry(why.empty() ? "recording stopped" : why);
         } else {

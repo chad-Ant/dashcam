@@ -487,6 +487,13 @@ void SegmentedRecorder::handleMessage(GstMessage* msg) {
         }
         const std::string text = std::string("pipeline error: ") + (err ? err->message : "?");
         doLog(log_, LogLevel::DEBUG, "recording pipeline error detail: %s", dbg ? dbg : "-");
+        // The file sink failing to open, write or sync a segment is the footage
+        // storage failing (card pulled, read-only); a full disk is left to retention.
+        if (err && err->domain == GST_RESOURCE_ERROR &&
+            (err->code == GST_RESOURCE_ERROR_WRITE || err->code == GST_RESOURCE_ERROR_OPEN_WRITE ||
+             err->code == GST_RESOURCE_ERROR_OPEN_READ_WRITE || err->code == GST_RESOURCE_ERROR_SYNC ||
+             err->code == GST_RESOURCE_ERROR_CLOSE))
+            storageFailed_.store(true);
         if (err) g_error_free(err);
         g_free(dbg);
         errorSeen_.store(true);
@@ -627,12 +634,26 @@ void SegmentedRecorder::syncLoop() {
     std::string lastErr;
     auto lastReport = clock::now() - std::chrono::minutes(1);
 
+    // A sync error that says the storage itself is gone or no longer takes
+    // writes (SD card pulled, exFAT remounted read-only after an error) ends
+    // the session at once, so the caller moves to its fallback directory now
+    // instead of after a later write error or the next rollover.  Anything
+    // else stays a rate-limited report.
+    auto escalate = [&](int err, const std::string& what) {
+        if (err == EIO || err == EROFS || err == ENODEV || err == ENXIO || err == ENOTCONN) {
+            storageFailed_.store(true);
+            setError("footage storage failed: " + what + ": " + std::strerror(err));
+        }
+    };
     auto syncOne = [&](int fd, bool directory) {
         if (syncTestHook_) syncTestHook_();
         const int64_t t0 = steadyNowNs();
-        if ((directory ? ::fsync(fd) : ::fdatasync(fd)) != 0) {
+        const int rc = syncErrnoHook_ ? syncErrnoHook_(directory)
+                                      : ((directory ? ::fsync(fd) : ::fdatasync(fd)) != 0 ? errno : 0);
+        if (rc != 0) {
             ++failCount;
-            lastErr = std::strerror(errno);
+            lastErr = std::strerror(rc);
+            escalate(rc, directory ? "directory sync" : "sync");
         } else if (!directory) {
             syncedFiles_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -642,9 +663,11 @@ void SegmentedRecorder::syncLoop() {
     // A file that does not exist (yet, or any more) is not a failure; any other
     // open error means that file is not being made durable — report it.
     auto openFailed = [&](const std::string& path) {
-        if (errno == ENOENT) return;
+        const int err = errno;
+        if (err == ENOENT) return;
         ++failCount;
-        lastErr = "open " + baseName(path) + ": " + std::strerror(errno);
+        lastErr = "open " + baseName(path) + ": " + std::strerror(err);
+        escalate(err, "open " + baseName(path));
     };
     auto track = [&](int& fd, std::string& open, const std::string& want) {
         if (want == open) return;
@@ -755,6 +778,7 @@ void SegmentedRecorder::checkWatchdog() {
                   "since then may not survive a power cut", static_cast<long long>(stuckMs));
         }
         if (stallMs > 0 && stuckMs >= stallMs) {
+            storageFailed_.store(true);          // the footage disk stopped answering (e.g. SD slot contact)
             setError("disk sync stuck for " + std::to_string(stuckMs) + " ms (disk not responding)");
             return;
         }
@@ -872,6 +896,7 @@ bool SegmentedRecorder::start(const std::string& devicePath, const RecordingForm
         currentFile_.clear();
         openSeqs_.clear();
     }
+    storageFailed_.store(false);
     auto fail = [this](const std::string& why) {
         {
             std::lock_guard<std::mutex> lock(stateMutex_);

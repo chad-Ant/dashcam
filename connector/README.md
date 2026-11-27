@@ -121,10 +121,12 @@ router keeps paired devices' saved address valid. The service's `IPAddressAllow`
 it uses (the rig has a drop-in for 192.168.1.0/24).
 
 ```bash
-printf 'LAN_ADDRESS=auto\nFOOTAGE_PATH=/user/output/footage\n' \
+printf 'LAN_ADDRESS=auto\nFOOTAGE_PATH=/mnt/sdcard/footage\n' \
   > ~/.config/dashcam-monitor/service.env
 chmod 600 ~/.config/dashcam-monitor/service.env
-# Edit FOOTAGE_PATH above to the actual HOST path backing the footage mount.
+# FOOTAGE_PATH is the HOST directory the recorder writes to (the SD card's
+# footage folder), not the container path.  Segments recorded to
+# <repo>/footage_fallback while the card was missing are not listed.
 sudo cp connector/dashcam-monitor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dashcam-monitor

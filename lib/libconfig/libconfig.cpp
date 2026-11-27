@@ -195,6 +195,8 @@ static void parseCamera(pugi::xml_node node, CameraConfig& cam,
 static void parseSystem(pugi::xml_node node, SystemConfig& sys,
                         const dashcam::log::LogCallback& log) {
     readVar(node, sys.footagePath,  log);
+    readVar(node, sys.footageMountPoint,   log);
+    readVar(node, sys.fallbackFootagePath, log);
 }
 
 static void parsePipeline(pugi::xml_node node, PipelineConfig& p,
@@ -431,6 +433,8 @@ static void writeCamera(pugi::xml_node parent, const CameraConfig& cam) {
 static void writeSystem(pugi::xml_node parent, const SystemConfig& sys) {
     pugi::xml_node n = parent.append_child("System");
     writeVar(n, sys.footagePath);
+    writeVar(n, sys.footageMountPoint);
+    writeVar(n, sys.fallbackFootagePath);
 }
 
 static void writePipeline(pugi::xml_node parent, const PipelineConfig& p) {

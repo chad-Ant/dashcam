@@ -16,10 +16,21 @@
 # No terminal is needed, so systemd can run this script (see below).
 #
 # Storage: /user/output/{configs,footage,logs,navcache} are bind mounts onto
-# $MEDIA_DIR; if the footage mount is unusable the program records into
-# <repo>/footage_fallback/ (same loop-overwrite rules) and moves back when the
-# mount works again.  navcache holds the <Navigation> map tile cache (SQLite,
-# <CacheBudgetMB>), so tiles survive restarts instead of being downloaded again.
+# $MEDIA_DIR (on the M.2 system SSD).  Host /mnt is shared in as /user/output/mnt
+# with slave propagation, so the SD card (fstab: /mnt/sdcard) and any later
+# re-mount of it are visible inside the running container.  To record to the
+# card, $MEDIA_DIR/configs/dashcam.xml (the file the recorder reads, not the repo
+# example) needs <System><FootagePath>/user/output/mnt/sdcard/footage and
+# <FootageMountPoint>/user/output/mnt/sdcard.  While the card is missing,
+# failing or read-only the program records into <FallbackFootagePath> (default
+# <repo>/footage_fallback/, also on the SSD; same loop-overwrite rules) and moves
+# back within a minute of the card being mounted and working again.  A card
+# inserted or re-inserted after boot is mounted again only with
+# docker_dev/99-dashcam-sdcard.rules installed; otherwise run
+# "sudo umount -l /mnt/sdcard; sudo mount /mnt/sdcard".  To eject the card, stop
+# dashcam-v04, smbd and dashcam-monitor, then umount /mnt/sdcard (see README).
+# navcache holds the <Navigation> map tile cache (SQLite, <CacheBudgetMB>), so
+# tiles survive restarts instead of being downloaded again.
 #
 # Autostart at boot (needs sudo once):
 #   sudo cp /home/$USER/dashcam/docker_dev/dashcam-v04.service /etc/systemd/system/
@@ -60,6 +71,7 @@ exec docker run $TTY_FLAGS --rm --name "$CONTAINER_NAME" --stop-timeout 20 \
     -v $MEDIA_DIR/footage:/user/output/footage \
     -v $MEDIA_DIR/logs:/user/output/logs \
     -v $MEDIA_DIR/navcache:/user/output/navcache \
+    -v /mnt:/user/output/mnt:rslave \
     -v /run/dashcam-monitor:/run/dashcam-monitor \
     -v /etc/localtime:/etc/localtime:ro \
     -v /etc/timezone:/etc/timezone:ro \

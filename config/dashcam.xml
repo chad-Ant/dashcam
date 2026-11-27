@@ -41,6 +41,12 @@
     </Camera>
   </Cameras>
   <System>
-    <FootagePath>/user/output/footage</FootagePath>
+    <!-- Footage on the SD card (host /mnt/sdcard, shared in by the v0.4
+         launcher as /user/output/mnt), used only while the card is mounted;
+         otherwise recording goes to FallbackFootagePath (empty =
+         <repo>/footage_fallback on the system SSD). -->
+    <FootagePath>/user/output/mnt/sdcard/footage</FootagePath>
+    <FootageMountPoint>/user/output/mnt/sdcard</FootageMountPoint>
+    <FallbackFootagePath></FallbackFootagePath>
   </System>
 </DashcamConfig>

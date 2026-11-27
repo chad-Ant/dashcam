@@ -1,0 +1,23 @@
+# udev rules: keep the dashcam SD card's mount (/etc/fstab: /mnt/sdcard) in step
+# with the card itself, so dashcam v0.4 (<System><FootageMountPoint>) falls back
+# to the SSD when the card goes and moves back to it, without a restart, when it
+# returns.
+#
+#   inserted after boot -> start mnt-sdcard.mount (fstab mounts only run at boot)
+#   pulled              -> lazily detach the dead mount.  Nothing else unmounts
+#                          it (a plain umount would be refused, EBUSY, while the
+#                          recorder container holds its propagated copy), and the
+#                          stale mount would block the next mount at /mnt/sdcard.
+#                          udevd has a private mount namespace, so the umount
+#                          runs via systemd-run in the host's.
+#
+# Both rules key on the card's filesystem UUID, the same one /etc/fstab mounts
+# (a re-inserted card may come back as mmcblk1 while the old one is still held);
+# a new card needs both updated (blkid /dev/mmcblk*p1).
+#
+# Install:  sudo cp docker_dev/99-dashcam-sdcard.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload
+# Remove:   sudo rm /etc/udev/rules.d/99-dashcam-sdcard.rules && sudo udevadm control --reload
+
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="3264-6531", ENV{SYSTEMD_WANTS}+="mnt-sdcard.mount"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="3264-6531", RUN+="/usr/bin/systemd-run --no-block --collect /usr/bin/umount -l /mnt/sdcard"

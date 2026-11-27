@@ -32,6 +32,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +66,7 @@ struct RecorderTestHook {
     static void setSource(SegmentedRecorder& r, std::string desc) { r.testSourceDesc_ = std::move(desc); }
     static GstElement* pipeline(SegmentedRecorder& r) { return r.pipeline_; }
     static void setSyncHook(SegmentedRecorder& r, std::function<void()> fn) { r.syncTestHook_ = std::move(fn); }
+    static void setSyncErrno(SegmentedRecorder& r, std::function<int(bool)> fn) { r.syncErrnoHook_ = std::move(fn); }
     static void setWorkerHook(SegmentedRecorder& r, std::function<void()> fn) { r.workerTestHook_ = std::move(fn); }
     static void closePreviewGate(SegmentedRecorder& r) { r.previewGate_.store(false); }  ///< As stop() does first.
 };
@@ -1058,6 +1060,7 @@ static void syncStallCase(uint32_t stallMs, double expectFailAt, bool blockSidec
           tag + ": unhealthy after the warning, at ~" + std::to_string(int(expectFailAt)) + " s (" +
           std::to_string(failAt) + " s)");
     check(r.lastError().find("disk sync stuck") != std::string::npos, tag + ": reason: " + r.lastError());
+    check(r.storageFailed(), tag + ": reported as a storage failure");
     release.store(true);                                  // the disk answers again
     check(r.stop(), tag + ": stop() finalises once the disk answers");
     const auto segs = listSegments(dir);
@@ -1070,6 +1073,51 @@ static void testSyncStall() {
     syncStallCase(7000, 7.0);                             // the configured limit
     syncStallCase(1000, 6.0);                             // below 2 x warning: floored, warning first
     syncStallCase(1000, 6.0, true);                       // worker blocked on the same disk
+}
+
+// ─── A14b: failing footage storage ends the session at once ──────────────────
+//
+// A sync error that means the card is gone or read-only (EIO / EROFS) makes the
+// session unhealthy within one sync round, so the caller moves to its fallback
+// directory; any other error (here EINVAL) stays a rate-limited report.
+
+static void syncErrorCase(int err, bool fatal) {
+    const std::string tag = std::string("sync error ") + std::strerror(err);
+    const std::string dir = makeTempDir("syncerr");
+    rec::SegmentedRecorder r;
+    rec::RecorderTestHook::setSource(r, kMjpegSrc);
+    std::atomic<bool> fail{false};
+    rec::RecorderTestHook::setSyncErrno(r, [&](bool) { return fail.load() ? err : 0; });
+    auto o = segOpts(dir, 60);
+    o.syncIntervalMs = 200;
+    check(r.start("unused", fmt320(V4L2_PIX_FMT_MJPEG), o), tag + ": start");
+    feedClockOnly(r, 1000);
+    check(r.isRecording(), tag + ": healthy before the error");
+    fail.store(true);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    double failAt = -1;
+    while (secs() < 2.0 && failAt < 0) {
+        feedClockOnly(r, 50);
+        if (!r.isRecording()) failAt = secs();
+    }
+    if (fatal) {
+        check(failAt >= 0 && failAt < 1.0, tag + ": unhealthy within a sync round (" + std::to_string(failAt) + " s)");
+        check(r.lastError().find("footage storage failed") != std::string::npos, tag + ": reason: " + r.lastError());
+        check(r.storageFailed(), tag + ": reported as a storage failure");
+    } else {
+        check(failAt < 0 && r.isRecording() && !r.storageFailed(), tag + ": not fatal, still recording");
+    }
+    fail.store(false);
+    r.stop();
+    fs::remove_all(dir);
+}
+
+static void testSyncError() {
+    std::cout << "\n--- A14b: failing footage storage ---\n";
+    syncErrorCase(EIO, true);       // card pulled
+    syncErrorCase(EROFS, true);     // exFAT remounted read-only after an error
+    syncErrorCase(EINVAL, false);   // not a storage failure
 }
 
 // ─── A15: compressed preview tap (ES3C28P display preview) ───────────────────
@@ -1673,6 +1721,7 @@ static void runPartA() {
     testDurableSync();
     testAbruptExitLowRate();
     testSyncStall();
+    testSyncError();
     testPreviewTap();
 }
 

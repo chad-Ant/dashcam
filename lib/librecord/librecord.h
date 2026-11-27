@@ -607,6 +607,12 @@ public:
     /// Why the session went unhealthy / failed to start ("" when fine).
     std::string lastError() const;
 
+    /// True when this session failed because the footage storage itself failed
+    /// (a sync/open error such as EIO or EROFS, a disk sync stuck past
+    /// syncStallTimeoutMs, or a write error from the file sink) rather than the camera: the caller should record elsewhere for a
+    /// while instead of retrying the same directory.  Reset by start().
+    bool storageFailed() const { return storageFailed_.load(); }
+
     /// Retention watermark: owned segments with SEQ below this are closed and
     /// safe to delete.  UINT64_MAX when no session is active.
     uint64_t deletableBelowSeq() const;
@@ -667,6 +673,7 @@ private:
     bool                    monStop_ = false;    ///< Guarded by monMu_.
     std::atomic<bool>    stopFlag_{false};
     std::atomic<bool>    healthy_{false};
+    std::atomic<bool>    storageFailed_{false};   ///< See storageFailed().
     std::atomic<bool>    eosSeen_{false};
     std::atomic<bool>    errorSeen_{false};
     std::atomic<uint64_t> bufferCount_{0};
@@ -678,6 +685,7 @@ private:
     std::atomic<int64_t>  syncBusySinceNs_{0};  ///< steady ns a sync round began; 0 = idle.
     int64_t               syncWarnedFor_ = 0;   ///< Monitor: the stuck round already reported.
     std::function<void()> syncTestHook_;        ///< Test hook: runs before each sync call.
+    std::function<int(bool)> syncErrnoHook_;    ///< Test hook: replaces each sync call; returns its errno (0 = ok); arg = directory sync.
     std::function<void()> workerTestHook_;      ///< Test hook: runs where the worker writes the sidecar.
     std::atomic<uint64_t> sourceCount_{0};      ///< Frames entering the RecordFps cap.
     bool                  hasRateCap_ = false;

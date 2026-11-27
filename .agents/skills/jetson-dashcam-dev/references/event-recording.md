@@ -152,7 +152,7 @@ This makes events queryable later without re-running inference — important sin
 
 ## Storage budgeting
 
-**Storage decision:** footage goes on the **SD card** (`mmcblk0`, currently mounted at `/media/jetson/backup`, ~167 GB usable; a dedicated footage directory there is TBD). The ~1 TB system NVMe (`nvme0n1p1`, rootfs `/`) stays for OS/software; the second NVMe (`nvme1n1`) holds swap + ~103 GB free. Footage-on-SD is exactly what commercial dashcams do — the card choice and write pattern are what make it robust:
+**Storage decision:** footage goes on the **SD card** (`mmcblk0`, 512 GB exFAT, mounted by fstab at `/mnt/sdcard`; v0.4 records to `/mnt/sdcard/footage`, seen in the container as `/user/output/mnt/sdcard/footage` and guarded by `<FootageMountPoint>`). `/media/jetson/backup` is now a plain directory on the system NVMe holding configs/logs/navcache; the v0.4 fallback `<repo>/footage_fallback` is on the NVMe too. The ~1 TB system NVMe (`nvme0n1p1`, rootfs `/`) stays for OS/software; the second NVMe (`nvme1n1`) holds swap + ~103 GB free. Footage-on-SD is exactly what commercial dashcams do — the card choice and write pattern are what make it robust:
 
 - **Throughput is a non-issue at these bitrates.** A single 4 Mbps H.264 stream is ~0.5 MB/s; even a modest Class-10/U1 card (~10 MB/s sustained) has 20× headroom. SD write-throttling only matters at 4K/high-Mbps, not here.
 - **Endurance is the real constraint.** Continuous record writes ~14 GB/8 h-day (~43 GB/day 24/7); a consumer card's TBW is spent fast. Use a **high-endurance / surveillance-rated microSD** (SanDisk High Endurance, Samsung PRO Endurance) or an industrial card, and plan to monitor + replace it.

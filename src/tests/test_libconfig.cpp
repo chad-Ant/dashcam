@@ -73,7 +73,17 @@ static bool test_load_real_file() {
     }
 
     // System defaults
-    check(cfg.system.footagePath == "/user/output/footage", "system.footagePath == \"/user/output/footage\"");
+    // The shipped file records to the SD card (v0.4 launcher's /mnt bind), guarded
+    // by its mount, with the build-local fallback; the built-in defaults differ.
+    check(cfg.system.footagePath == "/user/output/mnt/sdcard/footage", "system.footagePath == the SD card's footage dir");
+    check(cfg.system.footageMountPoint == "/user/output/mnt/sdcard",   "system.footageMountPoint == the SD card's mount");
+    check(std::string(cfg.system.fallbackFootagePath).empty(),         "system.fallbackFootagePath empty (<repo>/footage_fallback)");
+    {
+        const SystemConfig defaults;
+        check(defaults.footagePath == kDefaultFootageDir && std::string(defaults.footageMountPoint).empty() &&
+                  std::string(defaults.fallbackFootagePath).empty(),
+              "SystemConfig defaults: /user/output/footage, no mount check, build-local fallback");
+    }
 
     // Sections/fields absent from the on-disk file keep their built-in defaults.
     check(cfg.log.queueSize == 8192,               "log.queueSize default 8192 (section may be absent)");
@@ -117,6 +127,8 @@ static bool test_roundtrip() {
     src.recording.focusMode           = std::string("fixed");
     src.recording.focusAbsolute       = 250;
     src.system.footagePath  = "/mnt/ssd/footage";
+    src.system.footageMountPoint   = "/user/output/mnt/sdcard";
+    src.system.fallbackFootagePath = "/user/dashcam/footage_fallback";
     src.pipeline.branchQueueDepth = 5;
     src.log.queueSize     = 4096;
     src.log.rotateSizeKb  = 1024;
@@ -268,6 +280,8 @@ static bool test_roundtrip() {
     check((std::string)dst.recording.focusMode == "fixed", "recording.focusMode round-trip");
     check(dst.recording.focusAbsolute       == 250,    "recording.focusAbsolute round-trip");
     check(dst.system.footagePath  == "/mnt/ssd/footage", "system.footagePath round-trip");
+    check(dst.system.footageMountPoint   == "/user/output/mnt/sdcard",        "system.footageMountPoint round-trip");
+    check(dst.system.fallbackFootagePath == "/user/dashcam/footage_fallback", "system.fallbackFootagePath round-trip");
     check(dst.pipeline.branchQueueDepth == 5, "pipeline.branchQueueDepth round-trip");
     check(dst.log.queueSize     == 4096,      "log.queueSize round-trip");
     check(dst.log.rotateSizeKb  == 1024,      "log.rotateSizeKb round-trip");

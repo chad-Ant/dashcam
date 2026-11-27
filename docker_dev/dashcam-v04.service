@@ -11,9 +11,16 @@
 # User/paths assume the Jetson account "jetson" and the launcher's clone at
 # /home/jetson/dashcam; edit both if yours differ.
 
+#
+# Footage goes to the SD card (/etc/fstab: /mnt/sdcard, nofail).  Wants/After
+# make the recorder wait for that mount at boot.  It is deliberately not
+# Requires=/RequiresMountsFor=: with the card missing the recorder must still
+# start and record to its fallback directory on the SSD.
+
 [Unit]
 Description=dashcam v0.4 recording
-After=docker.service local-fs.target
+After=docker.service local-fs.target mnt-sdcard.mount
+Wants=mnt-sdcard.mount
 Requires=docker.service
 
 [Service]
