@@ -1,13 +1,11 @@
 package com.dashcam.connector
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
-import android.provider.MediaStore
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,8 +26,10 @@ import java.util.Locale
 // and serves the .mkv and .ass files by byte range; this app reads the Matroska itself and decodes
 // each JPEG frame, so the Jetson only moves bytes.
 
+/** [playable] is false when the segment has no usable seek index (cut short by a power loss): it can still be
+ *  downloaded for recovery. Connectors before 2026-11-27 do not send it; their segments count as playable. */
 data class RecordingSegment(val id: String, val seq: Int, val start: String, val durationS: Double?,
-                            val bytes: Long, val captionBytes: Long?) {
+                            val bytes: Long, val captionBytes: Long?, val playable: Boolean = true) {
     val day get() = start.take(10)
     val time get() = start.drop(11)
 }
@@ -39,7 +39,8 @@ internal fun parseSegments(list: JSONArray): List<RecordingSegment> = (0 until l
     val j = list.getJSONObject(i)
     RecordingSegment(j.getString("id"), j.getInt("seq"), j.getString("start"),
         if (j.isNull("duration_s")) null else j.getDouble("duration_s"), j.getLong("bytes"),
-        if (j.isNull("caption_bytes")) null else j.getLong("caption_bytes"))
+        if (j.isNull("caption_bytes")) null else j.getLong("caption_bytes"),
+        j.opt("playable") != false)
 }
 
 /** Why recordings are unavailable, in words fit for the screen. */
@@ -79,8 +80,13 @@ class RecordingSource(private val client: OkHttpClient, private val base: HttpUr
         }
     }
 
-    /** Blocking: the whole file into [sink], reporting (done, total); stops when [cancelled] says so. */
-    fun download(name: String, sink: OutputStream, cancelled: () -> Boolean, progress: (Long, Long) -> Unit) {
+    /**
+     * Blocking: the whole file into [sink], reporting (done, total); stops when [cancelled] says so. Throws
+     * unless exactly the announced length (and [expected], when known: the size the list gave) arrived, so a
+     * cut-short transfer is never published as a finished file.
+     */
+    fun download(name: String, sink: OutputStream, expected: Long?, cancelled: () -> Boolean,
+                 progress: (Long, Long) -> Unit) {
         client.newCall(request(name, null)).execute().use { r ->
             if (!r.isSuccessful) throw failure(r.code)
             val body = r.body!!
@@ -97,6 +103,7 @@ class RecordingSource(private val client: OkHttpClient, private val base: HttpUr
                     progress(done, total)
                 }
             }
+            checkComplete(done, total, expected)
         }
     }
 
@@ -158,14 +165,14 @@ class RecordingsBrowser(private val context: Context, private val repository: Mo
             return
         }
         jobs[segment.id] = scope.launch(Dispatchers.IO) {
-            var place = ""
             try {
-                val files = listOfNotNull("${segment.id}.mkv", segment.captionBytes?.let { "${segment.id}.ass" })
-                for (name in files) {
-                    place = save(name) { out ->
-                        source.download(name, out, { !isActive }) { done, total ->
-                            downloadsMutable.update { it + (segment.id to DownloadState.Running(name, done, total)) }
-                        }
+                val sizes = linkedMapOf<String, Long?>("${segment.id}.mkv" to segment.bytes)
+                segment.captionBytes?.let { sizes["${segment.id}.ass"] = it }
+                // Both files are staged, checked and only then published together: an interrupted download
+                // never replaces (or erases) the copy saved earlier. See DownloadStaging.kt.
+                val place = saveStaged(target(), sizes.keys.toList()) { name, out ->
+                    source.download(name, out, sizes[name], { !isActive }) { done, total ->
+                        downloadsMutable.update { it + (segment.id to DownloadState.Running(name, done, total)) }
                     }
                 }
                 downloadsMutable.update { it + (segment.id to DownloadState.Saved(place)) }
@@ -177,37 +184,16 @@ class RecordingsBrowser(private val context: Context, private val repository: Mo
         }
     }
 
-    /** Writes [name] to Download/Dashcam (MediaStore on Android 10+, the app's own folder on 9). */
-    private fun save(name: String, write: (OutputStream) -> Unit): String {
-        if (Build.VERSION.SDK_INT >= 29) {
-            val resolver = context.contentResolver
-            val folder = Environment.DIRECTORY_DOWNLOADS + "/Dashcam/"
-            // A second download of a segment replaces this app's earlier copy instead of adding "name (1).mkv".
-            resolver.delete(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                "${MediaStore.Downloads.RELATIVE_PATH} = ? AND ${MediaStore.Downloads.DISPLAY_NAME} = ?", arrayOf(folder, name))
-            val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, name)
-                // Only the video gets a type. MediaStore appends the extension of any type that does not
-                // match the name ("text/plain" turned x.ass into x.ass.txt, which players do not pick up
-                // as captions); without one it keeps the name exactly.
-                if (name.endsWith(".mkv")) put(MediaStore.Downloads.MIME_TYPE, "video/x-matroska")
-                put(MediaStore.Downloads.RELATIVE_PATH, folder)
-                put(MediaStore.Downloads.IS_PENDING, 1)
-            }
-            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw IOException("Could not create the download")
-            try {
-                resolver.openOutputStream(uri)!!.use(write)
-                values.clear(); values.put(MediaStore.Downloads.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-            } catch (e: Throwable) { resolver.delete(uri, null, null); throw e }
-            return "Download/Dashcam"
-        }
-        val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Dashcam").apply { mkdirs() }
-        val file = File(dir, name)
-        try { file.outputStream().use(write) } catch (e: Throwable) { file.delete(); throw e }
-        return dir.absolutePath
-    }
+    /** Download/Dashcam: MediaStore on Android 10+, the app's own folder on 9. */
+    private fun target(): DownloadTarget =
+        if (Build.VERSION.SDK_INT >= 29) MediaStoreTarget(context)
+        else DirectoryTarget(File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Dashcam"))
+}
+
+/** A transfer that ended early, or did not match the size the list announced, is an error, never a file. */
+internal fun checkComplete(done: Long, total: Long, expected: Long?) {
+    if (total >= 0 && done != total) throw IOException("Download ended early ($done of $total bytes)")
+    if (expected != null && done != expected) throw IOException("Download size $done does not match the listed $expected")
 }
 
 data class PlayerState(val status: String = "Loading", val positionMs: Long = 0, val durationMs: Long = 0,
@@ -250,17 +236,20 @@ class RecordingPlayer(private val source: RecordingSource, val segment: Recordin
                     width = mkv.width, height = mkv.height, captionsAvailable = script != null)
                 playFrom(0, autoplay = true)
             } catch (e: CancellationException) { throw e
-            } catch (e: MkvFormatException) { fail("Cannot play this segment: ${e.message}")
-            } catch (e: RecordingsException) { fail(e.message ?: "Unavailable")
-            } catch (_: Exception) { fail("Could not reach the Jetson") }
+            } catch (e: Exception) { stop(playbackFailure(e, started = false)) }
         }
     }
 
-    private fun fail(why: String) { stateMutable.update { it.copy(status = why, failed = true, playing = false, buffering = false) } }
+    /** A terminal failure disables Play; a lost connection only pauses, and Play resumes (or reloads). */
+    private fun stop(failure: PlaybackFailure) {
+        stateMutable.update { it.copy(status = failure.message, failed = failure.terminal, playing = false, buffering = false) }
+    }
 
     fun play() {
         val s = stateMutable.value
-        if (info == null || s.failed) return
+        if (s.failed || closed) return
+        if (info == null) { if (job?.isActive != true) start(); return }   // the header never arrived: load again
+        // From the last frame shown (positionMs follows it), through the Cues already in memory.
         playFrom(if (s.positionMs >= s.durationMs - 50) 0 else s.positionMs, autoplay = true)
     }
 
@@ -282,9 +271,7 @@ class RecordingPlayer(private val source: RecordingSource, val segment: Recordin
         job = scope.launch(Dispatchers.Default) {
             try { playback(fromMs, autoplay) }
             catch (e: CancellationException) { throw e }
-            catch (e: MkvFormatException) { fail("Cannot play this segment: ${e.message}") }
-            catch (e: RecordingsException) { fail(e.message ?: "Unavailable") }
-            catch (_: Exception) { fail("Connection lost · tap Play to resume") }
+            catch (e: Exception) { stop(playbackFailure(e, started = true)) }
         }
     }
 
@@ -339,6 +326,21 @@ class RecordingPlayer(private val source: RecordingSource, val segment: Recordin
         else BitmapFactory.decodeByteArray(frame.bytes, frame.offset, frame.length,
             BitmapFactory.Options().apply { inSampleSize = decodeSampleSize(bounds.outWidth, bounds.outHeight) })
     } catch (_: Exception) { null }
+}
+
+/** What the player says after an error, and whether Play stays enabled (review 2026-11-27 #8). */
+data class PlaybackFailure(val message: String, val terminal: Boolean)
+
+/**
+ * Unreadable media and the Jetson's refusals (404 deleted, 409 still recording, 401) are terminal. Anything
+ * else is the transport (Wi-Fi drop, timeout, reset) and is recoverable: playback pauses at the last frame
+ * shown and Play resumes from there. [started]: the header and Cues had loaded.
+ */
+internal fun playbackFailure(e: Exception, started: Boolean): PlaybackFailure = when (e) {
+    is MkvFormatException -> PlaybackFailure("Cannot play this segment: ${e.message}", terminal = true)
+    is RecordingsException -> PlaybackFailure(e.message ?: "Unavailable", terminal = true)
+    else -> PlaybackFailure(if (started) "Connection lost · tap Play to resume" else "Could not reach the Jetson · tap Play to retry",
+        terminal = false)
 }
 
 /** "3:00", "1:02:03". */

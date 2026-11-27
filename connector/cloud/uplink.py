@@ -26,7 +26,8 @@ CLIP_UPLOAD_SCHEME, CLIP_UPLOAD_HOST = 'https', 'storage.googleapis.com'
 SEGMENT = re.compile(r'dashcam_\d{6}_\d{8}_\d{6}')
 MAX_LISTED = 1500   # about 210 KB of JSON: under the relay's 256 KB uplink message limit
 CLIP_ERRORS = {400: 'The clip request was not valid', 404: 'That segment is no longer on the Jetson',
-               409: 'That segment is still recording', 422: 'The Jetson could not make that clip',
+               409: 'That segment is still recording', 416: 'The clip starts after the end of that segment',
+               422: 'The Jetson could not make that clip',
                503: 'The Jetson is busy exporting another clip', 504: 'The clip took too long to make'}
 
 

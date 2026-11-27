@@ -76,7 +76,9 @@ def clip_command(ffmpeg, video, start, duration, quality, captions, out):
     segment's own time (PTS + start) and the clip's timestamps are reset afterwards.
     """
     q = CLIP_QUALITIES[quality]
-    cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y']
+    # -abort_on empty_output: a start past the last frame otherwise "succeeds" with a 262-byte MP4 holding
+    # no stream (ffmpeg 4.4.2 on the Jetson, 2026-11-27). A clip that only runs past the end is still made.
+    cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-abort_on', 'empty_output']
     if q['lowres']:
         cmd += ['-lowres', '1']
     cmd += ['-ss', f'{start:.3f}', '-t', f'{duration:.3f}', '-i', str(video)]
@@ -347,11 +349,114 @@ def video_message(frame, age_s):
                              frame['width'], frame['height']) + frame['jpeg']
 
 
+MKV_EBML, MKV_SEGMENT, MKV_SEEK_HEAD, MKV_SEEK, MKV_SEEK_ID, MKV_SEEK_POSITION = (
+    0x1A45DFA3, 0x18538067, 0x114D9B74, 0x4DBB, 0x53AB, 0x53AC)
+MKV_INFO, MKV_SCALE, MKV_DURATION, MKV_CLUSTER, MKV_CUES = 0x1549A966, 0x2AD7B1, 0x4489, 0x1F43B675, 0x1C53BB6B
+MKV_HEADER_BYTES = 65536   # as the clients read it
+
+
+def _vint(b, at, marker):
+    """(value, length) of an EBML variable-length integer; size -1 means unknown. ValueError if cut off."""
+    if at >= len(b):
+        raise ValueError('truncated')
+    first, n = b[at], 1
+    while n <= 8 and not first & (0x80 >> (n - 1)):
+        n += 1
+    if n > 8 or at + n > len(b):
+        raise ValueError('bad vint')
+    value = first if marker else first & (0xFF >> n)
+    for k in range(1, n):
+        value = value * 256 + b[at + k]
+    if not marker and value == 2 ** (7 * n) - 1:
+        value = -1
+    return value, n
+
+
+def _element(b, at):
+    """(id, body start, body end or None for an unknown size) of the element at @p at."""
+    ident, a = _vint(b, at, True)
+    size, c = _vint(b, at + a, False)
+    body = at + a + c
+    return ident, body, None if size < 0 else body + size
+
+
+def mkv_index(path, size):
+    """What the players need from a segment, read as they read it (MkvReader.kt, app.js): a SeekHead entry
+    for the Cues, a Cues element there that ends inside the file, and a duration. Returns (playable,
+    duration_s or None). A segment cut short by a power loss has no Cues (or they lie past its end): it stays
+    listed and downloadable for recovery, but is not offered for playback."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(MKV_HEADER_BYTES)
+            ident, body, end = _element(head, 0)
+            if ident != MKV_EBML or end is None:
+                return False, None
+            ident, data, _ = _element(head, end)
+            if ident != MKV_SEGMENT:
+                return False, None
+            cues, scale, duration, at = -1, 1_000_000, None, data
+            while at < len(head):
+                ident, body, end = _element(head, at)
+                if ident == MKV_CLUSTER or end is None or end > len(head):
+                    break
+                if ident == MKV_SEEK_HEAD:
+                    seek = body
+                    while seek < end:
+                        sid, sbody, send = _element(head, seek)
+                        if send is None or send > end:
+                            break
+                        if sid == MKV_SEEK:
+                            target, position, field = 0, -1, sbody
+                            while field < send:
+                                fid, fbody, fend = _element(head, field)
+                                if fend is None or fend > send:
+                                    break
+                                value = int.from_bytes(head[fbody:fend], 'big')
+                                if fid == MKV_SEEK_ID:
+                                    target = value
+                                elif fid == MKV_SEEK_POSITION:
+                                    position = value
+                                field = fend
+                            if target == MKV_CUES and position >= 0:
+                                cues = data + position
+                        seek = send
+                elif ident == MKV_INFO:
+                    field = body
+                    while field < end:
+                        fid, fbody, fend = _element(head, field)
+                        if fend is None or fend > end:
+                            break
+                        if fid == MKV_SCALE:
+                            scale = int.from_bytes(head[fbody:fend], 'big') or scale
+                        elif fid == MKV_DURATION and fend - fbody in (4, 8):
+                            duration = struct.unpack('>f' if fend - fbody == 4 else '>d', head[fbody:fend])[0]
+                        field = fend
+                at = end
+            seconds = duration * scale / 1e9 if duration is not None and math.isfinite(duration) else None
+            if cues < 0 or cues >= size or seconds is None:
+                return False, seconds
+            f.seek(cues)
+            ident, _, end = _element(f.read(16), 0)
+            return ident == MKV_CUES and end is not None and cues + end <= size, seconds
+    except (OSError, ValueError, struct.error):
+        return False, None
+
+
 class Recordings:
     """The footage directory as a read-only list of finished segments. Names, never paths, come from clients."""
 
     def __init__(self, directory):
         self.dir = Path(directory) if directory else None
+        self._index = {}   # name -> (size, mtime_ns, (playable, duration_s)); segments never change once settled
+
+    def index(self, path, info):
+        """mkv_index(), cached for an unchanged file."""
+        cached = self._index.get(path.name)
+        if cached and cached[:2] == (info.st_size, info.st_mtime_ns):
+            return cached[2]
+        result = mkv_index(path, info.st_size)
+        self._index[path.name] = (info.st_size, info.st_mtime_ns, result)
+        return result
 
     def available(self):
         return self.dir is not None and self.dir.is_dir()
@@ -377,9 +482,10 @@ class Recordings:
                 continue
             # The name is the Jetson's local start time; the last write is the end.
             duration = info.st_mtime - time.mktime(start.timetuple())
+            playable, _ = self.index(self.dir / (base + '.mkv'), info)
             out.append({'id': base, 'seq': int(match[2]), 'start': start.strftime('%Y-%m-%d %H:%M:%S'),
                         'duration_s': round(duration, 1) if 0 <= duration <= 3600 else None,
-                        'bytes': info.st_size, 'caption_bytes': captions.get(base)})
+                        'bytes': info.st_size, 'caption_bytes': captions.get(base), 'playable': playable})
         out.sort(key=lambda item: (item['start'], item['seq']), reverse=True)
         return out
 
@@ -798,6 +904,9 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
             raise web.HTTPConflict(text='Segment still recording')
         if video is None:
             raise web.HTTPNotFound(text='No such segment')
+        _, length = await asyncio.to_thread(state.recordings.index, video, os.lstat(video))
+        if length is not None and start >= length:
+            raise web.HTTPRequestRangeNotSatisfiable(text=f'The clip starts after the end of the segment ({length:.1f} s)')
         ass = None
         if captions:
             ass, _ = await asyncio.to_thread(state.recordings.resolve, name[:-4] + '.ass')
@@ -816,6 +925,7 @@ def create_app(state, port=8443, web_dir=None, session_days=30):
                     proc.kill()
                     await proc.wait()
                     raise web.HTTPGatewayTimeout(text='Clip export took too long') from None
+                # Exit 0 is not enough: an empty-output abort still leaves a stub file behind.
                 if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
                     print(f'WARNING: clip export failed ({proc.returncode}): {err.decode(errors="replace")[-300:]}', flush=True)
                     raise web.HTTPUnprocessableEntity(text='Clip export failed (is the start inside the segment?)')

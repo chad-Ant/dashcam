@@ -10,12 +10,12 @@ This file has three parts:
 
 ## Outstanding work brief (updated 2026-11-27)
 
-- **Recordings review, eight open findings.** Before deploying the recordings update, protect existing Android downloads and make cloud exports recover from signing failures and uplink reconnects. Five medium-priority findings cover browser recovery, clip and segment validity, and Android playback retry. [Findings, proposed fixes and regression checks](#2026-11-27-recordings-code-review)
+- **Recordings review: all eight findings fixed (2026-11-27, not deployed).** Each one was reproduced against the old code first, then checked against the fix. Relay, agent and uplink are covered by new tests (on the Jetson and the PC), the web client by browser-pane runs against a scripted relay, and Android by JVM tests and lint. Still to run on a phone: the MediaStore download path and Play after a Wi-Fi drop on the S25. Deploying now means: `stage.sh` (relay and web), the agent restart and the `uplink.py` install on the Jetson, and a new APK. [Fixes](#2026-11-27-recordings-review-fixes-not-deployed) · [Findings](#2026-11-27-recordings-code-review)
 
 - **Connector software.** Commit `c75773d` addresses the seven [interface review](#2026-11-25-web-and-android-connector-interface-review) findings. The debug APK is built and the Firebase full-vehicle integration test passed on the PC. The browser capacity timing issue it found afterwards is also fixed on `camera`. Next: deploy and run the field checks.
 - **Live view and fullscreen.** The Jetson and S25 Ultra run `68de9e1`. The S25 showed 720×404 SD at 10 fps and 1080p HD at 30 fps on Wi-Fi, and displayed cloud SD in fullscreen. The four review findings are fixed and regression-tested, but not deployed yet. [Findings](#2026-11-26-live-view-review) · [Fixes](#2026-11-26-live-view-review-fixes-not-deployed)
 - **Recordings on the LAN (2026-11-26, not deployed).** Both clients can now list, play (with telemetry captions, seek and fullscreen) and download v0.4's recorded segments over a direct LAN connection. The client decodes the video; the Jetson only serves files. It is built and tested on real footage in a browser. Not deployed; the Android player has not run on a phone yet. [Log](#2026-11-26-recordings-on-the-lan-not-deployed)
-- **Cloud recordings (2026-11-26, not deployed).** A cloud session's Recordings page now lists the segments. Owners and viewers can export a clip: up to 3 min of one segment, made into an H.264 MP4 on the Jetson and uploaded to a private Cloud Storage bucket. The relay answers with signed play and download links that last an hour. The code and tests are done, and the web page was checked against a fake relay. **2026-11-27:** the Jetson is on `eaa8c6e` and the agent with the clip route is running. The uplink in `/opt` is still old. The remaining work is the user's: check the relay's signing grant, create the bucket, run `stage.sh`, install `uplink.py`, then build and install the APK. Fix review findings 1–3 before real use. [Configuration runbook](#2026-11-27-cloud-recordings-configuration-partly-deployed) · [Log](#2026-11-26-cloud-recordings-not-deployed)
+- **Cloud recordings (2026-11-26, not deployed).** A cloud session's Recordings page now lists the segments. Owners and viewers can export a clip: up to 3 min of one segment, made into an H.264 MP4 on the Jetson and uploaded to a private Cloud Storage bucket. The relay answers with signed play and download links that last an hour. The code and tests are done, and the web page was checked against a fake relay. **2026-11-27:** the Jetson is on `eaa8c6e` and the agent with the clip route is running. The uplink in `/opt` is still old. The remaining work is the user's: check the relay's signing grant, create the bucket, run `stage.sh`, install `uplink.py`, then build and install the APK. The review findings are fixed on `camera` (agent, uplink, relay, web and APK all changed), so deploy that commit. [Configuration runbook](#2026-11-27-cloud-recordings-configuration-partly-deployed) · [Log](#2026-11-26-cloud-recordings-not-deployed)
 - **Connector field checks.** Exercise the Android token-refresh retry after rejection and mobile data on the A54. On the car network, check CAN/GNSS source loss and recovery, reconnect after a router or Jetson reboot, and recording performance with a phone and laptop watching. Tablet and local-browser CA checks remain. The S25 mobile-data trial, two-phone viewing and ten idle minutes already passed. [Pilot results](#2026-11-21-dashcam-connect-cloud-pilot) · [Physical checklist](connector/VALIDATION.md#remaining-physical-acceptance)
 - **Next drive.** Secure the CSI mount, verify the connected devices and stock CSI driver, then calibrate the lane crops while parked. The IMX296 still resets in bright sun despite the gain floor. Run the parked raw-CAN loss test and collect day and night lane data. The recorder service and lane harness require separate runs. [Drive preparation](#open-work-in-priority-order)
 - **Bench work and owner decisions.** The main bench items are CSI night tuning and chart captures, MKR clock and C3 transmit-stall measurements, and display navigation/throughput checks. The turning EKF needs the antenna offset and a measured course. The incident threshold, CAN speed scale, stale-row handling and lane inference rate still need decisions. [Prioritized work and later prototypes](#open-work-in-priority-order)
@@ -418,6 +418,57 @@ compile-checked from these parts:
 
 # Log (newest first)
 
+## 2026-11-27 Recordings review fixes (not deployed)
+
+All eight [review findings](#2026-11-27-recordings-code-review) are fixed. For each one, the failure was
+reproduced first on the old code (the old file run against the new check), then checked against the fix.
+Nothing is deployed. The Jetson still runs the `eaa8c6e` agent, and the relay, web assets, uplink and APK are
+unchanged in the field.
+
+| # | Fix | Where | Old code | Fixed |
+|---|---|---|---|---|
+| 1 High | Both files of a download are written under temporary names (`x.partial-<hex>.mkv`), their byte counts checked against Content-Length and the listed size, then published together. An earlier copy is deleted only once its replacement is complete. Android 10+ uses pending MediaStore entries; Android 9 uses an atomic rename in the folder. | `DownloadStaging.kt`, `Recordings.kt` | code read: delete before write (10+), truncate (9) | JVM: earlier hashes survive a drop in the video and in the captions; a cancel leaves nothing; a retry leaves one named pair |
+| 2 High | Both signing calls are caught. Only that request fails, with "could not sign", and the vehicle and viewer sockets keep serving. | `relay.py` | download-signing failure closed the vehicle socket; upload-signing failure closed the viewer | a second viewer keeps telemetry; the next export succeeds |
+| 3 High | Each request records the vehicle socket it went to, and has a deadline (list 60 s, clip 10 min). When the socket closes or is replaced, its requests fail at once. A late answer from another socket is ignored. | `relay.py` | "Wait for the clip…" after a reconnect; no deadline | one error for the original id; export again at once; a silent device times out without another request |
+| 4 Med | Requests belong to their socket. Closing it fails each handler at once. An interrupted list reloads on the next connection; an interrupted export offers **Export again** and is never resent automatically. | `app.js` | hidden tab: Refresh stuck disabled, no second list request | Refresh re-enabled, list reloaded on the new socket, late answer ignored |
+| 5 Med | ffmpeg runs with `-abort_on empty_output`. A start at or past the header's Duration answers 416 before ffmpeg runs, and the uplink maps that to "starts after the end". | `service.py`, `uplink.py` | Jetson ffmpeg 4.4.2: exit 0, 262-byte MP4, no stream | 416 known length, 422 unknown length, overlap-EOF clip has video |
+| 6 Med | The agent reads each segment's SeekHead/Cues/Duration as the players do, caches it per file, and lists `playable`. Both clients disable Play (Download stays) when it is false; a missing field counts as true. | `service.py`, `app.js`, `Recordings*.kt` | truncated and broken-index copies listed with no marker | both `playable: false`, still served byte for byte; the finished fixture is playable |
+| 7 Med | Export progress, errors and links are stored per vehicle/segment, outside the rows. The row on screen renders from them, and expired links turn into **Export again**. | `app.js` | a refresh dropped progress; finished links were written to a detached row | links survive a refresh during and after the export; one clip request |
+| 8 Med | Errors are classified. Unreadable media and Jetson refusals are terminal. A transport error pauses at the last frame with Play enabled, and Play resumes from there through the Cues in memory. A failed first load can be retried with Play. | `Recordings.kt` | code read: `failed = true` disabled Play | JVM: a dropped socket is recoverable, format and 409 errors are terminal |
+
+**The recorder marker for finding 6 was not added.** The Cues check covers legacy footage and new segments alike,
+needs no recorder change, and leaves v0.4 running undisturbed. The marker can be revisited if the header read
+ever costs too much.
+
+**Real footage (bench Jetson, `/media/jetson/backup/footage`).**
+- 5 of 831 segments are cut short: 000148, 000297, 000408, 000417 and 000431. Each has Duration 0 and no Cues in
+  its last 2 MB, although the SeekHead has a Cues entry. Before this fix, those 5 were offered for Play and failed
+  with "Segment has no index".
+- The neighbouring finished segment 000430 reads playable at 180.0 s.
+- The first list takes 1.25 s (it reads every header); after that it takes 0.067 s.
+
+**Tests.**
+- **Jetson (container-free venv):** 74 agent tests (72 + 2 new) and 17 cloud tests (13 + 4 new) pass, from a
+  copy in `/tmp/rev/new`. The live checkout is unchanged.
+- **PC:** the cloud suite passes in `.connector-venv`. The new relay tests fail 4 of 4 on the old `relay.py`.
+- **Android:** 60 JVM tests pass (53 + 7 new in `RecordingsReviewTest`). Lint caught that `MediaStoreTarget`
+  needed `@RequiresApi(29)`, which was added.
+- **Web:** the browser pane ran a scripted fake relay (scratchpad, not committed). The old and the new `app.js`
+  ran the same scenarios: tab hidden during a list, refresh during and after an export, tab hidden during an
+  export, and a late answer on the new socket.
+
+**Not run yet.**
+- On a phone: the MediaStore staging path (pending insert, rename, delete of the earlier copy) and the review's S25
+  check (Wi-Fi off during playback, then Play). No phone was attached.
+- The LAN page's disabled Play for a cut-short segment was not opened in a browser (code read only).
+- Deployed relay, bucket and uplink: still the [configuration runbook](#2026-11-27-cloud-recordings-configuration-partly-deployed).
+
+**Deploy order** (unchanged from the runbook):
+1. `stage.sh` (relay and web).
+2. On the Jetson: `git pull`, `sudo systemctl restart dashcam-monitor`, install `uplink.py` and restart
+   `dashcam-uplink`.
+3. The release APK. An older APK ignores `playable`; an older relay never sends the new error paths.
+
 ## 2026-11-27 Cloud recordings configuration (partly deployed)
 
 This section replaces the five-line deploy order in the [2026-11-26 Cloud recordings](#2026-11-26-cloud-recordings-not-deployed)
@@ -459,7 +510,10 @@ rollback. gcloud, firebase, sudo and the release keystore are the user's.
 closes the vehicle socket, and a vehicle reconnect leaves an export pending. Finding 1 (a failed Android download
 erases the saved copy) is in the APK. Fix those three before cloud recordings are used for real. Steps 1 and 2 can be
 run first as infrastructure: an empty bucket costs nothing, and the relay can be staged with `CLIP_BUCKET=` until
-the fixes land.
+the fixes land. *Update, later on 2026-11-27: all eight findings are fixed on `camera`
+([fixes](#2026-11-27-recordings-review-fixes-not-deployed)), so stage and install from that commit. Step 4
+still installs only `uplink.py` (it gained the 416 message). Step 5 now needs `git pull` and a `dashcam-monitor`
+restart for the new agent.*
 
 **Step 1: check the relay account can sign (one-time pilot provisioning).** `ClipStorage` signs V4 URLs through IAM
 signBlob, so there is no key file. That needs the IAM Credentials API and `roles/iam.serviceAccountTokenCreator`
@@ -569,6 +623,8 @@ stay; its lifecycle rule empties it.
 ## 2026-11-27 Recordings code review
 
 Reviewed the seven commits on `camera` after `68de9e1` through `eaa8c6e`. All eight findings below are open.
+*Update, later on 2026-11-27: all eight are fixed; see
+[Recordings review fixes](#2026-11-27-recordings-review-fixes-not-deployed).*
 The regression checks describe how to verify each proposed fix. Source locations refer to `eaa8c6e`.
 
 ### 1. High — An interrupted Android download can erase the saved copy

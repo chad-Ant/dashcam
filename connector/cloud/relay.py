@@ -28,7 +28,11 @@ REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 SEGMENT = re.compile(r'dashcam_\d{6}_\d{8}_\d{6}')
 CLIP_QUALITIES = ('small', '720p')
 MAX_CLIP_SECONDS = 180
-PENDING_SECONDS = 15 * 60   # an unanswered request is forgotten after this
+# How long the vehicle has to answer before the viewer is told it did not. A 3 min 720p clip took 127 s on the
+# Jetson plus its upload; the list takes well under a second. Tests shorten these.
+REQUEST_SECONDS = {'recordings': 60, 'clip': 10 * 60}
+VEHICLE_GONE = 'The vehicle disconnected before it answered. Try again.'
+SIGNING_FAILED = 'The relay could not sign the clip links. Try again in a moment.'
 
 
 class ClipStorage:
@@ -160,17 +164,38 @@ class Relay:
         self.viewers = set()
         self.devices = {}
         self.releasing = set()
-        self.requests = {}   # token sent to the device -> dict(viewer, id, kind, object, filename, at)
+        # token sent to the device -> dict(viewer, id, kind, device, timer[, object, filename]). Every entry ends
+        # exactly once, through finish(): the vehicle's answer, its socket closing or being replaced, the deadline,
+        # or the viewer leaving (which ends it silently).
+        self.requests = {}
+
+    def finish(self, token, reply=None):
+        """Ends a pending request: forgets it, stops its deadline and, if given, sends @p reply to its viewer."""
+        request = self.requests.pop(token, None)
+        if request is None:
+            return None
+        if request.get('timer'):
+            request['timer'].cancel()
+        if reply is not None and request['viewer'] in self.viewers:
+            request['viewer'].reply(dict(reply, id=request['id']))
+        return request
+
+    def fail_device(self, ws, error=VEHICLE_GONE):
+        """The vehicle socket @p ws is gone or replaced: its unanswered requests fail now, not at their deadline."""
+        for token in [t for t, r in self.requests.items() if r['device'] is ws]:
+            self.finish(token, dict(type='error', error=error))
+
+    def expire(self, token):
+        request = self.requests.get(token)
+        if request is not None:
+            trace('recordings_timeout', requestId=request['viewer'].request_id, kind=request['kind'])
+            self.finish(token, dict(type='error', error='The vehicle did not answer in time. Try again.'))
 
     async def recording_request(self, viewer, key, body):
         """A viewer's 'recordings' or 'clip' request: checked here, carried out by the vehicle."""
         rid = body.get('id')
         if not isinstance(rid, str) or not REQUEST_ID.fullmatch(rid):
             raise ValueError('request id')
-        now = time.monotonic()
-        for token, request in list(self.requests.items()):
-            if now - request['at'] > PENDING_SECONDS:
-                del self.requests[token]
 
         def fail(error):
             viewer.reply(dict(type='error', id=rid, error=error))
@@ -179,7 +204,7 @@ class Relay:
             return fail('The vehicle is not connected yet. Try again in a moment.')
         token = secrets.token_hex(12)
         if body['type'] == 'recordings':
-            self.requests[token] = dict(viewer=viewer, id=rid, kind='recordings', at=now)
+            request = dict(kind='recordings')
             message = dict(type='list_recordings', id=token)
         else:
             if self.clips is None:
@@ -196,35 +221,48 @@ class Relay:
                     or not 0 <= start <= 3600 or not 1 <= duration <= MAX_CLIP_SECONDS):
                 return fail('The clip request was not valid')
             name = self.clips.object_name(key, segment, start, quality)
-            upload = await asyncio.to_thread(self.clips.upload_url, name)
-            filename = f'{segment}_{int(start)}s_{int(duration)}s_{quality}.mp4'
-            self.requests[token] = dict(viewer=viewer, id=rid, kind='clip', object=name, filename=filename, at=now)
+            try:
+                upload = await asyncio.to_thread(self.clips.upload_url, name)
+            except Exception as e:   # IAM signBlob, token refresh, network: the request fails, the sockets stay
+                trace('clip_signing_failed', requestId=viewer.request_id, stage='upload', error=type(e).__name__)
+                return fail(SIGNING_FAILED)
+            if self.devices.get(key) is not device or device.closed:   # it went away while we signed
+                return fail('The vehicle is not connected yet. Try again in a moment.')
+            request = dict(kind='clip', object=name, filename=f'{segment}_{int(start)}s_{int(duration)}s_{quality}.mp4')
             message = dict(type='export_clip', id=token, segment=segment, start_s=start, duration_s=duration,
                            quality=quality, captions=captions, upload_url=upload)
+        request.update(viewer=viewer, id=rid, device=device,
+                       timer=asyncio.get_running_loop().call_later(REQUEST_SECONDS[request['kind']], self.expire, token))
+        self.requests[token] = request
+        if request['kind'] == 'clip':
             viewer.reply(dict(type='clip_status', id=rid, status='exporting'))
         trace('recordings_request', requestId=viewer.request_id, vehicle=key, kind=body['type'])
         try:
             await asyncio.wait_for(device.send_json(message), 5)
-        except (ConnectionError, asyncio.TimeoutError):
-            self.requests.pop(token, None)
-            fail('The vehicle is not connected yet. Try again in a moment.')
+        except (ConnectionError, asyncio.TimeoutError, RuntimeError):
+            self.finish(token, dict(type='error', error='The vehicle is not connected yet. Try again in a moment.'))
 
-    async def recording_response(self, body):
-        """The vehicle's answer, to the viewer that asked (if still connected)."""
-        request = self.requests.pop(body.get('id'), None)
-        if request is None or request['viewer'] not in self.viewers:
+    async def recording_response(self, ws, body):
+        """The vehicle's answer, to the viewer that asked (if still connected). Only the socket the request
+        went to may answer it: a late reply from a replaced socket is ignored."""
+        token = body.get('id')
+        request = self.requests.get(token) if isinstance(token, str) else None
+        if request is None or request['device'] is not ws:
             return
-        viewer, rid = request['viewer'], request['id']
         if body.get('error') or (request['kind'] == 'clip' and not body.get('ok')):
-            return viewer.reply(dict(type='error', id=rid, error=str(body.get('error') or 'The clip failed')[:300]))
+            return self.finish(token, dict(type='error', error=str(body.get('error') or 'The clip failed')[:300]))
         if request['kind'] == 'recordings':
             segments = body.get('segments')
-            return viewer.reply(dict(type='recordings', id=rid, segments=segments if isinstance(segments, list) else []))
-        play, download = await asyncio.to_thread(self.clips.download_urls, request['object'], request['filename'])
-        viewer.reply(dict(type='clip', id=rid, url=play, download=download, bytes=body.get('bytes'),
-                          captions=bool(body.get('captions')), expires_s=self.clips.LINK_SECONDS,
-                          filename=request['filename']))
-        trace('clip_ready', requestId=viewer.request_id, bytes=body.get('bytes'))
+            return self.finish(token, dict(type='recordings', segments=segments if isinstance(segments, list) else []))
+        try:
+            play, download = await asyncio.to_thread(self.clips.download_urls, request['object'], request['filename'])
+        except Exception as e:   # never let a signing failure reach the vehicle's socket loop
+            trace('clip_signing_failed', requestId=request['viewer'].request_id, stage='download', error=type(e).__name__)
+            return self.finish(token, dict(type='error', error=SIGNING_FAILED))
+        if self.finish(token, dict(type='clip', url=play, download=download, bytes=body.get('bytes'),
+                                   captions=bool(body.get('captions')), expires_s=self.clips.LINK_SECONDS,
+                                   filename=request['filename'])):
+            trace('clip_ready', requestId=request['viewer'].request_id, bytes=body.get('bytes'))
 
     async def release(self, key, uid, session):
         doc = await self.store.update(key, uid, session=session)
@@ -339,7 +377,7 @@ class Relay:
         finally:
             self.viewers.discard(v)
             for token in [t for t, r in self.requests.items() if r['viewer'] is v]:
-                del self.requests[token]
+                self.finish(token)   # nobody to tell; a late answer from the vehicle is then ignored
             writer.cancel()
             release = asyncio.create_task(self.release(key, user['uid'], v.request_id))
             self.releasing.add(release)
@@ -359,6 +397,7 @@ class Relay:
         old = self.devices.get(key)
         self.devices[key] = ws
         if old:
+            self.fail_device(old)   # its pending answers can no longer arrive here
             await old.close()
         granted, until, generation, version = [], 0, None, None
         last_traffic = last_check = time.monotonic()
@@ -405,7 +444,7 @@ class Relay:
                         await ws.send_json(dict(type='heartbeat'))
                         continue
                     if body.get('type') in ('recordings', 'clip_result'):
-                        await self.recording_response(body)
+                        await self.recording_response(ws, body)
                         continue
                     if body.get('type') != 'snapshot':
                         break
@@ -424,6 +463,7 @@ class Relay:
         finally:
             if self.devices.get(key) is ws:
                 del self.devices[key]
+            self.fail_device(ws)
             await ws.close()
         return ws
 

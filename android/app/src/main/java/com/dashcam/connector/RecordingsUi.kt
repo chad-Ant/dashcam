@@ -57,9 +57,10 @@ internal fun LazyListScope.recordingsPage(browser: RecordingsBrowser, onPlay: (R
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(segment.time + (segment.durationS?.let { " · " + formatClock((it * 1000).toLong()) } ?: ""),
             fontWeight = FontWeight.SemiBold)
-        Hint(formatBytes(segment.bytes) + if (segment.captionBytes != null) " · captions" else " · no captions")
+        Hint(formatBytes(segment.bytes) + (if (segment.captionBytes != null) " · captions" else " · no captions") +
+            if (segment.playable) "" else " · cut short: download only")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = onPlay) { Text("Play") }
+            Button(onClick = onPlay, enabled = segment.playable) { Text("Play") }
             when (download) {
                 is DownloadState.Running -> {
                     val pct = if (download.total > 0) download.done * 100 / download.total else 0

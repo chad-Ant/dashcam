@@ -850,6 +850,7 @@
     ws = null; snap = null; lastMs = 0;
     if (cloud && vws) closeVideo();
     if (sock) sock.close(1000);
+    if (cloud && sock) cloudRequestsClosed(sock);   // their answers can only come on this socket
   }
   function parseSnapshot(text) {
     if (typeof text !== 'string' || text.length > 65536 || !identity) return null;
@@ -884,10 +885,10 @@
         if (vws === sock) receiveFrame(ev.data);
         return;
       }
-      if (cloud && cloudRecordingMessage(ev.data)) return;
+      if (cloud && cloudRecordingMessage(sock, ev.data)) return;
       const data = parseSnapshot(ev.data);
       if (!data) { closeSocket(); return retryLater(epoch, 'Unsupported or invalid monitoring data · retrying'); }
-      if (cloud && data.type === 'connecting') { requestId = data.requestId; return; }
+      if (cloud && data.type === 'connecting') { requestId = data.requestId; cloudConnected(); return; }
       if (cloud && firstSampleMs === null && data.runtime_fresh) firstSampleMs = performance.now() - openedMs;
       if (cloud) waitSince = 0;
       if (data.session === lastSession && data.seq <= lastSeq) return;
@@ -1359,11 +1360,15 @@
         for (const s of segments) {
           const row = h('div', 'rec-row');
           const label = String(s.start).slice(11) + (typeof s.duration_s === 'number' ? ' · ' + clock(s.duration_s * 1000) : '');
-          const meta = megabytes(s.bytes) + (s.caption_bytes ? ' · captions' : ' · no captions');
+          // playable: false = no usable seek index (cut short by a power loss); absent on older connectors.
+          const cut = s.playable === false;
+          const meta = megabytes(s.bytes) + (s.caption_bytes ? ' · captions' : ' · no captions') +
+            (cut ? ' · cut short: download only' : '');
           const text = h('div', 'rec-text');
           text.append(h('strong', null, label), h('span', 'hint', meta));
-          const actions = h('div', 'actions');
-          actions.append(button('Play', 'btn', () => openPlayer(s)), downloadLink(s.id + '.mkv', 'Video'));
+          const actions = h('div', 'actions'), play = button('Play', 'btn', () => openPlayer(s));
+          play.disabled = cut;
+          actions.append(play, downloadLink(s.id + '.mkv', 'Video'));
           if (s.caption_bytes) actions.append(downloadLink(s.id + '.ass', 'Captions'));
           row.append(text, actions);
           group.append(row);
@@ -1384,24 +1389,37 @@
   // The relay forwards {type: 'recordings'} and {type: 'clip'} to the vehicle; the Jetson makes an H.264 MP4
   // and uploads it, and the relay answers with expiring play and download links (connector/README.md
   // "Cloud recordings"). The browser plays the MP4 natively.
-  const cloudRequests = new Map();   // request id -> handler(message)
-  let cloudExport = null;            // the row exporting now: {id, render}
+  // Every request belongs to the socket that sent it. When that socket closes (a hidden tab, a lost link,
+  // a reconnect), each of its handlers gets {type: 'error', closed: true} at once, so no control stays
+  // disabled waiting for an answer that can no longer arrive; answers on a newer socket never match it.
+  const cloudRequests = new Map();   // request id -> {sock, handler(message)}
   function cloudRequest(body, handler) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     const id = 'w' + Math.random().toString(36).slice(2, 12);
-    cloudRequests.set(id, handler);
+    cloudRequests.set(id, { sock: ws, handler });
     ws.send(JSON.stringify(Object.assign({ id }, body)));
     return true;
   }
-  function cloudRecordingMessage(text) {
+  function cloudRequestsClosed(sock) {
+    for (const [id, r] of [...cloudRequests]) {
+      if (r.sock !== sock) continue;
+      cloudRequests.delete(id);
+      r.handler({ type: 'error', id, closed: true, error: 'The connection to the vehicle closed' });
+    }
+  }
+  function cloudRecordingMessage(sock, text) {
     if (typeof text !== 'string' || text.length > 1 << 20 || !/^\{"type": ?"(recordings|clip|clip_status|error)"/.test(text)) return false;
     let j;
     try { j = JSON.parse(text); } catch (_) { return false; }
-    const handler = isObj(j) && cloudRequests.get(j.id);
-    if (!handler) return true;   // an answer to a request this page no longer waits for
+    const r = isObj(j) && cloudRequests.get(j.id);
+    if (!r || r.sock !== sock) return true;   // an answer to a request this page no longer waits for
     if (j.type !== 'clip_status') cloudRequests.delete(j.id);
-    handler(j);
+    r.handler(j);
     return true;
+  }
+  let recReloadOnConnect = false;    // a list request died with its socket: ask again on the next one
+  function cloudConnected() {
+    if (recReloadOnConnect && page === 'recordings') { recReloadOnConnect = false; cloudLoadRecordings(); }
   }
   function cloudLoadRecordings() {
     if (recLoading) return;
@@ -1411,10 +1429,23 @@
       if (m.type === 'recordings' && Array.isArray(m.segments)) {
         recList = m.segments;
         recStatus = recList.length ? recList.length + (recList.length === 1 ? ' segment' : ' segments') : 'No finished segments yet';
+      } else if (m.closed) {
+        recReloadOnConnect = true;
+        recStatus = 'Connection lost · the list reloads when the vehicle is back';
       } else recStatus = m.error || 'The vehicle did not answer';
       renderRecordings();
     });
     if (!asked) { recLoading = false; recStatus = 'Not connected to the vehicle yet · Refresh in a moment'; renderRecordings(); }
+  }
+  // Export progress and results live here, by vehicle and segment, not in the row elements: a list refresh
+  // rebuilds every row, and the new row shows the same export (and its still-valid links). The page serves one
+  // vehicle (?vehicle=), and changing vehicle or signing out loads another page, which starts this afresh.
+  const cloudExports = new Map();    // vehicle/segment -> {phase, note, url, download, expires}
+  const cloudExportViews = new Map();// vehicle/segment -> render() of the row on screen now
+  function exportKey(segment) { return vehicleKey + '/' + segment; }
+  function setExport(segment, value) {
+    cloudExports.set(exportKey(segment), value);
+    cloudExportViews.get(exportKey(segment))?.();
   }
   function cloudRecordingsPage() {
     const status = hint(''), list = h('div', 'rec-days');
@@ -1429,6 +1460,7 @@
       if (recList === shown) return;
       shown = recList;
       list.replaceChildren();
+      cloudExportViews.clear();
       const days = new Map();
       for (const s of recList || []) {
         const day = String(s.start).slice(0, 10);
@@ -1465,29 +1497,48 @@
     const go = button('Export', 'btn', exportNow), note = hint(''), result = h('div', 'rec-result');
     panel.append(field('Start (s into the segment)', start), field('Length', span), field('Quality', quality),
       field('Burn in captions', captions), go, note, result);
+    let drawn = null;   // the result drawn now, so a re-render does not reload a playing video
+    function render() {
+      const e = cloudExports.get(exportKey(s.id));
+      if (e) panel.hidden = false;
+      const expired = e && e.phase === 'ready' && Date.now() >= e.expires;
+      go.disabled = Boolean(e && (e.phase === 'asking' || e.phase === 'exporting'));
+      setText(go, e && (e.phase === 'interrupted' || e.phase === 'failed' || expired) ? 'Export again' : 'Export');
+      setText(note, !e ? '' : expired ? 'The links have expired · export again for new ones' : e.note);
+      const want = e && e.phase === 'ready' && !expired ? e : null;
+      if (want === drawn) return;
+      drawn = want;
+      if (!want) { result.replaceChildren(); return; }
+      const video = h('video');
+      Object.assign(video, { controls: true, playsInline: true, preload: 'metadata', src: want.url });
+      const download = h('a', 'btn secondary rec-link', 'Download MP4');
+      download.href = want.download; download.rel = 'noopener';
+      result.replaceChildren(video, download);
+    }
     function exportNow() {
       const body = { type: 'clip', segment: s.id, start_s: Math.max(0, Math.min(+start.value || 0, length - 1)),
         duration_s: +span.value, quality: quality.value, captions: captions.checked };
-      result.replaceChildren();
       const began = performance.now();
       const asked = cloudRequest(body, m => {
-        if (m.type === 'clip_status') { setText(note, 'Making the clip on the Jetson and uploading it…'); return; }
-        go.disabled = false;
-        if (m.type !== 'clip' || typeof m.url !== 'string' || !m.url.startsWith('https://storage.googleapis.com/')) {
-          setText(note, m.error || 'The clip failed'); return;
+        if (m.type === 'clip_status') { setExport(s.id, { phase: 'exporting', note: 'Making the clip on the Jetson and uploading it…' }); return; }
+        if (m.closed) {   // the clip may still be made: never resend by itself, which could make it twice
+          setExport(s.id, { phase: 'interrupted', note: 'The connection closed during the export · Export again to retry' });
+          return;
         }
-        setText(note, 'Ready after ' + Math.round((performance.now() - began) / 1000) + ' s · ' + megabytes(m.bytes || 0) +
-          (m.captions ? ' · captions burned in' : '') + ' · links expire in ' + Math.round((m.expires_s || 3600) / 60) + ' min');
-        const video = h('video');
-        Object.assign(video, { controls: true, playsInline: true, preload: 'metadata', src: m.url });
-        const download = h('a', 'btn secondary rec-link', 'Download MP4');
-        download.href = m.download; download.rel = 'noopener';
-        result.replaceChildren(video, download);
+        if (m.type !== 'clip' || typeof m.url !== 'string' || !m.url.startsWith('https://storage.googleapis.com/') ||
+            typeof m.download !== 'string' || !m.download.startsWith('https://storage.googleapis.com/')) {
+          setExport(s.id, { phase: 'failed', note: m.error || 'The clip failed' }); return;
+        }
+        const minutes = Math.round((m.expires_s || 3600) / 60);
+        setExport(s.id, { phase: 'ready', url: m.url, download: m.download, expires: Date.now() + minutes * 60000,
+          note: 'Ready after ' + Math.round((performance.now() - began) / 1000) + ' s · ' + megabytes(m.bytes || 0) +
+            (m.captions ? ' · captions burned in' : '') + ' · links expire in ' + minutes + ' min' });
       });
-      if (!asked) { setText(note, 'Not connected to the vehicle · try again in a moment'); return; }
-      go.disabled = true;
-      setText(note, 'Asking the vehicle…');
+      if (!asked) { setExport(s.id, { phase: 'failed', note: 'Not connected to the vehicle · try again in a moment' }); return; }
+      setExport(s.id, { phase: 'asking', note: 'Asking the vehicle…' });
     }
+    cloudExportViews.set(exportKey(s.id), render);
+    render();
     row.append(text, actions, panel);
     return row;
   }
@@ -1663,7 +1714,7 @@
     for (const p of Object.keys(PAGES)) $('page-' + p).hidden = p !== name;
     $('title').textContent = PAGES[name];
     page = name;
-    if (name === 'recordings' && recList === null) loadRecordings();
+    if (name === 'recordings' && (recList === null || recReloadOnConnect)) { recReloadOnConnect = false; loadRecordings(); }
     syncVideo();
     render();
   }

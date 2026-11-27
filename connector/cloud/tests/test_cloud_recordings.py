@@ -56,21 +56,31 @@ class Ref:
 
 
 class FakeStore:
-    def __init__(self):
-        self.granted = {('owner-1', 'A'): {'role': 'owner'}, ('viewer-1', 'A'): {'role': 'viewer'}}
+    """@p live: a viewer's telemetry demand is granted, so the device can register and forward snapshots."""
+    def __init__(self, live=False):
+        self.granted = {('owner-1', 'A'): {'role': 'owner'}, ('viewer-1', 'A'): {'role': 'viewer'},
+                        ('owner-2', 'A'): {'role': 'owner'}}
+        self.live = live
 
     def grant(self, uid, key):
         return Ref(self.granted.get((uid, key)))
 
+    def _expiry(self):
+        return relay_time(time.time() + 120) if self.live else None
+
     async def device_control(self, key, uid):
         if uid != 'device-A':
             raise PermissionError
-        return dict(deviceUid=uid, demandGeneration=1, configVersion=1, expiresAt=None, desiredMode='on_demand',
-                    channels=[])
+        return dict(deviceUid=uid, demandGeneration=1, configVersion=1, expiresAt=self._expiry(), desiredMode='on_demand',
+                    channels=['telemetry'] if self.live else [])
 
     async def update(self, key, uid, **kwargs):
         return dict(desiredMode='on_demand', configVersion=1, demandGeneration=1, channels=kwargs.get('channels') or [],
-                    expiresAt=None, requestId=kwargs.get('session'))
+                    expiresAt=self._expiry(), requestId=kwargs.get('session'))
+
+
+def relay_time(seconds):
+    return types.SimpleNamespace(timestamp=lambda: seconds)
 
 
 class FakeClips:
@@ -78,16 +88,21 @@ class FakeClips:
 
     def __init__(self):
         self.signed = []
+        self.broken = set()   # 'PUT' and/or 'GET': that signing call raises, as an IAM or token failure would
 
     @staticmethod
     def object_name(vehicle, segment, start, quality):
         return f'clips/{vehicle}/{segment}_{int(start)}s_{quality}.mp4'
 
     def upload_url(self, name):
+        if 'PUT' in self.broken:
+            raise RuntimeError('signBlob: 503')
         self.signed.append(('PUT', name))
         return f'https://storage.googleapis.com/bucket/{name}?X-Goog-Signature=put'
 
     def download_urls(self, name, filename):
+        if 'GET' in self.broken:
+            raise RuntimeError('signBlob: 503')
         self.signed.append(('GET', name, filename))
         return (f'https://storage.googleapis.com/bucket/{name}?X-Goog-Signature=get',
                 f'https://storage.googleapis.com/bucket/{name}?X-Goog-Signature=dl')
@@ -99,7 +114,7 @@ async def fake_identity(request, device=False):
         if who != 'device-A':
             raise PermissionError
         return dict(uid=who, firebase=dict(sign_in_provider='custom'))
-    if who not in ('owner-1', 'viewer-1', 'stranger'):
+    if who not in ('owner-1', 'owner-2', 'viewer-1', 'stranger'):
         raise PermissionError
     return dict(uid=who, exp=time.time() + 3600, auth_time=time.time(), firebase=dict(sign_in_provider='google.com'))
 
@@ -191,6 +206,122 @@ class RelayRecordingsTests(unittest.IsolatedAsyncioTestCase):
         await device.send_json(dict(type='heartbeat'))
         self.assertEqual((await self.next_of(device, 'heartbeat'))['type'], 'heartbeat')   # still healthy
         await device.close()
+
+    # ---- review 2026-11-27 #2 and #3 -------------------------------------------------------------------
+    async def live(self):
+        """A registered device with telemetry granted, and a second viewer watching it."""
+        await self.client.close()
+        self.client = TestClient(TestServer(relay.application(FakeStore(live=True), {}, self.clips)))
+        await self.client.start_server()
+        device = await self.device()
+        await device.send_json(dict(type='register', generation=1, attempt=1))
+        self.assertEqual((await self.next_of(device, 'grant'))['channels'], ['telemetry'])
+        watcher = await self.viewer('owner-2')
+        await watcher.send_json(dict(channels=['telemetry']))
+        await asyncio.sleep(.1)
+        return device, watcher
+
+    async def still_serving(self, device, watcher, seq):
+        """The vehicle socket is open and still forwards telemetry to the other viewer."""
+        await device.send_json(dict(type='snapshot', seq=seq))
+        self.assertEqual((await self.next_of(watcher, 'snapshot'))['seq'], seq)
+        await device.send_json(dict(type='heartbeat'))
+        self.assertEqual((await self.next_of(device, 'heartbeat'))['type'], 'heartbeat')
+
+    async def export(self, viewer, rid):
+        await viewer.send_json(dict(type='clip', id=rid, segment=SEGMENT, start_s=0, duration_s=10, quality='small'))
+
+    async def test_upload_signing_failure_fails_the_request_only(self):
+        device, watcher = await self.live()
+        viewer = await self.viewer('owner-1')
+        self.clips.broken = {'PUT'}
+        await self.export(viewer, 'c1')
+        error = await self.next_of(viewer, 'error')
+        self.assertEqual((error['id'], error['error']), ('c1', relay.SIGNING_FAILED))
+        await self.still_serving(device, watcher, 1)
+        self.clips.broken = set()   # signing recovers: the same viewer exports at once
+        await self.export(viewer, 'c2')
+        self.assertEqual((await self.next_of(viewer, 'clip_status'))['id'], 'c2')
+        asked = await self.next_of(device, 'export_clip')
+        await device.send_json(dict(type='clip_result', id=asked['id'], ok=True, bytes=10))
+        self.assertEqual((await self.next_of(viewer, 'clip'))['id'], 'c2')
+        for ws in (viewer, watcher, device):
+            await ws.close()
+
+    async def test_download_signing_failure_keeps_the_vehicle_connected(self):
+        device, watcher = await self.live()
+        viewer = await self.viewer('owner-1')
+        self.clips.broken = {'GET'}
+        await self.export(viewer, 'c1')
+        asked = await self.next_of(device, 'export_clip')
+        await device.send_json(dict(type='clip_result', id=asked['id'], ok=True, bytes=10))
+        error = await self.next_of(viewer, 'error')
+        self.assertEqual((error['id'], error['error']), ('c1', relay.SIGNING_FAILED))
+        await self.still_serving(device, watcher, 2)
+        self.clips.broken = set()
+        await self.export(viewer, 'c2')
+        asked = await self.next_of(device, 'export_clip')
+        await device.send_json(dict(type='clip_result', id=asked['id'], ok=True, bytes=10))
+        self.assertEqual((await self.next_of(viewer, 'clip'))['id'], 'c2')
+        for ws in (viewer, watcher, device):
+            await ws.close()
+
+    async def test_vehicle_reconnect_fails_its_pending_export(self):
+        device = await self.device()
+        viewer = await self.viewer('owner-1')
+        await self.export(viewer, 'c1')
+        first = await self.next_of(device, 'export_clip')
+        await device.close()   # the uplink drops after accepting the clip
+        error = await self.next_of(viewer, 'error')
+        self.assertEqual((error['id'], error['error']), ('c1', relay.VEHICLE_GONE))
+        device = await self.device()
+        await self.export(viewer, 'c2')   # no "Wait for the clip being exported"
+        self.assertEqual((await self.next_of(viewer, 'clip_status'))['id'], 'c2')
+        second = await self.next_of(device, 'export_clip')
+        # A replacing socket fails the requests of the one it replaces, at once.
+        await self.export(watcher := await self.viewer('owner-2'), 'w1')
+        await self.next_of(device, 'export_clip')
+        replacement = await self.device()
+        for ws, rid in ((viewer, 'c2'), (watcher, 'w1')):
+            error = await self.next_of(ws, 'error')
+            self.assertEqual((error['id'], error['error']), (rid, relay.VEHICLE_GONE))
+        # An answer to a token from the replaced socket is ignored when another socket sends it.
+        await replacement.send_json(dict(type='clip_result', id=second['id'], ok=True, bytes=10))
+        await replacement.send_json(dict(type='clip_result', id=first['id'], ok=True, bytes=10))
+        await replacement.send_json(dict(type='heartbeat'))
+        self.assertEqual((await self.next_of(replacement, 'heartbeat'))['type'], 'heartbeat')
+        await viewer.send_json(dict(type='recordings', id='r1'))
+        asked = await self.next_of(replacement, 'list_recordings')
+        await replacement.send_json(dict(type='recordings', id=asked['id'], segments=[]))
+        seen = []
+        while not seen or seen[-1]['type'] != 'recordings':
+            seen.append(await viewer.receive_json(timeout=3))
+        self.assertFalse([m for m in seen if m['type'] in ('clip', 'error')], seen)   # nothing late for c1/c2
+        self.assertFalse(any(s[0] == 'GET' for s in self.clips.signed))
+        for ws in (viewer, watcher, replacement):
+            await ws.close()
+
+    async def test_silent_vehicle_times_out_without_another_request(self):
+        saved = dict(relay.REQUEST_SECONDS)
+        relay.REQUEST_SECONDS.update(clip=.3, recordings=.3)
+        try:
+            device = await self.device()
+            viewer = await self.viewer('owner-1')
+            await self.export(viewer, 'c1')
+            await self.next_of(device, 'export_clip')   # and never answers
+            error = await self.next_of(viewer, 'error')
+            self.assertEqual(error['id'], 'c1')
+            self.assertIn('did not answer', error['error'])
+            await viewer.send_json(dict(type='recordings', id='r1'))
+            await self.next_of(device, 'list_recordings')
+            self.assertEqual((await self.next_of(viewer, 'error'))['id'], 'r1')
+            await self.export(viewer, 'c2')   # free to export again
+            self.assertEqual((await self.next_of(viewer, 'clip_status'))['id'], 'c2')
+            await viewer.close()
+            await device.close()
+        finally:
+            relay.REQUEST_SECONDS.clear()
+            relay.REQUEST_SECONDS.update(saved)
 
     async def test_bad_request_id_closes_and_ungranted_viewer_is_refused(self):
         viewer = await self.viewer()

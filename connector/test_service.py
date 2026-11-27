@@ -1487,6 +1487,53 @@ class ClipTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data[4:8], b'ftyp')
             self.assertLess(data.find(b'moov'), data.find(b'mdat'))   # fast start: the index first
 
+    async def test_clip_past_the_end_is_refused_not_empty(self):
+        """Review 2026-11-27 #5: a start beyond the last frame gave exit 0 and a 261-byte MP4 with no video."""
+        if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            self.skipTest('ffmpeg not installed')
+        self.assertIn('empty_output', service.clip_command('ffmpeg', Path('v.mkv'), 0, 5, '720p', None, Path('o.mp4')))
+        # Known length (the fixture's Duration, 1 s): refused before ffmpeg runs.
+        r = await self.clip(self.name, start_s=2, duration_s=1, quality='720p')
+        self.assertEqual(r.status, 416, await r.text())
+        # Unknown length: ffmpeg itself must fail, not hand back an empty file.
+        self.state.recordings.index = lambda path, info: (True, None)
+        r = await self.clip(self.name, start_s=2, duration_s=1, quality='720p')
+        self.assertEqual(r.status, 422, await r.text())
+        # Overlapping the end still gives the frames that exist.
+        r = await self.clip(self.name, start_s=0.5, duration_s=1, quality='720p')
+        data = await r.read()
+        self.assertEqual(r.status, 200)
+        with tempfile.NamedTemporaryFile(suffix='.mp4') as f:
+            f.write(data)
+            f.flush()
+            probe = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type',
+                                               '-of', 'json', f.name], capture_output=True, text=True, check=True).stdout)
+        self.assertEqual([s['codec_type'] for s in probe['streams']], ['video'])
+
+    async def test_cut_short_segment_is_listed_but_not_playable(self):
+        """Review 2026-11-27 #6: a segment without a usable Cues index (power cut) was offered for playback."""
+        full = FIXTURE.read_bytes()
+        old = time.time() - 600
+        cut = 'dashcam_000003_20261126_120600.mkv'
+        (self.dir / cut).write_bytes(full[:len(full) * 7 // 10])   # aged, truncated before the Cues
+        cues = full.find(bytes.fromhex('1C53BB6B'))
+        self.assertGreater(cues, 0)
+        broken = 'dashcam_000004_20261126_120900.mkv'
+        (self.dir / broken).write_bytes(full[:cues] + b'\0\0\0\0' + full[cues + 4:])   # index points at no Cues
+        for name in (cut, broken):
+            os.utime(self.dir / name, (old, old))
+        listed = {s['id']: s for s in (await (await self.client.get('/v1/recordings', headers=self.headers)).json())['segments']}
+        self.assertIs(listed[self.name]['playable'], True)               # finished segment
+        self.assertIs(listed[cut[:-4]]['playable'], False)
+        self.assertIs(listed[broken[:-4]]['playable'], False)
+        self.assertNotIn('dashcam_000002_20261126_120300', listed)       # growing: not listed at all
+        # Still downloadable for recovery, byte for byte.
+        r = await self.client.get('/v1/recordings/' + cut, headers=self.headers)
+        self.assertEqual((r.status, await r.read()), (200, full[:len(full) * 7 // 10]))
+        playable, length = service.mkv_index(self.dir / (self.name + '.mkv'), len(full))
+        self.assertIs(playable, True)
+        self.assertAlmostEqual(length, 1.0, delta=.1)
+
     async def test_one_export_at_a_time(self):
         if not shutil.which('ffmpeg'):
             self.skipTest('ffmpeg not installed')

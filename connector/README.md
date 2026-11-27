@@ -461,6 +461,12 @@ symlinks. Requests are by name, never by path. The segment still being written (
 with no Cues yet) is neither listed nor served (409). A segment that retention deletes while it plays or
 downloads ends with "Not found".
 
+**Cut-short segments.** A segment the recorder never finished (power lost mid-segment) has no Cues and a zero
+Duration, so the players cannot seek it. The agent reads each segment's header and its Cues position as the
+players do, caches the result per file, and lists such a segment with `playable: false`. Both clients then
+disable Play but keep Download, for recovery. On the bench Jetson, 5 of 831 segments were cut short
+(2026-11-27). The first listing reads every header (1.25 s for 831); later ones use the cache (70 ms).
+
 **Privacy.** Recordings are a location and time history. On the LAN they need the same pairing credential or
 browser session as live view. Run the agent with `--no-recordings` to withhold them. That also withholds them from cloud sessions.
 
@@ -498,7 +504,16 @@ clip's place in the segment: at 5 s into a clip that starts 60 s into a segment 
 22:36:55.
 
 **Limits.** A clip is at most 180 s and comes from one finished segment. The segment still being written
-answers 409. Export time is bounded at 60 s + 3 × the clip length. Clip objects are deleted by the bucket's
+answers 409. A start at or past the segment's end answers 416, and ffmpeg runs with `-abort_on empty_output`,
+so an empty MP4 is never uploaded. Export time is bounded at 60 s + 3 × the clip length.
+
+**When things go wrong.** Each pending request belongs to the vehicle socket it was sent on. If that socket
+closes or is replaced, the viewer gets an error at once. A silent vehicle gets one at a deadline: 60 s for a
+list, 10 min for a clip. A signing failure ends only that request; the vehicle and viewer sockets keep serving.
+In the browser, export progress and links are kept per segment, so a list refresh keeps them. A request whose
+socket closes (for example a hidden tab) fails at once. An interrupted list reloads on the next connection.
+An interrupted export offers **Export again** and is never resent automatically, since resending could make
+the clip twice. Clip objects are deleted by the bucket's
 lifecycle rule a day after upload. Links expire after an hour; export again for new ones. Setup:
 cloud/README.md "Cloud recordings bucket".
 
