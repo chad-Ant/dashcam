@@ -112,7 +112,10 @@ private fun Dashboard(model: DashboardModel, onKeepAwake: (Boolean) -> Unit, onP
     var playing by remember { mutableStateOf<RecordingSegment?>(null) }
     val playerScope = rememberCoroutineScope()
     val player = remember(playing) {
-        playing?.let { segment -> model.repository.openRecordings()?.let { RecordingPlayer(it, segment, playerScope).also { p -> p.start() } } }
+        val deviceId = selected
+        playing?.takeIf { deviceId != null }?.let { segment ->
+            RecordingPlayer({ model.repository.openRecordings(deviceId) }, segment, playerScope).also { it.start() }
+        }
     }
     DisposableEffect(player) { onDispose { player?.close() } }
     LaunchedEffect(selected) { playing = null; model.recordings.refresh() }

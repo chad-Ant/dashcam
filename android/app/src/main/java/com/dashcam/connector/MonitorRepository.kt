@@ -250,8 +250,9 @@ class MonitorRepository(context: Context, private val scope: CoroutineScope) {
      * or null while no device is selected or there is no Wi-Fi. Same pin and credential as the
      * live connection; the caller closes it.
      */
-    fun openRecordings(): RecordingSource? {
+    fun openRecordings(deviceId: String? = null): RecordingSource? {
         val device = desired ?: return null
+        if (deviceId != null && device.id != deviceId) return null
         val network = wifi ?: return null
         val base = HttpUrl.Builder().scheme("https").host(device.host).port(device.port)
             .addPathSegments("v1/recordings").build()

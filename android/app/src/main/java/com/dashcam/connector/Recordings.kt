@@ -179,7 +179,7 @@ class RecordingsBrowser(private val context: Context, private val repository: Mo
             } catch (e: CancellationException) { throw e
             } catch (e: Exception) {
                 downloadsMutable.update { it + (segment.id to DownloadState.Failed(
-                    (e as? RecordingsException)?.message ?: "Download failed · tap Download to retry")) }
+                    (e as? RecordingsException)?.message ?: "Download failed")) }
             } finally { source.close() }
         }
     }
@@ -206,7 +206,7 @@ data class PlayerState(val status: String = "Loading", val positionMs: Long = 0,
  * skipped rather than delayed. Pictures go to [picture] (a CameraSurface draws them off the main
  * thread); the captions for the frame on screen go to [captions].
  */
-class RecordingPlayer(private val source: RecordingSource, val segment: RecordingSegment,
+class RecordingPlayer(private val openSource: () -> RecordingSource?, val segment: RecordingSegment,
                       private val scope: CoroutineScope) {
     private val name = segment.id + ".mkv"
     private val stateMutable = MutableStateFlow(PlayerState())
@@ -223,8 +223,8 @@ class RecordingPlayer(private val source: RecordingSource, val segment: Recordin
     private var closed = false
 
     fun start() {
-        job = scope.launch(Dispatchers.IO) {
-            try {
+        runPlayback { source ->
+            withContext(Dispatchers.IO) {
                 val header = source.range(name, 0, Mkv.HEADER_BYTES - 1L)
                 val mkv = Mkv.parseHeader(header)
                 clusters = Mkv.parseCues(source.range(name, mkv.cuesPosition, null), mkv)
@@ -234,9 +234,8 @@ class RecordingPlayer(private val source: RecordingSource, val segment: Recordin
                 } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
                 stateMutable.value = PlayerState("Playing", 0, mkv.durationMs, playing = true, buffering = true,
                     width = mkv.width, height = mkv.height, captionsAvailable = script != null)
-                playFrom(0, autoplay = true)
-            } catch (e: CancellationException) { throw e
-            } catch (e: Exception) { stop(playbackFailure(e, started = false)) }
+            }
+            withContext(Dispatchers.Default) { playback(source, 0, autoplay = true) }
         }
     }
 
@@ -261,21 +260,30 @@ class RecordingPlayer(private val source: RecordingSource, val segment: Recordin
         playFrom(ms.coerceIn(0, stateMutable.value.durationMs), autoplay = stateMutable.value.playing)
     }
 
-    fun close() { closed = true; job?.cancel(); pictureMutable.value = null; source.close() }
+    fun close() { closed = true; job?.cancel(); pictureMutable.value = null }
 
     private fun playFrom(fromMs: Long, autoplay: Boolean) {
         job?.cancel()
         if (closed) return
         stateMutable.update { it.copy(positionMs = fromMs, playing = autoplay, buffering = true,
             status = if (autoplay) "Playing" else "Paused") }
-        job = scope.launch(Dispatchers.Default) {
-            try { playback(fromMs, autoplay) }
+        runPlayback { source -> withContext(Dispatchers.Default) { playback(source, fromMs, autoplay) } }
+    }
+
+    private fun runPlayback(action: suspend (RecordingSource) -> Unit) {
+        job = scope.launch {
+            try {
+                // Android assigns a new Network handle when Wi-Fi reconnects. Keep the pin and device,
+                // but open a source on the current Wi-Fi for every Play or seek action.
+                val source = openSource() ?: throw IOException("Wi-Fi unavailable")
+                source.use { action(it) }
+            }
             catch (e: CancellationException) { throw e }
-            catch (e: Exception) { stop(playbackFailure(e, started = true)) }
+            catch (e: Exception) { stop(playbackFailure(e, started = info != null)) }
         }
     }
 
-    private suspend fun playback(fromMs: Long, autoplay: Boolean) = coroutineScope {
+    private suspend fun playback(source: RecordingSource, fromMs: Long, autoplay: Boolean) = coroutineScope {
         val mkv = info ?: return@coroutineScope
         fun fetch(i: Int) = async(Dispatchers.IO) {
             val end = if (i + 1 < clusters.size) clusters[i + 1].offset else mkv.cuesPosition

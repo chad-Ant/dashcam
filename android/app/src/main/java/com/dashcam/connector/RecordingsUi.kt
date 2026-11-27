@@ -68,10 +68,11 @@ internal fun LazyListScope.recordingsPage(browser: RecordingsBrowser, onPlay: (R
                     TextButton(onClick = onCancel) { Text("Cancel") }
                 }
                 is DownloadState.Saved -> Hint("Saved to ${download.where}")
-                is DownloadState.Failed -> { Hint(download.why); TextButton(onClick = onDownload) { Text("Retry") } }
+                is DownloadState.Failed -> TextButton(onClick = onDownload) { Text("Retry") }
                 null -> OutlinedButton(onClick = onDownload) { Text("Download") }
             }
         }
+        if (download is DownloadState.Failed) Hint(download.why)
     }
 }
 
